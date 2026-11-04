@@ -153,8 +153,11 @@ residency and accounting. Small-store streams remain independent.
 Small store retains per-ring data segment reservation, concurrent append,
 pre-created spare segments, payload fsync, seal/delete/atomic replacement,
 TTI checkpoints, capacity eviction and garbage-ratio policy. Insert requests
-`Written`; seal, committed deletion and replacement request `Durable` after
-their required data/directory ordering. Small objects are not also recorded in
+`Written`; flush, seal, deletion within a durable prefix, and replacement request
+`Durable` after their required data/directory ordering. Flush records a recoverable
+prefix without sealing the active segment. Snapshots retain its durable end and
+any pending tail; startup trims the tail before durably finalizing the prefix.
+Small objects are not also recorded in
 the paged catalog. Each adapter decides which state is safe to recover.
 
 Background rate/I/O budgets belong to Worker policy. Shared snapshot/cleanup

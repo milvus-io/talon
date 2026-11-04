@@ -661,6 +661,13 @@ fn native_small_io_uses_current_ring_without_blocking_fallback() {
                 .await
                 .unwrap();
         }
+        store.flush().await.unwrap();
+        {
+            let state = store.state.lock().await;
+            let segment = &state.segments[&state.active.unwrap()];
+            assert_eq!(segment.durable_end, 10 * 3072);
+            assert!(!segment.sealed);
+        }
         store.maintain(true).await.unwrap();
         let old = store.get(&id("9")).await.unwrap().unwrap();
         for n in 0..9 {
@@ -911,7 +918,7 @@ async fn out_of_order_append_rollover_and_cancelled_caller_preserve_seal_barrier
         let state = store.state.lock().await;
         assert_eq!(state.sealing, Some(old));
         assert_ne!(state.active, Some(old));
-        assert_eq!(state.segments[&old].in_flight, 1);
+        assert_eq!(state.segments[&old].in_flight.len(), 1);
         assert!(!state.segments[&old].sealed);
         assert!(state.segments[&old].bytes + state.segments[&old].metadata <= store.segment_size);
     }
@@ -964,7 +971,7 @@ async fn append_slots_bound_submissions_without_holding_state_lock() {
             .await
             .segments
             .values()
-            .map(|s| s.in_flight)
+            .map(|s| s.in_flight.len())
             .sum::<usize>(),
         1
     );
@@ -1008,7 +1015,7 @@ async fn failed_reserved_index_prevents_peer_publication_and_keeps_durable_segme
             .await
             .segments
             .values()
-            .map(|s| s.in_flight)
+            .map(|s| s.in_flight.len())
             .sum::<usize>(),
         0
     );

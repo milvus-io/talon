@@ -2,6 +2,71 @@ use super::*;
 use crate::small_store::{tests::files, SegmentStore};
 use std::time::Duration;
 use talon_core::{Backend, BlockId, ObjectId, Version, WorkerConfig};
+
+#[test]
+fn legacy_snapshot_headers_preserve_the_original_durability_boundary() {
+    use talon_journal::Machine;
+    for sealed in [false, true] {
+        let mut bytes = vec![4];
+        for n in [1u64, 0, 5, 64] {
+            bytes.extend_from_slice(&n.to_le_bytes());
+        }
+        bytes.push(u8::from(sealed));
+        let record = Model::decode_snapshot(&bytes).unwrap();
+        let mut model = Model {
+            next: 2,
+            ..Default::default()
+        };
+        model.restore(record).unwrap();
+        assert_eq!(model.segments[&1].durable_end, if sealed { 5 } else { 0 });
+    }
+}
+
+#[test]
+fn flush_boundaries_reject_record_splits_and_regression() {
+    let mut model = Model::default();
+    for (offset, key) in [(0, "a"), (5, "b")] {
+        model
+            .apply(Event::Insert {
+                slot: 0,
+                segment: 1,
+                offset,
+                record: Record {
+                    key: format::key(&id(key)).unwrap().into(),
+                    len: 5,
+                    checksum: 0,
+                },
+            })
+            .unwrap();
+    }
+    for durable_end in [0, 3, 11] {
+        assert!(model
+            .apply(Event::Flush {
+                segment: 1,
+                durable_end
+            })
+            .is_err());
+    }
+    model
+        .apply(Event::Flush {
+            segment: 1,
+            durable_end: 5,
+        })
+        .unwrap();
+    model
+        .apply(Event::Flush {
+            segment: 1,
+            durable_end: 10,
+        })
+        .unwrap();
+    assert!(model
+        .apply(Event::Flush {
+            segment: 1,
+            durable_end: 5
+        })
+        .is_err());
+}
+
 fn id(n: &str) -> BlockId {
     BlockId::new(
         ObjectId::new(Backend::S3, "bucket", n),

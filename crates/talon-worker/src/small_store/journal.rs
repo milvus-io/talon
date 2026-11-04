@@ -97,9 +97,9 @@ impl Journal {
         ))
     }
 
-    /// Called only after all sealed payloads and identities have been validated
+    /// Called only after all recoverable payloads and identities have been validated
     /// and their locators constructed. Never delete orphan data on that failure.
-    pub(super) fn finish_recovery(&self, model: &Model) -> io::Result<()> {
+    pub(super) fn finish_recovery(&self, model: &Model) -> io::Result<BTreeMap<u64, u64>> {
         let root = &self.root;
         let handle = &self.handle;
         let mut next = model.next;
@@ -130,7 +130,7 @@ impl Journal {
                     id.checked_add(1)
                         .ok_or_else(|| invalid("segment id overflow"))?,
                 );
-                if !model.segments.get(&id).is_some_and(|s| s.sealed) {
+                if !model.segments.get(&id).is_some_and(|s| s.durable_end > 0) {
                     orphans.push(path);
                 }
             }
@@ -138,11 +138,34 @@ impl Journal {
         let abandoned: Vec<_> = model
             .segments
             .iter()
-            .filter_map(|(&id, s)| (!s.sealed).then_some(id))
+            .filter_map(|(&id, s)| (s.durable_end == 0).then_some(id))
             .collect();
+        let mut allocations = BTreeMap::new();
         // Resolve old unsealed state before deleting its payloads or accepting
         // new inserts. The allocator high-water mark survives orphan cleanup.
         futures::executor::block_on(tokio::task::unconstrained(async {
+            for (&segment, meta) in model
+                .segments
+                .iter()
+                .filter(|(_, s)| !s.sealed && s.durable_end > 0)
+            {
+                use std::os::unix::fs::MetadataExt;
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(self.data_path(segment))?;
+                file.set_len(meta.durable_end)?;
+                file.sync_all()?;
+                #[cfg(test)]
+                super::tests::crash("recover_truncate");
+                // Restart stops the old append stream. Seal its retained prefix
+                // only after trimming the uncommitted tail durably.
+                handle
+                    .append(Event::Recover { segment }, Ack::Durable)
+                    .await?;
+                #[cfg(test)]
+                super::tests::crash("recover_commit");
+                allocations.insert(segment, file.metadata()?.blocks() * 512);
+            }
             for old in abandoned {
                 handle
                     .append(Event::Replace { old, new: None }, Ack::Durable)
@@ -160,7 +183,7 @@ impl Journal {
         tracing::info!(root = %root.display(),
             reconcile_ms = reconcile_started.elapsed().as_secs_f64() * 1000.0,
             "small journal recovery reconciled");
-        Ok(())
+        Ok(allocations)
     }
     pub fn set_budget(&self, budget: Arc<crate::background::BackgroundBudget>) {
         self.handle.set_maintenance(budget);

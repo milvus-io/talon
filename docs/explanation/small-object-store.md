@@ -60,7 +60,7 @@ access times for every ring. The existing access-checkpoint interval controls
 periodic writes, and graceful shutdown flushes a final snapshot. TTI can be
 enabled for small-object storage even when paged L2 is disabled. Publication uses
 temporary-file sync, rename, and directory sync; hits only update memory.
-Recovery applies ages only to objects actually recovered from sealed segments,
+Recovery applies ages only to objects within recovered durable segment prefixes,
 including objects relocated since the snapshot. Downtime counts toward idle age.
 A crash can lose access updates since the last successful checkpoint, so expiry
 is approximate. Missing or corrupt snapshots grant a fresh idle interval (with
@@ -102,24 +102,36 @@ retain independent active/spare segments but do not own separate directories or
 index files. Payload files are created exclusively and never overwritten.
 
 The metadata writer owns checksummed, versioned log records: insert (stream,
-segment, offset, length, checksum, full identity), delete (segment, offset), seal,
-and atomic replacement of an old segment with a new one. Metadata is kept separate
+segment, offset, length, checksum, full identity), delete (segment, offset), flush
+(segment, durable end), seal, recovery truncation, and atomic replacement of an
+old segment with a new one. Metadata is kept separate
 from payloads; it is not a redo log containing origin data. Identity includes
 backend, bucket, path, version, block offset and block size, compared in full.
 Sendfile/splice still use retained payload descriptors and explicit byte ranges.
 
 `metadata/CURRENT` selects a checksummed snapshot and an explicit ordered set of
 log generations to replay. It also records exact pending cleanup paths.
-The snapshot stores the current segment table and live-object mappings, including
-pending unsealed segments needed by later seal records. Startup reads that
-snapshot, replays the remaining logs in order, discards segments without a
-committed seal/replacement, validates referenced payload lengths and duplicate
-identities, and then removes unreferenced payloads and obsolete metadata files.
+The snapshot stores the current segment table, durable ends and live-object mappings,
+including uncommitted tails needed by later flush/seal records. Startup reads that
+snapshot and replays the remaining logs in order. A durable flush makes an active
+segment's prefix recoverable without closing it to further appends. Startup first
+validates every retained payload range and all recovered identities. It then trims
+uncommitted tails, syncs those files, and durably records recovery of each prefix.
+Recovered prefixes are closed to further appends; new writes use a fresh active
+segment. Interruption before the recovery record repeats the same trim; interruption
+after it recovers the finalized prefix. Segments with no durable prefix are discarded.
+Unreferenced payloads and obsolete metadata files are removed after validation.
 It never scans payload contents or stats individual objects to build the index.
 A partial final log frame is discarded because it cannot have been acknowledged;
 checksum corruption, gaps in log generations, corrupt snapshots, and missing
 committed data fail recovery closed. Removing a partial WAL tail is recovery
-repair, not payload truncation for space reclamation.
+repair. Payload tail truncation also occurs only during exclusive startup recovery,
+before any readers or writers can retain that file.
+
+Snapshots written before durable-prefix support remain readable: sealed segments
+derive their durable end from their length, and unsealed segments have no durable
+prefix. Older binaries cannot read the new flush/recovery records or snapshots;
+downgrades require a new empty cache root.
 
 The engine and metadata writer both retain metadata proportional to resident
 objects. Keys are compact binary identities, but the writer's checkpoint state
@@ -141,7 +153,7 @@ steps preserve resident byte charges, block-wide idle clocks, and eviction
 semantics. Persisted small-object access ages are restored after policy tokens
 are attached.
 
-Small-store startup constructs locators while validating each sealed payload's
+Small-store startup constructs locators while validating each recoverable payload's
 length. It reserves each ring's key directory from the recovered record counts
 and bulk-collects segment offset tables. Cross-ring uniqueness uses a temporary
 vector of fingerprints and borrowed key bytes collected during that same pass;
@@ -221,11 +233,23 @@ Seal waits for a data segment's outstanding appends, syncs its payload and shard
 ancestry, then submits a durable seal record. The log writer never waits for a
 data ring to fsync: it receives the seal request only after that work finishes.
 Different data streams can become recoverable independently. Segments seal when
-full, at the next maintenance tick after 30 seconds, or during graceful shutdown.
-An abrupt exit can lose the bounded unsealed cache segments; the origin remains
-the durability point. Deleting a sealed object waits for its log tombstone to be
-synced before removing the locator. Per-identity guards retain cross-ring
-write/delete ordering; per-stream publication gates order seal, deletion and GC.
+full, when pressure reclamation requires it, or during graceful shutdown.
+
+At a maintenance tick, an active segment with dirty data is flushed after 30 seconds
+since its stream's last flush or after accumulating 8 MiB beyond its durable end.
+This timing is subject to maintenance scheduling and I/O budgets. Flush captures the
+reservation end, waits only for outstanding appends before that cut, syncs payload
+and shard ancestry, then commits a durable flush record. Appends beyond the cut can
+continue while it waits or syncs. Per-stream tracking is bounded by the existing
+32-append admission limit. No per-object fsync is added, and an idle flushed segment
+remains open for later appends instead of rotating an underfilled file.
+
+An abrupt exit can lose the suffix after the last durable flush; the origin remains
+the durability source. Deleting an object within a durable prefix waits for its log
+tombstone to be synced before removing the locator, even if the segment is still
+active. Per-identity guards retain cross-ring write/delete ordering; per-stream
+publication gates order flush, seal, deletion and GC. Flush failures stop further
+mutations on that data stream without invalidating its previously durable prefix.
 
 ## Snapshots and log reclamation
 

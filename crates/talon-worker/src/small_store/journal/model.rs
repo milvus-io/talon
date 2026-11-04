@@ -13,9 +13,24 @@ pub(crate) struct Record {
 pub(crate) struct SegmentMeta {
     pub slot: usize,
     pub bytes: u64,
+    pub durable_end: u64,
     pub metadata: u64,
     pub sealed: bool,
     pub records: BTreeMap<u64, Record>,
+}
+
+impl SegmentMeta {
+    pub fn recovered_metadata(&self) -> u64 {
+        if self.sealed {
+            self.metadata
+        } else {
+            8 + self
+                .records
+                .range(..self.durable_end)
+                .map(|(_, r)| 37 + r.key.len() as u64)
+                .sum::<u64>()
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -36,6 +51,13 @@ pub(crate) enum Event {
         offset: u64,
     },
     Seal {
+        segment: u64,
+    },
+    Flush {
+        segment: u64,
+        durable_end: u64,
+    },
+    Recover {
         segment: u64,
     },
     SetNext {
@@ -74,6 +96,18 @@ impl Event {
             }
             Self::Seal { segment } => {
                 b.push(2);
+                b.extend_from_slice(&segment.to_le_bytes());
+            }
+            Self::Flush {
+                segment,
+                durable_end,
+            } => {
+                b.push(6);
+                b.extend_from_slice(&segment.to_le_bytes());
+                b.extend_from_slice(&durable_end.to_le_bytes());
+            }
+            Self::Recover { segment } => {
+                b.push(7);
                 b.extend_from_slice(&segment.to_le_bytes());
             }
             Self::Replace { old, new } => {
@@ -117,6 +151,13 @@ impl Event {
                 offset: format::u64(&mut b)?,
             },
             2 => Self::Seal {
+                segment: format::u64(&mut b)?,
+            },
+            6 => Self::Flush {
+                segment: format::u64(&mut b)?,
+                durable_end: format::u64(&mut b)?,
+            },
+            7 => Self::Recover {
                 segment: format::u64(&mut b)?,
             },
             3 => {
@@ -163,12 +204,13 @@ impl Model {
                     Arc::new(SegmentMeta {
                         slot,
                         bytes: 0,
+                        durable_end: 0,
                         metadata: 8,
                         sealed: false,
                         records: BTreeMap::new(),
                     })
                 }));
-                if s.slot != slot || s.sealed {
+                if s.slot != slot || s.sealed || offset < s.durable_end {
                     return Err(invalid("insert into sealed/wrong stream"));
                 }
                 let end = offset
@@ -201,24 +243,62 @@ impl Model {
                 s.metadata += 21;
             }
             Event::Seal { segment } => {
-                Arc::make_mut(
+                let s = Arc::make_mut(
                     self.segments
                         .get_mut(&segment)
                         .ok_or_else(|| invalid("seal missing segment"))?,
-                )
-                .sealed = true;
+                );
+                s.durable_end = s.bytes;
+                s.sealed = true;
+            }
+            Event::Flush {
+                segment,
+                durable_end,
+            } => {
+                let s = Arc::make_mut(
+                    self.segments
+                        .get_mut(&segment)
+                        .ok_or_else(|| invalid("flush missing segment"))?,
+                );
+                if s.sealed
+                    || durable_end == 0
+                    || durable_end < s.durable_end
+                    || durable_end > s.bytes
+                    || s.records
+                        .range(..durable_end)
+                        .next_back()
+                        .is_some_and(|(offset, record)| offset + record.len > durable_end)
+                {
+                    return Err(invalid("invalid durable segment boundary"));
+                }
+                s.durable_end = durable_end;
+            }
+            Event::Recover { segment } => {
+                let s = Arc::make_mut(
+                    self.segments
+                        .get_mut(&segment)
+                        .ok_or_else(|| invalid("recover missing segment"))?,
+                );
+                if s.sealed || s.durable_end == 0 {
+                    return Err(invalid("invalid segment recovery"));
+                }
+                s.metadata = s.recovered_metadata();
+                s.records.retain(|offset, _| *offset < s.durable_end);
+                s.bytes = s.durable_end;
+                s.sealed = true;
             }
             Event::Replace { old, new } => {
                 if let Some(new) = new {
                     if old == new {
                         return Err(invalid("self relocation"));
                     }
-                    Arc::make_mut(
+                    let s = Arc::make_mut(
                         self.segments
                             .get_mut(&new)
                             .ok_or_else(|| invalid("replacement missing segment"))?,
-                    )
-                    .sealed = true;
+                    );
+                    s.durable_end = s.bytes;
+                    s.sealed = true;
                 }
                 // Empty standby/active files have no Insert record.
                 self.segments.remove(&old);
@@ -276,11 +356,12 @@ impl Iterator for Snapshot {
             self.current = None;
         }
         let (id, s) = self.segments.next()?;
-        let mut b = vec![4];
+        let mut b = vec![8];
         for n in [id, s.slot as u64, s.bytes, s.metadata] {
             b.extend_from_slice(&n.to_le_bytes());
         }
         b.push(u8::from(s.sealed));
+        b.extend_from_slice(&s.durable_end.to_le_bytes());
         self.current = Some((id, s, None));
         Some(Ok(b.into()))
     }
@@ -292,8 +373,8 @@ impl talon_journal::Machine for Model {
     fn encoded_len(event: &Event) -> io::Result<usize> {
         Ok(match event {
             Event::Insert { record, .. } => 41 + record.key.len(),
-            Event::Delete { .. } | Event::Replace { .. } => 17,
-            Event::Seal { .. } | Event::SetNext { .. } => 9,
+            Event::Delete { .. } | Event::Replace { .. } | Event::Flush { .. } => 17,
+            Event::Seal { .. } | Event::SetNext { .. } | Event::Recover { .. } => 9,
         })
     }
     fn encode(event: &Event) -> io::Result<Bytes> {
@@ -323,7 +404,7 @@ impl talon_journal::Machine for Model {
                 }
                 Ok(SnapshotRecord::Next(next))
             }
-            4 => {
+            4 | 8 => {
                 let id = format::u64(&mut b)?;
                 let slot =
                     usize::try_from(format::u64(&mut b)?).map_err(|_| invalid("slot overflow"))?;
@@ -334,14 +415,22 @@ impl talon_journal::Machine for Model {
                     1 => true,
                     _ => return Err(invalid("snapshot seal")),
                 };
-                if !b.is_empty() {
-                    return Err(invalid("snapshot header trailing bytes"));
+                let durable_end = if kind == 8 {
+                    format::u64(&mut b)?
+                } else if sealed {
+                    bytes
+                } else {
+                    0
+                };
+                if !b.is_empty() || durable_end > bytes || (sealed && durable_end != bytes) {
+                    return Err(invalid("invalid snapshot segment header"));
                 }
                 Ok(SnapshotRecord::Segment(
                     id,
                     SegmentMeta {
                         slot,
                         bytes,
+                        durable_end,
                         metadata,
                         sealed,
                         records: BTreeMap::new(),
@@ -380,6 +469,7 @@ impl talon_journal::Machine for Model {
                     || offset
                         .checked_add(record.len)
                         .map_or(true, |end| end > s.bytes)
+                    || (offset < s.durable_end && offset + record.len > s.durable_end)
                     || s.records
                         .range(..=offset)
                         .next_back()

@@ -1,10 +1,11 @@
 //! Packed small-object cache. Published payload extents are never overwritten.
 //!
 //! Data streams append independently; one bounded native writer owns the
-//! namespace metadata log and snapshots. Only committed seals are recovered.
+//! namespace metadata log and snapshots. Durable prefixes survive before sealing.
 //! Relocation commits are durable before old payload files are unlinked.
 mod access;
 mod disk_io;
+mod flush;
 mod format;
 mod journal;
 mod rings;
@@ -16,7 +17,7 @@ use crate::eviction::AccessHandle;
 use crate::{CacheUnit, Lru};
 use bytes::Bytes;
 use format::invalid;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::OpenOptions;
 use std::io;
 use std::os::fd::OwnedFd;
@@ -116,8 +117,9 @@ struct Segment {
     file: Arc<SegmentFile>,
     // Reservation ends, including writes whose completions are still pending.
     bytes: u64,
+    durable_end: u64,
     metadata: u64,
-    in_flight: usize,
+    in_flight: BTreeSet<u64>,
     live: u64,
     live_payload: u64,
     allocated: u64,
@@ -150,7 +152,7 @@ struct State {
     live: u64,
     written: u64,
     poisoned: bool,
-    last_seal: Instant,
+    last_flush: Instant,
 }
 
 /// One independently appended and sealed stream within a namespace/credential scope.
@@ -162,6 +164,8 @@ struct SegmentStore {
     seal_pause: Mutex<Option<Arc<tests::SealPause>>>,
     #[cfg(test)]
     append_pause: Mutex<Option<Arc<tests::AppendPause>>>,
+    #[cfg(test)]
+    flush_pause: Mutex<Option<Arc<tests::AppendPause>>>,
     slot: usize,
     journal: Arc<journal::Journal>,
     threshold: u64,
@@ -219,7 +223,6 @@ impl SegmentStore {
         if streams.len() != 1 {
             return Err(invalid("test stream has foreign slot"));
         }
-        journal.finish_recovery(&model)?;
         let mut store = streams.remove(&0).unwrap();
         store.refresh_recovered_stats();
         Ok(store)
@@ -238,6 +241,8 @@ impl SegmentStore {
             seal_pause: Mutex::new(None),
             #[cfg(test)]
             append_pause: Mutex::new(None),
+            #[cfg(test)]
+            flush_pause: Mutex::new(None),
             slot,
             journal,
             threshold,
@@ -252,7 +257,7 @@ impl SegmentStore {
                 live: 0,
                 written: 0,
                 poisoned: false,
-                last_seal: Instant::now(),
+                last_flush: Instant::now(),
             }),
             publication: tokio::sync::Mutex::new(()),
             pipeline_changed: tokio::sync::Notify::new(),
@@ -407,7 +412,7 @@ impl SegmentStore {
             let data = s.data().await?;
             s.bytes += len;
             s.metadata += 37 + key.len() as u64;
-            s.in_flight += 1;
+            s.in_flight.insert(loc.offset);
             state.written += charge;
             break (loc, data);
         };
@@ -455,10 +460,8 @@ impl SegmentStore {
             .segments
             .get_mut(&loc.segment)
             .expect("in-flight segment is retained");
-        segment.in_flight -= 1;
-        if segment.in_flight == 0 {
-            self.appends_drained.notify_waiters();
-        }
+        segment.in_flight.remove(&loc.offset);
+        self.appends_drained.notify_waiters();
         let allocated = match result {
             Ok(allocated) => allocated,
             Err(error) => {
@@ -530,7 +533,7 @@ impl SegmentStore {
                         segment: loc.segment,
                         offset: loc.offset,
                     },
-                    segment.sealed,
+                    loc.offset < segment.durable_end,
                 )
                 .await?;
             segment.metadata += 21;
@@ -612,15 +615,14 @@ impl SegmentStore {
             state
                 .active
                 .and_then(|id| state.segments.get(&id))
-                .is_some_and(|s| s.in_flight == 0 && meets_reclaim_threshold(s))
+                .is_some_and(|s| s.in_flight.is_empty() && meets_reclaim_threshold(s))
         } else {
             false
         };
-        if checkpoint
-            || pressure_seal
-            || self.state.lock().await.last_seal.elapsed() >= Duration::from_secs(30)
-        {
+        if checkpoint || pressure_seal {
             self.checkpoint().await?;
+        } else if self.flush_due().await {
+            self.flush().await?;
         }
         let _publication = self.publication.lock().await;
         // Pay before taking the mutation lock. A segment selected here cannot
@@ -696,6 +698,7 @@ impl SegmentStore {
                 let previous = s.allocated;
                 s.allocated = allocated;
                 s.sealed = true;
+                s.durable_end = s.bytes;
                 s.close_writers();
                 state.allocated = state
                     .allocated
@@ -792,8 +795,9 @@ impl SegmentStore {
             }),
             data: Some(data),
             bytes: 0,
+            durable_end: 0,
             metadata: 8,
-            in_flight: 0,
+            in_flight: BTreeSet::new(),
             live: 0,
             live_payload: 0,
             allocated,
@@ -915,7 +919,7 @@ impl SegmentStore {
             self.healthy(&state)?;
             let Some(id) = state.sealing else { break None };
             let s = &state.segments[&id];
-            if s.in_flight == 0 {
+            if s.in_flight.is_empty() {
                 break Some((id, s.data().await?, s.records.is_empty()));
             }
             drop(state);
@@ -946,6 +950,7 @@ impl SegmentStore {
                 s.allocated = allocated;
                 // Publication lock excludes delete/GC until the seal record is durable.
                 s.sealed = true;
+                s.durable_end = s.bytes;
                 s.close_writers();
                 state.allocated = state
                     .allocated
@@ -957,7 +962,6 @@ impl SegmentStore {
             tests::crash("seal_manifest");
             let mut state = self.state.lock().await;
             state.sealing = None;
-            state.last_seal = Instant::now();
         }
         Ok(())
     }
@@ -975,7 +979,6 @@ impl SegmentStore {
                 continue;
             }
             let Some(id) = state.active.take() else {
-                state.last_seal = Instant::now();
                 return Ok(());
             };
             state.sealing = Some(id);
@@ -1007,7 +1010,7 @@ impl SegmentStore {
             .write(true)
             .open(self.path(id, "data"))?;
         let metadata = file.metadata()?;
-        if metadata.len() != meta.bytes {
+        if metadata.len() < meta.durable_end || (meta.sealed && metadata.len() != meta.bytes) {
             return Err(invalid("segment length disagrees with metadata"));
         }
         drop(file);
@@ -1018,12 +1021,12 @@ impl SegmentStore {
         let allocated = metadata.blocks() * 512;
         let records = meta
             .records
-            .iter()
+            .range(..meta.durable_end)
             .map(|(&offset, record)| (offset, record.key.clone()))
             .collect();
         let mut live = 0;
         let mut live_payload = 0;
-        for (&offset, record) in &meta.records {
+        for (&offset, record) in meta.records.range(..meta.durable_end) {
             live += charge(&record.key, record.len);
             live_payload += record.len;
             keys.push((xxhash_rust::xxh3::xxh3_64(&record.key), &record.key));
@@ -1050,15 +1053,17 @@ impl SegmentStore {
         let state = self.state.get_mut();
         state.allocated += allocated;
         state.live += live;
-        state.written += meta.bytes + meta.metadata;
+        let recovered_metadata = meta.recovered_metadata();
+        state.written += meta.durable_end + recovered_metadata;
         state.segments.insert(
             id,
             Segment {
                 data: None,
                 file,
-                bytes: meta.bytes,
-                metadata: meta.metadata,
-                in_flight: 0,
+                bytes: meta.durable_end,
+                durable_end: meta.durable_end,
+                metadata: recovered_metadata,
+                in_flight: BTreeSet::new(),
                 live,
                 live_payload,
                 allocated,
@@ -1127,7 +1132,7 @@ fn reclaimable(state: &State, id: u64) -> bool {
     Some(id) != state.standby
         && Some(id) != state.sealing
         && state.segments.get(&id).is_some_and(|segment| {
-            segment.in_flight == 0
+            segment.in_flight.is_empty()
                 && meets_reclaim_threshold(segment)
                 && (segment.live == 0 || segment.sealed)
         })

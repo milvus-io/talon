@@ -59,7 +59,6 @@ impl SmallObjectStore {
         let recovered =
             Self::recover_streams(&journal, &model, threshold, segment_size, root_lock)?;
         let locators_ms = locators_started.elapsed().as_secs_f64() * 1000.0;
-        journal.finish_recovery(&model)?;
         let setup_started = Instant::now();
         let mut streams = BTreeMap::new();
         for (slot, mut stream) in recovered {
@@ -101,8 +100,9 @@ impl SmallObjectStore {
         root_lock: Option<Arc<crate::page_access_store::CacheRootLock>>,
     ) -> io::Result<BTreeMap<usize, SegmentStore>> {
         let mut counts = BTreeMap::<usize, usize>::new();
-        for meta in model.segments.values().filter(|meta| meta.sealed) {
-            *counts.entry(meta.slot).or_default() += meta.records.len();
+        for meta in model.segments.values().filter(|meta| meta.durable_end > 0) {
+            *counts.entry(meta.slot).or_default() +=
+                meta.records.len() - meta.records.range(meta.durable_end..).count();
         }
         // Only borrow key bytes already retained by the model. Hashes speed up
         // sorting; comparing full bytes on collisions keeps validation exact.
@@ -130,13 +130,27 @@ impl SmallObjectStore {
             });
             stream.entries.get_mut().unwrap().reserve(count);
         }
-        for (&id, meta) in model.segments.iter().filter(|(_, meta)| meta.sealed) {
+        for (&id, meta) in model
+            .segments
+            .iter()
+            .filter(|(_, meta)| meta.durable_end > 0)
+        {
             let stream = recovered
                 .get_mut(&meta.slot)
                 .expect("reserved recovery stream");
             stream.recover(id, meta, &mut keys)?;
         }
         validate_recovered_keys(&mut keys)?;
+        for (id, allocated) in journal.finish_recovery(model)? {
+            let state = recovered
+                .get_mut(&model.segments[&id].slot)
+                .unwrap()
+                .state
+                .get_mut();
+            let segment = state.segments.get_mut(&id).unwrap();
+            state.allocated = state.allocated - segment.allocated + allocated;
+            segment.allocated = allocated;
+        }
         Ok(recovered)
     }
 
@@ -358,7 +372,10 @@ impl SmallObjectStore {
         for stream in self.streams() {
             let state = stream.state.lock().await;
             for (&id, s) in &state.segments {
-                if Some(id) == state.standby || s.in_flight != 0 || !meets_reclaim_threshold(s) {
+                if Some(id) == state.standby
+                    || !s.in_flight.is_empty()
+                    || !meets_reclaim_threshold(s)
+                {
                     continue;
                 }
                 let destination = if s.live == 0 {
