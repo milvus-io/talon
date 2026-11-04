@@ -11,6 +11,93 @@ pub(crate) struct Directory {
     live: usize,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::eviction::{CacheUnit, SharedUnit};
+    use crate::{BlockIndex, Lru};
+    use std::sync::{mpsc, Arc, RwLock};
+    use std::time::Duration;
+    use talon_core::{Backend, BlockId, ObjectId, Version};
+
+    #[test]
+    fn late_policy_removal_cannot_release_an_unpublished_locator() {
+        let id = BlockId::new(
+            ObjectId::new(Backend::S3, "b", "o"),
+            0,
+            256,
+            Version::new("v"),
+        );
+        let unit = SharedUnit {
+            block: BlockKey::new(&id),
+            page: None,
+        };
+        let directory = Arc::new(RwLock::new(Directory::default()));
+        let index = Arc::new(BlockIndex::new());
+        index.register_small_directory(&directory);
+        let lru = Arc::new(Lru::from_recovered(
+            index.clone(),
+            Vec::new(),
+            0,
+            false,
+            false,
+        ));
+        let (entered, paused) = mpsc::channel();
+        let (resume, resumed) = mpsc::channel();
+        *lru.before_small_publish.lock().unwrap() = Some(Box::new(move || {
+            entered.send(()).unwrap();
+            resumed.recv().unwrap();
+        }));
+        let publisher = {
+            let lru = lru.clone();
+            let directory = directory.clone();
+            std::thread::spawn(move || {
+                lru.publish_small(
+                    unit,
+                    10,
+                    &directory,
+                    Location {
+                        file: Arc::new(super::super::SegmentFile {
+                            path: "unused".into(),
+                            fd: tokio::sync::Mutex::default(),
+                        }),
+                        segment: 1,
+                        offset: 0,
+                        len: 1,
+                        checksum: 0,
+                        access: None,
+                    },
+                )
+            })
+        };
+        paused.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(index.policy_get(&CacheUnit::Whole(id.clone())).is_some());
+        assert!(directory.read().unwrap().get(&id).is_none());
+        let (attempt, attempted) = mpsc::channel();
+        let (removed, removal) = mpsc::channel();
+        let remover = {
+            let lru = lru.clone();
+            let id = id.clone();
+            std::thread::spawn(move || {
+                attempt.send(()).unwrap();
+                lru.remove(&CacheUnit::Whole(id));
+                removed.send(()).unwrap();
+            })
+        };
+        attempted.recv_timeout(Duration::from_secs(5)).unwrap();
+        let blocked = removal.recv_timeout(Duration::from_millis(20)).is_err();
+        resume.send(()).unwrap();
+        publisher.join().unwrap();
+        remover.join().unwrap();
+        assert!(blocked, "removal must wait for locator publication");
+        let mut directory = directory.write().unwrap();
+        assert!(directory.get(&id).is_some());
+        assert!(directory.policy_get(&id).is_none());
+        directory.remove(&id);
+        assert!(directory.identity(&id).is_none());
+    }
+}
+
 struct Entry {
     key: BlockKey,
     location: Location,

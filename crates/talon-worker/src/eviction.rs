@@ -13,7 +13,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 #[cfg(test)]
 use talon_core::Version;
@@ -319,6 +319,8 @@ impl std::ops::Deref for PolicyEntry {
 pub struct Lru {
     inner: Mutex<Inner>,
     eviction: Mutex<()>,
+    #[cfg(test)]
+    pub(crate) before_small_publish: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 /// A cancellation-safe capacity-policy pin.
@@ -472,6 +474,8 @@ impl Lru {
                 admission_ceiling: 0,
             }),
             eviction: Mutex::new(()),
+            #[cfg(test)]
+            before_small_publish: Mutex::default(),
         }
     }
 
@@ -516,9 +520,40 @@ impl Lru {
         bytes: u64,
         independent: bool,
     ) -> AccessHandle {
+        let mut g = self.inner.lock().unwrap();
+        Self::insert_locked(&mut g, unit, bytes, independent)
+    }
+
+    pub(crate) fn publish_small(
+        &self,
+        unit: SharedUnit,
+        bytes: u64,
+        directory: &RwLock<crate::small_store::directory::Directory>,
+        location: crate::small_store::Location,
+    ) {
+        let mut g = self.inner.lock().unwrap();
+        directory
+            .write()
+            .unwrap()
+            .stage(unit.block.clone(), location);
+        let access = Self::insert_locked(&mut g, unit.clone(), bytes, true);
+        #[cfg(test)]
+        if let Some(pause) = self.before_small_publish.lock().unwrap().take() {
+            pause();
+        }
+        let mut directory = directory.write().unwrap();
+        directory.attach_access(&unit.block, access);
+        directory.publish(&unit.block);
+    }
+
+    fn insert_locked(
+        g: &mut Inner,
+        unit: impl UnitKey,
+        bytes: u64,
+        independent: bool,
+    ) -> AccessHandle {
         let independent = independent || unit.kind() == UnitKind::ExactRange;
         assert!(!independent || !matches!(unit.kind(), UnitKind::Page(_)));
-        let mut g = self.inner.lock().unwrap();
         let position = g.clock;
         g.clock = g.clock.checked_add(1).expect("eviction sequence exhausted");
         g.admission_ceiling = g.clock;

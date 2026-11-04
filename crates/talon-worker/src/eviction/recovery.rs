@@ -186,6 +186,8 @@ impl Lru {
                 admission_ceiling: clock,
             }),
             eviction: Mutex::new(()),
+            #[cfg(test)]
+            before_small_publish: Mutex::default(),
         };
         let drop_started = std::time::Instant::now();
         drop(units);

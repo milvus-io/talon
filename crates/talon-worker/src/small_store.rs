@@ -559,12 +559,11 @@ impl SegmentStore {
         state.live += charge;
         // Publish policy and locator together. The runtime's block gate keeps
         // eviction from retiring this admission before its mutation completes.
-        self.entries.write().unwrap().stage(key.clone(), loc);
         if let Some(policy) = policy {
-            let access = policy.insert_with_policy(unit, charge, true);
-            self.entries.write().unwrap().attach_access(&key, access);
+            policy.publish_small(unit, charge, &self.entries, loc);
+        } else {
+            self.entries.write().unwrap().insert(key, loc);
         }
-        self.entries.write().unwrap().publish(&key);
         self.refresh_stats(&state);
         Ok(charge)
     }
