@@ -6,7 +6,7 @@ use talon_core::{Backend, BlockId, ObjectId, Version, WorkerConfig};
 #[tokio::test]
 async fn identity_is_shared_by_live_and_recovered_journal_locator_and_policy() {
     use crate::block_key::BlockIdentity;
-    use crate::{small_store::SmallObjectStore, BlockIndex, Lru};
+    use crate::{small_store::SmallObjectStore, Lru};
     let dir = tempfile::tempdir().unwrap();
     let block = id("shared/路径");
     for recovered in [false, true] {
@@ -15,14 +15,9 @@ async fn identity_is_shared_by_live_and_recovered_journal_locator_and_policy() {
                 .unwrap(),
         );
         let mut units = Vec::new();
-        store.restore_policy_units(&mut units);
-        let policy = Arc::new(Lru::from_recovered(
-            Arc::new(BlockIndex::new()),
-            units,
-            store.len(),
-            true,
-            true,
-        ));
+        let index = Arc::new(crate::BlockIndex::new());
+        store.restore_policy_units(&index, &mut units);
+        let policy = Arc::new(Lru::from_recovered(index, units, store.len(), true, true));
         store.bind_policy(policy.clone());
         if !recovered {
             store

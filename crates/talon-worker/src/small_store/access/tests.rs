@@ -19,9 +19,10 @@ fn open_with_policy(root: &Path) -> (Arc<SmallObjectStore>, Arc<Lru>) {
         SmallObjectStore::open(root.to_owned(), 128 << 10, 256 << 10, 16 << 20, None).unwrap(),
     );
     let mut units = Vec::new();
-    store.restore_policy_units(&mut units);
+    let index = Arc::new(crate::BlockIndex::new());
+    store.restore_policy_units(&index, &mut units);
     let policy = Arc::new(crate::Lru::from_recovered(
-        Arc::new(crate::BlockIndex::new()),
+        index,
         units,
         store.len(),
         true,

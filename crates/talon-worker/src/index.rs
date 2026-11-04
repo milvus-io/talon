@@ -43,6 +43,7 @@ pub enum Presence {
 #[derive(Default)]
 pub struct BlockIndex {
     entries: RwLock<Directory>,
+    small: RwLock<Vec<Arc<RwLock<crate::small_store::directory::Directory>>>>,
     resident_blocks: AtomicU64,
     resident_bytes: AtomicU64,
     resident_pages: AtomicU64,
@@ -307,6 +308,7 @@ impl BlockIndex {
     /// Startup only, before serving. Reusing a recovered index starts a new
     /// runtime generation without retaining the previous policy or lifecycle.
     pub(crate) fn prepare_runtime_recovery(&self) {
+        self.small.write().unwrap().clear();
         let mut entries = self.entries.write().unwrap();
         entries.retain(|_, directory| {
             if directory.lifecycle.is_none()
@@ -343,9 +345,10 @@ impl BlockIndex {
     }
 
     pub(crate) fn policy_block_get(&self, id: &dyn BlockIdentity) -> Option<BlockActivity> {
+        let small = self.small_policy(id).is_some();
         let entries = self.entries.read().unwrap();
         let entry = entries.get(id)?;
-        Some(entry.activity.as_deref()?.snapshot(entry.policy.len))
+        Some(entry.activity.as_deref()?.snapshot(entry.policy.len + usize::from(small)))
     }
 
     pub(crate) fn policy_block_observe_ownership(
@@ -353,11 +356,12 @@ impl BlockIndex {
         id: &dyn BlockIdentity,
         admission_limit: u64,
     ) -> Option<BlockActivity> {
+        let small = self.small_policy(id).is_some();
         let entries = self.entries.read().unwrap();
         let entry = entries.get(id)?;
         let activity = entry.activity.as_deref()?;
         activity.observe_ownership(admission_limit);
-        Some(activity.snapshot(entry.policy.len))
+        Some(activity.snapshot(entry.policy.len + usize::from(small)))
     }
 
     pub(crate) fn policy_block_update<T>(
@@ -391,6 +395,11 @@ impl BlockIndex {
     }
 
     pub(crate) fn policy_get(&self, unit: &impl crate::eviction::UnitKey) -> Option<PolicyEntry> {
+        if unit.page().is_none() {
+            if let Some(policy) = self.small_policy(unit.block()) {
+                return Some(policy);
+            }
+        }
         let entries = self.entries.read().unwrap();
         let policy = &entries.get(unit.block())?.policy;
         let read = |slot: &UnitSlot| {
@@ -409,11 +418,13 @@ impl BlockIndex {
     }
 
     pub(crate) fn policy_units(&self, id: &dyn BlockIdentity) -> Vec<(UnitKind, PolicyState)> {
+        let small = self.small_policy(id);
+        let mut units: Vec<_> = small.iter().map(|p| (UnitKind::Whole, p.state)).collect();
         let entries = self.entries.read().unwrap();
         let Some(entry) = entries.get(id) else {
-            return Vec::new();
+            return units;
         };
-        let mut units = Vec::with_capacity(entry.policy.len);
+        units.reserve(entry.policy.len);
         if let Some(exact) = &entry.policy.exact {
             units.push((UnitKind::ExactRange, exact.state));
         }
@@ -433,6 +444,11 @@ impl BlockIndex {
     }
 
     pub(crate) fn shared_identity(&self, id: &dyn BlockIdentity) -> Option<BlockKey> {
+        if let Some(directory) = self.small_directory(id) {
+            if let Some(key) = directory.read().unwrap().identity(id) {
+                return Some(key);
+            }
+        }
         self.entries
             .read()
             .unwrap()
@@ -457,6 +473,17 @@ impl BlockIndex {
     }
 
     pub(crate) fn policy_insert(&self, unit: &SharedUnit, entry: PolicyEntry) -> AccessHandle {
+        if entry.independent && unit.page.is_none() {
+            if let Some(directory) = self.small_directory(unit.block()) {
+                if let Some(access) = directory
+                    .write()
+                    .unwrap()
+                    .policy_insert(unit.block(), entry.clone())
+                {
+                    return access;
+                }
+            }
+        }
         let mut entries = self.entries.write().unwrap();
         let directory = if let Some(directory) = entries.get_mut(unit.block()) {
             directory
@@ -516,6 +543,14 @@ impl BlockIndex {
         unit: &impl crate::eviction::UnitKey,
         update: impl FnOnce(&mut PolicyState) -> T,
     ) -> Option<T> {
+        if !matches!(unit.kind(), UnitKind::Page(_)) {
+            if let Some(directory) = self.small_directory(unit.block()) {
+                let mut directory = directory.write().unwrap();
+                if directory.policy_get(unit.block()).is_some() {
+                    return directory.policy_update(unit.block(), update);
+                }
+            }
+        }
         if unit.kind() == UnitKind::ExactRange {
             let mut entries = self.entries.write().unwrap();
             let policy = &mut entries.get_mut(unit.block())?.policy;
@@ -546,6 +581,13 @@ impl BlockIndex {
         &self,
         unit: &impl crate::eviction::UnitKey,
     ) -> Option<PolicyEntry> {
+        if unit.page().is_none() {
+            if let Some(directory) = self.small_directory(unit.block()) {
+                if let Some(entry) = directory.write().unwrap().policy_remove(unit.block()) {
+                    return Some(entry);
+                }
+            }
+        }
         let mut entries = self.entries.write().unwrap();
         let directory = entries.get_mut(unit.block())?;
         let take = |slot: &mut UnitSlot| {
@@ -589,6 +631,32 @@ impl BlockIndex {
             entries.remove(unit.block());
         }
         Some(removed)
+    }
+
+    pub(crate) fn register_small_directory(
+        &self,
+        directory: &Arc<RwLock<crate::small_store::directory::Directory>>,
+    ) {
+        let mut small = self.small.write().unwrap();
+        if !small.iter().any(|entry| Arc::ptr_eq(entry, directory)) {
+            small.push(directory.clone());
+        }
+    }
+
+    fn small_directory(
+        &self,
+        id: &dyn BlockIdentity,
+    ) -> Option<Arc<RwLock<crate::small_store::directory::Directory>>> {
+        self.small
+            .read()
+            .unwrap()
+            .iter()
+            .find(|directory| directory.read().unwrap().identity(id).is_some())
+            .cloned()
+    }
+
+    fn small_policy(&self, id: &dyn BlockIdentity) -> Option<PolicyEntry> {
+        self.small_directory(id)?.read().unwrap().policy_get(id)
     }
     /// Startup-only bulk restoration. Exclusive ownership prevents publication
     /// to readers while workers build page tables without the directory lock.
@@ -1281,6 +1349,54 @@ impl BlockIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn small_locators_own_policy_through_delete_and_readmission() {
+        use crate::{small_store::SmallObjectStore, Lru};
+        let root = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            SmallObjectStore::open(root.path().to_owned(), 128 << 10, 256 << 10, 4 << 20, None)
+                .unwrap(),
+        );
+        let index = Arc::new(BlockIndex::new());
+        let mut units = Vec::new();
+        store.restore_policy_units(&index, &mut units);
+        let lru = Arc::new(Lru::from_recovered(index.clone(), units, 0, false, false));
+        store.bind_policy(lru.clone());
+        let id = block(0);
+        let unit = CacheUnit::Whole(id.clone());
+        for _ in 0..20 {
+            store
+                .put(&id, bytes::Bytes::from_static(b"payload"))
+                .await
+                .unwrap();
+            assert!(index.entries.read().unwrap().is_empty());
+            assert_eq!(lru.len(), 1);
+            assert_eq!(index.policy_units(&id).len(), 1);
+            assert!(lru.pin(&unit));
+            let old = index.policy_get(&unit).unwrap().access;
+            store.delete(&id).await.unwrap();
+            assert!(!store.contains(&id));
+            assert!(index.policy_get(&unit).is_some());
+            lru.unpin(&unit);
+            lru.remove(&unit);
+            assert!(index.small_directory(&id).is_none());
+            store
+                .put(&id, bytes::Bytes::from_static(b"payload"))
+                .await
+                .unwrap();
+            let new = index.policy_get(&unit).unwrap().access;
+            assert!(!Arc::ptr_eq(&old.state, &new.state));
+            old.touch();
+            assert_eq!(store.read(&id).await.unwrap().unwrap(), b"payload"[..]);
+            lru.remove(&unit);
+            assert!(store.contains(&id));
+            store.delete(&id).await.unwrap();
+            assert!(index.small_directory(&id).is_none());
+        }
+        assert_eq!(lru.total_bytes(), 0);
+        assert!(index.entries.read().unwrap().is_empty());
+    }
     use std::sync::Arc;
     use talon_core::{Backend, ObjectId, Version};
 

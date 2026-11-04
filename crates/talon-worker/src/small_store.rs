@@ -5,6 +5,7 @@
 //! Relocation commits are durable before old payload files are unlinked.
 mod access;
 pub(crate) use access::DirtyAccess;
+pub(crate) mod directory;
 mod disk_io;
 mod flush;
 mod format;
@@ -218,7 +219,7 @@ struct SegmentStore {
     pipeline_changed: tokio::sync::Notify,
     appends_drained: tokio::sync::Notify,
     append_slots: tokio::sync::Semaphore,
-    entries: RwLock<HashMap<BlockKey, Location>>,
+    entries: Arc<RwLock<directory::Directory>>,
     // Async opens run outside the directory lock, but must finish before GC
     // replaces locators and unlinks their source paths.
     readers: tokio::sync::RwLock<()>,
@@ -320,7 +321,7 @@ impl SegmentStore {
             pipeline_changed: tokio::sync::Notify::new(),
             appends_drained: tokio::sync::Notify::new(),
             append_slots: tokio::sync::Semaphore::new(32),
-            entries: RwLock::new(HashMap::new()),
+            entries: Arc::default(),
             readers: tokio::sync::RwLock::new(()),
             tasks: Arc::new(crate::page_gc::Mutations::new(true)),
             cached_stats: RwLock::new(SmallStoreStats::default()),
@@ -419,20 +420,21 @@ impl SegmentStore {
             .acquire()
             .await
             .expect("append slots stay open");
-        let (mut loc, data) = loop {
+        let (loc, data) = loop {
             let changed = self.pipeline_changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
             let mut state = self.state.lock().await;
             self.healthy(&state)?;
-            if let Some(old) = self.entries.write().unwrap().get_mut(&key) {
+            let existing = self.entries.read().unwrap().get(&key).cloned();
+            if let Some(old) = existing {
                 if old.len != len || old.checksum != checksum {
                     return Err(invalid(
                         "different bytes for immutable small object identity",
                     ));
                 }
                 if let Some(policy) = &policy {
-                    old.access = Some(policy.insert_with_policy(unit.clone(), charge, true));
+                    policy.insert_with_policy(unit.clone(), charge, true);
                 }
                 return Ok(charge);
             }
@@ -557,12 +559,12 @@ impl SegmentStore {
         state.live += charge;
         // Publish policy and locator together. The runtime's block gate keeps
         // eviction from retiring this admission before its mutation completes.
-        let mut entries = self.entries.write().unwrap();
+        self.entries.write().unwrap().stage(key.clone(), loc);
         if let Some(policy) = policy {
-            loc.access = Some(policy.insert_with_policy(unit, charge, true));
+            let access = policy.insert_with_policy(unit, charge, true);
+            self.entries.write().unwrap().attach_access(&key, access);
         }
-        entries.insert(key, loc);
-        drop(entries);
+        self.entries.write().unwrap().publish(&key);
         self.refresh_stats(&state);
         Ok(charge)
     }
@@ -1119,7 +1121,7 @@ impl SegmentStore {
             keys.push((hash.finish(), &record.key));
             if self
                 .entries
-                .get_mut()
+                .write()
                 .unwrap()
                 .insert(
                     record.key.clone(),

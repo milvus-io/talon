@@ -505,6 +505,10 @@ impl Lru {
             .unwrap_or_else(|| BlockKey::new(id))
     }
 
+    pub(crate) fn index(&self) -> Arc<crate::BlockIndex> {
+        self.inner.lock().unwrap().index.clone()
+    }
+
     /// Packed objects are independent full keys, with no cross-version eviction.
     pub(crate) fn insert_with_policy(
         &self,

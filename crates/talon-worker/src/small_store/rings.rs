@@ -21,6 +21,7 @@ pub struct SmallObjectStore {
     pub(super) access_bytes: std::sync::atomic::AtomicU64,
     streams: RwLock<BTreeMap<usize, Stream>>,
     policy: std::sync::OnceLock<Arc<Lru>>,
+    index: std::sync::OnceLock<Weak<crate::BlockIndex>>,
     // Only in-flight identities are retained; no second resident-object index.
     mutations: Arc<InFlightLoads>,
     pub(super) tasks: Arc<crate::page_gc::Mutations>,
@@ -92,6 +93,7 @@ impl SmallObjectStore {
             journal,
             streams: RwLock::new(streams),
             policy: std::sync::OnceLock::new(),
+            index: std::sync::OnceLock::new(),
             mutations: Arc::new(InFlightLoads::new()),
             tasks: Arc::new(crate::page_gc::Mutations::new(true)),
         })
@@ -133,7 +135,7 @@ impl SmallObjectStore {
                     journal.clone(),
                 )
             });
-            stream.entries.get_mut().unwrap().reserve(count);
+            stream.entries.write().unwrap().reserve(count);
         }
         for (&id, meta) in model
             .segments
@@ -179,13 +181,17 @@ impl SmallObjectStore {
                 .clone()
         });
         cell.get_or_try_init(|| async {
-            Ok(Arc::new(SegmentStore::empty(
+            let stream = Arc::new(SegmentStore::empty(
                 self.fallback.threshold,
                 self.fallback.segment_size,
                 self.fallback._root_lock.clone(),
                 slot,
                 self.journal.clone(),
-            )))
+            ));
+            if let Some(index) = self.index.get().and_then(Weak::upgrade) {
+                index.register_small_directory(&stream.entries);
+            }
+            Ok(stream)
         })
         .await
         .cloned()
@@ -328,12 +334,15 @@ impl SmallObjectStore {
 
     /// Startup only. Attach access tokens to locators and contribute units to
     /// the shared bulk policy construction without registering in BlockIndex.
-    pub(crate) fn restore_policy_units(&self, units: &mut Vec<crate::eviction::RecoveredUnit>) {
+    pub(crate) fn restore_policy_units(
+        &self,
+        index: &Arc<crate::BlockIndex>,
+        units: &mut Vec<crate::eviction::RecoveredUnit>,
+    ) {
+        self.bind_index(index);
         let shared_access = units
             .iter()
-            .filter(|unit| {
-                u64::from(unit.unit.block.view().block_size) <= talon_core::MAX_EXACT_READ_LEN
-            })
+            .filter(|unit| u64::from(unit.unit.block.view().block_size) <= talon_core::MAX_EXACT_READ_LEN)
             .map(|unit| (unit.unit.block.materialize(), unit.access.clone()))
             .collect();
         for stream in self.streams() {
@@ -344,7 +353,22 @@ impl SmallObjectStore {
     }
 
     /// Bind the policy built from both stores, then restore persisted access ages.
+    fn bind_index(&self, index: &Arc<crate::BlockIndex>) {
+        if let Some(bound) = self.index.get() {
+            assert!(
+                bound.ptr_eq(&Arc::downgrade(index)),
+                "small store index changed"
+            );
+            return;
+        }
+        assert!(self.index.set(Arc::downgrade(index)).is_ok());
+        for stream in self.streams() {
+            index.register_small_directory(&stream.entries);
+        }
+    }
+
     pub(crate) fn bind_policy(&self, policy: Arc<Lru>) {
+        self.bind_index(&policy.index());
         assert!(
             self.policy.set(policy).is_ok(),
             "small store already bound to a runtime"
@@ -962,13 +986,14 @@ mod recovery_tests {
         drop(store);
         let store = Arc::new(open(dir.path()).unwrap());
         let mut units = Vec::new();
-        store.restore_policy_units(&mut units);
+        let index = Arc::new(crate::BlockIndex::new());
+        store.restore_policy_units(&index, &mut units);
         let serial = crate::Lru::new();
         for unit in &units {
             serial.insert_with_policy(unit.unit.materialize(), unit.bytes, true);
         }
         let policy = Arc::new(crate::Lru::from_recovered(
-            Arc::new(crate::BlockIndex::new()),
+            index,
             units,
             store.len(),
             true,
