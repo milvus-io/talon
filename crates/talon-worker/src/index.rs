@@ -83,13 +83,6 @@ impl Entry {
     }
 }
 
-fn materialized_pages(meta: &StoredMeta) -> u64 {
-    match &meta.form {
-        BlockForm::Whole => 0,
-        BlockForm::Paged { present, .. } => u64::from(present.count()),
-    }
-}
-
 /// Data-file allocation discovered during startup; never persisted in sidecars.
 pub(crate) struct StoredBlock {
     pub meta: StoredMeta,
@@ -124,8 +117,19 @@ impl From<StoredMeta> for BlockMeta {
 }
 
 struct IndexedBlock {
-    meta: StoredMeta,
+    meta: ResidentMeta,
     units: IndexedUnits,
+    // Retained policy/lifecycle tables can change after directory detachment.
+    // Retirement refunds this incarnation's charges, independently of them.
+    charged_bytes: u64,
+    charged_pages: u64,
+}
+
+struct ResidentMeta {
+    id: Arc<BlockId>,
+    len: u64,
+    page_size: u32,
+    page_count: u32,
 }
 
 enum IndexedUnits {
@@ -135,6 +139,7 @@ enum IndexedUnits {
 
 #[derive(Default)]
 pub(crate) struct UnitSlot {
+    resident: bool,
     allocated: u64,
     access: Option<AccessHandle>,
     policy: Option<PolicyState>,
@@ -188,11 +193,46 @@ impl IndexedUnits {
 
 impl From<StoredMeta> for IndexedBlock {
     fn from(meta: StoredMeta) -> Self {
-        let units = match &meta.form {
-            BlockForm::Whole => IndexedUnits::Whole(Arc::default()),
-            BlockForm::Paged { .. } => IndexedUnits::Paged(Arc::default()),
+        let charged_pages = match &meta.form {
+            BlockForm::Whole => 0,
+            BlockForm::Paged { present, .. } => u64::from(present.count()),
         };
-        Self { meta, units }
+        let (page_size, page_count, units) = match meta.form {
+            BlockForm::Whole => (
+                0,
+                0,
+                IndexedUnits::Whole(Arc::new(RwLock::new(UnitSlot {
+                    resident: true,
+                    ..Default::default()
+                }))),
+            ),
+            BlockForm::Paged { page_size, present } => {
+                let mut pages = crate::page_table::PageMap::default();
+                for page in 0..present.len() {
+                    if present.is_present(PageIndex(page)) {
+                        let mut entry = PageEntry::unbound();
+                        entry.unit.resident = true;
+                        pages.insert(page, entry);
+                    }
+                }
+                (
+                    page_size,
+                    present.len(),
+                    IndexedUnits::Paged(Arc::new(RwLock::new(pages))),
+                )
+            }
+        };
+        Self {
+            meta: ResidentMeta {
+                id: meta.id,
+                len: meta.len,
+                page_size,
+                page_count,
+            },
+            units,
+            charged_bytes: 0,
+            charged_pages,
+        }
     }
 }
 
@@ -215,10 +255,10 @@ impl IndexedBlock {
             IndexedUnits::Paged(slots) => {
                 for (page, allocated) in allocated {
                     let page = page.expect("paged allocation must have a page index");
-                    let BlockForm::Paged { present, .. } = &entry.meta.form else {
-                        unreachable!()
-                    };
-                    assert!(page.0 < present.len(), "page outside block geometry");
+                    assert!(
+                        page.0 < entry.meta.page_count,
+                        "page outside block geometry"
+                    );
                     slots
                         .write()
                         .unwrap()
@@ -228,7 +268,35 @@ impl IndexedBlock {
                 }
             }
         }
+        entry.charged_bytes = entry.units.allocated_bytes();
         entry
+    }
+
+    fn materialized_pages(&self) -> u64 {
+        self.charged_pages
+    }
+
+    fn metadata(&self) -> StoredMeta {
+        let form = match &self.units {
+            IndexedUnits::Whole(_) => BlockForm::Whole,
+            IndexedUnits::Paged(pages) => {
+                let mut present = PresentBitmap::new(self.meta.page_count);
+                for (&page, slot) in pages.read().unwrap().iter() {
+                    if slot.unit.resident {
+                        present.set(PageIndex(page));
+                    }
+                }
+                BlockForm::Paged {
+                    page_size: self.meta.page_size,
+                    present,
+                }
+            }
+        };
+        StoredMeta {
+            id: self.meta.id.clone(),
+            len: self.meta.len,
+            form,
+        }
     }
 }
 
@@ -249,24 +317,20 @@ impl BlockIndex {
                 let block = guard.as_mut().expect("live directory entry");
                 let allocated = match &block.units {
                     IndexedUnits::Whole(slot) => vec![(None, slot.read().unwrap().allocated)],
-                    IndexedUnits::Paged(pages) => {
-                        let BlockForm::Paged { present, .. } = &block.meta.form else {
-                            unreachable!()
-                        };
-                        pages
-                            .read()
-                            .unwrap()
-                            .iter()
-                            .filter_map(|(&page, entry)| {
-                                let page = PageIndex(page);
-                                present
-                                    .is_present(page)
-                                    .then_some((Some(page), entry.unit.allocated))
-                            })
-                            .collect()
-                    }
+                    IndexedUnits::Paged(pages) => pages
+                        .read()
+                        .unwrap()
+                        .iter()
+                        .filter_map(|(&page, entry)| {
+                            let page = PageIndex(page);
+                            entry
+                                .unit
+                                .resident
+                                .then_some((Some(page), entry.unit.allocated))
+                        })
+                        .collect(),
                 };
-                *block = IndexedBlock::allocated(block.meta.clone(), allocated);
+                *block = IndexedBlock::allocated(block.metadata(), allocated);
             }
             directory.lifecycle = None;
             directory.policy = PolicyUnits::default();
@@ -463,9 +527,15 @@ impl BlockIndex {
                     .resident
                     .as_ref()
                     .map(|entry| entry.block.read().unwrap());
-                let present = resident.as_ref().and_then(|entry| entry.as_ref()).is_some_and(|entry| {
-                    matches!(&entry.meta.form, BlockForm::Paged { present, .. } if present.is_present(page))
-                });
+                let present = resident
+                    .as_ref()
+                    .and_then(|entry| entry.as_ref())
+                    .is_some_and(|entry| {
+                        entry
+                            .units
+                            .read(Some(page), |slot| slot.resident)
+                            .unwrap_or(false)
+                    });
                 let mut pages = directory.policy.pages.as_ref()?.write().unwrap();
                 let entry = pages.get_mut(&page.0)?;
                 let removed = take(&mut entry.unit)?;
@@ -509,8 +579,8 @@ impl BlockIndex {
             let (meta, allocated) = decode(item)?;
             let id = meta.id.clone();
             let entry = IndexedBlock::allocated(meta, allocated);
-            let bytes = entry.units.allocated_bytes();
-            let pages = materialized_pages(&entry.meta);
+            let bytes = entry.charged_bytes;
+            let pages = entry.materialized_pages();
             Ok((id, Arc::new(Entry::new(entry)), bytes, pages))
         })
         .into_iter()
@@ -544,8 +614,8 @@ impl BlockIndex {
                     .unwrap()
                     .take()
                     .expect("live recovery entry");
-                *bytes -= old.units.allocated_bytes();
-                *pages -= materialized_pages(&old.meta);
+                *bytes -= old.charged_bytes;
+                *pages -= old.materialized_pages();
             } else {
                 *self.resident_blocks.get_mut() += 1;
             }
@@ -678,18 +748,15 @@ impl BlockIndex {
             return None;
         }
         self.read_entry(id, |entry| {
-            let BlockForm::Paged { present, .. } = &entry.meta.form else {
-                return None;
-            };
-            if !present.range_present(start, end) {
-                return None;
-            }
             let IndexedUnits::Paged(pages) = &entry.units else {
-                unreachable!()
+                return None;
             };
             let pages = pages.read().unwrap();
             let acquire = |page| {
                 let state = pages.get(&page)?;
+                if !state.unit.resident {
+                    return None;
+                }
                 let access = state.unit.access.as_ref()?;
                 let guard = state.handle.acquire()?;
                 access.touch();
@@ -742,17 +809,14 @@ impl BlockIndex {
                     access,
                 });
             };
-            match &entry.meta.form {
-                BlockForm::Whole => {
+            match &entry.units {
+                IndexedUnits::Whole(_) => {
                     entry.units.write(None, |slot| add(None, slot));
                 }
-                BlockForm::Paged { present, .. } => {
-                    let IndexedUnits::Paged(pages) = &entry.units else {
-                        unreachable!()
-                    };
+                IndexedUnits::Paged(pages) => {
                     for (&page, state) in pages.write().unwrap().iter_mut() {
                         let page = PageIndex(page);
-                        if present.is_present(page) {
+                        if state.unit.resident {
                             add(Some(page), &mut state.unit);
                         }
                     }
@@ -787,7 +851,7 @@ impl BlockIndex {
             let paged = {
                 let guard = entry.block.read().unwrap();
                 let entry = guard.as_ref().expect("live directory entry");
-                matches!(&entry.meta.form, BlockForm::Paged { present, .. } if present.count() > 0)
+                entry.materialized_pages() > 0
             };
             if paged {
                 lifecycle.block(&id);
@@ -821,7 +885,7 @@ impl BlockIndex {
             entries
                 .iter()
                 .map(|entry| {
-                    BlockMeta::from(entry.as_ref().expect("live directory entry").meta.clone())
+                    BlockMeta::from(entry.as_ref().expect("live directory entry").metadata())
                         .resident_bytes()
                 })
                 .sum()
@@ -835,7 +899,7 @@ impl BlockIndex {
 
     /// Look up a copy of a block's metadata.
     pub fn get(&self, id: &BlockId) -> Option<BlockMeta> {
-        self.read_entry(id, |entry| entry.meta.clone().into())
+        self.read_entry(id, |entry| entry.metadata().into())
     }
 
     /// Resolve metadata and mark a whole-block read in the same index lookup.
@@ -846,14 +910,14 @@ impl BlockIndex {
                     access.touch();
                 }
             });
-            entry.meta.clone().into()
+            entry.metadata().into()
         })
     }
 
     /// Probe the whole-block fast path without touching any paged entries.
     pub(crate) fn is_whole_and_touch(&self, id: &BlockId) -> bool {
         self.read_entry(id, |entry| {
-            if !matches!(entry.meta.form, BlockForm::Whole) {
+            if !matches!(entry.units, IndexedUnits::Whole(_)) {
                 return false;
             }
             entry.units.read(None, |slot| {
@@ -874,17 +938,11 @@ impl BlockIndex {
             CacheUnit::Page(block, page) => (block, Some(*page)),
         };
         self.write_entry(block, |entry| {
-            let resident = match (&entry.meta.form, page) {
-                (BlockForm::Whole, None) => true,
-                (BlockForm::Paged { present, .. }, Some(page)) => present.is_present(page),
-                _ => false,
-            };
-            if resident {
-                entry
-                    .units
-                    .write(page, |slot| slot.access = Some(access))
-                    .expect("resident unit has a slot");
-            }
+            entry.units.write(page, |slot| {
+                if slot.resident {
+                    slot.access = Some(access);
+                }
+            });
         });
     }
 
@@ -916,26 +974,19 @@ impl BlockIndex {
             for guard in entries {
                 let entry = guard.as_ref().expect("live directory entry");
                 let meta = &entry.meta;
-                match &meta.form {
-                    BlockForm::Whole => out.push((
+                match &entry.units {
+                    IndexedUnits::Whole(slot) => out.push((
                         meta.id.as_ref().clone(),
                         None,
-                        entry
-                            .units
-                            .read(None, |slot| slot.allocated)
-                            .expect("whole unit has a slot"),
+                        slot.read().unwrap().allocated,
                     )),
-                    BlockForm::Paged { present, .. } => {
-                        for p in 0..present.len() {
-                            let page = PageIndex(p);
-                            if present.is_present(page) {
+                    IndexedUnits::Paged(pages) => {
+                        for (&page, slot) in pages.read().unwrap().iter() {
+                            if slot.unit.resident {
                                 out.push((
                                     meta.id.as_ref().clone(),
-                                    Some(page),
-                                    entry
-                                        .units
-                                        .read(Some(page), |slot| slot.allocated)
-                                        .expect("resident page has a slot"),
+                                    Some(PageIndex(page)),
+                                    slot.unit.allocated,
                                 ));
                             }
                         }
@@ -968,10 +1019,10 @@ impl BlockIndex {
         meta: StoredMeta,
         allocated: impl IntoIterator<Item = (Option<PageIndex>, u64)>,
     ) {
-        let pages = materialized_pages(&meta);
         let id = meta.id.clone();
         let mut entry = IndexedBlock::allocated(meta, allocated);
-        let added = entry.units.allocated_bytes();
+        let pages = entry.materialized_pages();
+        let added = entry.charged_bytes;
         let mut entries = self.entries.write().unwrap();
         // Structural mutations take directory -> entry. Ordinary operations
         // never reacquire the directory while holding an entry lock.
@@ -991,12 +1042,8 @@ impl BlockIndex {
                 .take()
                 .expect("live directory entry")
         });
-        let old_bytes = previous
-            .as_ref()
-            .map_or(0, |old| old.units.allocated_bytes());
-        let old_pages = previous
-            .as_ref()
-            .map_or(0, |old| materialized_pages(&old.meta));
+        let old_bytes = previous.as_ref().map_or(0, |old| old.charged_bytes);
+        let old_pages = previous.as_ref().map_or(0, |old| old.materialized_pages());
         self.replace_bytes(old_bytes, added);
         if pages >= old_pages {
             self.resident_pages
@@ -1098,20 +1145,21 @@ impl BlockIndex {
     /// already-present pages), so byte accounting is never double-counted.
     pub fn mark_page_allocated(&self, id: &BlockId, page: PageIndex, allocated: u64) -> bool {
         self.write_entry(id, |entry| {
-            let BlockForm::Paged { present, .. } = &mut entry.meta.form else {
+            let IndexedUnits::Paged(pages) = &mut entry.units else {
                 return false;
             };
-            if page.0 >= present.len() {
+            if page.0 >= entry.meta.page_count {
                 return false;
             }
-            let fresh = !present.is_present(page);
-            present.set(page);
-            let IndexedUnits::Paged(pages) = &mut entry.units else {
-                unreachable!("paged metadata has a page table");
-            };
             let mut pages = pages.write().unwrap();
             let slot = pages.get_or_insert_with(page.0, PageEntry::unbound);
+            let fresh = !std::mem::replace(&mut slot.unit.resident, true);
             let old = std::mem::replace(&mut slot.unit.allocated, allocated);
+            entry.charged_bytes = entry
+                .charged_bytes
+                .saturating_sub(old)
+                .saturating_add(allocated);
+            entry.charged_pages += u64::from(fresh);
             self.replace_bytes(old, allocated);
             self.resident_pages
                 .fetch_add(u64::from(fresh), Ordering::Relaxed);
@@ -1132,20 +1180,19 @@ impl BlockIndex {
     /// intact. Returns `true` if the page was present and is now cleared.
     pub fn clear_page(&self, id: &BlockId, page: PageIndex) -> bool {
         self.write_entry(id, |entry| {
-            let meta = &mut entry.meta;
-            let BlockForm::Paged { present, .. } = &mut meta.form else {
-                return false;
-            };
-            if !present.is_present(page) {
-                return false;
-            }
-            present.clear(page);
             let IndexedUnits::Paged(pages) = &mut entry.units else {
-                unreachable!("paged metadata has a page table");
+                return false;
             };
             let mut pages = pages.write().unwrap();
-            let slot = pages.get_mut(&page.0).expect("resident page has a slot");
+            let Some(slot) = pages.get_mut(&page.0) else {
+                return false;
+            };
+            if !std::mem::replace(&mut slot.unit.resident, false) {
+                return false;
+            }
             let bytes = std::mem::take(&mut slot.unit.allocated);
+            entry.charged_bytes = entry.charged_bytes.saturating_sub(bytes);
+            entry.charged_pages -= 1;
             if slot.unit.policy.is_none() {
                 slot.unit.access = None;
             }
@@ -1164,13 +1211,17 @@ impl BlockIndex {
     /// `start_page`/`end_page` are only consulted for paged blocks; for a whole
     /// block the answer is always [`Presence::Whole`].
     pub fn presence(&self, id: &BlockId, start_page: PageIndex, end_page: PageIndex) -> Presence {
-        self.read_entry(id, |entry| match &entry.meta.form {
-            BlockForm::Whole => Presence::Whole,
-            BlockForm::Paged { present, .. } => {
-                if !present.range_present(start_page, end_page) {
-                    return Presence::PageMiss;
+        self.read_entry(id, |entry| match &entry.units {
+            IndexedUnits::Whole(_) => Presence::Whole,
+            IndexedUnits::Paged(pages) => {
+                let pages = pages.read().unwrap();
+                if (start_page.0..end_page.0)
+                    .all(|page| pages.get(&page).is_some_and(|slot| slot.unit.resident))
+                {
+                    Presence::PageHit
+                } else {
+                    Presence::PageMiss
                 }
-                Presence::PageHit
             }
         })
         .unwrap_or(Presence::Miss)
@@ -1198,10 +1249,10 @@ impl BlockIndex {
             .unwrap()
             .take()
             .expect("removed entry is not retired");
-        self.replace_bytes(removed.units.allocated_bytes(), 0);
+        self.replace_bytes(removed.charged_bytes, 0);
         self.resident_pages
-            .fetch_sub(materialized_pages(&removed.meta), Ordering::Relaxed);
-        Some(removed.meta.into())
+            .fetch_sub(removed.materialized_pages(), Ordering::Relaxed);
+        Some(removed.metadata().into())
     }
 }
 
@@ -2005,6 +2056,86 @@ mod tests {
         });
         assert_eq!(index.resident_bytes(), 4096);
         assert_eq!(index.page_count(), 1);
+    }
+
+    #[test]
+    fn zero_allocation_presence_is_distinct_from_pending_and_policy_only_pages() {
+        let index = Arc::new(BlockIndex::new());
+        let id = block(1);
+        index.init_paged(id.clone(), 4096, 4096);
+        let life = crate::page_lifecycle::PageLifecycle::with_index(index.clone(), false);
+        let state = life.block(&id);
+        state.register(PageIndex(0), None, 0, false);
+        let lru = index.restore_lru();
+        lru.insert(CacheUnit::Page(id.clone(), PageIndex(0)), 0);
+        assert_eq!(
+            index.presence(&id, PageIndex(0), PageIndex(1)),
+            Presence::PageMiss
+        );
+        assert!(index.snapshot_units().is_empty());
+        assert!(index
+            .page_reads_and_touch(&id, PageIndex(0), PageIndex(1))
+            .is_none());
+        assert!(index.mark_page_allocated(&id, PageIndex(0), 0));
+        assert!(index
+            .page_reads_and_touch(&id, PageIndex(0), PageIndex(1))
+            .is_some());
+        assert_eq!(
+            index.snapshot_units(),
+            [(id.clone(), Some(PageIndex(0)), 0)]
+        );
+        assert!(index.clear_page(&id, PageIndex(0)));
+        assert_eq!(
+            index.presence(&id, PageIndex(0), PageIndex(1)),
+            Presence::PageMiss
+        );
+        assert_eq!((index.page_count(), index.resident_bytes()), (0, 0));
+        let BlockForm::Paged { present, .. } = index.get(&id).unwrap().form else {
+            panic!()
+        };
+        assert_eq!(present.count(), 0);
+    }
+
+    #[test]
+    fn detached_retirement_refunds_charges_after_shared_pages_are_removed() {
+        use std::time::{Duration, Instant};
+        for (allocated, bind) in [(0, false), (0, true), (4096, true)] {
+            let index = Arc::new(BlockIndex::new());
+            let id = block(1);
+            index.init_paged(id.clone(), 4096, 4096);
+            index.mark_page_allocated(&id, PageIndex(0), allocated);
+            let lru = index.restore_lru();
+            let life = crate::page_lifecycle::PageLifecycle::with_index(index.clone(), false);
+            let candidate = bind.then(|| {
+                let state = life.block(&id);
+                let candidate = state.candidate(PageIndex(0)).unwrap();
+                assert!(state.claim(&candidate, 0, None));
+                candidate
+            });
+            let entry = index.entry(&id).unwrap();
+            let held = entry.block.read().unwrap();
+            std::thread::scope(|scope| {
+                let removal = scope.spawn(|| index.remove(&id));
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while index.entry(&id).is_some() && Instant::now() < deadline {
+                    std::thread::yield_now();
+                }
+                let detached = index.entry(&id).is_none();
+                if detached {
+                    lru.remove(&CacheUnit::Page(id.clone(), PageIndex(0)));
+                    if let Some(candidate) = &candidate {
+                        candidate.block.finish(candidate, 0);
+                    }
+                }
+                drop(held);
+                assert!(detached);
+                assert!(removal.join().unwrap().is_some());
+            });
+            assert_eq!(
+                (index.len(), index.page_count(), index.resident_bytes()),
+                (0, 0, 0)
+            );
+        }
     }
 
     #[test]

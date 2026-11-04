@@ -142,3 +142,11 @@ page tables (232.19 MB), block identities (216.71 MB plus strings), resident ent
 (201.23 MB), catalog records (123.83 MB) and PageState (108.35 MB). Profiler RSS is
 not the normal-process RSS. The next work consolidates resident representations;
 the 1,000,000,000-byte target remains unmet and read performance is still pending.
+
+The eighth layer removes the resident bitmap. Page slots distinguish resident
+pages, including zero-byte allocations, from lifecycle or policy-only entries;
+public metadata reconstructs the bitmap on demand. Per-incarnation charged bytes
+and page counts survive directory detachment, even if an old policy/lifecycle
+owner subsequently removes shared slots before retirement finishes. Tests cover
+that deterministic interleaving and pending/zero-byte transitions. Validation
+passed 662 Worker tests (8 ignored) and Clippy; RSS has not yet been measured.
