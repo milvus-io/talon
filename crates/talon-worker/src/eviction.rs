@@ -44,37 +44,7 @@ impl CacheUnit {
     }
 }
 
-/// Block identity borrowed from a resident unit. The block map and its scan
-/// queues share that unit's immutable strings, even if this particular page is
-/// removed before its siblings. This retains metadata only, never a data pin.
-#[derive(Clone, Debug)]
-struct BlockKey(Arc<CacheUnit>);
-
-impl AsRef<BlockId> for BlockKey {
-    fn as_ref(&self) -> &BlockId {
-        self.0.block()
-    }
-}
-
-impl std::borrow::Borrow<BlockId> for BlockKey {
-    fn borrow(&self) -> &BlockId {
-        self.as_ref()
-    }
-}
-
-impl PartialEq for BlockKey {
-    fn eq(&self, other: &Self) -> bool {
-        self.as_ref() == other.as_ref()
-    }
-}
-
-impl Eq for BlockKey {}
-
-impl std::hash::Hash for BlockKey {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        std::hash::Hash::hash(self.as_ref(), state);
-    }
-}
+type BlockKey = Arc<BlockId>;
 
 /// Version-independent identity; offsets and block sizes must remain distinct.
 #[derive(PartialEq, Eq, Hash)]
@@ -193,8 +163,8 @@ pub(crate) struct StaleBlockCandidate {
     last_access: u64,
 }
 
-struct BlockActivity {
-    units: usize,
+#[derive(Clone)]
+pub(crate) struct BlockPolicy {
     pins: usize,
     position: u64,
     revision: u64,
@@ -202,6 +172,18 @@ struct BlockActivity {
     ownership_position: u64,
     ownership_pending: bool,
     access: Arc<AtomicU64>,
+}
+
+pub(crate) struct BlockActivity {
+    pub state: BlockPolicy,
+    pub units: usize,
+}
+
+impl std::ops::Deref for BlockActivity {
+    type Target = BlockPolicy;
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -250,8 +232,6 @@ struct Inner {
     /// Only live units are indexed. `None` denotes a whole block; storing page
     /// indices avoids duplicating object paths and versions for every page.
     versions: HashMap<LogicalBlock, HashMap<Version, HashSet<Option<PageIndex>>>>,
-    // Reference counts track resident units, not outstanding reader tokens.
-    block_access: HashMap<BlockKey, BlockActivity>,
     block_queue: BTreeMap<u64, BlockKey>,
     ownership_queue: BTreeMap<u64, BlockKey>,
     object_checks: HashMap<ObjectId, (usize, Option<u64>)>,
@@ -294,19 +274,22 @@ impl Inner {
         EvictionCandidate { unit, revision }
     }
 
-    /// All removal paths must update both maps under the same lock.
+    /// Remove membership, aggregate accounting and queues under the policy lock.
     fn remove(&mut self, unit: &CacheUnit) -> Option<u64> {
         let entry = self.index.policy_remove(unit)?;
         self.queue.remove(&entry.position);
         let block = unit.block();
-        let activity = self.block_access.get_mut(block).expect("tracked block");
-        activity.units -= 1;
-        activity.pins -= entry.pins as usize;
+        self.index
+            .policy_block_update(block, |activity| {
+                activity.pins -= entry.pins as usize;
+            })
+            .expect("tracked block");
+        let activity = self.index.policy_block_get(block).expect("tracked block");
         if activity.units == 0 {
             let position = activity.position;
             let ownership_position = activity.ownership_position;
             self.ownership_queue.remove(&ownership_position);
-            self.block_access.remove(block);
+            self.index.policy_block_remove(block);
             self.block_queue.remove(&position);
         }
         if let Some(check) = self.object_checks.get_mut(&block.object) {
@@ -368,7 +351,6 @@ impl Lru {
                 index: Arc::new(crate::BlockIndex::new()),
                 queue: BTreeMap::new(),
                 versions: HashMap::new(),
-                block_access: HashMap::new(),
                 block_queue: BTreeMap::new(),
                 ownership_queue: BTreeMap::new(),
                 object_checks: HashMap::new(),
@@ -414,14 +396,21 @@ impl Lru {
         let position = g.clock;
         g.clock = g.clock.checked_add(1).expect("eviction sequence exhausted");
         g.admission_ceiling = g.clock;
-        if let Some(activity) = g.block_access.get_mut(unit.block()) {
-            if !activity.ownership_pending {
+        let requeue = g
+            .index
+            .policy_block_update(unit.block(), |activity| {
+                if activity.ownership_pending {
+                    return None;
+                }
                 let previous = activity.ownership_position;
                 activity.ownership_position = position;
                 activity.ownership_pending = true;
-                let block = g.ownership_queue.remove(&previous).expect("queued block");
-                g.ownership_queue.insert(position, block);
-            }
+                Some(previous)
+            })
+            .flatten();
+        if let Some(previous) = requeue {
+            let block = g.ownership_queue.remove(&previous).expect("queued block");
+            g.ownership_queue.insert(position, block);
         }
         if let Some(e) = g.index.policy_get(&unit) {
             let old = e.bytes;
@@ -444,10 +433,8 @@ impl Lru {
                         .insert(unit.page());
                 }
             }
-            g.block_access
-                .get_mut(unit.block())
-                .expect("tracked block")
-                .revision = position;
+            g.index
+                .policy_block_update(unit.block(), |activity| activity.revision = position);
             Self::subtract_bytes(&mut g.total_bytes, old);
             Self::add_bytes(&mut g.total_bytes, bytes);
             return access;
@@ -463,14 +450,10 @@ impl Lru {
                 .or_default()
                 .insert(unit.page());
         }
-        if !g.block_access.contains_key(block) {
-            let key = BlockKey(unit.clone());
-            g.block_queue.insert(position, key.clone());
-            g.ownership_queue.insert(position, key.clone());
-            g.block_access.insert(
-                key,
-                BlockActivity {
-                    units: 0,
+        if g.index.policy_block_get(block).is_none() {
+            let key = g.index.policy_block_insert(
+                block,
+                BlockPolicy {
                     pins: 0,
                     position,
                     revision: position,
@@ -479,15 +462,17 @@ impl Lru {
                     access: Arc::new(AtomicU64::new(access_millis())),
                 },
             );
+            g.block_queue.insert(position, key.clone());
+            g.ownership_queue.insert(position, key);
         }
-        let activity = g.block_access.get_mut(block).expect("tracked block");
-        activity.units += 1;
-        activity.revision = position;
-        let access = AccessHandle(
-            Arc::new(AtomicBool::new(false)),
-            activity.access.clone(),
-            None,
-        );
+        let clock = g
+            .index
+            .policy_block_update(block, |activity| {
+                activity.revision = position;
+                activity.access.clone()
+            })
+            .expect("tracked block");
+        let access = AccessHandle(Arc::new(AtomicBool::new(false)), clock, None);
         // New pages also refresh the shared block idle age.
         access.1.fetch_max(access_millis(), Ordering::Relaxed);
         if g.track_checks {
@@ -525,13 +510,11 @@ impl Lru {
     ///
     /// Returns `true` if the unit exists.
     pub fn pin(&self, unit: &CacheUnit) -> bool {
-        let mut g = self.inner.lock().unwrap();
+        let g = self.inner.lock().unwrap();
         match g.index.policy_update(unit, |e| e.pins += 1) {
             Some(()) => {
-                g.block_access
-                    .get_mut(unit.block())
-                    .expect("tracked block")
-                    .pins += 1;
+                g.index
+                    .policy_block_update(unit.block(), |activity| activity.pins += 1);
                 true
             }
             None => false,
@@ -547,7 +530,7 @@ impl Lru {
 
     /// Release one pin previously taken with [`pin`](Self::pin).
     pub fn unpin(&self, unit: &CacheUnit) {
-        let mut g = self.inner.lock().unwrap();
+        let g = self.inner.lock().unwrap();
         if g.index.policy_update(unit, |e| {
             if e.pins == 0 {
                 return false;
@@ -556,10 +539,8 @@ impl Lru {
             true
         }) == Some(true)
         {
-            g.block_access
-                .get_mut(unit.block())
-                .expect("tracked block")
-                .pins -= 1;
+            g.index
+                .policy_block_update(unit.block(), |activity| activity.pins -= 1);
         }
     }
 
@@ -744,7 +725,7 @@ impl Lru {
                 break;
             };
             cursor.0 = position + 1;
-            let activity = &g.block_access[block];
+            let activity = g.index.policy_block_get(block).expect("tracked block");
             let access = activity.access.load(Ordering::Relaxed);
             let verified = g
                 .object_checks
@@ -788,20 +769,25 @@ impl Lru {
         let (&position, block) = g.ownership_queue.range(cursor.0..cursor.1).next()?;
         cursor.0 = position + 1;
         let block = block.clone();
-        let activity = g.block_access.get_mut(&block).expect("tracked block");
-        let revision = activity.revision;
-        if revision >= admission_limit {
-            activity.ownership_position = revision;
-            activity.ownership_pending = true;
-        } else {
-            activity.ownership_pending = false;
-        }
+        g.index
+            .policy_block_update(&block, |activity| {
+                let revision = activity.revision;
+                if revision >= admission_limit {
+                    activity.ownership_position = revision;
+                    activity.ownership_pending = true;
+                } else {
+                    activity.ownership_pending = false;
+                }
+            })
+            .expect("tracked block");
+        let activity = g.index.policy_block_get(&block).expect("tracked block");
         let candidate = StaleBlockCandidate {
             block: block.as_ref().clone(),
             units: activity.units,
-            revision,
+            revision: activity.revision,
             last_access: activity.access.load(Ordering::Relaxed),
         };
+        let revision = candidate.revision;
         if revision >= admission_limit && position != revision {
             let block = g.ownership_queue.remove(&position).expect("queued block");
             g.ownership_queue.insert(revision, block);
@@ -822,8 +808,8 @@ impl Lru {
         self.inner
             .lock()
             .unwrap()
-            .block_access
-            .get(&candidate.block)
+            .index
+            .policy_block_get(&candidate.block)
             .is_some_and(|entry| {
                 entry.pins == 0
                     && entry.revision == candidate.revision
@@ -1100,7 +1086,7 @@ mod tests {
         {
             let g = lru.inner.lock().unwrap();
             assert_eq!(g.ownership_queue.len(), 1);
-            let activity = &g.block_access[&block];
+            let activity = g.index.policy_block_get(&block).unwrap();
             assert_eq!(activity.ownership_position, 0);
             assert_eq!(activity.revision, 15);
         }
@@ -1225,7 +1211,7 @@ mod tests {
         lru.remove(&unit);
         {
             let g = lru.inner.lock().unwrap();
-            assert!(g.block_access.is_empty());
+            assert!(g.index.policy_block_get(unit.block()).is_none());
             assert!(g.block_queue.is_empty());
             assert!(g.object_checks.is_empty());
         }

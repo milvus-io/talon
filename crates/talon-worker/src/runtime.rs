@@ -242,6 +242,7 @@ impl WorkerRuntime {
         track_checks: bool,
     ) -> Self {
         let lru_started = Instant::now();
+        index.prepare_runtime_recovery();
         let mut units = index.restore_policy_units();
         let blocks = index.len() + small.as_ref().map_or(0, |small| small.len());
         if let Some(small) = &small {

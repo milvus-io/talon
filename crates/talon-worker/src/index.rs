@@ -16,7 +16,9 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, RwLockReadGuard};
 
-use crate::eviction::{AccessHandle, CacheUnit, PolicyEntry, PolicyState};
+use crate::eviction::{
+    AccessHandle, BlockActivity, BlockPolicy, CacheUnit, PolicyEntry, PolicyState,
+};
 use crate::page_lifecycle::{BlockState, PageEntry, PageReadGuard, PageTable};
 
 use talon_core::{BlockForm, BlockId, BlockMeta, PageIndex, PresentBitmap};
@@ -48,6 +50,7 @@ struct DirectoryEntry {
     resident: Option<Arc<Entry>>,
     lifecycle: Option<Arc<BlockState>>,
     policy: PolicyUnits,
+    activity: Option<BlockPolicy>,
 }
 
 #[derive(Default)]
@@ -59,7 +62,10 @@ struct PolicyUnits {
 
 impl DirectoryEntry {
     fn is_empty(&self) -> bool {
-        self.resident.is_none() && self.lifecycle.is_none() && self.policy.len == 0
+        self.resident.is_none()
+            && self.lifecycle.is_none()
+            && self.policy.len == 0
+            && self.activity.is_none()
     }
 }
 
@@ -199,6 +205,87 @@ impl IndexedBlock {
 }
 
 impl BlockIndex {
+    /// Startup only, before serving. Reusing a recovered index starts a new
+    /// runtime generation without retaining the previous policy or lifecycle.
+    pub(crate) fn prepare_runtime_recovery(&self) {
+        let mut entries = self.entries.write().unwrap();
+        entries.retain(|_, directory| {
+            if directory.lifecycle.is_none()
+                && directory.policy.len == 0
+                && directory.activity.is_none()
+            {
+                return true;
+            }
+            if let Some(entry) = &directory.resident {
+                let mut guard = entry.block.write().unwrap();
+                let block = guard.as_mut().expect("live directory entry");
+                let allocated = match &block.units {
+                    IndexedUnits::Whole(slot) => vec![(None, slot.read().unwrap().allocated)],
+                    IndexedUnits::Paged(pages) => {
+                        let BlockForm::Paged { present, .. } = &block.meta.form else {
+                            unreachable!()
+                        };
+                        pages
+                            .read()
+                            .unwrap()
+                            .iter()
+                            .filter_map(|(&page, entry)| {
+                                let page = PageIndex(page);
+                                present
+                                    .is_present(page)
+                                    .then_some((Some(page), entry.unit.allocated))
+                            })
+                            .collect()
+                    }
+                };
+                *block = IndexedBlock::allocated(block.meta.clone(), allocated);
+            }
+            directory.lifecycle = None;
+            directory.policy = PolicyUnits::default();
+            directory.activity = None;
+            directory.resident.is_some()
+        });
+    }
+
+    pub(crate) fn policy_block_get(&self, id: &BlockId) -> Option<BlockActivity> {
+        let entries = self.entries.read().unwrap();
+        let entry = entries.get(id)?;
+        Some(BlockActivity {
+            state: entry.activity.clone()?,
+            units: entry.policy.len,
+        })
+    }
+
+    pub(crate) fn policy_block_update<T>(
+        &self,
+        id: &BlockId,
+        update: impl FnOnce(&mut BlockPolicy) -> T,
+    ) -> Option<T> {
+        let mut entries = self.entries.write().unwrap();
+        Some(update(entries.get_mut(id)?.activity.as_mut()?))
+    }
+
+    pub(crate) fn policy_block_insert(&self, id: &BlockId, activity: BlockPolicy) -> Arc<BlockId> {
+        let mut entries = self.entries.write().unwrap();
+        let id = entries
+            .get_key_value(id)
+            .map(|(id, _)| id.clone())
+            .unwrap_or_else(|| Arc::new(id.clone()));
+        entries.entry(id.clone()).or_default().activity = Some(activity);
+        id
+    }
+
+    pub(crate) fn policy_block_remove(&self, id: &BlockId) {
+        let mut entries = self.entries.write().unwrap();
+        let Some(entry) = entries.get_mut(id) else {
+            return;
+        };
+        entry.activity = None;
+        if entry.is_empty() {
+            entries.remove(id);
+        }
+    }
+
     pub(crate) fn policy_get(&self, unit: &CacheUnit) -> Option<PolicyEntry> {
         let entries = self.entries.read().unwrap();
         let policy = &entries.get(unit.block())?.policy;
@@ -1892,6 +1979,38 @@ mod tests {
         lru.unpin(&unit);
         assert_eq!(lru.remove(&unit), Some(8192));
         assert!(index.entries.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn runtime_recovery_rebinds_a_reused_index_without_stale_policy_or_work() {
+        let index = Arc::new(BlockIndex::new());
+        let id = block(1);
+        let unit = CacheUnit::Page(id.clone(), PageIndex(0));
+        index.init_paged(id.clone(), 4096, 4096);
+        index.mark_page_allocated(&id, PageIndex(0), 4096);
+        let mut previous_clock = None;
+        for _ in 0..2 {
+            index.prepare_runtime_recovery();
+            let lru = index.restore_lru();
+            let life = crate::page_lifecycle::PageLifecycle::with_index(index.clone());
+            index.restore_page_states(&life);
+            let access = index.policy_get(&unit).unwrap().access;
+            if let Some(previous) = previous_clock {
+                assert!(!Arc::ptr_eq(&previous, access.clock()));
+            }
+            previous_clock = Some(access.clock().clone());
+            assert_eq!(lru.block_candidates(&id).len(), 1);
+            assert_eq!(index.policy_block_get(&id).unwrap().units, 1);
+            assert!(index
+                .page_reads_and_touch(&id, PageIndex(0), PageIndex(1))
+                .is_some());
+            assert_eq!((index.resident_bytes(), index.page_count()), (4096, 1));
+            lru.insert_with_policy(CacheUnit::Whole(block(2)), 8192, true);
+        }
+        index.prepare_runtime_recovery();
+        assert!(index.policy_get(&CacheUnit::Whole(block(2))).is_none());
+        assert!(index.lifecycle(&id).is_none());
+        assert_eq!(index.len(), 1);
     }
 
     #[test]

@@ -10,8 +10,9 @@ The stack separates independently testable changes:
 
 1. Share the block directory between BlockIndex and PageLifecycle.
 2. Share page storage, preserving read guards and deletion generations.
-3. Reuse resident objects for eviction membership; retain only necessary policy
-   queues and secondary indexes.
+3. Reuse resident objects for unit-level eviction membership.
+4. Share block-level policy state and identities; retain necessary policy queues
+   and secondary indexes.
 
 The first layer stores optional residency and lifecycle components under one
 canonical `Arc<BlockId>`. A pending fill can own lifecycle state without appearing
@@ -66,3 +67,35 @@ The third layer passed 654 Worker tests (8 ignored) and Clippy. Regressions cove
 pin and token preservation, delayed index retirement, policy-only residency
 isolation and bounded page churn. Independent concurrency and cleaness reviews
 found no remaining defect in this layer.
+
+
+The fourth local layer removes the block activity HashMap and uses the directory's
+canonical block identity in block and ownership queues. Unit membership has one
+count in `PolicyUnits`; activity reads expose a snapshot of that count. Reusing an
+index to initialize another runtime rebuilds resident slots and discards the old
+runtime's lifecycle and policy state while retaining metadata and allocation.
+The previous runtime must be stopped before this startup-only initialization.
+
+The complete local code passed 654 Worker library tests (8 ignored), Clippy with
+warnings denied, and a release build. Independent cleaness and concurrency reviews
+covered policy removal, retained incarnations, shared identity retirement, and
+runtime reinitialization. The work remains local and has not been published.
+
+Measured after these four local layers on the same QTP fixture:
+
+| Startup condition | Recovery median | Ready median | RSS median |
+|---|---:|---:|---:|
+| Warm, 3 runs | 15.395 s | 15.619 s | 6.867 GiB |
+| OS cache cleared, 3 runs | 15.676 s | 16.077 s | 6.867 GiB |
+
+The original-binary control recovered in 19.370 s. All runs restored exactly
+1,934,887 blocks/pages with zero evictions; 17,123 cached-content checks passed.
+The final binary SHA256 is
+`4d91b707d248f5702bcc4bba979cc26fcfb591e167fbec24ec0ceefaf4b74d61`.
+A readiness observer captured `coordinator_not_registered` for 4.94 s during one
+post-recovery delay; recovery time and end-to-end readiness remain separate metrics.
+The original services were restored and the original Worker was ready afterward.
+
+**The 1 GB target is not met.** RSS is still approximately 7.37 GB, or 3,811 bytes
+per object. Further work must budget the complete retained representation against
+approximately 500 bytes per object and verify read throughput, tail latency and CPU.
