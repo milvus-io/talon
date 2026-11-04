@@ -338,6 +338,7 @@ impl SmallObjectStore {
         &self,
         index: &Arc<crate::BlockIndex>,
         units: &mut Vec<crate::eviction::RecoveredUnit>,
+        track_clock: bool,
     ) {
         self.bind_index(index);
         let shared_access = units
@@ -347,7 +348,7 @@ impl SmallObjectStore {
             .collect();
         for stream in self.streams() {
             stream
-                .restore_policy_units(units, &shared_access)
+                .restore_policy_units(units, &shared_access, track_clock)
                 .expect("validated small object identity");
         }
     }
@@ -369,11 +370,18 @@ impl SmallObjectStore {
 
     pub(crate) fn bind_policy(&self, policy: Arc<Lru>) {
         self.bind_index(&policy.index());
+        let track_clock = policy.tracks_small_clock();
         assert!(
             self.policy.set(policy).is_ok(),
             "small store already bound to a runtime"
         );
-        self.restore_access();
+        if track_clock {
+            self.restore_access();
+        }
+    }
+
+    pub(super) fn policy(&self) -> Option<&Arc<Lru>> {
+        self.policy.get()
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -987,7 +995,7 @@ mod recovery_tests {
         let store = Arc::new(open(dir.path()).unwrap());
         let mut units = Vec::new();
         let index = Arc::new(crate::BlockIndex::new());
-        store.restore_policy_units(&index, &mut units);
+        store.restore_policy_units(&index, &mut units, true);
         let serial = crate::Lru::new();
         for unit in &units {
             serial.insert_with_policy(unit.unit.materialize(), unit.bytes, true);

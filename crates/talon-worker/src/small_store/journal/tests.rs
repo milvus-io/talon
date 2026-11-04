@@ -16,7 +16,7 @@ async fn identity_is_shared_by_live_and_recovered_journal_locator_and_policy() {
         );
         let mut units = Vec::new();
         let index = Arc::new(crate::BlockIndex::new());
-        store.restore_policy_units(&index, &mut units);
+        store.restore_policy_units(&index, &mut units, true);
         let policy = Arc::new(Lru::from_recovered(index, units, store.len(), true, true));
         store.bind_policy(policy.clone());
         if !recovered {

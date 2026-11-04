@@ -11,6 +11,70 @@ fn id(n: usize) -> BlockId {
         Version::new("v1"),
     )
 }
+
+#[tokio::test]
+async fn clocks_are_allocated_only_when_enabled_and_restore_persisted_ages() {
+    fn untracked(root: &Path) -> (Arc<SmallObjectStore>, Arc<Lru>) {
+        let store = Arc::new(
+            SmallObjectStore::open(root.to_owned(), 128 << 10, 256 << 10, 16 << 20, None).unwrap(),
+        );
+        let index = Arc::new(crate::BlockIndex::new());
+        let mut units = Vec::new();
+        store.restore_policy_units(&index, &mut units, false);
+        let policy = Arc::new(Lru::from_recovered(index, units, store.len(), false, false));
+        store.bind_policy(policy.clone());
+        (store, policy)
+    }
+    let root = tempfile::tempdir().unwrap();
+    let age;
+    {
+        let (store, policy) = untracked(root.path());
+        store
+            .put(&id(1), Bytes::from_static(b"payload"))
+            .await
+            .unwrap();
+        assert_eq!(store.access(&id(1)).unwrap().last_access(), 0);
+        store.enable_access_tracking().unwrap();
+        let access = store.access(&id(1)).unwrap();
+        let indexed = policy
+            .index()
+            .policy_get(&crate::CacheUnit::Whole(id(1)))
+            .unwrap()
+            .access;
+        assert!(Arc::ptr_eq(access.clock(), indexed.clock()));
+        age = access_millis().saturating_sub(10_000);
+        access.restore(age);
+        store
+            .put(&id(2), Bytes::from_static(b"payload"))
+            .await
+            .unwrap();
+        assert!(store.access(&id(2)).unwrap().last_access() > 0);
+        store.maintain(true).await.unwrap();
+        store.checkpoint_access(None).await.unwrap();
+    }
+    let (store, policy) = untracked(root.path());
+    assert_eq!(store.access(&id(1)).unwrap().last_access(), 0);
+    assert_eq!(
+        policy
+            .index()
+            .policy_get(&crate::CacheUnit::Whole(id(1)))
+            .unwrap()
+            .access
+            .last_access(),
+        0
+    );
+    store.enable_access_tracking().unwrap();
+    assert_eq!(store.access(&id(1)).unwrap().last_access(), age);
+    assert_eq!(
+        policy
+            .index()
+            .policy_get(&crate::CacheUnit::Whole(id(1)))
+            .unwrap()
+            .access
+            .last_access(),
+        age
+    );
+}
 fn open(root: &Path) -> Arc<SmallObjectStore> {
     open_with_policy(root).0
 }
@@ -20,7 +84,7 @@ fn open_with_policy(root: &Path) -> (Arc<SmallObjectStore>, Arc<Lru>) {
     );
     let mut units = Vec::new();
     let index = Arc::new(crate::BlockIndex::new());
-    store.restore_policy_units(&index, &mut units);
+    store.restore_policy_units(&index, &mut units, true);
     let policy = Arc::new(crate::Lru::from_recovered(
         index,
         units,

@@ -181,6 +181,7 @@ impl Lru {
                 object_checks,
                 track_checks,
                 track_blocks,
+                track_small_clock: track_blocks,
                 total_bytes,
                 clock,
                 admission_ceiling: clock,

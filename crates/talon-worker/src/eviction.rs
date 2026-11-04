@@ -169,6 +169,12 @@ impl AccessHandle {
         self.clock.as_ref().expect("access tracking enabled")
     }
 
+    pub(crate) fn enable_clock(mut self) -> Self {
+        self.clock
+            .get_or_insert_with(|| Arc::new(AtomicU64::new(access_millis())));
+        self
+    }
+
     pub(crate) fn track_small(mut self, dirty: Arc<crate::small_store::DirtyAccess>) -> Self {
         self.dirty = Some(dirty);
         self
@@ -343,6 +349,7 @@ struct Inner {
     object_checks: HashMap<ObjectId, (usize, Option<u64>)>,
     track_checks: bool,
     track_blocks: bool,
+    track_small_clock: bool,
     total_bytes: u64,
     clock: u64,
     // Unlike clock, this does not advance for capacity-policy rotations or reads.
@@ -469,6 +476,7 @@ impl Lru {
                 object_checks: HashMap::new(),
                 track_checks,
                 track_blocks,
+                track_small_clock: track_blocks,
                 total_bytes: 0,
                 clock: 0,
                 admission_ceiling: 0,
@@ -511,6 +519,14 @@ impl Lru {
 
     pub(crate) fn index(&self) -> Arc<crate::BlockIndex> {
         self.inner.lock().unwrap().index.clone()
+    }
+
+    pub(crate) fn tracks_small_clock(&self) -> bool {
+        self.inner.lock().unwrap().track_small_clock
+    }
+
+    pub(crate) fn enable_small_clock(&self) -> bool {
+        !std::mem::replace(&mut self.inner.lock().unwrap().track_small_clock, true)
     }
 
     /// Packed objects are independent full keys, with no cross-version eviction.
@@ -581,7 +597,7 @@ impl Lru {
                 e.bytes = bytes;
             });
             let mut access = e.access.clone();
-            if independent && access.clock.is_none() {
+            if independent && g.track_small_clock && access.clock.is_none() {
                 access.clock = Some(Arc::new(AtomicU64::new(access_millis())));
                 let unit = SharedUnit {
                     block: g
@@ -641,8 +657,9 @@ impl Lru {
             activity.revision = position;
             activity.access.clone()
         });
-        let clock =
-            clock.or_else(|| independent.then(|| Arc::new(AtomicU64::new(access_millis()))));
+        let clock = clock.or_else(|| {
+            (independent && g.track_small_clock).then(|| Arc::new(AtomicU64::new(access_millis())))
+        });
         let access = AccessHandle::with_state(Arc::default(), clock);
         // New pages also refresh the shared block idle age.
         if let Some(clock) = &access.clock {
@@ -1184,17 +1201,19 @@ mod tests {
             let access = lru.insert(unit.clone(), 10);
             let pin = lru.pin_guard(unit.clone());
             let updated = lru.insert_with_policy(unit.clone(), 20, true);
-            assert!(updated.clock.is_some());
-            assert!(lru
-                .inner
-                .lock()
-                .unwrap()
-                .index
-                .policy_get(&unit)
-                .unwrap()
-                .access
-                .clock
-                .is_some());
+            assert_eq!(updated.clock.is_some(), tracking);
+            assert_eq!(
+                lru.inner
+                    .lock()
+                    .unwrap()
+                    .index
+                    .policy_get(&unit)
+                    .unwrap()
+                    .access
+                    .clock
+                    .is_some(),
+                tracking
+            );
             assert!(Arc::ptr_eq(&access.state, &updated.state));
             assert!(lru.inner.lock().unwrap().versions.is_empty());
             assert_eq!(

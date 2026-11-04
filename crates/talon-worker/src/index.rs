@@ -1360,7 +1360,7 @@ mod tests {
         );
         let index = Arc::new(BlockIndex::new());
         let mut units = Vec::new();
-        store.restore_policy_units(&index, &mut units);
+        store.restore_policy_units(&index, &mut units, true);
         let lru = Arc::new(Lru::from_recovered(index.clone(), units, 0, false, false));
         store.bind_policy(lru.clone());
         let id = block(0);

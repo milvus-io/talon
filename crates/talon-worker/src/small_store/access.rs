@@ -208,12 +208,19 @@ impl SmallObjectStore {
         if self.access_dirty.enabled.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
+        let restore = self
+            .policy()
+            .map_or(true, |policy| policy.enable_small_clock());
         for stream in self.streams() {
             for (key, loc) in stream.entries.write().unwrap().iter_mut() {
                 if let Some(access) = loc.access.take() {
-                    loc.access = Some(self.attach_access(key.clone(), access, false));
+                    loc.access =
+                        Some(self.attach_access(key.clone(), access.enable_clock(), false));
                 }
             }
+        }
+        if restore {
+            self.restore_access();
         }
         Ok(())
     }

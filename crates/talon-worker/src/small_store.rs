@@ -653,14 +653,14 @@ impl SegmentStore {
         &self,
         units: &mut Vec<crate::eviction::RecoveredUnit>,
         shared_access: &HashMap<BlockId, AccessHandle>,
+        track_clock: bool,
     ) -> io::Result<()> {
         units.reserve(self.entries.read().unwrap().len());
         for (key, loc) in self.entries.write().unwrap().iter_mut() {
-            let unit = format::id(key)?;
             let access = shared_access
-                .get(unit.block())
+                .get(&key.materialize())
                 .map(AccessHandle::sibling)
-                .unwrap_or_default();
+                .unwrap_or_else(|| AccessHandle::new(track_clock));
             units.push(crate::eviction::RecoveredUnit {
                 unit: SharedUnit {
                     block: key.clone(),

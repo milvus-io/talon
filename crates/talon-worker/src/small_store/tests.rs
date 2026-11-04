@@ -578,9 +578,7 @@ async fn small_layout_probe() {
         .unwrap(),
     );
     let mut units = Vec::new();
-    store
-        .restore_policy_units(&mut units, &HashMap::new())
-        .unwrap();
+    store.restore_policy_units(&mut units, &HashMap::new(), true).unwrap();
     let policy = crate::Lru::from_recovered(
         Arc::new(crate::BlockIndex::new()),
         units,
