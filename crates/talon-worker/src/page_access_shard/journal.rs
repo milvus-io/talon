@@ -25,7 +25,7 @@ impl Default for JournalState {
 }
 impl JournalState {
     pub fn compact(&self) -> bool {
-        self.full || self.log_bytes >= COMPACT_BYTES.max(self.snapshot_bytes)
+        self.full || self.log_bytes >= COMPACT_BYTES.max(self.snapshot_bytes.div_ceil(2))
     }
 }
 fn header(magic: &[u8; 8], generation: u64) -> Vec<u8> {
@@ -318,7 +318,7 @@ mod tests {
     }
 
     #[test]
-    fn compaction_has_a_floor_and_scales_with_base_size() {
+    fn compaction_has_a_floor_and_scales_with_half_snapshot_size() {
         let mut state = JournalState {
             full: false,
             snapshot_bytes: 100,
@@ -329,8 +329,18 @@ mod tests {
         state.log_bytes += 1;
         assert!(state.compact());
         state.snapshot_bytes = 2 * COMPACT_BYTES;
+        assert!(state.compact());
+        state.snapshot_bytes = 4 * COMPACT_BYTES;
+        state.log_bytes = 2 * COMPACT_BYTES - 1;
         assert!(!state.compact());
-        state.log_bytes = state.snapshot_bytes;
+        state.log_bytes += 1;
+        assert!(state.compact());
+        state.snapshot_bytes += 1;
+        assert!(!state.compact());
+        state.log_bytes += 1;
+        assert!(state.compact());
+        state.full = true;
+        state.log_bytes = 0;
         assert!(state.compact());
     }
 }
