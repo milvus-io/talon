@@ -92,6 +92,7 @@ fn runtime_with_geometry(
         1024,
         WorkerMetrics::new(capacity),
         true,
+        true,
     );
     if paged {
         worker = worker.with_paged_store(PagedBlockStore::open(root.join("paged"), 1024).unwrap());

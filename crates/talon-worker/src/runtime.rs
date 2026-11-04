@@ -224,6 +224,7 @@ impl WorkerRuntime {
             l1_page_size_bytes,
             metrics,
             true,
+            true,
         )
     }
 
@@ -240,10 +241,11 @@ impl WorkerRuntime {
         l1_page_size_bytes: u64,
         metrics: WorkerMetrics,
         track_checks: bool,
+        track_blocks: bool,
     ) -> Self {
         let lru_started = Instant::now();
         index.prepare_runtime_recovery();
-        let mut units = index.restore_policy_units();
+        let mut units = index.restore_policy_units(track_blocks);
         let blocks = index.len() + small.as_ref().map_or(0, |small| small.len());
         if let Some(small) = &small {
             small.restore_policy_units(&mut units);
@@ -253,6 +255,7 @@ impl WorkerRuntime {
             units,
             blocks,
             track_checks,
+            track_blocks,
         ));
         let lru_ms = lru_started.elapsed().as_secs_f64() * 1000.0;
         let access_started = Instant::now();

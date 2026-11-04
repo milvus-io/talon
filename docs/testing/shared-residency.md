@@ -158,3 +158,19 @@ Arcs, so free-slot reuse does not change generation identity. Removal and recove
 reuse cleared slots. Capacity follows the historical peak, as with the previous
 HashMap. Validation passed 663 Worker tests (8 ignored), Clippy and independent
 correctness/cleaness reviews. This combined binary still needs an RSS measurement.
+
+The tenth layer skips block maintenance records, both block queues and ordinary
+block clocks when TTI, stale GC and ownership GC are all disabled. Capacity pins,
+second-chance bits and cross-version eviction remain active. Small-object access
+clocks remain available, including a lazy clock when an existing whole unit changes
+storage policy. Enabled maintenance configurations keep their original behavior.
+Validation passed 665 Worker tests (8 ignored), Clippy and a release build.
+
+Two warm runs through this layer recovered in 9.249 s and 9.379 s, with ready RSS
+1,851,793,408 and 1,852,964,864 bytes. Startup high-water RSS was 2,002,546,688 and
+2,003,795,968 bytes. Ready latency was 14.285 s and 14.433 s; those measurements
+include registration after recovery. All 1,934,887 blocks/pages remained present,
+zero evictions occurred, and 17,123 content checks passed. Original services were
+restored. Binary SHA256:
+`0788aaaca95fe986fe6b57934ffd69e813f4e8490d4e7c4feb506dd751a158b2`.
+The 1 GB target is still unmet; read performance has not been compared.

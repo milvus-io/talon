@@ -52,7 +52,7 @@ struct DirectoryEntry {
     resident: Option<Arc<Entry>>,
     lifecycle: Option<Arc<BlockState>>,
     policy: PolicyUnits,
-    activity: Option<BlockPolicy>,
+    activity: Option<Box<BlockPolicy>>,
 }
 
 #[derive(Default)]
@@ -344,7 +344,7 @@ impl BlockIndex {
         let entries = self.entries.read().unwrap();
         let entry = entries.get(id)?;
         Some(BlockActivity {
-            state: entry.activity.clone()?,
+            state: entry.activity.as_deref()?.clone(),
             units: entry.policy.len,
         })
     }
@@ -355,7 +355,7 @@ impl BlockIndex {
         update: impl FnOnce(&mut BlockPolicy) -> T,
     ) -> Option<T> {
         let mut entries = self.entries.write().unwrap();
-        Some(update(entries.get_mut(id)?.activity.as_mut()?))
+        Some(update(entries.get_mut(id)?.activity.as_deref_mut()?))
     }
 
     pub(crate) fn policy_block_insert(&self, id: &BlockId, activity: BlockPolicy) -> Arc<BlockId> {
@@ -364,7 +364,7 @@ impl BlockIndex {
             .get_key_value(id)
             .map(|(id, _)| id.clone())
             .unwrap_or_else(|| Arc::new(id.clone()));
-        entries.get_or_insert(id.clone()).1.activity = Some(activity);
+        entries.get_or_insert(id.clone()).1.activity = Some(Box::new(activity));
         id
     }
 
@@ -769,13 +769,17 @@ impl BlockIndex {
     pub(crate) fn restore_lru(self: &Arc<Self>) -> crate::eviction::Lru {
         crate::eviction::Lru::from_recovered(
             self.clone(),
-            self.restore_policy_units(),
+            self.restore_policy_units(true),
             self.len(),
+            true,
             true,
         )
     }
 
-    pub(crate) fn restore_policy_units(&self) -> Vec<crate::eviction::RecoveredUnit> {
+    pub(crate) fn restore_policy_units(
+        &self,
+        track_clock: bool,
+    ) -> Vec<crate::eviction::RecoveredUnit> {
         use crate::eviction::RecoveredUnit;
         let started = std::time::Instant::now();
         let entries = self.entries.read().unwrap();
@@ -783,7 +787,7 @@ impl BlockIndex {
         for entry in entries.values().filter_map(|entry| entry.resident.as_ref()) {
             let mut guard = entry.block.write().unwrap();
             let entry = guard.as_mut().expect("live directory entry");
-            let shared = AccessHandle::default();
+            let shared = AccessHandle::new(track_clock);
             let mut first = true;
             let mut add = |page: Option<PageIndex>, slot: &mut UnitSlot| {
                 let access = if first {

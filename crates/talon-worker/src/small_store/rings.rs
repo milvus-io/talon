@@ -892,6 +892,7 @@ mod recovery_tests {
             units,
             store.len(),
             true,
+            true,
         ));
         store.bind_policy(policy.clone());
         assert_eq!(policy.len(), 2050);

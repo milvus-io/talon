@@ -25,6 +25,7 @@ fn open_with_policy(root: &Path) -> (Arc<SmallObjectStore>, Arc<Lru>) {
         units,
         store.len(),
         true,
+        true,
     ));
     store.bind_policy(policy.clone());
     store.enable_access_tracking().unwrap();

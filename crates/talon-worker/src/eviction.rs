@@ -102,7 +102,7 @@ impl From<CacheUnit> for SharedUnit {
 #[derive(Clone)]
 pub struct AccessHandle(
     Arc<AtomicBool>,
-    Arc<AtomicU64>,
+    Option<Arc<AtomicU64>>,
     Option<Arc<crate::small_store::DirtyAccess>>,
 );
 
@@ -116,17 +116,20 @@ pub(crate) fn access_millis() -> u64 {
 
 impl Default for AccessHandle {
     fn default() -> Self {
-        Self(
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicU64::new(access_millis())),
-            None,
-        )
+        Self::new(true)
     }
 }
 
 impl AccessHandle {
+    pub(crate) fn new(track_clock: bool) -> Self {
+        Self(
+            Arc::new(AtomicBool::new(false)),
+            track_clock.then(|| Arc::new(AtomicU64::new(access_millis()))),
+            None,
+        )
+    }
     pub(crate) fn clock(&self) -> &Arc<AtomicU64> {
-        &self.1
+        self.1.as_ref().expect("access tracking enabled")
     }
 
     pub(crate) fn track_small(mut self, dirty: Arc<crate::small_store::DirtyAccess>) -> Self {
@@ -142,14 +145,16 @@ impl AccessHandle {
     }
 
     pub(crate) fn last_access(&self) -> u64 {
-        self.1.load(Ordering::Relaxed)
+        self.1
+            .as_ref()
+            .map_or(0, |clock| clock.load(Ordering::Relaxed))
     }
 
     /// Startup only, before serving. A clock rollback must not postpone expiry
     /// beyond one fresh idle window; a missing/invalid age starts that window.
     pub(crate) fn restore(&self, last_access: u64) {
         let now = access_millis();
-        self.1.store(
+        self.clock().store(
             if last_access == 0 {
                 now
             } else {
@@ -167,9 +172,11 @@ impl AccessHandle {
     /// Coalesce hits until the eviction hand consumes this second chance.
     /// This is advisory recency only, so relaxed ordering is sufficient.
     pub fn touch(&self) {
-        let now = access_millis();
-        if self.1.load(Ordering::Relaxed) < now {
-            self.1.fetch_max(now, Ordering::Relaxed);
+        if let Some(clock) = &self.1 {
+            let now = access_millis();
+            if clock.load(Ordering::Relaxed) < now {
+                clock.fetch_max(now, Ordering::Relaxed);
+            }
         }
         if let Some(dirty) = &self.2 {
             dirty.touch();
@@ -267,6 +274,7 @@ struct Inner {
     ownership_queue: BTreeMap<u64, BlockKey>,
     object_checks: HashMap<ObjectId, (usize, Option<u64>)>,
     track_checks: bool,
+    track_blocks: bool,
     total_bytes: u64,
     clock: u64,
     // Unlike clock, this does not advance for capacity-policy rotations or reads.
@@ -310,18 +318,18 @@ impl Inner {
         let entry = self.index.policy_remove(unit)?;
         self.queue.remove(&entry.position);
         let block = unit.block();
-        self.index
-            .policy_block_update(block, |activity| {
-                activity.pins -= entry.pins as usize;
-            })
-            .expect("tracked block");
-        let activity = self.index.policy_block_get(block).expect("tracked block");
-        if activity.units == 0 {
-            let position = activity.position;
-            let ownership_position = activity.ownership_position;
-            self.ownership_queue.remove(&ownership_position);
-            self.index.policy_block_remove(block);
-            self.block_queue.remove(&position);
+        if self.track_blocks {
+            self.index
+                .policy_block_update(block, |activity| {
+                    activity.pins -= entry.pins as usize;
+                })
+                .expect("tracked block");
+            let activity = self.index.policy_block_get(block).expect("tracked block");
+            if activity.units == 0 {
+                self.ownership_queue.remove(&activity.ownership_position);
+                self.index.policy_block_remove(block);
+                self.block_queue.remove(&activity.position);
+            }
         }
         if let Some(check) = self.object_checks.get_mut(&block.object) {
             check.0 -= 1;
@@ -380,10 +388,10 @@ impl Lru {
 
     /// Create an empty tracker.
     pub fn new() -> Self {
-        Self::with_object_checks(true)
+        Self::with_tracking(true, true)
     }
 
-    pub(crate) fn with_object_checks(track_checks: bool) -> Self {
+    fn with_tracking(track_checks: bool, track_blocks: bool) -> Self {
         Self {
             inner: Mutex::new(Inner {
                 index: Arc::new(crate::BlockIndex::new()),
@@ -393,6 +401,7 @@ impl Lru {
                 ownership_queue: BTreeMap::new(),
                 object_checks: HashMap::new(),
                 track_checks,
+                track_blocks,
                 total_bytes: 0,
                 clock: 0,
                 admission_ceiling: 0,
@@ -457,8 +466,29 @@ impl Lru {
                 e.independent = independent;
                 e.bytes = bytes;
             });
-            e.access.touch();
-            let access = e.access.clone();
+            let mut access = e.access.clone();
+            if independent && access.1.is_none() {
+                access.1 = Some(Arc::new(AtomicU64::new(access_millis())));
+                let unit = SharedUnit {
+                    block: g
+                        .index
+                        .shared_identity(unit.block())
+                        .expect("tracked block"),
+                    page: unit.page(),
+                };
+                g.index.policy_insert(
+                    &unit,
+                    PolicyEntry {
+                        state: PolicyState {
+                            independent,
+                            bytes,
+                            ..e.state
+                        },
+                        access: access.clone(),
+                    },
+                );
+            }
+            access.touch();
             if was_independent != independent {
                 if independent {
                     g.remove_version(&unit);
@@ -478,7 +508,7 @@ impl Lru {
         }
         Self::add_bytes(&mut g.total_bytes, bytes);
         let block = unit.block();
-        if g.index.policy_block_get(block).is_none() {
+        if g.track_blocks && g.index.policy_block_get(block).is_none() {
             let key = g.index.policy_block_insert(
                 block,
                 BlockPolicy {
@@ -493,16 +523,17 @@ impl Lru {
             g.block_queue.insert(position, key.clone());
             g.ownership_queue.insert(position, key);
         }
-        let clock = g
-            .index
-            .policy_block_update(block, |activity| {
-                activity.revision = position;
-                activity.access.clone()
-            })
-            .expect("tracked block");
+        let clock = g.index.policy_block_update(block, |activity| {
+            activity.revision = position;
+            activity.access.clone()
+        });
+        let clock =
+            clock.or_else(|| independent.then(|| Arc::new(AtomicU64::new(access_millis()))));
         let access = AccessHandle(Arc::new(AtomicBool::new(false)), clock, None);
         // New pages also refresh the shared block idle age.
-        access.1.fetch_max(access_millis(), Ordering::Relaxed);
+        if let Some(clock) = &access.1 {
+            clock.fetch_max(access_millis(), Ordering::Relaxed);
+        }
         if g.track_checks {
             g.object_checks
                 .entry(block.object.clone())
@@ -510,7 +541,10 @@ impl Lru {
                 .0 += 1;
         }
         let unit = SharedUnit {
-            block: g.index.shared_identity(block).expect("tracked block"),
+            block: g
+                .index
+                .shared_identity(block)
+                .unwrap_or_else(|| Arc::new(block.clone())),
             page: unit.page(),
         };
         if !independent {
@@ -970,47 +1004,84 @@ mod tests {
     }
 
     #[test]
-    fn switching_whole_storage_policy_preserves_access_and_pins() {
-        let lru = Arc::new(Lru::new());
-        let unit = whole(1);
-        let access = lru.insert(unit.clone(), 10);
-        let pin = lru.pin_guard(unit.clone());
-        let updated = lru.insert_with_policy(unit.clone(), 20, true);
-        assert!(Arc::ptr_eq(&access.0, &updated.0));
-        assert!(lru.inner.lock().unwrap().versions.is_empty());
-        assert_eq!(
-            lru.inner
-                .lock()
-                .unwrap()
-                .index
-                .policy_get(&unit)
-                .unwrap()
-                .pins,
-            1
-        );
-        let updated = lru.insert(unit.clone(), 30);
-        assert!(Arc::ptr_eq(&access.0, &updated.0));
-        assert_eq!(lru.inner.lock().unwrap().versions.len(), 1);
-        assert_eq!(
-            lru.inner
-                .lock()
-                .unwrap()
-                .index
-                .policy_get(&unit)
-                .unwrap()
-                .pins,
-            1
-        );
-        drop(pin);
-        lru.remove_block(unit.block());
+    fn disabled_block_tracking_keeps_capacity_pins_and_version_eviction() {
+        let lru = Lru::with_tracking(false, false);
+        let old = CacheUnit::Page(blk(0), PageIndex(0));
+        let mut new_block = blk(0);
+        new_block.version = Version::new("v2");
+        let new = CacheUnit::Page(new_block.clone(), PageIndex(0));
+        let token = lru.insert(old.clone(), 4096);
+        assert!(token.1.is_none());
+        token.touch();
+        assert!(lru.pin(&old));
+        lru.insert(new.clone(), 8192);
+        assert!(lru.evict_superseded(&new_block).is_empty());
+        assert_eq!(lru.evict_to_fit(0), [new]);
+        lru.unpin(&old);
+        assert_eq!(lru.evict_superseded(&new_block), [old]);
         assert!(lru.is_empty());
-        assert_eq!(lru.total_bytes(), 0);
+        let g = lru.inner.lock().unwrap();
+        assert!(g.block_queue.is_empty());
+        assert!(g.ownership_queue.is_empty());
+        assert!(g.index.policy_block_get(&blk(0)).is_none());
+        assert_eq!(g.total_bytes, 0);
+    }
+
+    #[test]
+    fn switching_whole_storage_policy_preserves_access_and_pins() {
+        for tracking in [false, true] {
+            let lru = Arc::new(Lru::with_tracking(tracking, tracking));
+            let unit = whole(1);
+            let access = lru.insert(unit.clone(), 10);
+            let pin = lru.pin_guard(unit.clone());
+            let updated = lru.insert_with_policy(unit.clone(), 20, true);
+            assert!(updated.1.is_some());
+            assert!(lru
+                .inner
+                .lock()
+                .unwrap()
+                .index
+                .policy_get(&unit)
+                .unwrap()
+                .access
+                .1
+                .is_some());
+            assert!(Arc::ptr_eq(&access.0, &updated.0));
+            assert!(lru.inner.lock().unwrap().versions.is_empty());
+            assert_eq!(
+                lru.inner
+                    .lock()
+                    .unwrap()
+                    .index
+                    .policy_get(&unit)
+                    .unwrap()
+                    .pins,
+                1
+            );
+            let updated = lru.insert(unit.clone(), 30);
+            assert!(Arc::ptr_eq(&access.0, &updated.0));
+            assert_eq!(lru.inner.lock().unwrap().versions.len(), 1);
+            assert_eq!(
+                lru.inner
+                    .lock()
+                    .unwrap()
+                    .index
+                    .policy_get(&unit)
+                    .unwrap()
+                    .pins,
+                1
+            );
+            drop(pin);
+            lru.remove_block(unit.block());
+            assert!(lru.is_empty());
+            assert_eq!(lru.total_bytes(), 0);
+        }
     }
 
     #[test]
     fn independent_keys_skip_version_index_and_preserve_exact_deletion() {
         for track_checks in [false, true] {
-            let lru = Lru::with_object_checks(track_checks);
+            let lru = Lru::with_tracking(track_checks, true);
             let v1 = blk(1);
             let mut v2 = v1.clone();
             v2.version = Version::new("v2");
@@ -1152,7 +1223,7 @@ mod tests {
         let second = CacheUnit::Page(blk(1), PageIndex(1));
         let access = lru.insert(first, 16);
         lru.insert(second.clone(), 16);
-        access.1.store(100, Ordering::Relaxed);
+        access.clock().store(100, Ordering::Relaxed);
         let mut cursor = (0, 0);
         assert!(lru
             .stale_gc_candidates(&mut cursor, 200, 100, 8, 8)
@@ -1161,7 +1232,7 @@ mod tests {
         assert_eq!(candidates.len(), 1);
         assert!(candidates.iter().all(|c| lru.stale_candidate_is_current(c)));
         // A touch of either page invalidates the block candidate.
-        access.1.store(201, Ordering::Relaxed);
+        access.clock().store(201, Ordering::Relaxed);
         lru.touch(&second);
         assert!(candidates
             .iter()
@@ -1173,7 +1244,7 @@ mod tests {
         let lru = Lru::new();
         let unit = whole(1);
         let old = lru.insert(unit.clone(), 16);
-        old.1.store(1, Ordering::Relaxed);
+        old.clock().store(1, Ordering::Relaxed);
         let candidates = lru.stale_gc_candidates(&mut (0, 0), 200, 100, 8, 8);
         assert_eq!(candidates.len(), 1);
         lru.stale_verified(&unit.block().object, 200);
@@ -1185,7 +1256,7 @@ mod tests {
             assert!(g.object_checks.is_empty());
         }
         let new = lru.insert(unit, 16);
-        assert!(!Arc::ptr_eq(&old.1, &new.1));
+        assert!(!Arc::ptr_eq(old.clock(), new.clock()));
         assert!(!lru.stale_candidate_is_current(&candidates[0]));
         assert!(lru
             .inner
