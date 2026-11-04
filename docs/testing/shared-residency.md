@@ -107,3 +107,12 @@ writes preserve the canonical identity. Online first admission still constructs
 separate catalog and runtime identities; that path needs further consolidation.
 Validation passed 657 Worker tests (8 ignored) and Clippy. Its RSS has not yet
 been measured. Memory is now the first milestone; read performance follows.
+
+The sixth layer creates lifecycle maintenance state on demand when TTI is off.
+Cold recovery keeps the resident PageState for read/delete arbitration, but does
+not allocate a BlockState, mutation gate or BlockWork for every block. Maintenance
+scans retire idle sidecars after callers release them; retries, cleanup and retained
+gates prevent retirement. Page handles keep their reader count through retirement
+and rebinding. Enabling TTI before serving still restores every resident page's age.
+Validation passed 659 Worker tests (8 ignored) and Clippy, including retained
+readers, gates, retry cancellation and access tracking bound after an earlier read.

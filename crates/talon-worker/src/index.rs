@@ -541,8 +541,8 @@ impl BlockIndex {
         block
     }
 
-    // Caller owns the lifecycle registry and has checked the empty block under
-    // its lock. The directory and registry are its only remaining owners.
+    // Caller owns the lifecycle registry. Retirement checks maintenance work
+    // while the directory and registry are the only remaining owners.
     pub(crate) fn retire_lifecycle(&self, id: &BlockId, block: &Arc<BlockState>) -> bool {
         let mut entries = self.entries.write().unwrap();
         let Some(slot) = entries.get_mut(id) else {
@@ -553,7 +553,7 @@ impl BlockIndex {
             .as_ref()
             .is_some_and(|old| Arc::ptr_eq(old, block))
             || Arc::strong_count(block) != 2
-            || !block.retire_if_empty()
+            || !block.retire_if_idle()
         {
             return false;
         }
@@ -643,9 +643,6 @@ impl BlockIndex {
             let acquire = |page| {
                 let state = pages.get(&page)?;
                 let access = state.unit.access.as_ref()?;
-                if !state.handle.is_bound() {
-                    return None;
-                }
                 let guard = state.handle.acquire()?;
                 access.touch();
                 Some(guard)
@@ -1186,7 +1183,7 @@ mod tests {
     #[test]
     fn lifecycle_directory_preserves_gates_across_residency_changes() {
         let index = Arc::new(BlockIndex::new());
-        let life = crate::page_lifecycle::PageLifecycle::with_index(index.clone());
+        let life = crate::page_lifecycle::PageLifecycle::with_index(index.clone(), true);
         let id = block(1);
         let pending = life.block(&id);
         assert_eq!(index.len(), 0);
@@ -1221,7 +1218,7 @@ mod tests {
     #[test]
     fn lifecycle_scan_retires_unpublished_blocks_from_the_shared_directory() {
         let index = Arc::new(BlockIndex::new());
-        let life = crate::page_lifecycle::PageLifecycle::with_index(index.clone());
+        let life = crate::page_lifecycle::PageLifecycle::with_index(index.clone(), true);
         for n in 0..100 {
             drop(life.block(&block(n)));
         }
@@ -1240,7 +1237,7 @@ mod tests {
     #[test]
     fn shared_pages_keep_retry_and_read_generations_across_storage_transitions() {
         let index = Arc::new(BlockIndex::new());
-        let life = crate::page_lifecycle::PageLifecycle::with_index(index.clone());
+        let life = crate::page_lifecycle::PageLifecycle::with_index(index.clone(), true);
         let id = block(1);
         index.init_paged(id.clone(), 4096, 8192);
         let block = life.block(&id);
@@ -1407,7 +1404,7 @@ mod tests {
         let page = PageIndex(255);
         let end = PageIndex(256);
         let unit = CacheUnit::Page(id.clone(), page);
-        let life = crate::page_lifecycle::PageLifecycle::with_index(index.clone());
+        let life = crate::page_lifecycle::PageLifecycle::with_index(index.clone(), true);
         index.init_paged(id.clone(), 1 << 20, u64::from(id.block_size));
         // Attaching state to an absent page must not allocate a sparse slot.
         index.set_access(&unit, AccessHandle::default());
@@ -1455,7 +1452,7 @@ mod tests {
             assert!(index.mark_page_allocated(&id, PageIndex(page), u64::from(page) + 1));
         }
         let last = PageIndex(255);
-        let life = crate::page_lifecycle::PageLifecycle::with_index(index.clone());
+        let life = crate::page_lifecycle::PageLifecycle::with_index(index.clone(), true);
         index.set_access(&CacheUnit::Page(id.clone(), last), AccessHandle::default());
         life.block(&id).register(last, None, 0, false);
         assert!(index.clear_page(&id, PageIndex(0)));
@@ -1623,7 +1620,7 @@ mod tests {
             index.mark_page_allocated(&paged, PageIndex(0), 0);
             index.mark_page_allocated(&paged, PageIndex(pages - 1), 8192);
             let lru = index.restore_lru();
-            let lifecycle = crate::page_lifecycle::PageLifecycle::with_index(index.clone());
+            let lifecycle = crate::page_lifecycle::PageLifecycle::with_index(index.clone(), true);
             index.restore_page_states(&lifecycle);
             assert_eq!(lru.len(), 3);
             assert_eq!(lru.total_bytes(), index.resident_bytes());
@@ -1697,7 +1694,7 @@ mod tests {
         let idx = Arc::new(BlockIndex::new());
         let lru = Lru::new();
         let id = block(1);
-        let life = crate::page_lifecycle::PageLifecycle::with_index(idx.clone());
+        let life = crate::page_lifecycle::PageLifecycle::with_index(idx.clone(), true);
         let block = life.block(&id);
         idx.init_paged(id.clone(), 4096, 8192);
         for p in 0..2 {
@@ -1747,7 +1744,7 @@ mod tests {
             idx.mark_page(&id, page);
             idx.set_access(unit, lru.insert(unit.clone(), 4096));
         }
-        let life = crate::page_lifecycle::PageLifecycle::with_index(idx.clone());
+        let life = crate::page_lifecycle::PageLifecycle::with_index(idx.clone(), true);
         life.block(&id).register(PageIndex(0), None, 0, false);
         assert!(idx
             .page_reads_and_touch(&id, PageIndex(0), PageIndex(1))
@@ -1897,7 +1894,7 @@ mod tests {
         let busy_entry = index.entry(&busy).unwrap();
         let busy_guard = busy_entry.block.write().unwrap();
         // A directory reader must not prevent mutations to existing entries.
-        let lifecycle = crate::page_lifecycle::PageLifecycle::with_index(index.clone());
+        let lifecycle = crate::page_lifecycle::PageLifecycle::with_index(index.clone(), true);
         let _other_lifecycle = lifecycle.block(&other);
         let directory_guard = index.entries.read().unwrap();
         let (tx, rx) = mpsc::channel();
@@ -2100,7 +2097,7 @@ mod tests {
         for _ in 0..2 {
             index.prepare_runtime_recovery();
             let lru = index.restore_lru();
-            let life = crate::page_lifecycle::PageLifecycle::with_index(index.clone());
+            let life = crate::page_lifecycle::PageLifecycle::with_index(index.clone(), true);
             index.restore_page_states(&life);
             let access = index.policy_get(&unit).unwrap().access;
             if let Some(previous) = previous_clock {
@@ -2159,7 +2156,7 @@ mod tests {
             (0, 0, 0)
         );
         assert!(index.get(&id).is_none());
-        let lifecycle = crate::page_lifecycle::PageLifecycle::with_index(index.clone());
+        let lifecycle = crate::page_lifecycle::PageLifecycle::with_index(index.clone(), true);
         let block = lifecycle.block(&id);
         drop(block);
         // A lifecycle sweep must not discard the small-store admission.
