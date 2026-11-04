@@ -1,5 +1,5 @@
 //! Page residency and idle age. Disk operations never run under these locks.
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -319,7 +319,7 @@ impl BlockPages {
     }
 }
 pub(crate) struct BlockState {
-    pub id: BlockId,
+    pub id: Arc<BlockId>,
     pub gate: Arc<PageMutationGate>,
     pub inner: Mutex<BlockPages>,
 }
@@ -600,7 +600,6 @@ pub(crate) struct GcCandidate {
 
 #[derive(Default)]
 struct Registry {
-    by_id: HashMap<BlockId, u64>,
     ordered: BTreeMap<u64, Arc<BlockState>>,
     next: u64,
     membership: u64,
@@ -661,14 +660,20 @@ pub(crate) struct ScanReport {
     pub empty: Vec<Arc<BlockState>>,
 }
 pub(crate) struct PageLifecycle {
+    index: Arc<crate::BlockIndex>,
     shards: Vec<Mutex<Registry>>,
     work: Vec<Arc<ShardWork>>,
     directories: Vec<Arc<tokio::sync::RwLock<()>>>,
     checkpoints: Vec<Arc<tokio::sync::Mutex<()>>>,
 }
 impl PageLifecycle {
+    #[cfg(test)]
     pub fn new() -> Self {
+        Self::with_index(Arc::new(crate::BlockIndex::new()))
+    }
+    pub fn with_index(index: Arc<crate::BlockIndex>) -> Self {
         Self {
+            index,
             work: (0..SHARDS).map(|_| Arc::default()).collect(),
             shards: (0..SHARDS)
                 .map(|_| Mutex::new(Registry::default()))
@@ -686,58 +691,59 @@ impl PageLifecycle {
     }
     #[cfg(test)]
     pub fn get(&self, id: &BlockId) -> Option<Arc<BlockState>> {
-        let g = self.shards[disk_shard(id)].lock().unwrap();
-        g.by_id.get(id).and_then(|n| g.ordered.get(n)).cloned()
+        self.index.lifecycle(id)
     }
     pub fn retire_empty(&self, id: &BlockId) {
         let mut g = self.shards[disk_shard(id)].lock().unwrap();
-        if let Some(&n) = g.by_id.get(id) {
-            let block = &g.ordered[&n];
+        let Some(block) = self.index.lifecycle(id) else {
+            return;
+        };
+        let n = block.inner.lock().unwrap().work.slot;
+        // Drop the lookup's temporary owner before checking for external users.
+        drop(block);
+        if let Some(block) = g.ordered.get(&n) {
             let state = block.inner.lock().unwrap();
-            let empty =
-                state.pages.is_empty() && !state.cleanup_pending && Arc::strong_count(block) == 1;
-            if empty {
-                state.work.retire();
+            if !state.pages.is_empty()
+                || state.cleanup_pending
+                || !self.index.retire_lifecycle(id, block)
+            {
+                return;
             }
+            state.work.retire();
             drop(state);
-            if empty {
-                g.ordered.remove(&n);
-                g.by_id.remove(id);
-                g.removed(id);
-            }
+            g.ordered.remove(&n);
+            g.removed(id);
         }
     }
     pub fn block(&self, id: &BlockId) -> Arc<BlockState> {
         let mut hash = DefaultHasher::new();
         id.hash(&mut hash);
-        let mut g = self.shards[disk_shard(id)].lock().unwrap();
-        if let Some(n) = g.by_id.get(id) {
-            return g.ordered[n].clone();
-        }
-        g.next += 1;
-        g.membership += 1;
-        let n = g.next;
-        let block = Arc::new(BlockState {
-            id: id.clone(),
-            gate: Arc::new(PageMutationGate {
-                directory: self.directory_gate(hash.finish()),
-                block: tokio::sync::RwLock::new(()),
-            }),
-            inner: Mutex::new(BlockPages {
-                work: Arc::new(BlockWork {
-                    shard: self.work[disk_shard(id)].clone(),
-                    slot: n,
-                    retired: AtomicBool::new(false),
-                    dirty_since: AtomicU64::new(UNKNOWN),
+        let shard = disk_shard(id);
+        let mut g = self.shards[shard].lock().unwrap();
+        self.index.lifecycle_or_insert(id, |id| {
+            g.next += 1;
+            g.membership += 1;
+            let n = g.next;
+            let block = Arc::new(BlockState {
+                id,
+                gate: Arc::new(PageMutationGate {
+                    directory: self.directory_gate(hash.finish()),
+                    block: tokio::sync::RwLock::new(()),
                 }),
-                ..Default::default()
-            }),
-        });
-        g.by_id.insert(id.clone(), n);
-        g.ordered.insert(n, block.clone());
-        // Failed fills and whole-block operations can leave empty registry state.
-        self.work[disk_shard(id)].pending.lock().unwrap().insert(n);
-        block
+                inner: Mutex::new(BlockPages {
+                    work: Arc::new(BlockWork {
+                        shard: self.work[shard].clone(),
+                        slot: n,
+                        retired: AtomicBool::new(false),
+                        dirty_since: AtomicU64::new(UNKNOWN),
+                    }),
+                    ..Default::default()
+                }),
+            });
+            g.ordered.insert(n, block.clone());
+            self.work[shard].pending.lock().unwrap().insert(n);
+            block
+        })
     }
     /// Ordered block slots and page keys let a batch resume without copying the registry.
     /// Empty blocks are retired only without outside references, preserving gate identity.
@@ -791,12 +797,14 @@ impl PageLifecycle {
             if state.pages.is_empty() && state.cleanup_pending {
                 report.empty.push(block.clone());
             }
-            if state.pages.is_empty() && !state.cleanup_pending && Arc::strong_count(block) == 1 {
-                let id = block.id.clone();
+            if state.pages.is_empty()
+                && !state.cleanup_pending
+                && self.index.retire_lifecycle(&block.id, block)
+            {
+                let id = (*block.id).clone();
                 state.work.retire();
                 drop(state);
                 registry.ordered.remove(&slot);
-                registry.by_id.remove(&id);
                 registry.removed(&id);
                 cursor.block = slot + 1;
                 cursor.page = 0;

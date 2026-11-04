@@ -261,6 +261,7 @@ impl WorkerRuntime {
             l1_page_size_bytes,
         ));
         metrics.set_l1_capacity(l1_capacity_bytes);
+        let page_lifecycle = Arc::new(PageLifecycle::with_index(index.clone()));
         // Residency gauges may already include other namespaces sharing these metrics.
         Self {
             membership: Arc::new(Mutex::new(None)),
@@ -296,7 +297,7 @@ impl WorkerRuntime {
             version_cache: Arc::new(Mutex::new(HashMap::new())),
             version_ttl: DEFAULT_VERSION_TTL,
             rate_limiter: Arc::new(NamespaceRateLimiter::disabled()),
-            page_lifecycle: Arc::new(PageLifecycle::new()),
+            page_lifecycle,
             page_clock: Arc::new(AccessClock::new()),
             page_gc_config: PageGcConfig::default(),
             page_mutations: Arc::new(Mutations::default()),

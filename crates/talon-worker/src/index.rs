@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, RwLockReadGuard};
 
 use crate::eviction::{AccessHandle, CacheUnit};
-use crate::page_lifecycle::{PageReadGuard, PageState};
+use crate::page_lifecycle::{BlockState, PageReadGuard, PageState};
 
 use talon_core::{BlockForm, BlockId, BlockMeta, PageIndex, PresentBitmap};
 
@@ -37,9 +37,16 @@ pub enum Presence {
 /// A thread-safe index of resident blocks.
 #[derive(Default)]
 pub struct BlockIndex {
-    entries: RwLock<HashMap<BlockId, Arc<Entry>>>,
+    entries: RwLock<HashMap<Arc<BlockId>, DirectoryEntry>>,
+    resident_blocks: AtomicU64,
     resident_bytes: AtomicU64,
     resident_pages: AtomicU64,
+}
+
+#[derive(Default)]
+struct DirectoryEntry {
+    resident: Option<Arc<Entry>>,
+    lifecycle: Option<Arc<BlockState>>,
 }
 
 struct Entry {
@@ -311,7 +318,8 @@ impl BlockIndex {
         let bytes = self.resident_bytes.get_mut();
         let pages = self.resident_pages.get_mut();
         for (id, entry, added_bytes, added_pages) in built {
-            if let Some(old) = entries.insert(id, entry) {
+            let slot = entries.entry(Arc::new(id)).or_default();
+            if let Some(old) = slot.resident.replace(entry) {
                 let old = old
                     .block
                     .write()
@@ -320,6 +328,8 @@ impl BlockIndex {
                     .expect("live recovery entry");
                 *bytes -= old.units.allocated_bytes();
                 *pages -= materialized_pages(&old.meta);
+            } else {
+                *self.resident_blocks.get_mut() += 1;
             }
             *bytes += added_bytes;
             *pages += added_pages;
@@ -327,13 +337,60 @@ impl BlockIndex {
         Ok(())
     }
 
+    pub(crate) fn lifecycle(&self, id: &BlockId) -> Option<Arc<BlockState>> {
+        self.entries.read().unwrap().get(id)?.lifecycle.clone()
+    }
+
+    pub(crate) fn lifecycle_or_insert(
+        &self,
+        id: &BlockId,
+        create: impl FnOnce(Arc<BlockId>) -> Arc<BlockState>,
+    ) -> Arc<BlockState> {
+        if let Some(block) = self.lifecycle(id) {
+            return block;
+        }
+        let mut entries = self.entries.write().unwrap();
+        let key = entries
+            .get_key_value(id)
+            .map(|(id, _)| id.clone())
+            .unwrap_or_else(|| Arc::new(id.clone()));
+        entries
+            .entry(key.clone())
+            .or_default()
+            .lifecycle
+            .get_or_insert_with(|| create(key))
+            .clone()
+    }
+
+    // Caller owns the lifecycle registry and has checked the empty block under
+    // its lock. The directory and registry are its only remaining owners.
+    pub(crate) fn retire_lifecycle(&self, id: &BlockId, block: &Arc<BlockState>) -> bool {
+        let mut entries = self.entries.write().unwrap();
+        let Some(slot) = entries.get_mut(id) else {
+            return false;
+        };
+        if !slot
+            .lifecycle
+            .as_ref()
+            .is_some_and(|old| Arc::ptr_eq(old, block))
+            || Arc::strong_count(block) != 2
+        {
+            return false;
+        }
+        slot.lifecycle = None;
+        if slot.resident.is_none() {
+            entries.remove(id);
+        }
+        true
+    }
+
     fn entry(&self, id: &BlockId) -> Option<Arc<Entry>> {
-        self.entries.read().unwrap().get(id).cloned()
+        self.entries.read().unwrap().get(id)?.resident.clone()
     }
 
     fn read_entry<T>(&self, id: &BlockId, read: impl FnOnce(&IndexedBlock) -> T) -> Option<T> {
         let entries = self.entries.read().unwrap();
-        let entry = entries.get(id)?;
+        let entry = entries.get(id)?.resident.as_ref()?;
         let guard = entry.block.read().unwrap();
         // Keeping membership stable also prevents this entry from retiring.
         Some(read(guard.as_ref().expect("live directory entry")))
@@ -374,6 +431,7 @@ impl BlockIndex {
         let entries = self.entries.read().unwrap();
         let guards: Vec<_> = entries
             .values()
+            .filter_map(|entry| entry.resident.as_ref())
             .map(|entry| entry.block.read().unwrap())
             .collect();
         read(&guards)
@@ -435,7 +493,7 @@ impl BlockIndex {
         let started = std::time::Instant::now();
         let entries = self.entries.read().unwrap();
         let mut units = Vec::with_capacity(entries.len());
-        for entry in entries.values() {
+        for entry in entries.values().filter_map(|entry| entry.resident.as_ref()) {
             let mut guard = entry.block.write().unwrap();
             let entry = guard.as_mut().expect("live directory entry");
             let shared = AccessHandle::default();
@@ -494,8 +552,14 @@ impl BlockIndex {
         lifecycle: &crate::page_lifecycle::PageLifecycle,
         now: u64,
     ) {
-        let entries = self.entries.read().unwrap();
-        for entry in entries.values() {
+        let entries: Vec<_> = self
+            .entries
+            .read()
+            .unwrap()
+            .values()
+            .filter_map(|entry| entry.resident.clone())
+            .collect();
+        for entry in entries {
             let mut guard = entry.block.write().unwrap();
             let entry = guard.as_mut().expect("live directory entry");
             if let BlockForm::Paged { present, .. } = &entry.meta.form {
@@ -526,12 +590,12 @@ impl BlockIndex {
 
     /// Number of blocks currently tracked.
     pub fn len(&self) -> usize {
-        self.entries.read().unwrap().len()
+        self.resident_blocks.load(Ordering::Relaxed) as usize
     }
 
     /// Whether the index is empty.
     pub fn is_empty(&self) -> bool {
-        self.entries.read().unwrap().is_empty()
+        self.len() == 0
     }
 
     /// Allocated disk bytes of indexed data files, also charged to eviction.
@@ -693,7 +757,8 @@ impl BlockIndex {
         let mut entries = self.entries.write().unwrap();
         // Structural mutations take directory -> entry. Ordinary operations
         // never reacquire the directory while holding an entry lock.
-        let previous = entries.get(&id).map(|old| {
+        let slot = entries.entry(Arc::new(id)).or_default();
+        let previous = slot.resident.as_ref().map(|old| {
             old.block
                 .write()
                 .unwrap()
@@ -714,7 +779,9 @@ impl BlockIndex {
             self.resident_pages
                 .fetch_sub(old_pages - pages, Ordering::Relaxed);
         }
-        entries.insert(id, Arc::new(Entry::new(entry)));
+        if slot.resident.replace(Arc::new(Entry::new(entry))).is_none() {
+            self.resident_blocks.fetch_add(1, Ordering::Relaxed);
+        }
         drop(entries);
         // Potentially large page tables and bitmaps are freed outside directory locks.
         drop(previous);
@@ -743,7 +810,7 @@ impl BlockIndex {
     /// must not reset the bitmap and lose the pages the first one materialized.
     /// Returns `true` if a new entry was created.
     pub fn init_paged(&self, id: BlockId, page_size: u32, len: u64) -> bool {
-        if self.entries.read().unwrap().contains_key(&id) {
+        if self.entry(&id).is_some() {
             // Already tracked — either paged (keep its bitmap) or whole (fully
             // resident, nothing to page in). Either way, do not reset it.
             return false;
@@ -761,10 +828,12 @@ impl BlockIndex {
             .into(),
         );
         let mut entries = self.entries.write().unwrap();
-        let std::collections::hash_map::Entry::Vacant(slot) = entries.entry(id) else {
+        let slot = entries.entry(Arc::new(id)).or_default();
+        if slot.resident.is_some() {
             return false;
-        };
-        slot.insert(Arc::new(entry));
+        }
+        slot.resident = Some(Arc::new(entry));
+        self.resident_blocks.fetch_add(1, Ordering::Relaxed);
         // A fresh paged entry has no present pages, so it adds no resident bytes.
         true
     }
@@ -854,7 +923,12 @@ impl BlockIndex {
     /// accounting finish; retained operations may complete in that interval.
     pub fn remove(&self, id: &BlockId) -> Option<BlockMeta> {
         let mut entries = self.entries.write().unwrap();
-        let entry = entries.remove(id)?;
+        let slot = entries.get_mut(id)?;
+        let entry = slot.resident.take()?;
+        if slot.lifecycle.is_none() {
+            entries.remove(id);
+        }
+        self.resident_blocks.fetch_sub(1, Ordering::Relaxed);
         // Retiring this detached entry must not block unrelated lookups or a
         // new entry with the same key. Its Arc keeps the old state alive.
         drop(entries);
@@ -892,6 +966,53 @@ mod tests {
             form: BlockForm::Whole,
             len,
         }
+    }
+
+    #[test]
+    fn lifecycle_directory_preserves_gates_across_residency_changes() {
+        let index = Arc::new(BlockIndex::new());
+        let life = crate::page_lifecycle::PageLifecycle::with_index(index.clone());
+        let id = block(1);
+        let pending = life.block(&id);
+        assert_eq!(index.len(), 0);
+        assert!(index.snapshot_lens().is_empty());
+        assert!(index.get(&id).is_none());
+
+        index.init_paged(id.clone(), 4096, 4096);
+        index.mark_page_allocated(&id, PageIndex(0), 4096);
+        assert!(Arc::ptr_eq(&pending, &life.block(&id)));
+        index.remove(&id).unwrap();
+        assert_eq!(index.len(), 0);
+        life.retire_empty(&id);
+        assert!(Arc::ptr_eq(&pending, &life.block(&id)));
+        index.commit(whole_meta(id.clone(), 4096));
+        assert!(Arc::ptr_eq(&pending, &life.block(&id)));
+        drop(pending);
+        life.retire_empty(&id);
+        assert!(life.get(&id).is_none());
+        assert_eq!(index.len(), 1);
+        assert_eq!(index.resident_bytes(), 4096);
+        index.remove(&id).unwrap();
+        assert!(index.entries.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn lifecycle_scan_retires_unpublished_blocks_from_the_shared_directory() {
+        let index = Arc::new(BlockIndex::new());
+        let life = crate::page_lifecycle::PageLifecycle::with_index(index.clone());
+        for n in 0..100 {
+            drop(life.block(&block(n)));
+        }
+        assert!(index.is_empty());
+        let (_, report) = life.scan(
+            &mut crate::page_lifecycle::ScanCursor::default(),
+            1000,
+            100,
+            None,
+            1000,
+        );
+        assert!(report.completed);
+        assert!(index.entries.read().unwrap().is_empty());
     }
 
     #[test]

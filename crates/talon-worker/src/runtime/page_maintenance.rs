@@ -297,7 +297,7 @@ impl WorkerRuntime {
             if !block.claim(&candidate, runtime.page_clock.now(), tti) {return None;}
             let paged = runtime.paged.as_ref()?;
             let page = candidate.page;
-            let id = &block.id;
+            let id = block.id.as_ref();
             let bytes = runtime.index.get(id).map(|m| talon_core::page_len(m.len, paged.page_size(), page)).unwrap_or(0);
             if let Err(error) = paged.evict_page_async(id, page).await {
                 block.abort(&candidate, reason); runtime.page_gc_metrics.delete_errors.inc();
@@ -607,7 +607,7 @@ impl WorkerRuntime {
                     let replace = full || state.revision != state.checkpointed_revision;
                     // Bound construction before retaining page guards or encoding.
                     let records = state.pages.len();
-                    size += serde_json::to_vec(&block.id)?.len() + records * 12 + 52;
+                    size += serde_json::to_vec(block.id.as_ref())?.len() + records * 12 + 52;
                     anyhow::ensure!(
                         size <= crate::page_access_shard::MAX_BYTES,
                         "access shard exceeds 64 MiB limit"
@@ -654,7 +654,7 @@ impl WorkerRuntime {
                     snapshots
                         .iter()
                         .filter(|(_, _, resident, _, _, _)| *resident)
-                        .map(|(block, snapshot, _, _, _, _)| (&block.id, snapshot)),
+                        .map(|(block, snapshot, _, _, _, _)| (block.id.as_ref(), snapshot)),
                 )?
             } else {
                 let empty = AccessSnapshot {
@@ -670,7 +670,7 @@ impl WorkerRuntime {
                         .iter()
                         .map(|id| (id, &empty, true))
                         .chain(snapshots.iter().map(|(block, snapshot, _, _, _, replace)| {
-                            (&block.id, snapshot, *replace)
+                            (block.id.as_ref(), snapshot, *replace)
                         })),
                 )?
             };
