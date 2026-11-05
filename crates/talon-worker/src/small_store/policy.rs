@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 pub(crate) struct SmallAccess {
     catalog: Weak<RwLock<Catalog>>,
     pub(super) address: Mutex<Address>,
+    position: Mutex<(u64, usize)>,
     pub(crate) state: Mutex<PolicyState>,
     retired: AtomicBool,
 }
@@ -48,12 +49,14 @@ impl SmallAccess {
         if self.retired.load(Ordering::Acquire) {
             return None;
         }
-        let address = *self.address.lock().unwrap();
-        let current = catalog.tickets.get(&address)?.upgrade()?;
-        if !std::ptr::eq(current.as_ref(), self) {
-            return None;
-        }
-        let slot = catalog.at(address)?;
+        let mut position = self.position.lock().unwrap();
+        let slot = if position.0 == catalog.lookup.epoch() {
+            position.1
+        } else {
+            let slot = catalog.at(*self.address.lock().unwrap())?;
+            *position = (catalog.lookup.epoch(), slot);
+            slot
+        };
         (catalog.lookup.flags(slot) & POLICY != 0).then_some(slot)
     }
 
@@ -151,6 +154,7 @@ impl Catalog {
                 let ticket = Arc::new(SmallAccess {
                     catalog: self.owner.clone(),
                     address: Mutex::new(address),
+                    position: Mutex::new((self.lookup.epoch(), slot)),
                     state: Mutex::new(PolicyState {
                         independent: true,
                         bytes,
@@ -275,10 +279,11 @@ impl Catalog {
         self.access.remove(&address);
     }
 
-    pub(super) fn relocate_policy(&mut self, old: Address, new: Address) {
+    pub(super) fn relocate_policy(&mut self, old: Address, new: Address, slot: usize) {
         if let Some(ticket) = self.tickets.remove(&old) {
             if let Some(ticket) = ticket.upgrade() {
                 *ticket.address.lock().unwrap() = new;
+                *ticket.position.lock().unwrap() = (self.lookup.epoch(), slot);
             }
             self.tickets.insert(new, ticket);
         }

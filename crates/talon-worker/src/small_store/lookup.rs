@@ -11,11 +11,23 @@ pub(super) struct Lookup {
     control: Vec<u8>,
     len: usize,
     deleted: usize,
+    epoch: u64,
     #[cfg(test)]
     rebuilds: usize,
 }
 
 impl Lookup {
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    fn changed(&mut self) {
+        self.epoch = self
+            .epoch
+            .checked_add(1)
+            .expect("small lookup epoch exhausted");
+    }
+
     pub fn len(&self) -> usize {
         self.len
     }
@@ -36,9 +48,11 @@ impl Lookup {
             control: vec![0; capacity],
             len: 0,
             deleted: 0,
+            epoch: self.epoch,
             #[cfg(test)]
             rebuilds: self.rebuilds + 1,
         };
+        next.changed();
         for (_, handle, flags) in self.iter() {
             next.insert(hash(handle), handle, flags);
         }
@@ -82,6 +96,7 @@ impl Lookup {
                     self.handles[slot] = handle;
                     self.control[slot] = (hash >> 59) as u8 | (flags & !FINGERPRINT);
                     self.len += 1;
+                    self.changed();
                     return slot;
                 }
                 DELETED => {
@@ -102,6 +117,7 @@ impl Lookup {
         self.handles[slot] = DELETED;
         self.len -= 1;
         self.deleted += 1;
+        self.changed();
         self.control[slot] & !FINGERPRINT
     }
 

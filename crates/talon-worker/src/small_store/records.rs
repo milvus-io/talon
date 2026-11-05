@@ -8,7 +8,7 @@ const WIDTH: usize = 30;
 #[derive(Clone, Default)]
 pub(super) struct Records {
     rows: Vec<[u8; WIDTH]>,
-    text: Vec<u8>,
+    text: String,
     live: usize,
 }
 
@@ -64,7 +64,7 @@ impl Records {
         let end = start + n16(&row[24..26]);
         let bucket = start + n16(&row[26..28]);
         let path = start + n16(&row[28..30]);
-        let string = |a, b| std::str::from_utf8(&self.text[a..b]).unwrap();
+        let string = |a, b| &self.text[a..b];
         Some((
             u64::from(n32(&row[..4])),
             RecordRef {
@@ -177,10 +177,9 @@ impl Records {
         if self.rows.len() == self.rows.capacity() {
             self.rows.reserve_exact(64);
         }
-        self.text.extend_from_slice(key.object.bucket.as_bytes());
-        self.text
-            .extend_from_slice(key.object.object_path.as_bytes());
-        self.text.extend_from_slice(key.version.as_bytes());
+        self.text.push_str(key.object.bucket);
+        self.text.push_str(key.object.object_path);
+        self.text.push_str(key.version);
         let index = self
             .rows
             .partition_point(|row| u64::from(n32(&row[..4])) <= offset);
@@ -242,13 +241,13 @@ impl Records {
             .map(|row| n16(&row[24..26]))
             .sum();
         let mut rows = Vec::with_capacity(self.live);
-        let mut text = Vec::with_capacity(bytes);
+        let mut text = String::with_capacity(bytes);
         for row in self.rows.iter().filter(live) {
             let start = n32(&row[16..20]) as usize;
             let end = start + n16(&row[24..26]);
             let mut row = *row;
             row[16..20].copy_from_slice(&(text.len() as u32).to_le_bytes());
-            text.extend_from_slice(&self.text[start..end]);
+            text.push_str(&self.text[start..end]);
             rows.push(row);
         }
         self.rows = rows;

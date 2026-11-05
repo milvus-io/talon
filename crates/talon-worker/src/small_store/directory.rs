@@ -282,7 +282,7 @@ impl Directory {
                 .lookup
                 .set_flags(old_slot, flags & !(VISIBLE | POLICY | REFERENCED));
             *catalog.live.entry(self.slot).or_default() -= 1;
-            catalog.relocate_policy(old_address, address);
+            catalog.relocate_policy(old_address, address, slot);
             if let Some(policy) = catalog.policy.remove(&old_address) {
                 catalog.policy.insert(address, policy);
             }
@@ -555,6 +555,104 @@ mod tests {
         access.touch();
         assert!(!new.small().unwrap().referenced());
         assert!(!access.small().unwrap().is_current(second));
+    }
+
+    #[test]
+    fn compact_token_refreshes_after_rehash_and_record_compaction() {
+        let (mut directory, key) = fixture(128);
+        let token = directory.get(&key(127)).unwrap().access.unwrap();
+        let file = directory.get(&key(0)).unwrap().file;
+        for n in 128..512 {
+            directory.insert(
+                BlockKey::new(&key(n)),
+                Location {
+                    file: file.clone(),
+                    segment: 1,
+                    offset: n,
+                    len: 1,
+                    checksum: 0,
+                    access: None,
+                },
+            );
+        }
+        token.touch();
+        assert!(directory
+            .get(&key(127))
+            .unwrap()
+            .access
+            .unwrap()
+            .small()
+            .unwrap()
+            .referenced());
+        for n in 0..6 {
+            directory
+                .catalog
+                .0
+                .write()
+                .unwrap()
+                .apply(super::super::journal::Event::Delete {
+                    segment: 1,
+                    offset: n,
+                })
+                .unwrap();
+        }
+        let candidate = token.small().unwrap().snapshot();
+        assert!(token.small().unwrap().is_current(candidate));
+        token.touch();
+        assert!(!token.small().unwrap().is_current(candidate));
+        assert!(directory
+            .get(&key(127))
+            .unwrap()
+            .access
+            .unwrap()
+            .small()
+            .unwrap()
+            .referenced());
+        assert!(!directory
+            .get(&key(126))
+            .unwrap()
+            .access
+            .unwrap()
+            .small()
+            .unwrap()
+            .referenced());
+    }
+
+    #[test]
+    fn compact_relocation_updates_a_token_at_the_current_epoch() {
+        let (mut directory, key) = fixture(1);
+        let id = key(0);
+        let old = directory.get(&id).unwrap();
+        let token = old.access.clone().unwrap();
+        directory
+            .catalog
+            .0
+            .write()
+            .unwrap()
+            .apply(super::super::journal::Event::Insert {
+                slot: 0,
+                segment: 2,
+                offset: 0,
+                record: super::super::journal::Record {
+                    key: BlockKey::new(&id),
+                    len: 1,
+                    checksum: 0,
+                },
+            })
+            .unwrap();
+        token.touch();
+        directory.insert(
+            BlockKey::new(&id),
+            Location {
+                segment: 2,
+                offset: 0,
+                ..old
+            },
+        );
+        let candidate = token.small().unwrap().snapshot();
+        assert!(token.small().unwrap().is_current(candidate));
+        token.touch();
+        assert!(!token.small().unwrap().is_current(candidate));
     }
 
     #[test]
