@@ -72,6 +72,18 @@ fn runtime_with_geometry(
     segment: u64,
     capacity: u64,
 ) -> (Arc<Origin>, WorkerRuntime) {
+    runtime_with_tracking(root, paged, l1, threshold, segment, capacity, true)
+}
+
+fn runtime_with_tracking(
+    root: &Path,
+    paged: bool,
+    l1: bool,
+    threshold: u64,
+    segment: u64,
+    capacity: u64,
+    tracking: bool,
+) -> (Arc<Origin>, WorkerRuntime) {
     let backend = Arc::new(Origin {
         len: AtomicU64::new(3072),
         fetches: AtomicUsize::new(0),
@@ -96,8 +108,8 @@ fn runtime_with_geometry(
         if l1 { 1 << 20 } else { 0 },
         1024,
         WorkerMetrics::new(capacity),
-        true,
-        true,
+        tracking,
+        tracking,
     );
     if paged {
         worker = worker.with_paged_store(PagedBlockStore::open(root.join("paged"), 1024).unwrap());
@@ -2006,4 +2018,48 @@ async fn exact_read_requires_small_store_and_keeps_cancelled_fill_owned() {
     );
     assert_eq!(bytes, data().slice(100..600));
     assert_eq!(origin.fetches.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn compact_policy_explicit_delete_preserves_other_units() {
+    for mixed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, w) = runtime_with_tracking(
+            dir.path(),
+            false,
+            false,
+            128 << 10,
+            256 << 10,
+            16 << 20,
+            false,
+        );
+        let ordinary = w.block_for(
+            &ObjectId::new(Backend::S3, "bucket", "ordinary"),
+            0,
+            &Version::new("v1"),
+        );
+        if mixed {
+            w.commit_cached_block(&ordinary, Bytes::from(vec![7; 128 << 10]))
+                .await
+                .unwrap();
+        }
+        w.write_object(&object(), data()).await.unwrap();
+        let small = id(&w);
+        assert!(w
+            .index
+            .policy_get(&CacheUnit::Whole(small.clone()))
+            .unwrap()
+            .access
+            .small()
+            .is_some());
+        w.delete_object(&object()).await.unwrap();
+        assert!(!w.small.as_ref().unwrap().contains(&small));
+        assert_eq!(w.lru.len(), usize::from(mixed));
+        if mixed {
+            assert!(w.index.get(&ordinary).is_some());
+            w.store_version(&ordinary.object, &ordinary.version, 128 << 10);
+            w.delete_object(&ordinary.object).await.unwrap();
+        }
+        assert_eq!(w.lru.total_bytes(), 0);
+    }
 }

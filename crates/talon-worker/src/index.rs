@@ -528,7 +528,7 @@ impl BlockIndex {
                     .get_or_insert_with(|| resident.1.unwrap_or_default());
                 let mut pages = pages.write().unwrap();
                 let page = pages.get_or_insert_with(page.0, || {
-                    PageEntry::with_handle(entry.access.state.clone())
+                    PageEntry::with_handle(entry.access.page_state().clone())
                 });
                 let access = entry.access.bind_state(page.handle.clone());
                 put(&mut page.unit, access)
@@ -657,6 +657,35 @@ impl BlockIndex {
 
     fn small_policy(&self, id: &dyn BlockIdentity) -> Option<PolicyEntry> {
         self.small_directory(id)?.read().unwrap().policy_get(id)
+    }
+
+    pub(crate) fn compact_small_totals(&self) -> (u64, usize) {
+        self.small
+            .read()
+            .unwrap()
+            .iter()
+            .fold((0, 0), |total, directory| {
+                let next = directory.read().unwrap().compact_totals();
+                (total.0 + next.0, total.1 + next.1)
+            })
+    }
+
+    pub(crate) fn compact_small_admit(
+        &self,
+        id: &dyn BlockIdentity,
+        bytes: u64,
+        clock: bool,
+    ) -> Option<AccessHandle> {
+        self.small_directory(id)?
+            .write()
+            .unwrap()
+            .compact_admit(id, bytes, clock)
+    }
+
+    pub(crate) fn compact_small_directories(
+        &self,
+    ) -> Vec<Arc<std::sync::RwLock<crate::small_store::directory::Directory>>> {
+        self.small.read().unwrap().clone()
     }
     /// Startup-only bulk restoration. Exclusive ownership prevents publication
     /// to readers while workers build page tables without the directory lock.
@@ -1360,7 +1389,7 @@ mod tests {
         );
         let index = Arc::new(BlockIndex::new());
         let mut units = Vec::new();
-        store.restore_policy_units(&index, &mut units, true);
+        store.restore_policy_units(&index, &mut units, false);
         let lru = Arc::new(Lru::from_recovered(index.clone(), units, 0, false, false));
         store.bind_policy(lru.clone());
         let id = block(0);
@@ -1386,7 +1415,7 @@ mod tests {
                 .await
                 .unwrap();
             let new = index.policy_get(&unit).unwrap().access;
-            assert!(!Arc::ptr_eq(&old.state, &new.state));
+            assert!(!Arc::ptr_eq(old.small().unwrap(), new.small().unwrap()));
             old.touch();
             assert_eq!(store.read(&id).await.unwrap().unwrap(), b"payload"[..]);
             lru.remove(&unit);

@@ -3,6 +3,7 @@ const DELETED: u32 = u32::MAX;
 const FINGERPRINT: u8 = 31;
 pub(super) const VISIBLE: u8 = 32;
 pub(super) const POLICY: u8 = 64;
+pub(super) const REFERENCED: u8 = 128;
 
 #[derive(Default)]
 pub(super) struct Lookup {
@@ -106,6 +107,11 @@ impl Lookup {
 
     pub fn handle(&self, slot: usize) -> u32 {
         self.handles[slot]
+    }
+
+    pub fn entry(&self, slot: usize) -> Option<(u32, u8)> {
+        let handle = *self.handles.get(slot)?;
+        (handle != EMPTY && handle != DELETED).then_some((handle, self.flags(slot)))
     }
 
     #[cfg(test)]

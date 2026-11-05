@@ -342,6 +342,10 @@ impl SmallObjectStore {
             .map(|unit| (unit.unit.block.materialize(), unit.access.clone()))
             .collect();
         for stream in self.streams() {
+            if !track_clock {
+                stream.entries.write().unwrap().enable_compact();
+                continue;
+            }
             stream
                 .restore_policy_units(units, &shared_access, track_clock)
                 .expect("validated small object identity");
@@ -847,6 +851,72 @@ mod recovery_tests {
     }
     fn open(root: &std::path::Path) -> io::Result<SmallObjectStore> {
         SmallObjectStore::open(root.to_owned(), 128 << 10, 256 << 10, 4 << 20, None)
+    }
+
+    #[tokio::test]
+    async fn compact_policy_survives_relocation_pins_and_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = Arc::new(open(dir.path()).unwrap());
+            let index = Arc::new(crate::BlockIndex::new());
+            let mut units = Vec::new();
+            store.restore_policy_units(&index, &mut units, false);
+            let policy = Arc::new(crate::Lru::from_recovered(index, units, 0, false, false));
+            store.bind_policy(policy.clone());
+            for n in 0..6 {
+                store
+                    .put(&id(n), Bytes::from(vec![n as u8; 48 << 10]))
+                    .await
+                    .unwrap();
+            }
+            let unit = crate::eviction::CacheUnit::Whole(id(3));
+            let before = store.lookup_entry(&id(3)).unwrap().unwrap();
+            let token = before.access.clone().unwrap();
+            assert!(policy.pin(&unit));
+            assert!(policy.pin(&unit));
+            for n in 0..3 {
+                store.delete(&id(n)).await.unwrap();
+                policy.remove(&crate::eviction::CacheUnit::Whole(id(n)));
+            }
+            store.maintain(true).await.unwrap();
+            let after = store.lookup_entry(&id(3)).unwrap().unwrap();
+            assert_ne!(before.segment, after.segment);
+            assert!(Arc::ptr_eq(
+                token.small().unwrap(),
+                after.access.unwrap().small().unwrap()
+            ));
+            token.touch();
+            assert!(token.small().unwrap().referenced());
+            assert!(policy
+                .candidates_to_fit(0, &Default::default())
+                .iter()
+                .all(|c| c.unit != unit));
+            policy.unpin(&unit);
+            assert!(policy
+                .candidates_to_fit(0, &Default::default())
+                .iter()
+                .all(|c| c.unit != unit));
+            policy.unpin(&unit);
+            let candidates = policy.candidates_to_fit(0, &Default::default());
+            assert!(candidates
+                .iter()
+                .any(|c| c.unit == unit && policy.candidate_is_current(c)));
+        }
+        let store = Arc::new(open(dir.path()).unwrap());
+        let index = Arc::new(crate::BlockIndex::new());
+        let mut units = Vec::new();
+        store.restore_policy_units(&index, &mut units, false);
+        assert!(units.is_empty());
+        let policy = Arc::new(crate::Lru::from_recovered(index, units, 0, false, false));
+        store.bind_policy(policy.clone());
+        assert_eq!(policy.len(), 3);
+        for n in 0..6 {
+            let actual = store.read(&id(n)).await.unwrap();
+            assert_eq!(
+                actual,
+                (n >= 3).then(|| Bytes::from(vec![n as u8; 48 << 10]))
+            );
+        }
     }
 
     #[test]

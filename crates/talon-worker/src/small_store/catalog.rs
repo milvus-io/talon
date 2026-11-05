@@ -3,10 +3,10 @@ use super::lookup::{Lookup, VISIBLE};
 use super::{Location, SegmentFile};
 use crate::block_key::{BlockIdentity, BlockKey};
 use crate::eviction::{AccessHandle, PolicyEntry};
-use std::collections::{hash_map::RandomState, BTreeMap, HashMap};
+use std::collections::{hash_map::RandomState, BTreeMap, HashMap, HashSet};
 use std::hash::BuildHasher;
 use std::io;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, Weak};
 
 pub(super) type Address = (u64, u64);
 
@@ -20,6 +20,7 @@ pub(super) struct Retired {
 
 #[derive(Default)]
 pub(super) struct Catalog {
+    pub owner: Weak<RwLock<Catalog>>,
     pub model: Model,
     pub lookup: Lookup,
     hash: RandomState,
@@ -30,13 +31,31 @@ pub(super) struct Catalog {
     pub policy: HashMap<Address, PolicyEntry>,
     pub access: HashMap<Address, AccessHandle>,
     pub live: HashMap<usize, usize>,
+    pub compact_streams: HashSet<usize>,
+    pub compact_totals: HashMap<usize, (u64, usize)>,
+    pub tickets: HashMap<Address, Weak<super::policy::SmallAccess>>,
+    pub pins: HashMap<Address, Arc<super::policy::SmallAccess>>,
+    pub charges: HashMap<Address, u64>,
+    pub revision: u64,
+    pub ticket_creations: usize,
     pub retired: HashMap<BlockKey, Retired>,
     retired_segments: BTreeMap<u64, Arc<SegmentMeta>>,
     active: bool,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(super) struct LiveModel(pub Arc<RwLock<Catalog>>);
+
+impl Default for LiveModel {
+    fn default() -> Self {
+        Self(Arc::new_cyclic(|owner| {
+            RwLock::new(Catalog {
+                owner: owner.clone(),
+                ..Default::default()
+            })
+        }))
+    }
+}
 
 impl Catalog {
     pub fn hash(&self, key: &dyn BlockIdentity) -> u64 {
@@ -86,19 +105,28 @@ impl Catalog {
             .find(self.hash(&record.key), |found, _| found == handle)
     }
 
-    pub fn location(&self, slot: usize) -> Option<Location> {
+    pub fn location(&mut self, slot: usize) -> Option<Location> {
         let (address, record) = self.record(self.lookup.handle(slot))?;
+        let len = record.len;
+        let checksum = record.checksum;
+        let compact = self
+            .compact_streams
+            .contains(&self.segment(address.0)?.slot);
+        let access = if compact && self.lookup.flags(slot) & super::lookup::POLICY != 0 {
+            Some(self.compact_entry(slot).access)
+        } else {
+            self.policy
+                .get(&address)
+                .map(|entry| entry.access.clone())
+                .or_else(|| self.access.get(&address).cloned())
+        };
         Some(Location {
             file: self.files.get(&address.0)?.clone(),
             segment: address.0,
             offset: address.1,
-            len: record.len,
-            checksum: record.checksum,
-            access: self
-                .policy
-                .get(&address)
-                .map(|entry| entry.access.clone())
-                .or_else(|| self.access.get(&address).cloned()),
+            len,
+            checksum,
+            access,
         })
     }
 
@@ -249,6 +277,14 @@ impl Catalog {
                     if let Some(location) = self.location(slot) {
                         let key =
                             BlockKey::new(&self.record(self.lookup.handle(slot)).unwrap().1.key);
+                        let policy = self.policy.remove(&address).or_else(|| {
+                            let access = location.access.as_ref()?;
+                            let state = *access.small()?.state.lock().unwrap();
+                            Some(PolicyEntry {
+                                state,
+                                access: access.clone(),
+                            })
+                        });
                         self.retired.insert(
                             key.clone(),
                             Retired {
@@ -256,7 +292,7 @@ impl Catalog {
                                 key,
                                 location,
                                 live: self.lookup.flags(slot) & VISIBLE != 0,
-                                policy: self.policy.remove(&address),
+                                policy,
                             },
                         );
                         self.access.remove(&address);

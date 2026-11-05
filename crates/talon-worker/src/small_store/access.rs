@@ -39,6 +39,9 @@ pub(crate) struct DirtyAccess {
     pending: AtomicBool,
 }
 impl DirtyAccess {
+    pub(crate) fn clock(&self) -> &Arc<AtomicU64> {
+        &self.clock
+    }
     pub(crate) fn touch(self: &Arc<Self>) {
         // Every hit publishes its timestamp even when already pending. The
         // consumer resets before sampling, so a racing hit belongs to this or

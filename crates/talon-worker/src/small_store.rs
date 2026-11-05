@@ -6,6 +6,7 @@
 mod access;
 mod catalog;
 mod lookup;
+pub(crate) mod policy;
 pub(crate) use access::DirtyAccess;
 pub(crate) mod directory;
 mod disk_io;
