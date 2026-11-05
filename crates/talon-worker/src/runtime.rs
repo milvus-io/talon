@@ -224,6 +224,7 @@ impl WorkerRuntime {
             l1_page_size_bytes,
             metrics,
             true,
+            true,
         )
     }
 
@@ -240,14 +241,22 @@ impl WorkerRuntime {
         l1_page_size_bytes: u64,
         metrics: WorkerMetrics,
         track_checks: bool,
+        track_blocks: bool,
     ) -> Self {
         let lru_started = Instant::now();
-        let mut units = index.restore_policy_units();
+        index.prepare_runtime_recovery();
+        let mut units = index.restore_policy_units(track_blocks);
         let blocks = index.len() + small.as_ref().map_or(0, |small| small.len());
         if let Some(small) = &small {
             small.restore_policy_units(&mut units);
         }
-        let lru = Arc::new(Lru::from_recovered(units, blocks, track_checks));
+        let lru = Arc::new(Lru::from_recovered(
+            index.clone(),
+            units,
+            blocks,
+            track_checks,
+            track_blocks,
+        ));
         let lru_ms = lru_started.elapsed().as_secs_f64() * 1000.0;
         let access_started = Instant::now();
         if let Some(small) = &small {
@@ -261,6 +270,7 @@ impl WorkerRuntime {
             l1_page_size_bytes,
         ));
         metrics.set_l1_capacity(l1_capacity_bytes);
+        let page_lifecycle = Arc::new(PageLifecycle::with_index(index.clone(), false));
         // Residency gauges may already include other namespaces sharing these metrics.
         Self {
             membership: Arc::new(Mutex::new(None)),
@@ -296,7 +306,7 @@ impl WorkerRuntime {
             version_cache: Arc::new(Mutex::new(HashMap::new())),
             version_ttl: DEFAULT_VERSION_TTL,
             rate_limiter: Arc::new(NamespaceRateLimiter::disabled()),
-            page_lifecycle: Arc::new(PageLifecycle::new()),
+            page_lifecycle,
             page_clock: Arc::new(AccessClock::new()),
             page_gc_config: PageGcConfig::default(),
             page_mutations: Arc::new(Mutations::default()),
@@ -433,8 +443,6 @@ impl WorkerRuntime {
         self.page_cleanup = Arc::new(tokio::sync::Mutex::new(
             crate::page_cleanup::CleanupCursor::new(paged.root().to_owned()),
         ));
-        self.index
-            .restore_page_states(&self.page_lifecycle, self.page_clock.now());
         self.paged = Some(Arc::new(paged));
         self
     }
@@ -1826,7 +1834,7 @@ impl WorkerRuntime {
                         runtime
                             .index
                             .init_paged(id.clone(), paged.page_size(), block_len);
-                        let handle = state.register(
+                        state.register(
                             page,
                             Some(runtime.page_clock.now()),
                             runtime.page_clock.now(),
@@ -1836,7 +1844,6 @@ impl WorkerRuntime {
                         let unit = CacheUnit::Page(id.clone(), page);
                         let access = runtime.lru.insert(unit.clone(), allocated);
                         runtime.index.set_access(&unit, access);
-                        runtime.index.set_page_state(&id, page, handle);
                         if !warm_only && runtime.l1.is_enabled() {
                             runtime.admit_l1_page(&id, page, bytes.into_bytes());
                         }
@@ -2309,7 +2316,7 @@ impl WorkerRuntime {
                         }
                         // Keep same-version paged residency and complete the admission
                         // even when the original requester stops waiting.
-                        let paged = !state.inner.lock().unwrap().pages.is_empty();
+                        let paged = !state.inner.lock().unwrap().pages.read().unwrap().is_empty();
                         if paged {
                             drop(gate);
                             let size = runtime.paged_page_size().expect("paged state");
@@ -3973,7 +3980,7 @@ mod tests {
         let store = WholeBlockStore::open(&root).unwrap();
         let index = Arc::new(BlockIndex::new());
         for entry in store.scan_allocated().unwrap() {
-            index.commit_allocated(entry.meta, entry.allocated);
+            index.commit_stored(entry);
         }
         let restarted = WorkerRuntime::new_with_l1(
             store,

@@ -59,6 +59,8 @@ impl WorkerRuntime {
             }
         }
         if let Some(paged) = self.paged.as_ref().filter(|_| config.tti_ms > 0) {
+            self.page_lifecycle.enable_access_tracking();
+            self.index.restore_page_states(&self.page_lifecycle);
             let now = self.page_clock.now();
             // Load each shard once; keep only one shard's recovered metadata in memory.
             for shard in 0..crate::page_lifecycle::SHARDS {
@@ -95,8 +97,16 @@ impl WorkerRuntime {
                                 now,
                             ),
                         };
-                        let pages: Vec<_> =
-                            state.inner.lock().unwrap().pages.keys().copied().collect();
+                        let pages: Vec<_> = state
+                            .inner
+                            .lock()
+                            .unwrap()
+                            .pages
+                            .read()
+                            .unwrap()
+                            .keys()
+                            .copied()
+                            .collect();
                         if recovered.corrupt {
                             self.page_gc_metrics.corrupt.add(pages.len() as u64);
                         }
@@ -297,7 +307,7 @@ impl WorkerRuntime {
             if !block.claim(&candidate, runtime.page_clock.now(), tti) {return None;}
             let paged = runtime.paged.as_ref()?;
             let page = candidate.page;
-            let id = &block.id;
+            let id = block.id.as_ref();
             let bytes = runtime.index.get(id).map(|m| talon_core::page_len(m.len, paged.page_size(), page)).unwrap_or(0);
             if let Err(error) = paged.evict_page_async(id, page).await {
                 block.abort(&candidate, reason); runtime.page_gc_metrics.delete_errors.inc();
@@ -312,7 +322,7 @@ impl WorkerRuntime {
             block.finish(&candidate, runtime.page_clock.now());
             runtime.metrics.record_eviction(); runtime.refresh_l1_metrics();
             runtime.page_gc_metrics.deleted[reason].inc(); runtime.page_gc_metrics.bytes[reason].add(bytes);
-            if block.inner.lock().unwrap().pages.is_empty() {
+            if block.inner.lock().unwrap().pages.read().unwrap().is_empty() {
                 match paged.delete_block_async(id).await {
                     Ok(()) => { block.inner.lock().unwrap().cleanup_pending = false; if runtime.index.get(id).is_some_and(|m| matches!(m.form, BlockForm::Paged {..})) {runtime.index.remove(id);} }
                     Err(error) => {runtime.page_gc_metrics.delete_errors.inc(); tracing::warn!(block = %id, %error, "empty page directory cleanup failed");}
@@ -329,7 +339,7 @@ impl WorkerRuntime {
                 runtime.background_delete().await;
                 let _background_io = runtime.background_io().await;
                 let _gate = block.gate.lock().await;
-                if !block.inner.lock().unwrap().pages.is_empty() {
+                if !block.inner.lock().unwrap().pages.read().unwrap().is_empty() {
                     return;
                 }
                 let Some(paged) = &runtime.paged else {
@@ -524,7 +534,7 @@ impl WorkerRuntime {
                             }
                             // A stale whole candidate must never delete newly
                             // materialized pages through a directory fallback.
-                            if !state.inner.lock().unwrap().pages.is_empty() {
+                            if !state.inner.lock().unwrap().pages.read().unwrap().is_empty() {
                                 return;
                             }
                             if let Err(error) = runtime.delete_whole(&id).await {
@@ -633,8 +643,8 @@ impl WorkerRuntime {
                     let summary = state.work.checkpoint();
                     let replace = full || state.revision != state.checkpointed_revision;
                     // Bound construction before retaining page guards or encoding.
-                    let records = state.pages.len();
-                    size += serde_json::to_vec(&block.id)?.len() + records * 12 + 52;
+                    let records = state.pages.read().unwrap().len();
+                    size += serde_json::to_vec(block.id.as_ref())?.len() + records * 12 + 52;
                     anyhow::ensure!(
                         size <= crate::page_access_shard::MAX_BYTES,
                         "access shard exceeds 64 MiB limit"
@@ -643,6 +653,8 @@ impl WorkerRuntime {
                     // remain dirty for the next checkpoint; failure restores markers.
                     let pages: Vec<_> = state
                         .pages
+                        .read()
+                        .unwrap()
                         .iter()
                         .map(|(&page, entry)| PageCheckpoint::new(page, &entry.handle))
                         .collect();
@@ -657,7 +669,7 @@ impl WorkerRuntime {
                             .filter_map(|page| page.access.map(|age| (page.page, age)))
                             .collect(),
                     };
-                    let resident = !state.pages.is_empty();
+                    let resident = !state.pages.read().unwrap().is_empty();
                     drop(state);
                     snapshots.push((block, snapshot, resident, pages, summary, replace));
                 }
@@ -681,7 +693,7 @@ impl WorkerRuntime {
                     snapshots
                         .iter()
                         .filter(|(_, _, resident, _, _, _)| *resident)
-                        .map(|(block, snapshot, _, _, _, _)| (&block.id, snapshot)),
+                        .map(|(block, snapshot, _, _, _, _)| (block.id.as_ref(), snapshot)),
                 )?
             } else {
                 let empty = AccessSnapshot {
@@ -697,7 +709,7 @@ impl WorkerRuntime {
                         .iter()
                         .map(|id| (id, &empty, true))
                         .chain(snapshots.iter().map(|(block, snapshot, _, _, _, replace)| {
-                            (&block.id, snapshot, *replace)
+                            (block.id.as_ref(), snapshot, *replace)
                         })),
                 )?
             };

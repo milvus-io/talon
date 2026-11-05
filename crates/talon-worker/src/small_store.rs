@@ -636,7 +636,7 @@ impl SegmentStore {
                 .map(AccessHandle::sibling)
                 .unwrap_or_default();
             units.push(crate::eviction::RecoveredUnit {
-                unit: Arc::new(unit),
+                unit: unit.into(),
                 bytes: charge(key, loc.len),
                 independent: true,
                 access: access.clone(),

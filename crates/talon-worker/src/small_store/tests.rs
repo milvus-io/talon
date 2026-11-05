@@ -581,7 +581,13 @@ async fn small_layout_probe() {
     store
         .restore_policy_units(&mut units, &HashMap::new())
         .unwrap();
-    let policy = crate::Lru::from_recovered(units, 10_000, true);
+    let policy = crate::Lru::from_recovered(
+        Arc::new(crate::BlockIndex::new()),
+        units,
+        10_000,
+        true,
+        true,
+    );
     let packed_restore = start.elapsed();
     assert_eq!(policy.len(), 10_000);
     let whole_usage = usage(&dir.path().join("whole"));

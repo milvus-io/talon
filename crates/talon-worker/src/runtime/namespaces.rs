@@ -183,6 +183,7 @@ impl NamespaceRuntimes {
             config.l1_page_size_bytes,
             self.metrics.clone(),
             config.stale_gc_enabled,
+            config.stale_gc_enabled || config.ownership_gc_enabled || config.page_tti_hours > 0,
         )
         .with_backend_kind(config.backend.as_deref().unwrap_or("azure").parse()?)
         .with_rate_limiter(self.limiter.clone())
@@ -1121,7 +1122,7 @@ mod tests {
                 paged.restore_index_with_workers(&index, workers).unwrap();
             } else {
                 for entry in paged.scan_allocated().unwrap() {
-                    index.commit_allocated(entry.meta, entry.allocated);
+                    index.commit_stored(entry);
                 }
             }
             let elapsed = started.elapsed();

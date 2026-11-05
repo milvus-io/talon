@@ -2,6 +2,7 @@
 //! Slot zero serves non-ring callers. Native ring N owns slot N+1. Every
 //! stream shares a metadata writer and globally unique sharded payload paths.
 use super::*;
+use crate::block_key::BlockIdentity;
 use crate::miss::{InFlightGuard, InFlightLoads, LoadKey};
 use tokio::sync::OnceCell;
 
@@ -334,9 +335,9 @@ impl SmallObjectStore {
         let shared_access = units
             .iter()
             .filter(|unit| {
-                u64::from(unit.unit.block().block_size) <= talon_core::MAX_EXACT_READ_LEN
+                u64::from(unit.unit.block.view().block_size) <= talon_core::MAX_EXACT_READ_LEN
             })
-            .map(|unit| (unit.unit.block().clone(), unit.access.clone()))
+            .map(|unit| (unit.unit.block.materialize(), unit.access.clone()))
             .collect();
         for stream in self.streams() {
             stream
@@ -887,6 +888,55 @@ mod recovery_tests {
     }
 
     #[tokio::test]
+    async fn recovered_exact_policy_preserves_pins_and_versions_with_optional_block_tracking() {
+        for tracking in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut block = id(0);
+            block.block_size = 4096;
+            let exact = CacheUnit::ExactRange(block.clone());
+            let page = CacheUnit::Page(block.clone(), talon_core::PageIndex(0));
+            let store = Arc::new(open(dir.path()).unwrap());
+            store.put(&exact, Bytes::from(vec![1; 4096])).await.unwrap();
+            store.maintain(true).await.unwrap();
+            drop(store);
+
+            let store = Arc::new(open(dir.path()).unwrap());
+            let index = Arc::new(crate::BlockIndex::new());
+            index.init_paged(block.clone(), 4096, 4096);
+            index.mark_page_allocated(&block, talon_core::PageIndex(0), 4096);
+            let mut units = index.restore_policy_units(tracking);
+            store.restore_policy_units(&mut units);
+            let policy = Arc::new(crate::Lru::from_recovered(
+                index.clone(),
+                units,
+                1,
+                tracking,
+                tracking,
+            ));
+            store.bind_policy(policy.clone());
+            store.enable_access_tracking().unwrap();
+            let access = store.access(&exact).unwrap();
+            access.restore(1);
+            assert_eq!(access.last_access(), 1);
+            assert_eq!(policy.len(), 2);
+            assert_eq!(index.page_count(), 1);
+            assert_eq!(index.resident_bytes(), 4096);
+
+            let pin = policy.pin_guard(exact.clone());
+            let mut newer = block.clone();
+            newer.version = Version::new("v2");
+            assert_eq!(policy.evict_superseded(&newer), [page]);
+            assert!(policy.superseded_candidates(&newer).is_empty());
+            assert!(policy.evict_to_fit(0).is_empty());
+            assert_eq!(policy.len(), 1);
+            drop(pin);
+            assert_eq!(policy.evict_to_fit(0), [exact]);
+            assert_eq!(policy.total_bytes(), 0);
+            assert!(policy.block_candidates(&block).is_empty());
+        }
+    }
+
+    #[tokio::test]
     async fn recovered_rings_bulk_policy_matches_serial_and_remains_writable() {
         let dir = tempfile::tempdir().unwrap();
         let store = open(dir.path()).unwrap();
@@ -906,9 +956,15 @@ mod recovery_tests {
         store.restore_policy_units(&mut units);
         let serial = crate::Lru::new();
         for unit in &units {
-            serial.insert_with_policy(unit.unit.as_ref().clone(), unit.bytes, true);
+            serial.insert_with_policy(unit.unit.materialize(), unit.bytes, true);
         }
-        let policy = Arc::new(crate::Lru::from_recovered(units, store.len(), true));
+        let policy = Arc::new(crate::Lru::from_recovered(
+            Arc::new(crate::BlockIndex::new()),
+            units,
+            store.len(),
+            true,
+            true,
+        ));
         store.bind_policy(policy.clone());
         assert_eq!(policy.len(), 2050);
         assert_eq!(policy.total_bytes(), serial.total_bytes());

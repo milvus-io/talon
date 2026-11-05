@@ -5,6 +5,7 @@
 //! implementation, with room to add tiered/persistent backends later.
 
 pub mod background;
+mod block_key;
 pub mod block_store;
 pub mod cache_reset;
 pub mod capacity;
@@ -26,6 +27,7 @@ pub mod page_access_store;
 mod page_cleanup;
 pub mod page_gc;
 mod page_lifecycle;
+mod page_table;
 pub mod paged_store;
 pub mod rate_limit;
 mod recovery;

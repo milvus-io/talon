@@ -60,7 +60,7 @@ fn runtime(root: &Path, l1: bool, capacity: u64, tti: u64) -> WorkerRuntime {
     let paged = PagedBlockStore::open(root.join("paged"), 16).unwrap();
     let index = Arc::new(BlockIndex::new());
     for entry in paged.scan_allocated().unwrap() {
-        index.commit_allocated(entry.meta, entry.allocated);
+        index.commit_stored(entry);
     }
     WorkerRuntime::new_with_l1(
         WholeBlockStore::open(root.join("whole")).unwrap(),
@@ -149,11 +149,8 @@ async fn disabled_tti_hits_leave_access_and_dirtiness_unchanged() {
         let block = r.page_lifecycle.get(&id()).unwrap();
         let before = {
             let state = block.inner.lock().unwrap();
-            (
-                state.revision,
-                state.dirty_since(),
-                state.pages[&0].handle.last_access(),
-            )
+            let access = state.pages.read().unwrap()[&0].handle.last_access();
+            (state.revision, state.dirty_since(), access)
         };
         r.page_clock.set(20000);
         assert_eq!(r.page_access_time(), None);
@@ -170,7 +167,7 @@ async fn disabled_tti_hits_leave_access_and_dirtiness_unchanged() {
             (
                 state.revision,
                 state.dirty_since(),
-                state.pages[&0].handle.last_access()
+                state.pages.read().unwrap()[&0].handle.last_access()
             ),
             before
         );
@@ -297,7 +294,9 @@ async fn restart_and_failback_never_renew_missing_or_old_access() {
         let r = runtime(root.path(), false, 0, 100);
         let state = r.page_lifecycle.get(&id()).unwrap();
         assert_eq!(
-            state.inner.lock().unwrap().pages[&0].handle.last_access(),
+            state.inner.lock().unwrap().pages.read().unwrap()[&0]
+                .handle
+                .last_access(),
             Some(10000)
         );
     }
@@ -578,7 +577,16 @@ fn page_tti_metadata_scale() {
             ("expired", usize::MAX),
         ] {
             for block in &blocks {
-                let pages: Vec<_> = block.inner.lock().unwrap().pages.keys().copied().collect();
+                let pages: Vec<_> = block
+                    .inner
+                    .lock()
+                    .unwrap()
+                    .pages
+                    .read()
+                    .unwrap()
+                    .keys()
+                    .copied()
+                    .collect();
                 for p in pages {
                     let age = if hot_modulus != usize::MAX && p as usize % hot_modulus == 0 {
                         1999
@@ -629,6 +637,8 @@ fn page_tti_metadata_scale() {
                 sampled_at: 2000,
                 records: state
                     .pages
+                    .read()
+                    .unwrap()
                     .iter()
                     .map(|(&p, e)| (p, e.handle.last_access().unwrap()))
                     .collect(),
@@ -1229,7 +1239,9 @@ async fn shard_checkpoint_preserves_clean_blocks_migrates_legacy_and_drops_delet
             .inner
             .lock()
             .unwrap()
-            .pages[&0]
+            .pages
+            .read()
+            .unwrap()[&0]
             .handle
             .last_access(),
         Some(10000)
@@ -1281,7 +1293,9 @@ async fn shard_checkpoint_preserves_clean_blocks_migrates_legacy_and_drops_delet
             .inner
             .lock()
             .unwrap()
-            .pages[&0]
+            .pages
+            .read()
+            .unwrap()[&0]
             .handle
             .last_access(),
         None
@@ -1294,7 +1308,9 @@ async fn index_lifecycle_handle_survives_read_delete_recreate_races() {
     let r = runtime(root.path(), true, 0, 100);
     r.serve_range(&request(0, 16)).await.unwrap();
     let state = r.page_lifecycle.get(&id()).unwrap();
-    let old = state.inner.lock().unwrap().pages[&0].handle.clone();
+    let old = state.inner.lock().unwrap().pages.read().unwrap()[&0]
+        .handle
+        .clone();
     let candidate = state.candidate(PageIndex(0)).unwrap();
     let read = r
         .index
@@ -1309,7 +1325,9 @@ async fn index_lifecycle_handle_survives_read_delete_recreate_races() {
         .is_none());
     assert!(old.acquire().is_none());
     r.serve_range(&request(0, 16)).await.unwrap();
-    let fresh = state.inner.lock().unwrap().pages[&0].handle.clone();
+    let fresh = state.inner.lock().unwrap().pages.read().unwrap()[&0]
+        .handle
+        .clone();
     assert!(!Arc::ptr_eq(&old, &fresh));
     assert!(
         old.acquire().is_none(),

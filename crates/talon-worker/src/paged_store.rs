@@ -459,7 +459,7 @@ impl PagedBlockStore {
         Ok(self
             .scan_allocated()?
             .into_iter()
-            .map(|entry| entry.meta)
+            .map(|entry| entry.meta.into())
             .collect())
     }
 
@@ -478,7 +478,7 @@ impl PagedBlockStore {
                         crate::cache_reset::incompatible("catalog page geometry mismatch").into(),
                     );
                 }
-                index.commit_allocated(entry.meta, entry.allocated);
+                index.commit_stored(entry);
             }
             return Ok(());
         }
@@ -528,7 +528,7 @@ impl PagedBlockStore {
                                 self.scan_shard(shard, &mut |entry| {
                                     // Publish one block at a time rather than retaining
                                     // a second full-cache metadata vector during recovery.
-                                    index.commit_allocated(entry.meta, entry.allocated);
+                                    index.commit_stored(entry);
                                 })?;
                             }
                             Ok(())
@@ -634,7 +634,10 @@ impl PagedBlockStore {
                 }
             }
             if present.count() > 0 {
-                visit(crate::index::StoredBlock { meta, allocated });
+                visit(crate::index::StoredBlock {
+                    meta: meta.into(),
+                    allocated,
+                });
             }
         }
         Ok(())
