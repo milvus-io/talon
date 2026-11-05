@@ -134,17 +134,17 @@ mod tests {
         );
         assert_eq!(
             index.blocks_at(7, &b).cloned().collect::<Vec<_>>(),
-            [b.clone()]
+            std::slice::from_ref(&b)
         );
         index.remove_at(7, &a);
         assert_eq!(
             index.blocks_at(7, &a).cloned().collect::<Vec<_>>(),
-            [a2.clone()]
+            std::slice::from_ref(&a2)
         );
         index.remove_at(7, &b);
         assert_eq!(
             index.blocks_at(7, &a).cloned().collect::<Vec<_>>(),
-            [a2.clone()]
+            std::slice::from_ref(&a2)
         );
         index.remove_at(7, &a2);
         assert!(index.is_empty());
