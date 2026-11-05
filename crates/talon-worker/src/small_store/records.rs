@@ -155,7 +155,7 @@ impl Records {
             .text
             .len()
             .checked_add(length)
-            .is_none_or(|end| end > u32::MAX as usize)
+            .map_or(true, |end| end > u32::MAX as usize)
         {
             return Err(format::invalid("small-object key arena exhausted"));
         }
