@@ -2,11 +2,11 @@
 //! so a snapshot can be encoded off the I/O thread while mutations continue.
 use super::super::records::Records;
 use super::*;
-use crate::block_key::BlockKey;
+use crate::small_store::key::SmallKey;
 
 #[derive(Clone)]
 pub(crate) struct Record {
-    pub key: BlockKey,
+    pub key: SmallKey,
     pub len: u64,
     pub checksum: u64,
 }
@@ -135,11 +135,10 @@ impl Event {
                 let len = format::u64(&mut b)?;
                 let checksum = format::u64(&mut b)?;
                 let id = format::view(b)?;
-                if len == 0 || len > 128 << 20 || id.offset != 0 || len >= u64::from(id.block_size)
-                {
+                if len > 128 << 20 || !id.valid_extent(len) {
                     return Err(invalid("journal extent"));
                 }
-                let key = BlockKey::new(&id);
+                let key = SmallKey::new(&id);
                 b = &[];
                 Self::Insert {
                     slot,

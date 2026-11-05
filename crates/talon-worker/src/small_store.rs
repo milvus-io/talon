@@ -5,6 +5,7 @@
 //! Relocation commits are durable before old payload files are unlinked.
 mod access;
 mod catalog;
+pub(crate) mod key;
 mod lookup;
 pub(crate) mod policy;
 pub(crate) use access::DirtyAccess;
@@ -19,8 +20,8 @@ pub use rings::SmallObjectStore;
 #[cfg(test)]
 pub(crate) mod tests;
 
-use crate::block_key::{BlockIdentity, BlockKey};
-use crate::eviction::{AccessHandle, SharedUnit};
+use crate::eviction::{AccessHandle, CacheUnit, SharedUnit};
+use crate::small_store::key::{SmallIdentity, SmallKey};
 use crate::Lru;
 use bytes::Bytes;
 use format::invalid;
@@ -341,20 +342,16 @@ impl SegmentStore {
         accepts_object(self.threshold, id, len)
     }
 
-    pub fn contains(&self, id: &BlockId) -> bool {
-        format::validate_key(id).is_ok()
-            && self
-                .entries
-                .read()
-                .unwrap()
-                .contains_key(id as &dyn BlockIdentity)
+    pub fn contains(&self, id: &(impl SmallStoreKey + ?Sized)) -> bool {
+        format::validate_key(&id.view()).is_ok()
+            && self.entries.read().unwrap().contains_key(&id.view())
     }
 
     #[cfg(test)]
     async fn lookup(&self, id: &(impl SmallStoreKey + ?Sized)) -> io::Result<Option<ReadLocation>> {
         let _readers = self.readers.read().await;
-        format::validate_key(id)?;
-        let loc = self.entries.read().unwrap().get(id as &dyn BlockIdentity);
+        format::validate_key(&id.view())?;
+        let loc = self.entries.read().unwrap().get(&id.view());
         match loc {
             Some(loc) => Ok(Some(loc.retain().await?)),
             None => Ok(None),
@@ -402,14 +399,17 @@ impl SegmentStore {
         if !accepts_object(u64::MAX, id, value.len() as u64) || value.len() > 128 << 20 {
             return Err(invalid("invalid small object extent"));
         }
-        format::validate_key(id)?;
-        let key = policy
-            .as_ref()
-            .map_or_else(|| BlockKey::new(id), |p| p.shared_identity(id));
+        format::validate_key(&id.view())?;
+        let view = id.view();
+        let block = policy.as_ref().map_or_else(
+            || crate::block_key::BlockKey::new(&view.block),
+            |p| p.shared_identity(&view.block),
+        );
         let unit = SharedUnit {
-            block: key.clone(),
-            page: None,
+            block,
+            kind: view.kind,
         };
+        let key = SmallKey(unit.clone());
         let len = value.len() as u64;
         let charge = charge(&key, len);
         if charge > self.segment_size {
@@ -590,13 +590,13 @@ impl SegmentStore {
     }
 
     async fn delete_inner(&self, id: &(impl SmallStoreKey + ?Sized)) -> io::Result<()> {
-        format::validate_key(id)?;
+        format::validate_key(&id.view())?;
         // A tombstone must be either included in the sealing fsync or synced
         // after publication. Serialize logical publication with seal/relocation.
         let _publication = self.publication.lock().await;
         let mut state = self.state.lock().await;
         self.healthy(&state)?;
-        let Some(loc) = self.entries.read().unwrap().get(id as &dyn BlockIdentity) else {
+        let Some(loc) = self.entries.read().unwrap().get(&id.view()) else {
             return Ok(());
         };
         let result = async {
@@ -613,7 +613,7 @@ impl SegmentStore {
             segment.metadata += 21;
             #[cfg(test)]
             tests::crash("delete_sync");
-            let removed = charge(id, loc.len);
+            let removed = charge(&id.view(), loc.len);
             segment.live -= removed;
             segment.live_payload -= loc.len;
             segment.records -= 1;
@@ -624,10 +624,7 @@ impl SegmentStore {
             state.live -= removed;
             state.written += 21;
             self.refresh_stats(&state);
-            self.entries
-                .write()
-                .unwrap()
-                .remove(id as &dyn BlockIdentity);
+            self.entries.write().unwrap().remove(&id.view());
             Ok(())
         }
         .await;
@@ -661,10 +658,7 @@ impl SegmentStore {
                 .map(AccessHandle::sibling)
                 .unwrap_or_else(|| AccessHandle::new(track_clock));
             units.push(crate::eviction::RecoveredUnit {
-                unit: SharedUnit {
-                    block: key.clone(),
-                    page: None,
-                },
+                unit: key.0.clone(),
                 bytes: charge(&key, loc.len),
                 independent: true,
                 access: access.clone(),
@@ -886,7 +880,7 @@ impl SegmentStore {
         &self,
         state: &mut State,
         id: u64,
-        key: &BlockKey,
+        key: &SmallKey,
         value: Bytes,
         publish: bool,
     ) -> io::Result<Location> {
@@ -1098,7 +1092,7 @@ impl SegmentStore {
             live += charge(&record.key, record.len);
             live_payload += record.len;
             self.entries.write().unwrap().restore(
-                BlockKey::new(&record.key),
+                SmallKey::new(&record.key),
                 Location {
                     file: file.clone(),
                     segment: id,
@@ -1197,7 +1191,7 @@ fn reclaimable(state: &State, id: u64) -> bool {
         })
 }
 
-fn charge(key: &dyn BlockIdentity, len: u64) -> u64 {
+fn charge(key: &dyn SmallIdentity, len: u64) -> u64 {
     len + format::key_len(key) as u64 + 37
 }
 fn validate_geometry(threshold: u64, segment_size: u64, capacity: u64) -> io::Result<()> {

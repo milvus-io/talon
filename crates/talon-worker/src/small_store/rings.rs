@@ -2,8 +2,8 @@
 //! Slot zero serves non-ring callers. Native ring N owns slot N+1. Every
 //! stream shares a metadata writer and globally unique sharded payload paths.
 use super::*;
-use crate::block_key::BlockIdentity;
 use crate::miss::{InFlightGuard, InFlightLoads, LoadKey};
+use crate::small_store::key::SmallIdentity;
 use tokio::sync::OnceCell;
 
 type Stream = Arc<OnceCell<Arc<SegmentStore>>>;
@@ -218,16 +218,16 @@ impl SmallObjectStore {
         self.fallback.accepts(id, len)
     }
     pub fn contains(&self, id: &(impl SmallStoreKey + ?Sized)) -> bool {
-        self.lookup_entry(id).ok().flatten().is_some()
+        self.lookup_entry(&id.view()).ok().flatten().is_some()
     }
 
     /// Resolve all ring-owned records through the namespace's shared index.
-    pub(crate) fn lookup_entry(&self, id: &dyn BlockIdentity) -> io::Result<Option<Location>> {
-        if id.view().offset != 0 {
+    pub(crate) fn lookup_entry(&self, id: &dyn SmallIdentity) -> io::Result<Option<Location>> {
+        if id.view().kind != crate::eviction::UnitKind::ExactRange && id.view().offset != 0 {
             return Ok(None);
         }
-        format::validate_key(id)?;
-        Ok(self.journal.model.lookup(id))
+        format::validate_key(&id.view())?;
+        Ok(self.journal.model.lookup(&id.view()))
     }
 
     pub(crate) async fn lookup(
@@ -235,7 +235,7 @@ impl SmallObjectStore {
         id: &(impl SmallStoreKey + ?Sized),
     ) -> io::Result<Option<ReadLocation>> {
         let _readers = self.journal.readers.read().await;
-        match self.lookup_entry(id)? {
+        match self.lookup_entry(&id.view())? {
             Some(location) => Ok(Some(location.retain().await?)),
             None => Ok(None),
         }
@@ -321,7 +321,10 @@ impl SmallObjectStore {
         self.bind_index(index);
         let shared_access = units
             .iter()
-            .filter(|unit| u64::from(unit.unit.block.view().block_size) <= talon_core::MAX_EXACT_READ_LEN)
+            .filter(|unit| {
+                u64::from(crate::block_key::BlockIdentity::view(&unit.unit.block).block_size)
+                    <= talon_core::MAX_EXACT_READ_LEN
+            })
             .map(|unit| (unit.unit.block.materialize(), unit.access.clone()))
             .collect();
         for stream in self.streams() {
@@ -396,7 +399,7 @@ impl SmallObjectStore {
 
     #[cfg(test)]
     pub(crate) fn access(&self, id: &(impl SmallStoreKey + ?Sized)) -> Option<AccessHandle> {
-        self.lookup_entry(id).ok().flatten()?.access
+        self.lookup_entry(&id.view()).ok().flatten()?.access
     }
 
     /// Only threshold-eligible segments provide planning credit. Garbage in a
@@ -801,8 +804,12 @@ mod tests {
 }
 
 #[cfg(test)]
-fn validate_recovered_keys(keys: &mut [(u64, crate::block_key::BlockRef<'_>)]) -> io::Result<()> {
-    fn parts(key: crate::block_key::BlockRef<'_>) -> (&str, &str, &str, u64, u32, &str) {
+fn validate_recovered_keys(
+    keys: &mut [(u64, crate::small_store::key::SmallRef<'_>)],
+) -> io::Result<()> {
+    fn parts(
+        key: crate::small_store::key::SmallRef<'_>,
+    ) -> (&str, &str, &str, u64, u32, &str, bool) {
         (
             key.object.backend.prefix(),
             key.object.bucket,
@@ -810,6 +817,7 @@ fn validate_recovered_keys(keys: &mut [(u64, crate::block_key::BlockRef<'_>)]) -
             key.offset,
             key.block_size,
             key.version,
+            key.kind == crate::eviction::UnitKind::ExactRange,
         )
     }
     keys.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| parts(a.1).cmp(&parts(b.1))));
@@ -979,9 +987,9 @@ mod recovery_tests {
 
     #[test]
     fn fingerprint_collisions_compare_complete_keys() {
-        let a = BlockKey::new(&id(1));
-        let b = BlockKey::new(&id(2));
-        let same = BlockKey::new(&id(1));
+        let a = SmallKey::new(&id(1));
+        let b = SmallKey::new(&id(2));
+        let same = SmallKey::new(&id(1));
         let mut distinct = [(0, b.view()), (0, a.view())];
         validate_recovered_keys(&mut distinct).unwrap();
         let mut duplicate = [(0, a.view()), (0, b.view()), (0, same.view())];
@@ -1067,7 +1075,7 @@ mod recovery_tests {
             index.init_paged(block.clone(), 4096, 4096);
             index.mark_page_allocated(&block, talon_core::PageIndex(0), 4096);
             let mut units = index.restore_policy_units(tracking);
-            store.restore_policy_units(&mut units);
+            store.restore_policy_units(&index, &mut units, true);
             let policy = Arc::new(crate::Lru::from_recovered(
                 index.clone(),
                 units,

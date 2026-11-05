@@ -11,7 +11,7 @@ fn snapshot_keeps_rows_when_live_deletion_compacts_and_append_moves_them() {
         segment: 1,
         offset,
         record: Record {
-            key: crate::block_key::BlockKey::new(&id(key)),
+            key: crate::small_store::key::SmallKey::new(&id(key)),
             len: 5,
             checksum: offset,
         },
@@ -74,7 +74,7 @@ fn dense_segment_snapshot_restores_one_hundred_thousand_extents() {
                 segment: 1,
                 offset,
                 record: Record {
-                    key: crate::block_key::BlockKey::new(&id(&offset.to_string())),
+                    key: crate::small_store::key::SmallKey::new(&id(&offset.to_string())),
                     len: 1,
                     checksum: offset,
                 },
@@ -93,14 +93,14 @@ fn dense_segment_snapshot_restores_one_hundred_thousand_extents() {
         assert_eq!(record.checksum, offset);
         assert_eq!(
             record.key,
-            crate::block_key::BlockIdentity::view(&id(&offset.to_string()))
+            crate::small_store::key::SmallIdentity::view(&id(&offset.to_string()))
         );
     }
 }
 
 #[tokio::test]
 async fn compact_journal_preserves_live_and_recovered_identity() {
-    use crate::block_key::BlockIdentity;
+    use crate::small_store::key::SmallIdentity;
     use crate::{small_store::SmallObjectStore, Lru};
     let dir = tempfile::tempdir().unwrap();
     let block = id("shared/路径");
@@ -146,12 +146,12 @@ async fn compact_journal_preserves_live_and_recovered_identity() {
             .entries
             .read()
             .unwrap()
-            .get_key_value(&block as &dyn BlockIdentity)
+            .get_key_value(&block as &dyn SmallIdentity)
             .unwrap()
             .0
             .clone();
         assert_eq!(journal_key, locator_key);
-        assert_eq!(journal_key, policy.shared_identity(&block));
+        assert_eq!(journal_key.0.block, policy.shared_identity(&block));
         assert_eq!(
             store.read(&block).await.unwrap().unwrap(),
             Bytes::from_static(b"shared")
@@ -189,7 +189,7 @@ fn flush_boundaries_reject_record_splits_and_regression() {
                 segment: 1,
                 offset,
                 record: Record {
-                    key: crate::block_key::BlockKey::new(&id(key)),
+                    key: crate::small_store::key::SmallKey::new(&id(key)),
                     len: 5,
                     checksum: 0,
                 },
@@ -399,7 +399,7 @@ async fn recovered_small_store_tail_uses_initial_snapshot_budget() {
             },
         )
         .unwrap();
-    let key = crate::block_key::BlockKey::new(&id(&"k".repeat(60 << 10)));
+    let key = crate::small_store::key::SmallKey::new(&id(&"k".repeat(60 << 10)));
     let log = root.join("metadata/journal.00000000000000000001");
     let mut offset = 0;
     // Build a valid large tail without checkpointing it, as can remain after

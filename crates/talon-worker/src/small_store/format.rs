@@ -1,16 +1,21 @@
 //! Versioned cache metadata. Payloads are raw bytes in a separate segment file.
-use crate::block_key::{BlockIdentity, BlockRef, ObjectRef};
+use crate::block_key::{BlockRef, ObjectRef};
+use crate::eviction::{CacheUnit, UnitKind};
+use crate::small_store::key::{SmallIdentity, SmallRef};
 use std::io::{self, Read, Write};
-use talon_core::{Backend, BlockId};
+use talon_core::Backend;
 
 pub(super) const MAX_KEY: usize = 64 * 1024;
 
-pub(super) fn key_len(id: &dyn BlockIdentity) -> usize {
+pub(super) fn key_len(id: &dyn SmallIdentity) -> usize {
     let id = id.view();
     25 + id.object.bucket.len() + id.object.object_path.len() + id.version.len()
 }
 
-pub(super) fn validate_key(id: &dyn BlockIdentity) -> io::Result<()> {
+pub(super) fn validate_key(id: &dyn SmallIdentity) -> io::Result<()> {
+    if matches!(id.view().kind, UnitKind::Page(_)) {
+        return Err(invalid("page is not a small-store key"));
+    }
     if key_len(id) > MAX_KEY {
         return Err(invalid("small object key too long"));
     }
@@ -18,20 +23,27 @@ pub(super) fn validate_key(id: &dyn BlockIdentity) -> io::Result<()> {
 }
 
 #[cfg(test)]
-pub(super) fn key(id: &dyn BlockIdentity) -> io::Result<Vec<u8>> {
+pub(super) fn key(id: &dyn SmallIdentity) -> io::Result<Vec<u8>> {
     let mut out = Vec::with_capacity(key_len(id));
     encode_key(&mut out, id)?;
     Ok(out)
 }
 
-pub(super) fn encode_key(out: &mut Vec<u8>, id: &dyn BlockIdentity) -> io::Result<()> {
+pub(super) fn encode_key(out: &mut Vec<u8>, id: &dyn SmallIdentity) -> io::Result<()> {
     validate_key(id)?;
     let id = id.view();
-    out.push(match id.object.backend {
-        Backend::S3 => 0,
-        Backend::Gcs => 1,
-        Backend::Azure => 2,
-    });
+    let tag = if id.kind == UnitKind::ExactRange {
+        0x80
+    } else {
+        0
+    };
+    out.push(
+        tag | match id.object.backend {
+            Backend::S3 => 0,
+            Backend::Gcs => 1,
+            Backend::Azure => 2,
+        },
+    );
     out.extend_from_slice(&id.offset.to_le_bytes());
     out.extend_from_slice(&id.block_size.to_le_bytes());
     for s in [id.object.bucket, id.object.object_path, id.version] {
@@ -41,11 +53,11 @@ pub(super) fn encode_key(out: &mut Vec<u8>, id: &dyn BlockIdentity) -> io::Resul
     Ok(())
 }
 
-pub(super) fn id(bytes: &[u8]) -> io::Result<BlockId> {
-    Ok(view(bytes)?.materialize())
+pub(super) fn id(bytes: &[u8]) -> io::Result<CacheUnit> {
+    Ok(view(bytes)?.cache_unit())
 }
 
-pub(super) fn view(mut bytes: &[u8]) -> io::Result<BlockRef<'_>> {
+pub(super) fn view(mut bytes: &[u8]) -> io::Result<SmallRef<'_>> {
     if bytes.len() > MAX_KEY {
         return Err(invalid("small object key too long"));
     }
@@ -76,15 +88,22 @@ pub(super) fn view(mut bytes: &[u8]) -> io::Result<BlockRef<'_>> {
     if !bytes.is_empty() {
         return Err(invalid("small object key trailing bytes"));
     }
-    Ok(BlockRef {
-        object: ObjectRef {
-            backend,
-            bucket,
-            object_path: path,
+    Ok(SmallRef {
+        kind: if exact {
+            UnitKind::ExactRange
+        } else {
+            UnitKind::Whole
         },
-        offset,
-        block_size: size,
-        version,
+        block: BlockRef {
+            object: ObjectRef {
+                backend,
+                bucket,
+                object_path: path,
+            },
+            offset,
+            block_size: size,
+            version,
+        },
     })
 }
 
@@ -129,8 +148,8 @@ pub(super) fn invalid(message: &str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block_key::BlockKey;
-    use talon_core::{ObjectId, Version};
+    use crate::small_store::key::SmallKey;
+    use talon_core::{BlockId, ObjectId, Version};
 
     #[test]
     fn shared_keys_preserve_disk_bytes_and_reject_invalid_identity() {
@@ -144,10 +163,20 @@ mod tests {
             2, 17, 0, 0, 0, 0, 0, 0, 0, 0xd2, 4, 0, 0, 3, 0, 0, 0, 0xe6, 0xa1, 0xb6, 2, 0, 0, 0,
             b'b', b'c', 1, 0, 0, 0, b'v',
         ];
-        let shared = BlockKey::new(&view(&encoded).unwrap());
+        let shared = SmallKey::new(&view(&encoded).unwrap());
         assert_eq!(shared.materialize(), block);
         assert_eq!(key(&shared).unwrap(), encoded);
         assert_eq!(key_len(&shared), encoded.len());
+        let exact = CacheUnit::ExactRange(block.clone());
+        let mut exact_bytes = encoded.clone();
+        exact_bytes[0] |= 0x80;
+        assert_eq!(key(&exact).unwrap(), exact_bytes);
+        assert_eq!(id(&exact_bytes).unwrap(), exact);
+        assert_eq!(
+            key(&SmallKey::new(&view(&exact_bytes).unwrap())).unwrap(),
+            exact_bytes
+        );
+        assert_ne!(view(&encoded).unwrap(), view(&exact_bytes).unwrap());
         for len in 0..encoded.len() {
             assert!(view(&encoded[..len]).is_err());
         }

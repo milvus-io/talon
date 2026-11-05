@@ -1449,6 +1449,54 @@ fn exact_runtime(root: &Path, paged: bool, l1: bool) -> (Arc<Origin>, WorkerRunt
     (origin, worker)
 }
 
+#[tokio::test]
+async fn exact_ranges_use_compact_policy_after_recovery_and_evict_independently() {
+    let dir = tempfile::tempdir().unwrap();
+    let open = || {
+        let (origin, worker) =
+            runtime_with_tracking(dir.path(), true, false, 1 << 20, 2 << 20, 16 << 20, false);
+        origin.len.store(2 << 20, Ordering::Relaxed);
+        (origin, worker)
+    };
+    let (origin, worker) = open();
+    let version = Version::new("v1");
+    let first = request();
+    let second = RangeRequest {
+        offset: first.offset + 1,
+        ..first.clone()
+    };
+    for range in [&first, &second] {
+        worker.serve_exact(range, &version, 2 << 20).await.unwrap();
+    }
+    assert_eq!(origin.fetches.load(Ordering::SeqCst), 2);
+    worker.maintain_small(true).await.unwrap();
+    drop(worker);
+    let (origin, worker) = open();
+    let unit = exact_unit(&first);
+    assert!(worker
+        .index
+        .policy_get(&unit)
+        .unwrap()
+        .access
+        .small()
+        .is_some());
+    assert_eq!(
+        exact_bytes(worker.serve_exact(&first, &version, 2 << 20).await.unwrap()),
+        data().slice(100..600)
+    );
+    assert_eq!(origin.fetches.load(Ordering::SeqCst), 0);
+    let candidates = worker.lru.block_candidates(unit.block());
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].unit, unit);
+    worker.unlink_units(candidates, 3).await;
+    assert!(!worker.small.as_ref().unwrap().contains(&unit));
+    assert!(worker
+        .small
+        .as_ref()
+        .unwrap()
+        .contains(&exact_unit(&second)));
+}
+
 fn exact_bytes(outcome: ServeOutcome) -> Vec<u8> {
     match outcome {
         ServeOutcome::Bytes(bytes) => bytes.to_vec(),

@@ -45,7 +45,7 @@ impl CacheUnit {
 
 use crate::block_key::{BlockIdentity, BlockKey};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum UnitKind {
     Whole,
     ExactRange,
@@ -270,7 +270,11 @@ impl AccessHandle {
     pub(crate) fn sibling(&self) -> Self {
         Self::with_state(
             Arc::default(),
-            Some(self.clock_opt().cloned().unwrap_or_else(|| Arc::new(AtomicU64::new(access_millis())))),
+            Some(
+                self.clock_opt()
+                    .cloned()
+                    .unwrap_or_else(|| Arc::new(AtomicU64::new(access_millis()))),
+            ),
         )
     }
     pub fn touch(&self) {
@@ -627,18 +631,16 @@ impl Lru {
         location: crate::small_store::Location,
     ) {
         let mut g = self.inner.lock().unwrap();
-        directory
-            .write()
-            .unwrap()
-            .stage(unit.block.clone(), location);
+        let key = crate::small_store::key::SmallKey(unit.clone());
+        directory.write().unwrap().stage(key.clone(), location);
         let access = Self::insert_locked(&mut g, unit.clone(), bytes, true);
         #[cfg(test)]
         if let Some(pause) = self.before_small_publish.lock().unwrap().take() {
             pause();
         }
         let mut directory = directory.write().unwrap();
-        directory.attach_access(&unit.block, access);
-        directory.publish(&unit.block);
+        directory.attach_access(&key, access);
+        directory.publish(&key);
     }
 
     fn insert_locked(
@@ -649,7 +651,10 @@ impl Lru {
     ) -> AccessHandle {
         let independent = independent || unit.kind() == UnitKind::ExactRange;
         if independent && !g.track_blocks && !g.track_checks {
-            if let Some(access) = g.index.compact_small_admit(unit.block(), bytes, g.track_small_clock) {
+            if let Some(access) = g
+                .index
+                .compact_small_admit(&unit, bytes, g.track_small_clock)
+            {
                 return access;
             }
         }

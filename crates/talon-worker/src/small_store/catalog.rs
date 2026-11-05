@@ -1,8 +1,8 @@
 use super::journal::{Event, Model, SegmentMeta};
 use super::lookup::{Lookup, VISIBLE};
 use super::{Location, SegmentFile};
-use crate::block_key::{BlockIdentity, BlockKey};
 use crate::eviction::{AccessHandle, PolicyEntry};
+use crate::small_store::key::{SmallIdentity, SmallKey};
 use std::collections::{hash_map::RandomState, BTreeMap, HashMap, HashSet};
 use std::hash::BuildHasher;
 use std::io;
@@ -12,7 +12,7 @@ pub(super) type Address = (u64, u64);
 
 pub(super) struct Retired {
     pub slot: usize,
-    pub key: BlockKey,
+    pub key: SmallKey,
     pub location: Location,
     pub live: bool,
     pub policy: Option<PolicyEntry>,
@@ -38,7 +38,7 @@ pub(super) struct Catalog {
     pub charges: HashMap<Address, u64>,
     pub revision: u64,
     pub ticket_creations: usize,
-    pub retired: HashMap<BlockKey, Retired>,
+    pub retired: HashMap<SmallKey, Retired>,
     retired_segments: BTreeMap<u64, Arc<SegmentMeta>>,
     active: bool,
 }
@@ -58,7 +58,7 @@ impl Default for LiveModel {
 }
 
 impl LiveModel {
-    pub fn lookup(&self, id: &dyn BlockIdentity) -> Option<Location> {
+    pub fn lookup(&self, id: &dyn SmallIdentity) -> Option<Location> {
         self.0.write().unwrap().lookup_location(id)
     }
 }
@@ -72,7 +72,7 @@ struct ResolvedRecord {
 }
 
 impl Catalog {
-    pub fn hash(&self, key: &dyn BlockIdentity) -> u64 {
+    pub fn hash(&self, key: &dyn SmallIdentity) -> u64 {
         self.hash.hash_one(key.view())
     }
 
@@ -98,7 +98,7 @@ impl Catalog {
         (self.segment_chunks[&segment][row / 1024] << 10 | (row % 1024) as u32) + 1
     }
 
-    pub fn find(&self, key: &dyn BlockIdentity, flags: u8) -> Option<usize> {
+    pub fn find(&self, key: &dyn SmallIdentity, flags: u8) -> Option<usize> {
         self.lookup.find(self.hash(key), |handle, state| {
             state & flags == flags
                 && self
@@ -119,7 +119,7 @@ impl Catalog {
             .find(self.hash(&record.key), |found, _| found == handle)
     }
 
-    fn lookup_location(&mut self, id: &dyn BlockIdentity) -> Option<Location> {
+    fn lookup_location(&mut self, id: &dyn SmallIdentity) -> Option<Location> {
         let mut resolved = None;
         let slot = self.lookup.find(self.hash(id), |handle, flags| {
             if flags & VISIBLE == 0 {
@@ -328,7 +328,7 @@ impl Catalog {
                 if let Some(slot) = self.at(address) {
                     if let Some(location) = self.location(slot) {
                         let key =
-                            BlockKey::new(&self.record(self.lookup.handle(slot)).unwrap().1.key);
+                            SmallKey::new(&self.record(self.lookup.handle(slot)).unwrap().1.key);
                         let policy = self.policy.remove(&address).or_else(|| {
                             let access = location.access.as_ref()?;
                             let state = *access.small()?.state.lock().unwrap();
@@ -444,7 +444,7 @@ mod tests {
                     segment: 1,
                     offset,
                     record: super::super::journal::Record {
-                        key: BlockKey::new(&BlockId::new(
+                        key: SmallKey::new(&BlockId::new(
                             ObjectId::new(Backend::S3, "b", offset.to_string()),
                             0,
                             1024,
@@ -476,7 +476,7 @@ mod tests {
                     segment: 1,
                     offset,
                     record: super::super::journal::Record {
-                        key: BlockKey::new(&BlockId::new(
+                        key: SmallKey::new(&BlockId::new(
                             ObjectId::new(Backend::S3, "b", offset.to_string()),
                             0,
                             1024,

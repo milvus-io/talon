@@ -1,8 +1,8 @@
 use super::catalog::{Catalog, LiveModel};
 use super::lookup::{POLICY, REFERENCED, VISIBLE};
 use super::Location;
-use crate::block_key::{BlockIdentity, BlockKey};
 use crate::eviction::{AccessHandle, PolicyEntry, PolicyState};
+use crate::small_store::key::{SmallIdentity, SmallKey};
 
 #[derive(Default)]
 pub(crate) struct Directory {
@@ -45,7 +45,7 @@ impl Directory {
 
     pub(crate) fn compact_admit(
         &mut self,
-        id: &dyn BlockIdentity,
+        id: &dyn SmallIdentity,
         bytes: u64,
         clock: bool,
     ) -> Option<AccessHandle> {
@@ -92,7 +92,7 @@ impl Directory {
             if catalog.segment(address.0).unwrap().slot != self.slot {
                 continue;
             }
-            let unit = crate::eviction::CacheUnit::Whole(record.key.materialize());
+            let unit = record.key.cache_unit();
             if excluded.contains(&unit) || selected.contains(&unit) {
                 continue;
             }
@@ -117,7 +117,7 @@ impl Directory {
         }
         out
     }
-    pub(super) fn restore(&mut self, key: BlockKey, location: Location) -> std::io::Result<()> {
+    pub(super) fn restore(&mut self, key: SmallKey, location: Location) -> std::io::Result<()> {
         if self.catalog.0.read().unwrap().find(&key, VISIBLE).is_some() {
             return Err(super::format::invalid("duplicate recovered object"));
         }
@@ -125,14 +125,14 @@ impl Directory {
         Ok(())
     }
 
-    pub(super) fn segment_entries(&self, segment: u64) -> Vec<(BlockKey, Location)> {
+    pub(super) fn segment_entries(&self, segment: u64) -> Vec<(SmallKey, Location)> {
         let mut catalog = self.catalog.0.write().unwrap();
         let entries: Vec<_> = catalog
             .segment(segment)
             .map(|meta| {
                 meta.records
                     .iter()
-                    .map(|(offset, record)| (offset, BlockKey::new(&record.key)))
+                    .map(|(offset, record)| (offset, SmallKey::new(&record.key)))
                     .collect()
             })
             .unwrap_or_default();
@@ -166,7 +166,7 @@ impl Directory {
             .activate()
             .expect("validated small catalog");
     }
-    fn find(&self, catalog: &Catalog, id: &dyn BlockIdentity, flags: u8) -> Option<usize> {
+    fn find(&self, catalog: &Catalog, id: &dyn SmallIdentity, flags: u8) -> Option<usize> {
         catalog.lookup.find(catalog.hash(id), |handle, state| {
             state & flags == flags
                 && catalog.record(handle).is_some_and(|(address, record)| {
@@ -177,7 +177,7 @@ impl Directory {
                 })
         })
     }
-    fn pending(&self, catalog: &Catalog, id: &dyn BlockIdentity) -> Option<usize> {
+    fn pending(&self, catalog: &Catalog, id: &dyn SmallIdentity) -> Option<usize> {
         let slot = catalog.at(self.staged?)?;
         (catalog.record(catalog.lookup.handle(slot))?.1.key == id.view()).then_some(slot)
     }
@@ -192,20 +192,20 @@ impl Directory {
             .unwrap_or(0)
     }
 
-    pub fn identity(&self, id: &dyn BlockIdentity) -> Option<BlockKey> {
+    pub fn identity(&self, id: &dyn SmallIdentity) -> Option<SmallKey> {
         let catalog = self.catalog.0.read().unwrap();
         if let Some(slot) = self
             .find(&catalog, id, VISIBLE)
             .or_else(|| self.find(&catalog, id, POLICY))
             .or_else(|| self.pending(&catalog, id))
         {
-            return Some(BlockKey::new(
+            return Some(SmallKey::new(
                 &catalog.record(catalog.lookup.handle(slot))?.1.key,
             ));
         }
         catalog.retired.get(id).map(|entry| entry.key.clone())
     }
-    pub fn get(&self, id: &dyn BlockIdentity) -> Option<Location> {
+    pub fn get(&self, id: &dyn SmallIdentity) -> Option<Location> {
         let mut catalog = self.catalog.0.write().unwrap();
         if let Some(slot) = self.find(&catalog, id, VISIBLE) {
             return catalog.location(slot);
@@ -216,13 +216,13 @@ impl Directory {
             .filter(|entry| entry.live && entry.slot == self.slot)
             .map(|entry| entry.location.clone())
     }
-    pub fn get_key_value(&self, id: &dyn BlockIdentity) -> Option<(BlockKey, Location)> {
-        self.get(id).map(|location| (BlockKey::new(id), location))
+    pub fn get_key_value(&self, id: &dyn SmallIdentity) -> Option<(SmallKey, Location)> {
+        self.get(id).map(|location| (SmallKey::new(id), location))
     }
-    pub fn contains_key(&self, id: &dyn BlockIdentity) -> bool {
+    pub fn contains_key(&self, id: &dyn SmallIdentity) -> bool {
         self.get(id).is_some()
     }
-    pub fn iter(&self) -> std::vec::IntoIter<(BlockKey, Location)> {
+    pub fn iter(&self) -> std::vec::IntoIter<(SmallKey, Location)> {
         let mut catalog = self.catalog.0.write().unwrap();
         let slots: Vec<_> = catalog
             .lookup
@@ -238,7 +238,7 @@ impl Directory {
         slots
             .into_iter()
             .filter_map(|slot| {
-                let key = BlockKey::new(&catalog.record(catalog.lookup.handle(slot))?.1.key);
+                let key = SmallKey::new(&catalog.record(catalog.lookup.handle(slot))?.1.key);
                 Some((key, catalog.location(slot)?))
             })
             .collect::<Vec<_>>()
@@ -248,7 +248,7 @@ impl Directory {
     pub fn values(&self) -> impl Iterator<Item = Location> + '_ {
         self.iter().map(|(_, location)| location)
     }
-    pub fn insert(&mut self, key: BlockKey, location: Location) -> Option<Location> {
+    pub fn insert(&mut self, key: SmallKey, location: Location) -> Option<Location> {
         let model = self.catalog.clone();
         let mut catalog = model.0.write().unwrap();
         let old = self.stage_in(&mut catalog, key.clone(), location);
@@ -259,7 +259,7 @@ impl Directory {
         self.publish_in(&mut catalog, &key);
         old
     }
-    pub fn stage(&mut self, key: BlockKey, location: Location) -> Option<Location> {
+    pub fn stage(&mut self, key: SmallKey, location: Location) -> Option<Location> {
         let model = self.catalog.clone();
         let mut catalog = model.0.write().unwrap();
         self.stage_in(&mut catalog, key, location)
@@ -267,7 +267,7 @@ impl Directory {
     fn stage_in(
         &mut self,
         catalog: &mut Catalog,
-        key: BlockKey,
+        key: SmallKey,
         location: Location,
     ) -> Option<Location> {
         catalog.activate().expect("validated small catalog");
@@ -323,12 +323,12 @@ impl Directory {
         }
         old
     }
-    pub fn publish(&mut self, id: &dyn BlockIdentity) {
+    pub fn publish(&mut self, id: &dyn SmallIdentity) {
         let model = self.catalog.clone();
         let mut catalog = model.0.write().unwrap();
         self.publish_in(&mut catalog, id);
     }
-    fn publish_in(&mut self, catalog: &mut Catalog, id: &dyn BlockIdentity) {
+    fn publish_in(&mut self, catalog: &mut Catalog, id: &dyn SmallIdentity) {
         let slot = self.pending(catalog, id).expect("staged small object");
         let flags = catalog.lookup.flags(slot);
         if flags & VISIBLE == 0 {
@@ -337,7 +337,7 @@ impl Directory {
         catalog.lookup.set_flags(slot, flags | VISIBLE);
         self.staged = None;
     }
-    pub fn attach_access(&mut self, id: &dyn BlockIdentity, access: AccessHandle) {
+    pub fn attach_access(&mut self, id: &dyn SmallIdentity, access: AccessHandle) {
         if access.small().is_some() && !access.tracks_clock() {
             return;
         }
@@ -353,7 +353,7 @@ impl Directory {
             catalog.access.insert(address, access);
         }
     }
-    pub fn remove(&mut self, id: &dyn BlockIdentity) -> Option<Location> {
+    pub fn remove(&mut self, id: &dyn SmallIdentity) -> Option<Location> {
         let mut catalog = self.catalog.0.write().unwrap();
         if let Some(slot) = self.find(&catalog, id, VISIBLE) {
             let location = catalog.location(slot);
@@ -374,7 +374,7 @@ impl Directory {
         *catalog.live.entry(self.slot).or_default() -= 1;
         Some(location)
     }
-    pub fn policy_get(&self, id: &dyn BlockIdentity) -> Option<PolicyEntry> {
+    pub fn policy_get(&self, id: &dyn SmallIdentity) -> Option<PolicyEntry> {
         let mut catalog = self.catalog.0.write().unwrap();
         if let Some(slot) = self.find(&catalog, id, POLICY) {
             if catalog.compact_streams.contains(&self.slot) {
@@ -391,7 +391,7 @@ impl Directory {
     }
     pub fn policy_insert(
         &mut self,
-        id: &dyn BlockIdentity,
+        id: &dyn SmallIdentity,
         policy: PolicyEntry,
     ) -> Option<AccessHandle> {
         let mut catalog = self.catalog.0.write().unwrap();
@@ -408,7 +408,7 @@ impl Directory {
     }
     pub fn policy_update<T>(
         &mut self,
-        id: &dyn BlockIdentity,
+        id: &dyn SmallIdentity,
         update: impl FnOnce(&mut PolicyState) -> T,
     ) -> Option<T> {
         let mut catalog = self.catalog.0.write().unwrap();
@@ -443,7 +443,7 @@ impl Directory {
             ))
         }
     }
-    pub fn policy_remove(&mut self, id: &dyn BlockIdentity) -> Option<PolicyEntry> {
+    pub fn policy_remove(&mut self, id: &dyn SmallIdentity) -> Option<PolicyEntry> {
         let mut catalog = self.catalog.0.write().unwrap();
         if let Some(slot) = self.find(&catalog, id, POLICY) {
             if catalog.compact_streams.contains(&self.slot) {
@@ -502,7 +502,7 @@ mod tests {
         });
         for n in 0..count {
             directory.insert(
-                BlockKey::new(&key(n)),
+                SmallKey::new(&key(n)),
                 Location {
                     file: file.clone(),
                     segment: 1,
@@ -556,7 +556,7 @@ mod tests {
         let access = old.access.clone().unwrap();
         access.touch();
         directory.insert(
-            BlockKey::new(&id),
+            SmallKey::new(&id),
             Location {
                 segment: 2,
                 offset: 0,
@@ -587,7 +587,7 @@ mod tests {
         let file = directory.get(&key(0)).unwrap().file;
         for n in 128..512 {
             directory.insert(
-                BlockKey::new(&key(n)),
+                SmallKey::new(&key(n)),
                 Location {
                     file: file.clone(),
                     segment: 1,
@@ -657,7 +657,7 @@ mod tests {
                 segment: 2,
                 offset: 0,
                 record: super::super::journal::Record {
-                    key: BlockKey::new(&id),
+                    key: SmallKey::new(&id),
                     len: 1,
                     checksum: 0,
                 },
@@ -665,7 +665,7 @@ mod tests {
             .unwrap();
         token.touch();
         directory.insert(
-            BlockKey::new(&id),
+            SmallKey::new(&id),
             Location {
                 segment: 2,
                 offset: 0,
@@ -694,7 +694,7 @@ mod tests {
         let publish_id = id.clone();
         let writer = std::thread::spawn(move || {
             directory.insert(
-                BlockKey::new(&publish_id),
+                SmallKey::new(&publish_id),
                 Location {
                     segment: 2,
                     offset: 0,
@@ -749,7 +749,7 @@ mod tests {
             fd: tokio::sync::Mutex::default(),
         });
         let key = |n: u64| {
-            BlockKey::new(&BlockId::new(
+            SmallKey::new(&BlockId::new(
                 ObjectId::new(Backend::S3, "b", n.to_string()),
                 0,
                 1024,
@@ -795,8 +795,8 @@ mod tests {
             Version::new("v"),
         );
         let unit = SharedUnit {
-            block: BlockKey::new(&id),
-            page: None,
+            block: crate::block_key::BlockKey::new(&id),
+            kind: crate::eviction::UnitKind::Whole,
         };
         let directory = Arc::new(RwLock::new(Directory::default()));
         let index = Arc::new(BlockIndex::new());

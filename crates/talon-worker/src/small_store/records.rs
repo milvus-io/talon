@@ -1,5 +1,7 @@
 use super::{format, journal::Record};
-use crate::block_key::{BlockIdentity, BlockKey, BlockRef, ObjectRef};
+use crate::block_key::{BlockRef, ObjectRef};
+use crate::eviction::UnitKind;
+use crate::small_store::key::{SmallIdentity, SmallKey, SmallRef};
 use std::io;
 use talon_core::Backend;
 
@@ -10,11 +12,12 @@ pub(super) struct Records {
     rows: Vec<[u8; WIDTH]>,
     text: String,
     live: usize,
+    exact_offsets: std::collections::HashMap<u32, u64>,
 }
 
 #[derive(Clone, Copy)]
 pub(super) struct RecordRef<'a> {
-    pub key: BlockRef<'a>,
+    pub key: SmallRef<'a>,
     pub len: u64,
     pub checksum: u64,
 }
@@ -22,7 +25,7 @@ pub(super) struct RecordRef<'a> {
 impl RecordRef<'_> {
     pub fn to_owned(self) -> Record {
         Record {
-            key: BlockKey::new(&self.key),
+            key: SmallKey::new(&self.key),
             len: self.len,
             checksum: self.checksum,
         }
@@ -60,6 +63,7 @@ impl Records {
             2 => Backend::Azure,
             _ => unreachable!("validated small-object backend"),
         };
+        let exact_offset = self.exact_offsets.get(&n32(&row[..4])).copied();
         let start = n32(&row[16..20]) as usize;
         let end = start + n16(&row[24..26]);
         let bucket = start + n16(&row[26..28]);
@@ -68,15 +72,22 @@ impl Records {
         Some((
             u64::from(n32(&row[..4])),
             RecordRef {
-                key: BlockRef {
-                    object: ObjectRef {
-                        backend,
-                        bucket: string(start, bucket),
-                        object_path: string(bucket, path),
+                key: SmallRef {
+                    kind: if exact_offset.is_some() {
+                        UnitKind::ExactRange
+                    } else {
+                        UnitKind::Whole
                     },
-                    offset: 0,
-                    block_size: n32(&row[20..24]),
-                    version: string(path, end),
+                    block: BlockRef {
+                        object: ObjectRef {
+                            backend,
+                            bucket: string(start, bucket),
+                            object_path: string(bucket, path),
+                        },
+                        offset: exact_offset.unwrap_or(0),
+                        block_size: n32(&row[20..24]),
+                        version: string(path, end),
+                    },
                 },
                 len: u64::from(len),
                 checksum: u64::from_le_bytes(row[8..16].try_into().unwrap()),
@@ -134,7 +145,7 @@ impl Records {
     pub fn insert(&mut self, offset: u64, record: Record) -> io::Result<usize> {
         format::validate_key(&record.key)?;
         let key = record.key.view();
-        if key.offset != 0
+        if !key.valid_extent(record.len)
             || offset >= 1 << 30
             || record.len == 0
             || record.len > 128 << 20
@@ -183,6 +194,9 @@ impl Records {
         let index = self
             .rows
             .partition_point(|row| u64::from(n32(&row[..4])) <= offset);
+        if key.kind == UnitKind::ExactRange {
+            self.exact_offsets.insert(offset as u32, key.offset);
+        }
         self.rows.insert(index, row);
         self.live += 1;
         Ok(index)
@@ -197,6 +211,7 @@ impl Records {
             .take_while(|row| u64::from(n32(&row[..4])) == *offset)
             .find(|row| n32(&row[4..8]) & ((1 << 28) - 1) != 0)?;
         row[4..8].fill(0);
+        self.exact_offsets.remove(&(*offset as u32));
         self.live -= 1;
         if (self.rows.len() - self.live) * 100 >= self.rows.len() {
             self.compact();
@@ -211,6 +226,8 @@ impl Records {
                 self.live -= 1;
             }
         }
+        self.exact_offsets
+            .retain(|offset, _| u64::from(*offset) < end);
         self.compact();
     }
 
@@ -230,6 +247,7 @@ impl Records {
     pub fn shrink_to_fit(&mut self) {
         self.rows.shrink_to_fit();
         self.text.shrink_to_fit();
+        self.exact_offsets.shrink_to_fit();
     }
 
     fn compact(&mut self) {
@@ -262,7 +280,7 @@ mod tests {
 
     fn record(path: &str) -> Record {
         Record {
-            key: BlockKey::new(&BlockId::new(
+            key: SmallKey::new(&BlockId::new(
                 ObjectId::new(Backend::Azure, "桶", path),
                 0,
                 256 << 20,
@@ -291,6 +309,41 @@ mod tests {
         assert_eq!(records.get(0).unwrap().0, 20);
         records.retain_before(20);
         assert!(records.is_empty());
+    }
+
+    #[test]
+    fn exact_offsets_and_kinds_survive_compaction_and_snapshot() {
+        for source_offset in [0, 1 << 40] {
+            let mut records = Records::default();
+            let mut ordinary = record("same-key");
+            let mut block = ordinary.key.materialize();
+            block.block_size = 16;
+            ordinary.key = SmallKey::new(&block);
+            ordinary.len = 8;
+            records.insert(0, ordinary.clone()).unwrap();
+            block.offset = source_offset;
+            let exact = crate::eviction::CacheUnit::ExactRange(block);
+            records
+                .insert(
+                    16,
+                    Record {
+                        key: SmallKey::new(&exact),
+                        len: 16,
+                        checksum: 7,
+                    },
+                )
+                .unwrap();
+            let snapshot = records.clone();
+            assert_ne!(records.get(0).unwrap().1.key, records.get(1).unwrap().1.key);
+            records.remove(&0).unwrap();
+            assert_eq!(records.get(0).unwrap().1.key.cache_unit(), exact);
+            assert_eq!(snapshot.get(1).unwrap().1.key.cache_unit(), exact);
+            assert_eq!(snapshot.get(0).unwrap().1.to_owned().key, ordinary.key);
+            records.retain_before(16);
+            assert!(records.exact_offsets.is_empty());
+            records.insert(16, ordinary.clone()).unwrap();
+            assert_eq!(records.get(0).unwrap().1.to_owned().key, ordinary.key);
+        }
     }
 
     #[test]

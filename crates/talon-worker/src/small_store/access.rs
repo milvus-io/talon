@@ -33,7 +33,7 @@ pub(super) struct DirtyQueue {
 /// Attached to packed read tokens when TTI is enabled. The
 /// queue owns metadata, never a payload pin; the weak back-reference avoids a cycle.
 pub(crate) struct DirtyAccess {
-    key: BlockKey,
+    key: SmallKey,
     clock: Arc<AtomicU64>,
     queue: Weak<DirtyQueue>,
     pending: AtomicBool,
@@ -136,7 +136,7 @@ fn decode_log(mut bytes: &[u8], ages: &mut HashMap<CacheUnit, u64>) -> io::Resul
     Ok(false)
 }
 
-fn encode(bytes: &mut Vec<u8>, key: &dyn BlockIdentity, last: u64) -> io::Result<()> {
+fn encode(bytes: &mut Vec<u8>, key: &dyn SmallIdentity, last: u64) -> io::Result<()> {
     let mut record = last.to_le_bytes().to_vec();
     format::encode_key(&mut record, key)?;
     format::frame(bytes, &record)
@@ -230,12 +230,12 @@ impl SmallObjectStore {
         Ok(())
     }
 
-    pub(crate) fn track_access(&self, id: &BlockId) -> io::Result<()> {
-        format::validate_key(id)?;
+    pub(crate) fn track_access(&self, id: &(impl SmallStoreKey + ?Sized)) -> io::Result<()> {
+        format::validate_key(&id.view())?;
         for stream in self.streams() {
             let mut entries = stream.entries.write().unwrap();
             let key = entries
-                .get_key_value(id as &dyn BlockIdentity)
+                .get_key_value(&id.view())
                 .map(|(key, _)| key.clone());
             if let Some(key) = key {
                 let loc = entries.get(&key).unwrap();
@@ -249,7 +249,7 @@ impl SmallObjectStore {
         Ok(())
     }
 
-    fn attach_access(&self, key: BlockKey, access: AccessHandle, dirty: bool) -> AccessHandle {
+    fn attach_access(&self, key: SmallKey, access: AccessHandle, dirty: bool) -> AccessHandle {
         let token = Arc::new(DirtyAccess {
             key,
             clock: access.clock().clone(),

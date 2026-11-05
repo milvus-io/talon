@@ -120,7 +120,7 @@ fn access_records_preserve_whole_and_exact_range_identities() {
     let shifted = CacheUnit::ExactRange(shifted);
     let mut bytes = Vec::new();
     for (unit, age) in [(&whole, 10), (&exact, 20), (&shifted, 30), (&exact, 15)] {
-        encode(&mut bytes, &format::key(unit).unwrap(), age).unwrap();
+        encode(&mut bytes, unit, age).unwrap();
     }
     let mut ages = HashMap::new();
     decode(&bytes, &mut ages).unwrap();
@@ -432,7 +432,7 @@ async fn million_item_sparse_access_probe() {
     for n in 0..count {
         let mut block = id(n);
         block.object.object_path = format!("{n:092}"); // bucket + path + version = 100 bytes
-        let key = BlockKey::new(&block);
+        let key = SmallKey::new(&block);
         stream.entries.write().unwrap().insert(
             key.clone(),
             Location {
