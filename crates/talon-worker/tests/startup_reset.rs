@@ -19,7 +19,6 @@ fn command(root: &Path) -> tokio::process::Command {
         .env("TALON_ZONE", "test")
         .env("TALON_WORKER_CACHE_DIRS", root)
         .env("TALON_WORKER_CLUSTER_ID", "new-cluster")
-        .env("TALON_WORKER_NODE_ID", "new-worker")
         .env("TALON_WORKER_BLOCK_SIZE", "16")
         .env("TALON_WORKER_L2_PAGE_SIZE_BYTES", "4")
         .env("TALON_WORKER_CAPACITY_BYTES", "268435456")
@@ -45,10 +44,10 @@ async fn failure(command: &mut tokio::process::Command) -> String {
 
 #[tokio::test]
 async fn startup_reset_defaults_on_and_can_be_disabled_explicitly() {
-    for mode in ["default", "env", "cli", "env-false", "cli-false"] {
+    for mode in ["default", "same-id", "env", "cli", "env-false", "cli-false"] {
         let root = tempfile::tempdir().unwrap();
         let lock = CacheRootLock::acquire(root.path()).unwrap();
-        lock.load_identity("old-cluster", Some("old-worker"), 64, 16)
+        lock.load_identity("new-cluster", Some("old-worker"), 64, 16)
             .unwrap();
         drop(lock);
         let identity_path = root.path().join("worker_identity");
@@ -56,6 +55,9 @@ async fn startup_reset_defaults_on_and_can_be_disabled_explicitly() {
         std::fs::write(root.path().join("old-state"), b"old").unwrap();
         let mut command = command(root.path());
         match mode {
+            "same-id" => {
+                command.env("TALON_WORKER_NODE_ID", "old-worker");
+            }
             "env" => {
                 command.env("TALON_WORKER_RESET_INCOMPATIBLE_CACHE", "true");
             }
@@ -87,12 +89,46 @@ async fn startup_reset_defaults_on_and_can_be_disabled_explicitly() {
             let identity: WorkerIdentity =
                 serde_json::from_slice(&std::fs::read(identity_path).unwrap()).unwrap();
             assert_eq!(identity.cluster_id, "new-cluster");
-            assert_eq!(identity.worker_id, "new-worker");
+            assert_eq!(identity.worker_id, "old-worker");
             assert_eq!((identity.block_size, identity.page_size), (16, 4));
         } else {
-            assert!(output.contains("different cluster"), "{output}");
+            assert!(output.contains("cache geometry conflicts"), "{output}");
             assert_eq!(std::fs::read(identity_path).unwrap(), original);
         }
+    }
+}
+
+#[tokio::test]
+async fn conflicting_node_id_exits_without_deleting_data() {
+    for interrupted in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let lock = CacheRootLock::acquire(root.path()).unwrap();
+        lock.load_identity("new-cluster", Some("old-worker"), 64, 16)
+            .unwrap();
+        drop(lock);
+        let identity_path = root.path().join("worker_identity");
+        let original = std::fs::read(&identity_path).unwrap();
+        std::fs::write(root.path().join("old-state"), b"keep").unwrap();
+        if interrupted {
+            std::fs::write(root.path().join(".worker-reset"), b"").unwrap();
+        }
+        let output = failure(
+            command(root.path())
+                .env("TALON_WORKER_NODE_ID", "new-worker")
+                .arg("--reset-incompatible-cache"),
+        )
+        .await;
+        assert!(output.contains("configured node_id conflicts"), "{output}");
+        assert!(
+            !output.contains("resetting incompatible local cache"),
+            "{output}"
+        );
+        assert_eq!(std::fs::read(identity_path).unwrap(), original);
+        assert_eq!(
+            std::fs::read(root.path().join("old-state")).unwrap(),
+            b"keep"
+        );
+        assert_eq!(root.path().join(".worker-reset").exists(), interrupted);
     }
 }
 

@@ -102,9 +102,14 @@ Each namespace and credential scope owns its own store under its existing cache
 root. `small-routing.json` binds the routing format and small-object threshold
 to that root. A changed threshold (including enabling or disabling small storage),
 malformed marker, or an existing cache without the marker is incompatible.
-By default, `reset_incompatible_cache = true` clears the entire active Worker
-cache root and retries startup once. Set it to `false` to reject incompatible
-state without deleting it. When upgrading from the disabled default, explicitly
+By default, `reset_incompatible_cache = true` clears the active Worker's cached
+data and metadata, preserves its Worker ID, and retries startup once. The
+identity remains durable throughout cleanup, including interrupted resets.
+An explicit `node_id` that differs from the persisted identity aborts startup
+without deleting data; an operator must resolve the mismatch. Invalid identities
+and cluster mismatches also require operator intervention.
+Set reset to `false` to reject incompatible cache state without deleting it.
+When upgrading from the disabled default, explicitly
 set `small_object_threshold_bytes = 0` to retain the previous routing and avoid
 a reset caused by the new threshold. This prevents read-time probing for
 historical routing choices. Do not run two owners against the same cache root;

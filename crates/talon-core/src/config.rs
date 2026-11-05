@@ -263,7 +263,7 @@ pub struct WorkerConfig {
     pub block_size: u32,
     /// One or more cache directory roots on local NVMe.
     pub cache_dirs: Vec<PathBuf>,
-    /// Clear incompatible local cache state during startup. Defaults to true.
+    /// Clear incompatible cache state while preserving the Worker identity. Defaults to true.
     pub reset_incompatible_cache: bool,
     /// Total cache capacity in bytes across all cache dirs.
     pub capacity_bytes: u64,
@@ -1095,7 +1095,7 @@ pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
         default: Some("true"),
         cli: true,
         secret: false,
-        help: "On incompatible local identity, cache geometry, layout, or metadata format, delete all worker data and metadata in the first cache directory and start empty. Invalid persisted metadata also triggers reset. Compatible caches are retained. Keeps the directory lock and filesystem lost+found directory; does not change coordinator membership or origin data. Lock, permission, capacity and ordinary I/O failures still abort startup. Interrupted resets require this option to finish. Destructive; enabled by default. Set false to reject incompatible local state without clearing it.",
+        help: "On incompatible cache geometry, layout, or metadata format, delete cached data and metadata in the first cache directory and start with an empty cache. Preserve the persisted Worker ID, including across interrupted resets, and update its cache geometry after cleanup. A conflicting explicit node_id, cluster mismatch, or invalid Worker identity aborts startup without deleting data and requires operator intervention. Compatible caches are retained. Keeps the directory lock and filesystem lost+found directory; does not change coordinator membership or origin data. Lock, permission, capacity and ordinary I/O failures still abort startup. Interrupted resets require this option to finish. Destructive; enabled by default. Set false to reject incompatible cache state without clearing it.",
     },
     ConfigVar {
         env: "TALON_WORKER_CAPACITY_BYTES",

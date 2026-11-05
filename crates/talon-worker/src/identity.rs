@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{cache_reset::incompatible, page_access_store::CacheRootLock};
 
-const IDENTITY_FILE: &str = "worker_identity";
+pub(crate) const IDENTITY_FILE: &str = "worker_identity";
 
 /// The identity and cache geometry travel with the disk, never with a Pod IP.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -31,6 +31,22 @@ impl CacheRootLock {
         block_size: u32,
         page_size: u64,
     ) -> anyhow::Result<WorkerIdentity> {
+        let identity = self.load_identity_owner(cluster, configured_id, block_size, page_size)?;
+        self.check_reset_complete()?;
+        ensure!(
+            identity.block_size == block_size && identity.page_size == page_size,
+            incompatible("cache geometry conflicts with directory identity")
+        );
+        Ok(identity)
+    }
+
+    pub(crate) fn load_identity_owner(
+        &self,
+        cluster: &str,
+        configured_id: Option<&str>,
+        block_size: u32,
+        page_size: u64,
+    ) -> anyhow::Result<WorkerIdentity> {
         ensure!(
             !cluster.trim().is_empty(),
             "identity cluster_id must not be empty"
@@ -39,7 +55,6 @@ impl CacheRootLock {
             configured_id.map_or(true, |id| !id.trim().is_empty()),
             "identity worker_id must not be empty"
         );
-        self.check_reset_complete()?;
         let path = self.root.join(IDENTITY_FILE);
         let identity = match File::open(&path) {
             Ok(file) => {
@@ -47,15 +62,14 @@ impl CacheRootLock {
                 file.take(16 * 1024 + 1).read_to_end(&mut bytes)?;
                 ensure!(
                     bytes.len() <= 16 * 1024,
-                    incompatible("worker identity exceeds size limit")
+                    "worker identity exceeds size limit"
                 );
-                serde_json::from_slice::<WorkerIdentity>(&bytes).map_err(|error| {
-                    incompatible(format!(
-                        "corrupt worker_identity; refusing to replace directory identity: {error}"
-                    ))
-                })?
+                serde_json::from_slice::<WorkerIdentity>(&bytes)
+                    .context("corrupt worker_identity; refusing to replace directory identity")?
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.check_reset_complete()
+                    .context("cannot recover interrupted reset without worker_identity")?;
                 let has_cache =
                     std::fs::read_dir(&self.root)?.try_fold(false, |found, entry| {
                         let entry = entry?;
@@ -74,9 +88,7 @@ impl CacheRootLock {
                     })?;
                 ensure!(
                     !has_cache || configured_id.is_some(),
-                    incompatible(
-                        "existing cache has no worker_identity; explicitly import its old node_id"
-                    )
+                    "existing cache has no worker_identity; explicitly import its old node_id"
                 );
                 let worker_id = match configured_id {
                     Some(id) => id.to_owned(),
@@ -93,43 +105,51 @@ impl CacheRootLock {
                     block_size,
                     page_size,
                 };
-                let mut temporary = tempfile::Builder::new()
-                    .prefix(".worker_identity.tmp.")
-                    .tempfile_in(&self.root)?;
-                temporary.write_all(&serde_json::to_vec(&identity)?)?;
-                temporary.as_file().sync_all()?;
-                temporary
-                    .persist_noclobber(&path)
-                    .context("publish worker identity")?;
-                File::open(&self.root)?.sync_all()?;
+                self.persist_identity(&identity, false)?;
                 identity
             }
             Err(error) => return Err(error).context("read worker identity"),
         };
         ensure!(
             identity.format_version == 1,
-            incompatible(format!(
-                "unsupported worker identity format {}",
-                identity.format_version
-            ))
+            "unsupported worker identity format {}",
+            identity.format_version
         );
         ensure!(
             identity.cluster_id == cluster,
-            incompatible("worker identity belongs to a different cluster")
+            "worker identity belongs to a different cluster"
         );
         ensure!(
             !identity.worker_id.trim().is_empty(),
-            incompatible("corrupt worker identity: empty worker_id")
+            "corrupt worker identity: empty worker_id"
         );
         ensure!(
             configured_id.map_or(true, |id| id == identity.worker_id),
-            incompatible("configured node_id conflicts with directory identity")
-        );
-        ensure!(
-            identity.block_size == block_size && identity.page_size == page_size,
-            incompatible("cache geometry conflicts with directory identity")
+            "configured node_id conflicts with directory identity"
         );
         Ok(identity)
+    }
+
+    pub(crate) fn persist_identity(
+        &self,
+        identity: &WorkerIdentity,
+        replace: bool,
+    ) -> anyhow::Result<()> {
+        let mut temporary = tempfile::Builder::new()
+            .prefix(".worker_identity.tmp.")
+            .tempfile_in(&self.root)?;
+        temporary.write_all(&serde_json::to_vec(identity)?)?;
+        temporary.as_file().sync_all()?;
+        let path = self.root.join(IDENTITY_FILE);
+        if replace {
+            temporary.persist(&path).context("update worker identity")?;
+        } else {
+            temporary
+                .persist_noclobber(&path)
+                .context("publish worker identity")?;
+        }
+        File::open(&self.root)?.sync_all()?;
+        Ok(())
     }
 }
 

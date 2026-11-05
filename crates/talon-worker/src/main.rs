@@ -561,11 +561,9 @@ async fn run() -> anyhow::Result<()> {
     let cache_root_lock = Arc::new(talon_worker::page_access_store::CacheRootLock::acquire(
         &root,
     )?);
-    talon_worker::cache_reset::open_or_reset(
-        cache_root_lock,
-        cfg.reset_incompatible_cache,
-        |lock| run_worker(cfg.clone(), lock),
-    )
+    talon_worker::cache_reset::open_or_reset(cache_root_lock, &cfg, |lock| {
+        run_worker(cfg.clone(), lock)
+    })
     .await
 }
 

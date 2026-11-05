@@ -774,7 +774,11 @@ mod tests {
     ) -> anyhow::Result<WorkerRuntime> {
         use crate::cache_reset::{classify_open_error, open_or_reset};
         let lock = Arc::new(CacheRootLock::acquire(root)?);
-        open_or_reset(lock, enabled, |lock| async move {
+        let cfg = &WorkerConfig {
+            reset_incompatible_cache: enabled,
+            ..cfg.clone()
+        };
+        open_or_reset(lock, cfg, |lock| async move {
             lock.load_identity(
                 &cfg.cluster_id,
                 cfg.node_id.as_deref(),
@@ -885,7 +889,7 @@ mod tests {
                     .all(|worker| worker.index.is_empty()),
                 "{case}"
             );
-            assert_ne!(
+            assert_eq!(
                 std::fs::read(dir.path().join("worker_identity")).unwrap(),
                 identity,
                 "{case}"
@@ -915,6 +919,7 @@ mod tests {
             .unwrap();
         drop(root);
 
+        let identity = std::fs::read(dir.path().join("worker_identity")).unwrap();
         cfg.reset_incompatible_cache = false;
         let error = open_with_reset(dir.path(), &cfg, cfg.reset_incompatible_cache)
             .await
@@ -934,6 +939,10 @@ mod tests {
             .await
             .unwrap();
         assert!(worker.small.is_some());
+        assert_eq!(
+            std::fs::read(dir.path().join("worker_identity")).unwrap(),
+            identity
+        );
         assert!(worker.accepts_small(&block(16), 8));
         assert!(!worker
             .paged
