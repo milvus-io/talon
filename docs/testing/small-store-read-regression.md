@@ -219,7 +219,7 @@ restored to their original inactive states.
 
 Final local validation passed 697 Worker library tests, with eight existing
 ignored tests, formatting, warnings-denied Clippy and both release builds in the
-data-backed development container. Independent cleaness and correctness reviews
+data-backed development container. Independent cleanliness and correctness reviews
 completed; codec overflow and deleted-offset reuse findings were fixed and retested.
 New regressions cover all decimal pairs, 256 trie branches with long labels,
 UTF-8/NUL identity round trips, cross-group reorder/delete/reinsert and frozen clones.
@@ -276,7 +276,7 @@ stopped to test removing BCD. The simpler plain-path version used approximately
 The final source passed 696 Worker library tests with eight existing ignored,
 formatting and warnings-denied Clippy for library/binary targets. All-target
 Clippy remains blocked by the existing `CARGO_BIN_EXE_talon-worker` compile-time
-requirement in `tests/instance_profile.rs`. Independent cleaness and correctness
+requirement in `tests/instance_profile.rs`. Independent cleanliness and correctness
 reviews found no outstanding issue in this follow-up. Decimal-pair-only coverage
 was removed with that encoding; UTF-8/NUL and lifecycle regressions remain.
 
