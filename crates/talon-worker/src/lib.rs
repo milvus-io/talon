@@ -6,6 +6,7 @@
 
 pub mod background;
 pub mod block_store;
+pub mod cache_reset;
 pub mod capacity;
 mod catalog;
 pub mod connection_admission;

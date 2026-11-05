@@ -4,6 +4,7 @@
 //! namespace metadata log and snapshots. Durable prefixes survive before sealing.
 //! Relocation commits are durable before old payload files are unlinked.
 mod access;
+pub(crate) use access::DirtyAccess;
 mod disk_io;
 mod flush;
 mod format;

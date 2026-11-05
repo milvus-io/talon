@@ -914,6 +914,12 @@ async fn small_tti_background_and_shutdown_checkpoint_without_paged_cache() {
         .unwrap();
     w.write_object(&object(), data()).await.unwrap();
     let block = id(&w);
+    w.small
+        .as_ref()
+        .unwrap()
+        .access(&block)
+        .unwrap()
+        .restore(crate::eviction::access_millis() - 60_000);
     let w = Arc::new(w);
     let service = WorkerBackground::start(
         w.clone(),
@@ -933,14 +939,10 @@ async fn small_tti_background_and_shutdown_checkpoint_without_paged_cache() {
     })
     .await
     .unwrap();
-    // Change age after the periodic checkpoint; orderly shutdown must flush it.
-    let cold = crate::eviction::access_millis() - 60_000;
-    w.small
-        .as_ref()
-        .unwrap()
-        .access(&block)
-        .unwrap()
-        .restore(cold);
+    // A real access after the periodic checkpoint must be flushed on shutdown.
+    let access = w.small.as_ref().unwrap().access(&block).unwrap();
+    access.touch();
+    let touched = access.last_access();
     service.shutdown().await;
     drop(w);
     let (_, w) = runtime(dir.path(), false, false);
@@ -951,7 +953,7 @@ async fn small_tti_background_and_shutdown_checkpoint_without_paged_cache() {
             .access(&block)
             .unwrap()
             .last_access(),
-        cold
+        touched
     );
 }
 
@@ -1697,6 +1699,69 @@ async fn exact_reads_use_ordinary_small_objects_only_below_one_mib() {
         );
         assert!(worker.index.is_empty());
     }
+}
+
+#[tokio::test]
+async fn exact_range_admission_and_hits_survive_incremental_access_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let open = || {
+        let (origin, worker) = exact_runtime(dir.path(), false, false);
+        let worker = worker
+            .with_page_gc(PageGcConfig {
+                tti_ms: 60_000,
+                checkpoint_interval_ms: 1_000,
+                ..Default::default()
+            })
+            .unwrap();
+        (origin, worker)
+    };
+    let (_, worker) = open();
+    let small = worker.small.as_ref().unwrap();
+    small.checkpoint_access(None).await.unwrap();
+    let root = dir.path().join("small");
+    let checkpoint = std::fs::read(root.join("access.checkpoint")).unwrap();
+    let request = request();
+    let unit = exact_unit(&request);
+    let version = Version::new("v1");
+    worker
+        .serve_exact(&request, &version, 2 << 20)
+        .await
+        .unwrap();
+    small
+        .access(&unit)
+        .unwrap()
+        .restore(crate::eviction::access_millis() - 30_000);
+    small.checkpoint_access(None).await.unwrap();
+    worker
+        .serve_exact(&request, &version, 2 << 20)
+        .await
+        .unwrap();
+    let last_access = small.access(&unit).unwrap().last_access();
+    small.checkpoint_access(None).await.unwrap();
+    assert_eq!(
+        std::fs::read(root.join("access.checkpoint")).unwrap(),
+        checkpoint
+    );
+    assert!(std::fs::metadata(root.join("access.log")).unwrap().len() > 16);
+    worker.maintain_small(true).await.unwrap();
+    drop(worker);
+
+    let (origin, worker) = open();
+    assert_eq!(
+        worker
+            .small
+            .as_ref()
+            .unwrap()
+            .access(&unit)
+            .unwrap()
+            .last_access(),
+        last_access
+    );
+    worker
+        .serve_exact(&request, &version, 2 << 20)
+        .await
+        .unwrap();
+    assert_eq!(origin.fetches.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

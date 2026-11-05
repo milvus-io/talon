@@ -47,6 +47,7 @@ pub(crate) struct AccessRecovery {
     pub records: BTreeMap<u32, u64>,
     pub corrupt: bool,
     pub future: usize,
+    pub future_pages: Vec<u32>,
 }
 pub(crate) struct PageAccessStore;
 impl PageAccessStore {
@@ -184,6 +185,7 @@ impl PageAccessStore {
             previous = Some(page);
             if access > now || access > sampled || sampled > now {
                 out.future += 1;
+                out.future_pages.push(page);
             } else {
                 out.records.insert(page, access);
             }

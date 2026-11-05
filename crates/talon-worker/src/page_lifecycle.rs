@@ -294,6 +294,7 @@ pub(crate) struct BlockPages {
     pub pages: BTreeMap<u32, PageEntry>,
     // Structural changes only: hot reads never lock or modify their block.
     pub revision: u64,
+    pub checkpointed_revision: u64,
     pub cleanup_pending: bool,
     retries: BTreeSet<u32>,
     pub work: Arc<BlockWork>,
@@ -571,7 +572,6 @@ impl PageCheckpoint {
             dirty_since,
         }
     }
-    #[cfg(test)]
     pub fn dirty(&self) -> bool {
         self.dirty_since != UNKNOWN
     }
@@ -605,6 +605,27 @@ struct Registry {
     next: u64,
     membership: u64,
     checkpointed_membership: u64,
+    removed: BTreeMap<u64, BlockId>,
+    removed_bytes: usize,
+    removal_overflow: u64,
+    journal: crate::page_access_shard::JournalState,
+}
+impl Registry {
+    fn removed(&mut self, id: &BlockId) {
+        self.membership += 1;
+        // No journal exists until TTI is enabled and its first base is published.
+        // Disabled TTI and whole-only traffic must not retain deletion identities.
+        if self.journal.generation == 0 {
+            return;
+        }
+        let bytes = id.object.bucket.len() + id.object.object_path.len() + id.version.0.len() + 128;
+        if self.removed_bytes + bytes > (1 << 20) {
+            self.removal_overflow = self.membership;
+        } else {
+            self.removed_bytes += bytes;
+            self.removed.insert(self.membership, id.clone());
+        }
+    }
 }
 #[derive(Default)]
 pub(crate) struct ScanCursor {
@@ -682,7 +703,7 @@ impl PageLifecycle {
             if empty {
                 g.ordered.remove(&n);
                 g.by_id.remove(id);
-                g.membership += 1;
+                g.removed(id);
             }
         }
     }
@@ -776,7 +797,7 @@ impl PageLifecycle {
                 drop(state);
                 registry.ordered.remove(&slot);
                 registry.by_id.remove(&id);
-                registry.membership += 1;
+                registry.removed(&id);
                 cursor.block = slot + 1;
                 cursor.page = 0;
                 work += 1;
@@ -882,8 +903,64 @@ impl PageLifecycle {
             .collect();
         batch
     }
+    /// Look up only notified blocks. Registry slots distinguish recreation of
+    /// the same BlockId; later notifications remain for the next flush.
+    pub fn checkpoint_dirty_batch(
+        &self,
+        shard: usize,
+        slot: &mut u64,
+        ceiling: u64,
+    ) -> Vec<Arc<BlockState>> {
+        if *slot > ceiling {
+            return Vec::new();
+        }
+        let g = self.shards[shard].lock().unwrap();
+        let work = self.work[shard].dirty.lock().unwrap();
+        work.range(*slot..=ceiling)
+            .take(64)
+            .filter_map(|(&n, _)| {
+                *slot = n + 1;
+                g.ordered.get(&n).cloned()
+            })
+            .collect()
+    }
+    pub fn checkpoint_journal(
+        &self,
+        shard: usize,
+        membership: u64,
+    ) -> (crate::page_access_shard::JournalState, Vec<BlockId>) {
+        let g = self.shards[shard].lock().unwrap();
+        let mut state = g.journal;
+        state.full |= g.removal_overflow != 0;
+        (
+            state,
+            g.removed
+                .range(..=membership)
+                .map(|(_, id)| id.clone())
+                .collect(),
+        )
+    }
+    pub fn set_checkpoint_journal(
+        &self,
+        shard: usize,
+        state: crate::page_access_shard::JournalState,
+    ) {
+        self.shards[shard].lock().unwrap().journal = state;
+    }
     pub fn checkpoint_finished(&self, shard: usize, membership: u64) {
-        self.shards[shard].lock().unwrap().checkpointed_membership = membership;
+        let mut g = self.shards[shard].lock().unwrap();
+        g.checkpointed_membership = membership;
+        g.removed.retain(|&revision, _| revision > membership);
+        g.removed_bytes = g
+            .removed
+            .values()
+            .map(|id| {
+                id.object.bucket.len() + id.object.object_path.len() + id.version.0.len() + 128
+            })
+            .sum();
+        if g.removal_overflow <= membership {
+            g.removal_overflow = 0;
+        }
     }
     pub fn checkpoint_recovered(&self, shard: usize) {
         // Also rewrite a recovered snapshot whose last pages disappeared in a
@@ -1318,6 +1395,42 @@ mod tests {
             summary.commit();
             assert_eq!(life.dirty_summary(), (0, None));
         }
+    }
+
+    #[test]
+    fn removal_journal_is_lazy_bounded_and_keeps_concurrent_deletions() {
+        let life = PageLifecycle::new();
+        for _ in 0..100 {
+            drop(life.block(&id()));
+            life.retire_empty(&id());
+        }
+        let shard = disk_shard(&id());
+        let (_, membership, _) = life.checkpoint_start(shard);
+        assert!(life.checkpoint_journal(shard, membership).1.is_empty());
+        life.set_checkpoint_journal(
+            shard,
+            crate::page_access_shard::JournalState {
+                generation: 1,
+                full: false,
+                ..Default::default()
+            },
+        );
+        for _ in 0..10000 {
+            drop(life.block(&id()));
+            life.retire_empty(&id());
+        }
+        let (_, membership, _) = life.checkpoint_start(shard);
+        assert!(life.checkpoint_journal(shard, membership).0.full);
+        assert!(life.shards[shard].lock().unwrap().removed_bytes <= 1 << 20);
+        life.checkpoint_finished(shard, membership);
+        drop(life.block(&id()));
+        life.retire_empty(&id());
+        // Completion of an older snapshot cannot erase later tombstones.
+        life.checkpoint_finished(shard, membership);
+        assert!(life.checkpoint_journal(shard, membership).1.is_empty());
+        let (_, latest, _) = life.checkpoint_start(shard);
+        assert_eq!(life.checkpoint_journal(shard, latest).1, vec![id()]);
+        assert!(!life.checkpoint_journal(shard, latest).0.full);
     }
 
     #[test]

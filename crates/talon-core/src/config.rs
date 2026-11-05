@@ -263,12 +263,15 @@ pub struct WorkerConfig {
     pub block_size: u32,
     /// One or more cache directory roots on local NVMe.
     pub cache_dirs: Vec<PathBuf>,
+    /// Clear incompatible cache state while preserving the Worker identity. Defaults to true.
+    pub reset_incompatible_cache: bool,
     /// Total cache capacity in bytes across all cache dirs.
     pub capacity_bytes: u64,
     /// Target packed segment size, including its index.
     pub small_object_segment_bytes: u64,
-    /// Upper exclusive object size for packed storage; 0 disables the engine.
-    /// Changing this value requires a new empty cache directory.
+    /// Upper exclusive object size for packed storage; defaults to 1 MiB.
+    /// Zero disables the engine. Changing this value makes existing routing
+    /// incompatible; `reset_incompatible_cache` controls whether startup clears it.
     pub small_object_threshold_bytes: u64,
     /// Worker-wide whole-block cached descriptor limit, shared by namespaces.
     /// Zero disables caching. Startup-only; active readers and sockets hold extra FDs.
@@ -600,9 +603,10 @@ impl Default for WorkerConfig {
             heartbeat_interval_ms: 5_000,
             block_size: 256 << 20,
             cache_dirs: vec![PathBuf::from("/var/cache/talon")],
+            reset_incompatible_cache: true,
             capacity_bytes: 64 << 30,
             small_object_segment_bytes: 67108864,
-            small_object_threshold_bytes: 0,
+            small_object_threshold_bytes: 1 << 20,
             whole_fd_cache_capacity: 1024,
             page_fd_cache_capacity: 16384,
             background_task_concurrency: 2,
@@ -697,6 +701,8 @@ pub struct WorkerConfigPatch {
     pub block_size: Option<u32>,
     /// Override for [`WorkerConfig::cache_dirs`].
     pub cache_dirs: Option<Vec<PathBuf>>,
+    /// Override for [`WorkerConfig::reset_incompatible_cache`].
+    pub reset_incompatible_cache: Option<bool>,
     /// Override for [`WorkerConfig::capacity_bytes`].
     pub capacity_bytes: Option<u64>,
     pub small_object_segment_bytes: Option<u64>,
@@ -835,6 +841,9 @@ impl Patch for WorkerConfigPatch {
             heartbeat_interval_ms: self.heartbeat_interval_ms.or(base.heartbeat_interval_ms),
             block_size: self.block_size.or(base.block_size),
             cache_dirs: self.cache_dirs.or(base.cache_dirs),
+            reset_incompatible_cache: self
+                .reset_incompatible_cache
+                .or(base.reset_incompatible_cache),
             capacity_bytes: self.capacity_bytes.or(base.capacity_bytes),
             small_object_segment_bytes: self
                 .small_object_segment_bytes
@@ -1081,6 +1090,14 @@ pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
         help: "Colon-separated cache directories.",
     },
     ConfigVar {
+        env: "TALON_WORKER_RESET_INCOMPATIBLE_CACHE",
+        key: "reset_incompatible_cache",
+        default: Some("true"),
+        cli: true,
+        secret: false,
+        help: "On incompatible cache geometry, layout, or metadata format, delete cached data and metadata in the first cache directory and start with an empty cache. Preserve the persisted Worker ID, including across interrupted resets, and update its cache geometry after cleanup. A conflicting explicit node_id, cluster mismatch, or invalid Worker identity aborts startup without deleting data and requires operator intervention. Compatible caches are retained. Keeps the directory lock and filesystem lost+found directory; does not change coordinator membership or origin data. Lock, permission, capacity and ordinary I/O failures still abort startup. Interrupted resets require this option to finish. Destructive; enabled by default. Set false to reject incompatible cache state without clearing it.",
+    },
+    ConfigVar {
         env: "TALON_WORKER_CAPACITY_BYTES",
         key: "capacity_bytes",
         default: Some("68719476736"),
@@ -1127,7 +1144,7 @@ pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
         secret: false,
         help: "L2 page size in bytes; 0 keeps whole-block L2, non-zero enables paged L2.",
     },
-    ConfigVar { env: "TALON_WORKER_SMALL_OBJECT_THRESHOLD_BYTES", key: "small_object_threshold_bytes", default: Some("0"), cli: false, secret: false, help: "Upper exclusive object size for packed storage; 0 disables the engine. Changing this value requires a new empty cache directory." },
+    ConfigVar { env: "TALON_WORKER_SMALL_OBJECT_THRESHOLD_BYTES", key: "small_object_threshold_bytes", default: Some("1048576"), cli: false, secret: false, help: "Upper exclusive object size for packed storage; defaults to 1 MiB. Zero disables the engine. Changing this value makes existing routing incompatible; reset_incompatible_cache controls whether startup clears it." },
     ConfigVar { env: "TALON_WORKER_SMALL_OBJECT_SEGMENT_BYTES", key: "small_object_segment_bytes", default: Some("67108864"), cli: false, secret: false, help: "Target packed segment size, including its index." },
     ConfigVar { env: "TALON_WORKER_OWNERSHIP_GC_ENABLED", key: "ownership_gc_enabled", default: Some("true"), cli: false, secret: false, help: "Reclaim misplaced cache blocks on membership changes and hourly admission checks." },
     ConfigVar { env: "TALON_WORKER_OWNERSHIP_GC_REPLICAS", key: "ownership_gc_replicas", default: Some("1"), cli: false, secret: false, help: "Number of placement candidates to retain; must cover every reader replica count." },
@@ -1356,6 +1373,7 @@ pub(crate) mod worker_env {
     pub const HEARTBEAT_INTERVAL_MS: &str = "TALON_WORKER_HEARTBEAT_INTERVAL_MS";
     pub const BLOCK_SIZE: &str = "TALON_WORKER_BLOCK_SIZE";
     pub const CACHE_DIRS: &str = "TALON_WORKER_CACHE_DIRS";
+    pub const RESET_INCOMPATIBLE_CACHE: &str = "TALON_WORKER_RESET_INCOMPATIBLE_CACHE";
     pub const WHOLE_FD_CACHE_CAPACITY: &str = "TALON_WORKER_WHOLE_FD_CACHE_CAPACITY";
     pub const PAGE_FD_CACHE_CAPACITY: &str = "TALON_WORKER_PAGE_FD_CACHE_CAPACITY";
     pub const CAPACITY_BYTES: &str = "TALON_WORKER_CAPACITY_BYTES";
@@ -1507,6 +1525,9 @@ impl WorkerConfigPatch {
                 .transpose()?,
             cache_dirs: get(worker_env::CACHE_DIRS)
                 .map(|v| v.split(':').map(PathBuf::from).collect()),
+            reset_incompatible_cache: get(worker_env::RESET_INCOMPATIBLE_CACHE)
+                .map(|v| parse_bool(v, worker_env::RESET_INCOMPATIBLE_CACHE))
+                .transpose()?,
             capacity_bytes: get(worker_env::CAPACITY_BYTES)
                 .map(|v| parse_u64(v, worker_env::CAPACITY_BYTES))
                 .transpose()?,
@@ -1737,6 +1758,9 @@ impl WorkerConfig {
                 .unwrap_or(d.heartbeat_interval_ms),
             block_size: merged.block_size.unwrap_or(d.block_size),
             cache_dirs: merged.cache_dirs.unwrap_or(d.cache_dirs),
+            reset_incompatible_cache: merged
+                .reset_incompatible_cache
+                .unwrap_or(d.reset_incompatible_cache),
             capacity_bytes: merged.capacity_bytes.unwrap_or(d.capacity_bytes),
             small_object_segment_bytes: merged
                 .small_object_segment_bytes
@@ -2517,6 +2541,44 @@ mod tests {
     }
 
     #[test]
+    fn reset_incompatible_cache_defaults_on_and_respects_precedence() {
+        assert!(WorkerConfig::default().reset_incompatible_cache);
+        assert!(
+            WorkerConfig::resolve(Default::default(), Default::default(), Default::default())
+                .unwrap()
+                .reset_incompatible_cache
+        );
+        let file = WorkerConfigPatch::from_toml("reset_incompatible_cache = false").unwrap();
+        assert!(
+            !WorkerConfig::resolve(file.clone(), Default::default(), Default::default())
+                .unwrap()
+                .reset_incompatible_cache
+        );
+        let env = WorkerConfigPatch::from_env_with(|key| {
+            (key == worker_env::RESET_INCOMPATIBLE_CACHE).then(|| "true".to_owned())
+        })
+        .unwrap();
+        assert!(
+            WorkerConfig::resolve(file.clone(), env.clone(), Default::default())
+                .unwrap()
+                .reset_incompatible_cache
+        );
+        let cli = WorkerConfigPatch {
+            reset_incompatible_cache: Some(false),
+            ..Default::default()
+        };
+        assert!(
+            !WorkerConfig::resolve(file, env, cli)
+                .unwrap()
+                .reset_incompatible_cache
+        );
+        assert!(WorkerConfigPatch::from_env_with(|key| {
+            (key == worker_env::RESET_INCOMPATIBLE_CACHE).then(|| "invalid".to_owned())
+        })
+        .is_err());
+    }
+
+    #[test]
     fn env_schemas_are_wellformed() {
         // Each schema's env names are unique and use its component prefix,
         // except for the worker's shared Broker timeout setting.
@@ -2624,7 +2686,14 @@ mod tests {
         let defaults =
             WorkerConfig::resolve(Default::default(), Default::default(), Default::default())
                 .unwrap();
-        assert_eq!(defaults.small_object_threshold_bytes, 0);
+        assert_eq!(defaults.small_object_threshold_bytes, 1 << 20);
+        let disabled = WorkerConfig::resolve(
+            WorkerConfigPatch::from_toml("small_object_threshold_bytes = 0").unwrap(),
+            Default::default(),
+            Default::default(),
+        )
+        .unwrap();
+        assert_eq!(disabled.small_object_threshold_bytes, 0);
         let file = WorkerConfigPatch::from_toml(
             "small_object_threshold_bytes = 131072\nsmall_object_segment_bytes = 4194304",
         )
@@ -2643,6 +2712,11 @@ mod tests {
         assert_eq!(disabled.small_object_threshold_bytes, 0);
         assert_eq!(disabled.small_object_segment_bytes, 8388608);
         for patch in [
+            WorkerConfigPatch {
+                block_size: Some(1 << 20),
+                capacity_bytes: Some(128 << 20),
+                ..Default::default()
+            },
             WorkerConfigPatch {
                 small_object_threshold_bytes: Some(131072),
                 small_object_segment_bytes: Some(131072),

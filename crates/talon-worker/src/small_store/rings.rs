@@ -13,6 +13,10 @@ pub struct SmallObjectStore {
     journal: Arc<journal::Journal>,
     allocation_unit: u64,
     pub(super) access_checkpoint: tokio::sync::Mutex<()>,
+    #[cfg(test)]
+    pub(super) access_pause: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+    pub(super) access_dirty: Arc<super::access::DirtyQueue>,
+    pub(super) access_disk: Mutex<super::access::DiskState>,
     pub(super) access_bytes: std::sync::atomic::AtomicU64,
     streams: RwLock<BTreeMap<usize, Stream>>,
     policy: std::sync::OnceLock<Arc<Lru>>,
@@ -66,11 +70,7 @@ impl SmallObjectStore {
             streams.insert(slot, Arc::new(OnceCell::new_with(Some(Arc::new(stream)))));
         }
         let fallback = streams[&0].get().unwrap().clone();
-        let access_bytes = match std::fs::metadata(root.join(super::access::FILE)) {
-            Ok(m) => m.blocks() * 512,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => 0,
-            Err(e) => return Err(e),
-        };
+        let access_bytes = super::access::allocated(&root)?;
         let allocation_unit = crate::capacity::filesystem_stats(&root)
             .map_err(io::Error::other)?
             .f_frsize
@@ -81,6 +81,10 @@ impl SmallObjectStore {
         Ok(Self {
             allocation_unit,
             access_checkpoint: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            access_pause: Mutex::default(),
+            access_dirty: Arc::default(),
+            access_disk: Mutex::default(),
             access_bytes: std::sync::atomic::AtomicU64::new(access_bytes),
             root,
             fallback,

@@ -415,6 +415,20 @@ dedup (a correctness requirement — per-shard dedup would refetch the same
   there is no full-cache minimum search for each victim or stale-node backlog.
   Capacity is per-worker, with support for multiple cache dirs each with its own
   cap.
+- **Packed-object idle metadata:** TTI reads coalesce dirty resident keys in
+  memory. Periodic flushes append full-key access deltas; a size-triggered base
+  snapshot bounds replay, with a full-checkpoint fallback on queue overflow or
+  I/O failure. Access metadata is advisory and separate from the residency
+  journal: incomplete append tails retain the valid prefix, while corruption
+  starts fresh idle windows without invalidating payloads. See the
+  [small-object store design](docs/explanation/small-object-store.md).
+- **Paged idle metadata:** each of 256 shards keeps an access snapshot and a
+  fixed append-only journal. Flushes sample dirty blocks and encode only dirty
+  page timestamps; structural changes replace a block's ages, and retired blocks
+  emit bounded deletion records. Startup, repair, queue overflow and size-triggered
+  compaction rebuild a shard baseline. Missing or corrupt ages remain eligible
+  for TTI reclamation, preserving the existing paged policy. Whole-block eviction
+  is unchanged. See [page TTI](docs/explanation/page-tti.md).
 - **Chunking:** the logical addressing unit is a fixed **256MB block**. Placement,
   the coordinator inventory, `etag/version`, and the cache key all operate at
   block granularity. The cache key includes

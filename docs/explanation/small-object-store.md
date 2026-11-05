@@ -17,17 +17,17 @@ See [the shared cache journal contract](cache-journal.md) for the catalog bounda
 ## Configuration and routing
 
 ```toml
-small_object_threshold_bytes = 0
+small_object_threshold_bytes = 1048576
 small_object_segment_bytes = 67108864
 ```
 
 The equivalent environment variables are
 `TALON_WORKER_SMALL_OBJECT_THRESHOLD_BYTES` and
-`TALON_WORKER_SMALL_OBJECT_SEGMENT_BYTES`. The engine is disabled by default
-(threshold zero). To enable it for a new cache directory, set the threshold
-explicitly, for example to `1048576` for objects smaller than 1 MiB. Segment size
-defaults to 64 MiB. An enabled engine requires capacity for four segments, and the LOAD
-payload budget must accommodate an entire eligible object.
+`TALON_WORKER_SMALL_OBJECT_SEGMENT_BYTES`. The engine is enabled by default for
+objects smaller than 1 MiB; exactly 1 MiB retains ordinary storage. Set the
+threshold to `0` to disable it. Segment size defaults to 64 MiB. An enabled
+engine requires capacity for four segments (256 MiB with the default segment
+size), and the LOAD payload budget must accommodate an entire eligible object.
 
 An eligible object has positive total size strictly below the threshold and
 fits in a short first block. Empty objects and full blocks retain existing
@@ -53,33 +53,69 @@ without a second residency entry. The locator carries the shared access token;
 relocation preserves that token and recovery reconstructs policy from locators.
 `GetCachedRange` remains an ordinary whole/paged-store operation: an object
 resident only in small storage returns `CacheMiss`, without origin access.
-Packed keys do not participate in cross-version supersession. Page TTI applies to the whole small object using its
-shared access timestamp. With TTI enabled, `small/access.checkpoint` stores a
-checksummed snapshot of exact versioned identities and anchored Unix-millisecond
-access times for every ring. The existing access-checkpoint interval controls
-periodic writes, and graceful shutdown flushes a final snapshot. TTI can be
-enabled for small-object storage even when paged L2 is disabled. Publication uses
-temporary-file sync, rename, and directory sync; hits only update memory.
-Recovery applies ages only to objects within recovered durable segment prefixes,
-including objects relocated since the snapshot. Downtime counts toward idle age.
-A crash can lose access updates since the last successful checkpoint, so expiry
-is approximate. Missing or corrupt snapshots grant a fresh idle interval (with
-corruption logged), and future timestamps are clamped to startup time after a
-clock rollback. This file is advisory and never establishes residency. Ordinary
-whole-block admissions preserve existing paged residency during an active fill.
-Admissions that would put the same identity in both small and ordinary storage
-are rejected under the block mutation gate.
+Packed keys do not participate in cross-version supersession. Page TTI applies
+to the whole small object using its shared access timestamp, including when
+paged L2 is disabled. With TTI enabled, reads update memory and coalesce dirty
+notifications per resident token. Tokens share the store's encoded key and do
+not pin payloads. The existing access-checkpoint interval flushes only dirty
+keys to `small/access.log`; graceful shutdown performs the same flush. A clean
+cycle does not traverse the resident index or write either access file.
+
+`small/access.checkpoint` is a full base snapshot. The first flush, migration
+from `TLSA0001`, or a log reaching `max(1 MiB, base snapshot size / 2)` rebuilds it
+from current residents. This remains O(N) CPU, memory and sequential writes,
+but is removed from the normal periodic flush. Recovery also requests a base
+checkpoint when a resident key has no saved age, or an age needed clock repair,
+so repeated restarts do not keep granting that key a fresh idle window.
+Deleted identities disappear
+at compaction; until then recovery ignores them. Each delta contains the full
+encoded cache-unit key and a Unix-millisecond access time, with length and checksum
+framing (20 bytes plus the encoded key). There is no persistent item-ID map.
+
+The pending queue is capped at 262,144 tokens and an estimated 64 MiB of retained
+metadata; overflow requests a full checkpoint. It is keyed by token identity,
+so a late reader cannot replace a new admission's notification for the same key.
+A flush resets markers before sampling. Concurrent hits remain pending, and
+write failures request a full retry from live clocks. Consequently, high-cardinality
+traffic, overflow or repeated I/O failure can still incur full checkpoint cost.
+A flush can hold one detached pending batch and the next collecting batch.
+
+Snapshot publication uses temporary-file sync, rename and directory sync, then
+publishes an empty log for the same generation. A crash between these steps
+leaves a valid new snapshot and an old-generation log, which recovery ignores.
+Normal appends use one file sync per batch and share the background disk budget;
+accepted flushes finish even if their caller is cancelled. The format uses
+`TLSA0002` for snapshots and `TLSL0001` for logs. Older readers reject the new
+advisory snapshot and start fresh idle windows; they cannot consume its deltas.
+
+Recovery validates the base and log before applying ages, only to objects
+within recovered durable segment prefixes, including relocated objects. A torn
+final log frame retains the valid prefix and requests compaction before the
+next append. Checksum/format corruption grants fresh idle intervals with a
+warning; access metadata never establishes residency or makes payload recovery
+fail. Future timestamps are clamped to startup time after clock rollback.
+Downtime counts toward idle age, and a crash can lose unflushed accesses, so
+expiry remains approximate. Ordinary whole admissions preserve paged residency during active fills;
+conflicting small and ordinary admissions are rejected under the block gate.
 
 Each namespace and credential scope owns its own store under its existing cache
 root. `small-routing.json` binds the routing format and small-object threshold
 to that root. A changed threshold (including enabling or disabling small storage),
-malformed marker, or an existing cache without the marker fails startup with an
-instruction to use a new empty cache directory. The worker neither migrates nor
-deletes incompatible data automatically. This prevents read-time probing for
+malformed marker, or an existing cache without the marker is incompatible.
+By default, `reset_incompatible_cache = true` clears the active Worker's cached
+data and metadata, preserves its Worker ID, and retries startup once. The
+identity remains durable throughout cleanup, including interrupted resets.
+An explicit `node_id` that differs from the persisted identity aborts startup
+without deleting data; an operator must resolve the mismatch. Invalid identities
+and cluster mismatches also require operator intervention.
+Set reset to `false` to reject incompatible cache state without deleting it.
+When upgrading from the disabled default, explicitly
+set `small_object_threshold_bytes = 0` to retain the previous routing and avoid
+a reset caused by the new threshold. This prevents read-time probing for
 historical routing choices. Do not run two owners against the same cache root;
 use a fresh cache directory when rolling back to a binary with older routing.
 Legacy `MANIFEST`, `ring-*`, and per-segment index/data layouts are also
-rejected; journal format changes require a new empty cache directory.
+rejected and follow the same reset policy.
 
 ## Exact range reads
 
@@ -115,8 +151,9 @@ Only identical coordinates and version hit: a shorter overlapping request must
 fetch again. Concurrent identical misses coalesce and use the source version
 precondition. Short origin responses are rejected before publication.
 
-Exact ranges share small-store capacity, reclamation, access snapshots, recovery,
-and eviction. Hits retain segment descriptors for sendfile/splice. Existing
+Exact ranges share small-store capacity, reclamation, access snapshots and delta
+logs, recovery, and eviction. Access records preserve the distinction between
+whole objects and exact ranges. Hits retain segment descriptors for sendfile/splice. Existing
 ordinary-key encodings are unchanged; exact keys reserve the high bit of the
 backend tag. Older workers reject the new wire operations, and older binaries
 cannot recover a cache containing these keys. Use a fresh cache root when
@@ -127,6 +164,7 @@ rolling back after admitting exact ranges.
 ```text
 small/
   access.checkpoint
+  access.log
   metadata/
     CURRENT
     snapshot.00000000000000000042
@@ -319,8 +357,8 @@ worker's configured background byte, I/O and
 delete budgets after background initialization. Foreground log writes and
 commit fsyncs do not consume that background budget. Checkpoint publication
 failure stops that metadata stream rather than proceeding with uncertain
-recovery state; other streams remain independently usable. The TTI `access.checkpoint` remains a separate advisory snapshot and never
-establishes object residency.
+recovery state; other streams remain independently usable. The TTI snapshot and access log remain separate advisory metadata and never
+establish object residency.
 
 ## Reclamation and capacity
 

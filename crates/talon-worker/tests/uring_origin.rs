@@ -824,6 +824,7 @@ fn uring_https_load_whole_paged_namespace_and_recovery() {
         for page_size in [0, 4] {
             let root = tempfile::tempdir().unwrap();
             let config = WorkerConfig {
+                small_object_threshold_bytes: 0,
                 block_size: 8,
                 capacity_bytes: 1024 * 1024,
                 l1_capacity_bytes: 0,
@@ -1001,6 +1002,7 @@ fn wire_load_and_read_run_without_tokio_scheduler_or_blocking_pool() {
         ));
         let root = tempfile::tempdir().unwrap();
         let config = WorkerConfig {
+            small_object_threshold_bytes: 0,
             block_size: 8,
             capacity_bytes: 1024 * 1024,
             l1_capacity_bytes: l1_capacity,
@@ -1219,6 +1221,7 @@ fn aligned_http_bodies_and_paged_commits_preserve_payload() {
                 for (page_size, l1_capacity) in [(0, 0), (0, 65536), (4096, 0), (4096, 65536)] {
                     let root = tempfile::tempdir().unwrap();
                     let config = WorkerConfig {
+                        small_object_threshold_bytes: 0,
                         block_size: 16384,
                         capacity_bytes: 131072,
                         l1_capacity_bytes: l1_capacity,

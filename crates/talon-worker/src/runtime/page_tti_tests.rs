@@ -211,7 +211,10 @@ async fn access_only_checkpoint_failure_retries_without_structural_changes() {
         assert_eq!(state.dirty_since(), Some(10100));
     }
     let dir = r.paged.as_ref().unwrap().dir_for(&id());
-    let path = dir.parent().unwrap().join("access.shard");
+    let path = dir
+        .parent()
+        .unwrap()
+        .join(crate::page_access_shard::LOG_NAME);
     std::fs::remove_file(&path).unwrap();
     std::fs::create_dir(&path).unwrap();
     assert_eq!(r.checkpoint_access_times().await.failures, 1);
@@ -1182,6 +1185,7 @@ fn orphan_cleanup_recovers_sigkill_at_checkpoint_boundaries() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // Prove dirty flush never locks a cold sibling.
 async fn shard_checkpoint_preserves_clean_blocks_migrates_legacy_and_drops_deleted_records() {
     use crate::page_access_store::{AccessSnapshot, PageAccessStore};
     let root = tempfile::tempdir().unwrap();
@@ -1237,7 +1241,11 @@ async fn shard_checkpoint_preserves_clean_blocks_migrates_legacy_and_drops_delet
         .acquire(PageIndex(0))
         .unwrap()
         .record_access(10010);
-    assert_eq!(r.checkpoint_access_times().await.blocks, 2);
+    let cold = r.page_lifecycle.get(&b).unwrap();
+    let held = cold.inner.lock().unwrap();
+    let report = tokio::time::timeout(Duration::from_secs(1), r.checkpoint_access_times()).await;
+    drop(held);
+    assert_eq!(report.expect("dirty flush must skip cold blocks").blocks, 1);
     let dir = r.paged.as_ref().unwrap().dir_for(&a);
     let load = || {
         crate::page_access_shard::load(
@@ -1531,4 +1539,44 @@ fn maintenance_rate_waits_release_blocking_threads_and_survive_caller_cancellati
                 }
             }
         });
+}
+
+/// Metadata only: no payload files, origin traffic, or end-to-end throughput claim.
+#[tokio::test]
+#[ignore = "manual million-page access journal probe"]
+async fn page_access_journal_scale() {
+    let root = tempfile::tempdir().unwrap();
+    let r = runtime(root.path(), false, 0, 1000);
+    r.page_clock.set(10000);
+    let mut blocks = Vec::new();
+    for b in 0..1000 {
+        let id = BlockId::new(object(), b * 16000, 16000, Version::new("v1"));
+        std::fs::create_dir_all(r.paged.as_ref().unwrap().dir_for(&id).parent().unwrap()).unwrap();
+        let block = r.page_lifecycle.block(&id);
+        for page in 0..1000 {
+            block.register(PageIndex(page), Some(10000), 10000, true);
+        }
+        blocks.push(block);
+    }
+    let started = Instant::now();
+    let base = r.checkpoint_access_times().await;
+    let base_ms = started.elapsed().as_millis();
+    assert_eq!(base.failures, 0);
+    assert_eq!(base.blocks, 1000);
+    r.page_clock.set(10100);
+    for block in blocks.iter().take(10) {
+        for page in 0..1000 {
+            block.acquire(PageIndex(page)).unwrap().record_access(10100);
+        }
+    }
+    let started = Instant::now();
+    let delta = r.checkpoint_access_times().await;
+    let delta_ms = started.elapsed().as_millis();
+    assert_eq!(delta.failures, 0);
+    assert_eq!(delta.blocks, 10);
+    assert!(delta.bytes < base.bytes / 50);
+    let clean = r.checkpoint_access_times().await;
+    assert_eq!(clean.bytes, 0);
+    assert_eq!(clean.blocks, 0);
+    println!("pages=1000000 dirty_pages=10000 dirty_blocks=10 base_bytes={} delta_bytes={} base_ms={base_ms} delta_ms={delta_ms}", base.bytes, delta.bytes);
 }
