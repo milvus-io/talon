@@ -108,8 +108,7 @@ impl SmallObjectStore {
     ) -> io::Result<BTreeMap<usize, SegmentStore>> {
         let mut counts = BTreeMap::<usize, usize>::new();
         for meta in model.segments.values().filter(|meta| meta.durable_end > 0) {
-            *counts.entry(meta.slot).or_default() +=
-                meta.records.len() - meta.records.range(meta.durable_end..).count();
+            *counts.entry(meta.slot).or_default() += meta.records.before(meta.durable_end).count();
         }
         // Only borrow key bytes already retained by the model. Hashes speed up
         // sorting; comparing full bytes on collisions keeps validation exact.
@@ -818,7 +817,7 @@ mod tests {
     }
 }
 
-fn validate_recovered_keys(keys: &mut [(u64, &BlockKey)]) -> io::Result<()> {
+fn validate_recovered_keys(keys: &mut [(u64, crate::block_key::BlockRef<'_>)]) -> io::Result<()> {
     fn parts(key: crate::block_key::BlockRef<'_>) -> (&str, &str, &str, u64, u32, &str) {
         (
             key.object.backend.prefix(),
@@ -829,10 +828,7 @@ fn validate_recovered_keys(keys: &mut [(u64, &BlockKey)]) -> io::Result<()> {
             key.version,
         )
     }
-    keys.sort_unstable_by(|a, b| {
-        a.0.cmp(&b.0)
-            .then_with(|| parts(a.1.view()).cmp(&parts(b.1.view())))
-    });
+    keys.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| parts(a.1).cmp(&parts(b.1))));
     if keys.windows(2).any(|pair| pair[0].1 == pair[1].1) {
         return Err(invalid("duplicate recovered object"));
     }
@@ -861,9 +857,9 @@ mod recovery_tests {
         let a = BlockKey::new(&id(1));
         let b = BlockKey::new(&id(2));
         let same = BlockKey::new(&id(1));
-        let mut distinct = [(0, &b), (0, &a)];
+        let mut distinct = [(0, b.view()), (0, a.view())];
         validate_recovered_keys(&mut distinct).unwrap();
-        let mut duplicate = [(0, &a), (0, &b), (0, &same)];
+        let mut duplicate = [(0, a.view()), (0, b.view()), (0, same.view())];
         assert!(validate_recovered_keys(&mut duplicate).is_err());
     }
 

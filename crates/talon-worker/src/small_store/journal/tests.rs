@@ -4,7 +4,7 @@ use std::time::Duration;
 use talon_core::{Backend, BlockId, ObjectId, Version, WorkerConfig};
 
 #[tokio::test]
-async fn identity_is_shared_by_live_and_recovered_journal_locator_and_policy() {
+async fn compact_journal_preserves_live_and_recovered_identity() {
     use crate::block_key::BlockIdentity;
     use crate::{small_store::SmallObjectStore, Lru};
     let dir = tempfile::tempdir().unwrap();
@@ -39,8 +39,8 @@ async fn identity_is_shared_by_live_and_recovered_journal_locator_and_policy() {
                     .flat_map(|s| s.records.values())
                     .next()
                     .unwrap()
-                    .key
-                    .clone())
+                    .to_owned()
+                    .key)
             })
             .unwrap();
         let locator_key = stream
@@ -51,8 +51,8 @@ async fn identity_is_shared_by_live_and_recovered_journal_locator_and_policy() {
             .unwrap()
             .0
             .clone();
-        assert!(journal_key.ptr_eq(&locator_key));
-        assert!(journal_key.ptr_eq(&policy.shared_identity(&block)));
+        assert_eq!(journal_key, locator_key);
+        assert_eq!(journal_key, policy.shared_identity(&block));
         assert_eq!(
             store.read(&block).await.unwrap().unwrap(),
             Bytes::from_static(b"shared")

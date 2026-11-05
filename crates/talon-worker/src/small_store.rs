@@ -10,6 +10,7 @@ mod disk_io;
 mod flush;
 mod format;
 mod journal;
+mod records;
 mod rings;
 pub use rings::SmallObjectStore;
 #[cfg(test)]
@@ -1088,7 +1089,7 @@ impl SegmentStore {
         &mut self,
         id: u64,
         meta: &'a journal::SegmentMeta,
-        keys: &mut Vec<(u64, &'a BlockKey)>,
+        keys: &mut Vec<(u64, crate::block_key::BlockRef<'a>)>,
     ) -> io::Result<()> {
         let file = OpenOptions::new()
             .read(true)
@@ -1106,24 +1107,24 @@ impl SegmentStore {
         let allocated = metadata.blocks() * 512;
         let records = meta
             .records
-            .range(..meta.durable_end)
-            .map(|(&offset, record)| (offset, record.key.clone()))
+            .before(meta.durable_end)
+            .map(|(offset, record)| (offset, BlockKey::new(&record.key)))
             .collect();
         let mut live = 0;
         let mut live_payload = 0;
-        for (&offset, record) in meta.records.range(..meta.durable_end) {
+        for (offset, record) in meta.records.before(meta.durable_end) {
             live += charge(&record.key, record.len);
             live_payload += record.len;
             use std::hash::{Hash, Hasher};
             let mut hash = xxhash_rust::xxh3::Xxh3::new();
             record.key.hash(&mut hash);
-            keys.push((hash.finish(), &record.key));
+            keys.push((hash.finish(), record.key));
             if self
                 .entries
                 .write()
                 .unwrap()
                 .insert(
-                    record.key.clone(),
+                    BlockKey::new(&record.key),
                     Location {
                         file: file.clone(),
                         segment: id,
