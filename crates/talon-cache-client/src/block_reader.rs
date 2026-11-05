@@ -43,6 +43,7 @@ impl From<BlockReadError> for DetailedBlockReadError {
 enum OriginReadMode {
     Current,
     ExactVersion(u64),
+    ExactRange(u64),
 }
 
 /// Errors from a block read.
@@ -361,6 +362,43 @@ impl BlockReader {
         .await
     }
 
+    /// Send an exact-read RPC using `block` for placement and source identity.
+    /// Small objects use ordinary block keys; larger objects use the exact range as the key.
+    pub async fn read_exact_block_into(
+        &self,
+        block: &BlockId,
+        offset_in_block: u32,
+        dst: &mut [u8],
+        object_len: u64,
+        namespace: &talon_core::NamespaceId,
+    ) -> Result<usize, BlockReadError> {
+        if dst.len() as u64 > talon_core::MAX_EXACT_READ_LEN
+            || block
+                .offset
+                .checked_add(u64::from(offset_in_block))
+                .and_then(|offset| offset.checked_add(dst.len() as u64))
+                .map_or(true, |end| end > object_len)
+            || block.version.0.trim().is_empty()
+        {
+            return Err(WorkerError::from(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid exact read range or version",
+            ))
+            .into());
+        }
+        if dst.is_empty() {
+            return Ok(0);
+        }
+        self.read_block_into_with_mode(
+            block,
+            offset_in_block,
+            dst,
+            OriginReadMode::ExactRange(object_len),
+            namespace,
+        )
+        .await
+    }
+
     async fn read_block_into_with_mode(
         &self,
         block: &BlockId,
@@ -389,6 +427,17 @@ impl BlockReader {
             let result = match mode {
                 OriginReadMode::Current => {
                     worker.fetch_range_into(&block.object, offset, dst).await
+                }
+                OriginReadMode::ExactRange(object_len) => {
+                    worker
+                        .fetch_exact_range_into(
+                            &block.object,
+                            &block.version,
+                            offset,
+                            dst,
+                            object_len,
+                        )
+                        .await
                 }
                 OriginReadMode::ExactVersion(object_len) => {
                     worker
@@ -466,6 +515,9 @@ impl BlockReader {
                     worker
                         .fetch_range(&block.object, offset, u64::from(len))
                         .await
+                }
+                OriginReadMode::ExactRange(_) => {
+                    unreachable!("exact ranges use the buffer read path")
                 }
                 OriginReadMode::ExactVersion(object_len) => {
                     worker

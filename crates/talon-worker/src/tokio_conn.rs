@@ -61,8 +61,12 @@ fn decode_range_with_namespace(
             let (frame, scoped) = data::decode_namespace_request(&full)?;
             Ok((frame, scoped.request, None, scoped.namespace))
         }
-        MsgType::GetVersionedRange => {
-            let (frame, versioned) = data::decode_versioned_request(&full)?;
+        MsgType::GetVersionedRange | MsgType::GetExactRange => {
+            let (frame, versioned) = if header.msg_type == MsgType::GetExactRange {
+                data::decode_exact_request(&full)?
+            } else {
+                data::decode_versioned_request(&full)?
+            };
             Ok((
                 frame,
                 versioned.request,
@@ -70,8 +74,12 @@ fn decode_range_with_namespace(
                 NamespaceId::Unattributed,
             ))
         }
-        MsgType::GetVersionedRangeNamespace => {
-            let (frame, scoped) = data::decode_versioned_namespace_request(&full)?;
+        MsgType::GetVersionedRangeNamespace | MsgType::GetExactRangeNamespace => {
+            let (frame, scoped) = if header.msg_type == MsgType::GetExactRangeNamespace {
+                data::decode_exact_namespace_request(&full)?
+            } else {
+                data::decode_versioned_namespace_request(&full)?
+            };
             Ok((
                 frame,
                 scoped.request.request,
@@ -269,6 +277,8 @@ async fn handle_request(
             | MsgType::GetRangeNamespace
             | MsgType::GetVersionedRange
             | MsgType::GetVersionedRangeNamespace
+            | MsgType::GetExactRange
+            | MsgType::GetExactRangeNamespace
     ) {
         let mut err = data::encode_typed_error(
             header.request_id,
@@ -341,6 +351,10 @@ async fn handle_request(
 
     let end = req.offset.checked_add(req.len);
     if end.is_none()
+        || (matches!(
+            h.msg_type,
+            MsgType::GetExactRange | MsgType::GetExactRangeNamespace
+        ) && req.len > talon_core::MAX_EXACT_READ_LEN)
         || expected_version
             .as_ref()
             .map(|(_, size)| *size)
@@ -349,7 +363,7 @@ async fn handle_request(
         let mut err = data::encode_typed_error(
             h.request_id,
             DataErrorCode::InvalidRequest,
-            "range overflows u64 or exceeds supplied object length",
+            "range exceeds the object size, u64 bounds, or the 1 MiB exact-read limit",
         );
         err[2] = response_version;
         talon_telemetry::outcome("error");
@@ -401,6 +415,14 @@ async fn handle_request(
     }
 
     let outcome = match expected_version.as_ref() {
+        Some((version, size))
+            if matches!(
+                h.msg_type,
+                MsgType::GetExactRange | MsgType::GetExactRangeNamespace
+            ) =>
+        {
+            worker.serve_exact(&req, version, *size).await
+        }
         Some((version, size)) => worker.serve_versioned(&req, version, *size).await,
         None => worker.serve(&req).await,
     };

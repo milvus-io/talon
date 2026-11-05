@@ -2,6 +2,7 @@
 //! Slot zero serves non-ring callers. Native ring N owns slot N+1. Every
 //! stream shares a metadata writer and globally unique sharded payload paths.
 use super::*;
+use crate::block_key::BlockIdentity;
 use crate::miss::{InFlightGuard, InFlightLoads, LoadKey};
 use tokio::sync::OnceCell;
 
@@ -190,12 +191,16 @@ impl SmallObjectStore {
         .cloned()
     }
 
-    fn owner(&self, id: &BlockId) -> Option<Arc<SegmentStore>> {
+    fn owner(&self, id: &(impl SmallStoreKey + ?Sized)) -> Option<Arc<SegmentStore>> {
         self.streams().into_iter().find(|s| s.contains(id))
     }
 
-    async fn mutation(&self, id: &BlockId) -> InFlightGuard {
-        let key = LoadKey::Whole(id.clone());
+    async fn mutation(&self, id: &(impl SmallStoreKey + ?Sized)) -> InFlightGuard {
+        let key = if id.exact_range() {
+            LoadKey::ExactRange(id.block().clone())
+        } else {
+            LoadKey::Whole(id.block().clone())
+        };
         loop {
             if let Some(guard) = self.mutations.admit_owned(key.clone()) {
                 return guard;
@@ -208,18 +213,21 @@ impl SmallObjectStore {
         self.journal.set_budget(budget);
     }
 
-    pub fn accepts(&self, id: &BlockId, len: u64) -> bool {
+    pub fn accepts(&self, id: &(impl SmallStoreKey + ?Sized), len: u64) -> bool {
         self.fallback.accepts(id, len)
     }
-    pub fn contains(&self, id: &BlockId) -> bool {
+    pub fn contains(&self, id: &(impl SmallStoreKey + ?Sized)) -> bool {
         self.lookup_entry(id).ok().flatten().is_some()
     }
 
     /// Resolve residency and physical placement in one directory lookup per
     /// stream. Encode once and borrow the stream registry without allocating a
     /// temporary Vec. The worker validates routing compatibility at startup.
-    pub(crate) fn lookup_entry(&self, id: &BlockId) -> io::Result<Option<Location>> {
-        if id.offset != 0 {
+    pub(crate) fn lookup_entry(
+        &self,
+        id: &(impl SmallStoreKey + ?Sized),
+    ) -> io::Result<Option<Location>> {
+        if !id.exact_range() && id.block().offset != 0 {
             return Ok(None);
         }
         let key = format::key(id)?;
@@ -237,8 +245,11 @@ impl SmallObjectStore {
         Ok(None)
     }
 
-    pub(crate) async fn lookup(&self, id: &BlockId) -> io::Result<Option<ReadLocation>> {
-        if id.offset != 0 {
+    pub(crate) async fn lookup(
+        &self,
+        id: &(impl SmallStoreKey + ?Sized),
+    ) -> io::Result<Option<ReadLocation>> {
+        if !id.exact_range() && id.block().offset != 0 {
             return Ok(None);
         }
         for stream in self.streams() {
@@ -249,14 +260,14 @@ impl SmallObjectStore {
         Ok(None)
     }
 
-    pub async fn get(&self, id: &BlockId) -> io::Result<Option<BlockHandle>> {
+    pub async fn get(&self, id: &(impl SmallStoreKey + ?Sized)) -> io::Result<Option<BlockHandle>> {
         self.lookup(id)
             .await?
             .map(|loc| loc.range(0, loc.len()))
             .transpose()
     }
 
-    pub async fn read(&self, id: &BlockId) -> io::Result<Option<Bytes>> {
+    pub async fn read(&self, id: &(impl SmallStoreKey + ?Sized)) -> io::Result<Option<Bytes>> {
         if let Some(loc) = self.lookup(id).await? {
             loc.touch();
             return Ok(Some(loc.read().await?));
@@ -264,11 +275,15 @@ impl SmallObjectStore {
         Ok(None)
     }
 
-    pub async fn put(self: &Arc<Self>, id: &BlockId, value: Bytes) -> io::Result<u64> {
+    pub async fn put(
+        self: &Arc<Self>,
+        id: &(impl SmallStoreKey + ?Sized),
+        value: Bytes,
+    ) -> io::Result<u64> {
         // Capture before an owned task can run on a different Tokio thread.
         let slot = talon_uring::ring_id().map_or(0, |id| id + 1);
         let store = self.clone();
-        let id = id.clone();
+        let id = id.cache_unit();
         self.tasks
             .run(async move {
                 let _guard = store.mutation(&id).await;
@@ -285,9 +300,9 @@ impl SmallObjectStore {
             .await
     }
 
-    pub async fn delete(self: &Arc<Self>, id: &BlockId) -> io::Result<()> {
+    pub async fn delete(self: &Arc<Self>, id: &(impl SmallStoreKey + ?Sized)) -> io::Result<()> {
         let store = self.clone();
-        let id = id.clone();
+        let id = id.cache_unit();
         self.tasks
             .run(async move {
                 let _guard = store.mutation(&id).await;
@@ -317,9 +332,16 @@ impl SmallObjectStore {
     /// Startup only. Attach access tokens to locators and contribute units to
     /// the shared bulk policy construction without registering in BlockIndex.
     pub(crate) fn restore_policy_units(&self, units: &mut Vec<crate::eviction::RecoveredUnit>) {
+        let shared_access = units
+            .iter()
+            .filter(|unit| {
+                u64::from(unit.unit.block.view().block_size) <= talon_core::MAX_EXACT_READ_LEN
+            })
+            .map(|unit| (unit.unit.block.materialize(), unit.access.clone()))
+            .collect();
         for stream in self.streams() {
             stream
-                .restore_policy_units(units)
+                .restore_policy_units(units, &shared_access)
                 .expect("validated small object identity");
         }
     }
@@ -362,7 +384,7 @@ impl SmallObjectStore {
     }
 
     #[cfg(test)]
-    pub(crate) fn access(&self, id: &BlockId) -> Option<AccessHandle> {
+    pub(crate) fn access(&self, id: &(impl SmallStoreKey + ?Sized)) -> Option<AccessHandle> {
         self.lookup_entry(id).ok().flatten()?.access
     }
 
@@ -863,6 +885,55 @@ mod recovery_tests {
             .to_string()
             .contains("length"));
         assert_eq!(std::fs::read(orphan).unwrap(), b"retain");
+    }
+
+    #[tokio::test]
+    async fn recovered_exact_policy_preserves_pins_and_versions_with_optional_block_tracking() {
+        for tracking in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut block = id(0);
+            block.block_size = 4096;
+            let exact = CacheUnit::ExactRange(block.clone());
+            let page = CacheUnit::Page(block.clone(), talon_core::PageIndex(0));
+            let store = Arc::new(open(dir.path()).unwrap());
+            store.put(&exact, Bytes::from(vec![1; 4096])).await.unwrap();
+            store.maintain(true).await.unwrap();
+            drop(store);
+
+            let store = Arc::new(open(dir.path()).unwrap());
+            let index = Arc::new(crate::BlockIndex::new());
+            index.init_paged(block.clone(), 4096, 4096);
+            index.mark_page_allocated(&block, talon_core::PageIndex(0), 4096);
+            let mut units = index.restore_policy_units(tracking);
+            store.restore_policy_units(&mut units);
+            let policy = Arc::new(crate::Lru::from_recovered(
+                index.clone(),
+                units,
+                1,
+                tracking,
+                tracking,
+            ));
+            store.bind_policy(policy.clone());
+            store.enable_access_tracking().unwrap();
+            let access = store.access(&exact).unwrap();
+            access.restore(1);
+            assert_eq!(access.last_access(), 1);
+            assert_eq!(policy.len(), 2);
+            assert_eq!(index.page_count(), 1);
+            assert_eq!(index.resident_bytes(), 4096);
+
+            let pin = policy.pin_guard(exact.clone());
+            let mut newer = block.clone();
+            newer.version = Version::new("v2");
+            assert_eq!(policy.evict_superseded(&newer), [page]);
+            assert!(policy.superseded_candidates(&newer).is_empty());
+            assert!(policy.evict_to_fit(0).is_empty());
+            assert_eq!(policy.len(), 1);
+            drop(pin);
+            assert_eq!(policy.evict_to_fit(0), [exact]);
+            assert_eq!(policy.total_bytes(), 0);
+            assert!(policy.block_candidates(&block).is_empty());
+        }
     }
 
     #[tokio::test]

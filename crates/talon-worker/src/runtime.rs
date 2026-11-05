@@ -645,6 +645,124 @@ impl WorkerRuntime {
         self.serve_at(request, version, Some(object_len)).await
     }
 
+    /// Require packed storage, using ordinary reads for objects smaller than 1 MiB.
+    /// Larger objects cache precisely one versioned range without page rounding or L1 admission.
+    pub async fn serve_exact(
+        &self,
+        request: &RangeRequest,
+        version: &Version,
+        object_len: u64,
+    ) -> anyhow::Result<ServeOutcome> {
+        self.ensure_configured_object(&request.object)?;
+        anyhow::ensure!(
+            request.len <= talon_core::MAX_EXACT_READ_LEN,
+            "exact read exceeds 1 MiB"
+        );
+        anyhow::ensure!(
+            !version.0.trim().is_empty(),
+            "exact read requires a source version"
+        );
+        anyhow::ensure!(
+            request
+                .offset
+                .checked_add(request.len)
+                .is_some_and(|end| end <= object_len),
+            "exact read exceeds supplied object length"
+        );
+        let small = self
+            .small
+            .as_ref()
+            .ok_or_else(|| {
+                anyhow::anyhow!("exact reads require small-object storage to be enabled")
+            })?
+            .clone();
+        if request.len == 0 {
+            return Ok(ServeOutcome::Bytes(bytes::Bytes::new()));
+        }
+        if object_len < talon_core::MAX_EXACT_READ_LEN {
+            return self.serve_at(request, version, Some(object_len)).await;
+        }
+        let block = BlockId::new(
+            request.object.clone(),
+            request.offset,
+            request.len as u32,
+            version.clone(),
+        );
+        let unit = CacheUnit::ExactRange(block.clone());
+        if let Some(loc) = small.lookup(&unit).await? {
+            let handle = loc.range(0, request.len)?;
+            self.record_l2_hit();
+            return Ok(ServeOutcome::Sendfile(handle));
+        }
+        let runtime = self.clone();
+        let request = request.clone();
+        self.page_mutations
+            .run(async move {
+                let key = LoadKey::ExactRange(block.clone());
+                loop {
+                    if let Some(loc) = small.lookup(&unit).await? {
+                        let handle = loc.range(0, request.len)?;
+                        runtime.record_l2_hit();
+                        return Ok(ServeOutcome::Sendfile(handle));
+                    }
+                    let (admission, flight) = runtime.inflight.admit_traced(key.clone());
+                    if let Some(_guard) = admission {
+                        // The preceding leader may have published between lookup and admission.
+                        if let Some(loc) = small.lookup(&unit).await? {
+                            let handle = loc.range(0, request.len)?;
+                            runtime.record_l2_hit();
+                            return Ok(ServeOutcome::Sendfile(handle));
+                        }
+                        runtime.metrics.record_cache_miss();
+                        let started = Instant::now();
+                        let fetched = runtime
+                            .backend()?
+                            .fetch_range_if_match(
+                                &request.object,
+                                request.offset,
+                                request.len,
+                                (block.version.as_str() != UNCHECKED_VERSION)
+                                    .then_some(&block.version),
+                            )
+                            .await;
+                        let bytes = match fetched {
+                            Ok(bytes) => {
+                                runtime.metrics.record_backend_fetch_success(
+                                    bytes.len() as u64,
+                                    started.elapsed(),
+                                );
+                                bytes
+                            }
+                            Err(error) => {
+                                runtime
+                                    .metrics
+                                    .record_backend_fetch_error(started.elapsed());
+                                return Err(error.into());
+                            }
+                        };
+                        anyhow::ensure!(
+                            bytes.len() as u64 == request.len,
+                            "short exact range fetch"
+                        );
+                        let state = runtime.page_lifecycle.block(&block);
+                        let gate = state.gate.lock().await;
+                        small.put(&unit, bytes.clone()).await?;
+                        if runtime.page_gc_config.tti_ms > 0 {
+                            small.track_access(&unit)?;
+                        }
+                        let _pin = runtime.lru.pin_guard(unit.clone());
+                        drop(gate);
+                        drop(state);
+                        runtime.page_lifecycle.retire_empty(&block);
+                        runtime.enforce_capacity().await;
+                        return Ok(ServeOutcome::Bytes(bytes));
+                    }
+                    talon_telemetry::wait_for(&flight, runtime.inflight.wait(&key)).await;
+                }
+            })
+            .await
+    }
+
     /// Serve a versioned range only from resident cache state.
     ///
     /// Unlike [`serve`](Self::serve), this path neither resolves metadata nor
@@ -1938,7 +2056,10 @@ impl WorkerRuntime {
     /// Management scans include each store's own residency directory. This is
     /// never a substitute for the locator lookup used by the read path.
     fn contains_block(&self, block: &BlockId) -> bool {
-        self.small.as_ref().is_some_and(|s| s.contains(block)) || self.index.get(block).is_some()
+        self.small
+            .as_ref()
+            .is_some_and(|s| s.contains(block) || s.contains(&CacheUnit::ExactRange(block.clone())))
+            || self.index.get(block).is_some()
     }
 
     async fn cached_small_range(
@@ -2622,7 +2743,10 @@ impl WorkerRuntime {
                 position,
                 candidates
                     .into_iter()
-                    .filter(|c| small.contains(&c.block))
+                    .filter(|c| {
+                        small.contains(&c.block)
+                            || small.contains(&CacheUnit::ExactRange(c.block.clone()))
+                    })
                     .collect::<Vec<_>>(),
             )
         })

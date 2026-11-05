@@ -424,6 +424,12 @@ impl WorkerRuntime {
                     tracing::warn!(block = %id, %error, "stale block unlink failed; retaining accounting");
                     return;
                 }
+                if let Some(small) = &runtime.small {
+                    if let Err(error) = small.delete(&CacheUnit::ExactRange(id.clone())).await {
+                        tracing::warn!(block = %id, %error, "exact range unlink failed");
+                        return;
+                    }
+                }
                 if let Some(paged) = runtime.paged.as_ref().filter(|_| pages > 0) {
                     if let Err(error) = paged.delete_block_async(id).await {
                         runtime.page_gc_metrics.delete_errors.inc();
@@ -478,7 +484,7 @@ impl WorkerRuntime {
         let work =
             futures::stream::iter(candidates.into_iter().map(|(unit, candidate)| async move {
                 let retired = match &unit.unit {
-                    CacheUnit::Page(id, _) | CacheUnit::Whole(id) => id.clone(),
+                    CacheUnit::Page(id, _) | CacheUnit::Whole(id) | CacheUnit::ExactRange(id) => id.clone(),
                 };
                 match unit.unit.clone() {
                     CacheUnit::Page(_, _) => {
@@ -487,6 +493,27 @@ impl WorkerRuntime {
                                 self.evict_page_candidate_to_target(c, reason, target).await;
                             }
                         }
+                    }
+                    CacheUnit::ExactRange(id) => {
+                        let state = self.page_lifecycle.block(&id);
+                        let runtime = self.clone();
+                        self.page_mutations.run(async move {
+                            runtime.background_delete().await;
+                            let _background_io = runtime.background_io().await;
+                            let _gate = state.gate.lock().await;
+                            if reason == 1 && (runtime.capacity_bytes == 0 || runtime.resident_bytes() <= target) {
+                                return;
+                            }
+                            if !runtime.lru.candidate_is_current(&unit) { return; }
+                            if let Some(small) = &runtime.small {
+                                if let Err(error) = small.delete(&unit.unit).await {
+                                    tracing::warn!(block = %id, %error, "exact range unlink failed");
+                                    return;
+                                }
+                            }
+                            runtime.lru.remove(&unit.unit);
+                            runtime.metrics.record_eviction();
+                        }).await;
                     }
                     CacheUnit::Whole(id) => {
                         let state = self.page_lifecycle.block(&id);

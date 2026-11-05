@@ -133,8 +133,7 @@ impl Event {
                 let len = format::u64(&mut b)?;
                 let checksum = format::u64(&mut b)?;
                 let id = format::id(b)?;
-                if len == 0 || len > 128 << 20 || id.offset != 0 || len >= u64::from(id.block_size)
-                {
+                if len > 128 << 20 || !crate::small_store::accepts_object(u64::MAX, &id, len) {
                     return Err(invalid("journal extent"));
                 }
                 let key = Arc::from(b);

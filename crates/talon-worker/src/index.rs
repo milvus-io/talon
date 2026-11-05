@@ -20,7 +20,7 @@ use std::sync::{Arc, RwLock, RwLockReadGuard};
 
 use crate::eviction::{
     AccessHandle, BlockActivity, BlockPolicy, CacheUnit, PolicyEntry, PolicyState, SharedUnit,
-    UnitKey,
+    UnitKey, UnitKind,
 };
 use crate::page_lifecycle::{BlockState, PageEntry, PageReadGuard, PageTable};
 
@@ -59,6 +59,7 @@ struct DirectoryEntry {
 #[derive(Default)]
 struct PolicyUnits {
     whole: Option<Arc<RwLock<UnitSlot>>>,
+    exact: Option<Box<PolicyEntry>>,
     pages: Option<PageTable>,
     len: usize,
 }
@@ -393,30 +394,33 @@ impl BlockIndex {
                 access: slot.access.as_ref()?.clone(),
             })
         };
-        match unit.page() {
-            None => read(&policy.whole.as_ref()?.read().unwrap()),
-            Some(page) => read(&policy.pages.as_ref()?.read().unwrap().get(&page.0)?.unit),
+        match unit.kind() {
+            UnitKind::Whole => read(&policy.whole.as_ref()?.read().unwrap()),
+            UnitKind::ExactRange => policy.exact.as_deref().cloned(),
+            UnitKind::Page(page) => {
+                read(&policy.pages.as_ref()?.read().unwrap().get(&page.0)?.unit)
+            }
         }
     }
 
-    pub(crate) fn policy_units(
-        &self,
-        id: &dyn BlockIdentity,
-    ) -> Vec<(Option<PageIndex>, PolicyState)> {
+    pub(crate) fn policy_units(&self, id: &dyn BlockIdentity) -> Vec<(UnitKind, PolicyState)> {
         let entries = self.entries.read().unwrap();
         let Some(entry) = entries.get(id) else {
             return Vec::new();
         };
         let mut units = Vec::with_capacity(entry.policy.len);
+        if let Some(exact) = &entry.policy.exact {
+            units.push((UnitKind::ExactRange, exact.state));
+        }
         if let Some(whole) = &entry.policy.whole {
             if let Some(policy) = whole.read().unwrap().policy {
-                units.push((None, policy));
+                units.push((UnitKind::Whole, policy));
             }
         }
         if let Some(pages) = &entry.policy.pages {
             for (&page, slot) in pages.read().unwrap().iter() {
                 if let Some(policy) = slot.unit.policy {
-                    units.push((Some(PageIndex(page)), policy));
+                    units.push((UnitKind::Page(PageIndex(page)), policy));
                 }
             }
         }
@@ -443,7 +447,8 @@ impl BlockIndex {
                 .policy
                 .is_some_and(|policy| policy.independent)
         });
-        entry.policy.len > usize::from(independent_whole)
+        entry.policy.len
+            > usize::from(independent_whole) + usize::from(entry.policy.exact.is_some())
     }
 
     pub(crate) fn policy_insert(&self, unit: &SharedUnit, entry: PolicyEntry) -> AccessHandle {
@@ -453,6 +458,12 @@ impl BlockIndex {
         } else {
             entries.get_or_insert(unit.block.clone()).1
         };
+        if unit.kind == UnitKind::ExactRange {
+            let access = entry.access.clone();
+            let fresh = directory.policy.exact.replace(Box::new(entry)).is_none();
+            directory.policy.len += usize::from(fresh);
+            return access;
+        }
         let resident = directory
             .resident
             .as_ref()
@@ -469,15 +480,16 @@ impl BlockIndex {
             slot.access = Some(access.clone());
             (fresh, access)
         };
-        let (fresh, access) = match unit.page() {
-            None => {
+        let (fresh, access) = match unit.kind() {
+            UnitKind::ExactRange => unreachable!(),
+            UnitKind::Whole => {
                 let slot = directory
                     .policy
                     .whole
                     .get_or_insert_with(|| resident.0.unwrap_or_default());
                 put(&mut slot.write().unwrap(), entry.access)
             }
-            Some(page) => {
+            UnitKind::Page(page) => {
                 let pages = directory
                     .policy
                     .pages
@@ -499,13 +511,19 @@ impl BlockIndex {
         unit: &impl crate::eviction::UnitKey,
         update: impl FnOnce(&mut PolicyState) -> T,
     ) -> Option<T> {
+        if unit.kind() == UnitKind::ExactRange {
+            let mut entries = self.entries.write().unwrap();
+            let policy = &mut entries.get_mut(unit.block())?.policy;
+            return Some(update(&mut policy.exact.as_deref_mut()?.state));
+        }
         let entries = self.entries.read().unwrap();
         let policy = &entries.get(unit.block())?.policy;
-        match unit.page() {
-            None => Some(update(
+        match unit.kind() {
+            UnitKind::ExactRange => unreachable!(),
+            UnitKind::Whole => Some(update(
                 policy.whole.as_ref()?.write().unwrap().policy.as_mut()?,
             )),
-            Some(page) => Some(update(
+            UnitKind::Page(page) => Some(update(
                 policy
                     .pages
                     .as_ref()?
@@ -531,9 +549,10 @@ impl BlockIndex {
                 access: slot.access.as_ref().expect("policy access token").clone(),
             })
         };
-        let removed = match unit.page() {
-            None => take(&mut directory.policy.whole.as_ref()?.write().unwrap())?,
-            Some(page) => {
+        let removed = match unit.kind() {
+            UnitKind::ExactRange => *directory.policy.exact.take()?,
+            UnitKind::Whole => take(&mut directory.policy.whole.as_ref()?.write().unwrap())?,
+            UnitKind::Page(page) => {
                 let resident = directory
                     .resident
                     .as_ref()
@@ -811,7 +830,7 @@ impl BlockIndex {
                         independent: false,
                         unit: crate::eviction::SharedUnit {
                             block: entry.meta.id.clone(),
-                            page,
+                            kind: page.map_or(UnitKind::Whole, UnitKind::Page),
                         },
                         bytes: slot.allocated,
                         access,
@@ -942,6 +961,7 @@ impl BlockIndex {
     /// handle. Capacity pinning and byte accounting remain owned by the policy.
     pub(crate) fn set_access(&self, unit: &CacheUnit, access: AccessHandle) {
         let (block, page) = match unit {
+            CacheUnit::ExactRange(_) => return,
             CacheUnit::Whole(block) => (block, None),
             CacheUnit::Page(block, page) => (block, Some(*page)),
         };

@@ -17,17 +17,17 @@ See [the shared cache journal contract](cache-journal.md) for the catalog bounda
 ## Configuration and routing
 
 ```toml
-small_object_threshold_bytes = 0
+small_object_threshold_bytes = 1048576
 small_object_segment_bytes = 67108864
 ```
 
 The equivalent environment variables are
 `TALON_WORKER_SMALL_OBJECT_THRESHOLD_BYTES` and
-`TALON_WORKER_SMALL_OBJECT_SEGMENT_BYTES`. The engine is disabled by default
-(threshold zero). To enable it for a new cache directory, set the threshold
-explicitly, for example to `1048576` for objects smaller than 1 MiB. Segment size
-defaults to 64 MiB. An enabled engine requires capacity for four segments, and the LOAD
-payload budget must accommodate an entire eligible object.
+`TALON_WORKER_SMALL_OBJECT_SEGMENT_BYTES`. The engine is enabled by default for
+objects smaller than 1 MiB; exactly 1 MiB retains ordinary storage. Set the
+threshold to `0` to disable it. Segment size defaults to 64 MiB. An enabled
+engine requires capacity for four segments (256 MiB with the default segment
+size), and the LOAD payload budget must accommodate an entire eligible object.
 
 An eligible object has positive total size strictly below the threshold and
 fits in a short first block. Empty objects and full blocks retain existing
@@ -69,7 +69,7 @@ checkpoint when a resident key has no saved age, or an age needed clock repair,
 so repeated restarts do not keep granting that key a fresh idle window.
 Deleted identities disappear
 at compaction; until then recovery ignores them. Each delta contains the full
-encoded BlockId and a Unix-millisecond access time, with length and checksum
+encoded cache-unit key and a Unix-millisecond access time, with length and checksum
 framing (20 bytes plus the encoded key). There is no persistent item-ID map.
 
 The pending queue is capped at 262,144 tokens and an estimated 64 MiB of retained
@@ -101,13 +101,63 @@ conflicting small and ordinary admissions are rejected under the block gate.
 Each namespace and credential scope owns its own store under its existing cache
 root. `small-routing.json` binds the routing format and small-object threshold
 to that root. A changed threshold (including enabling or disabling small storage),
-malformed marker, or an existing cache without the marker fails startup with an
-instruction to use a new empty cache directory. The worker neither migrates nor
-deletes incompatible data automatically. This prevents read-time probing for
+malformed marker, or an existing cache without the marker is incompatible.
+By default, `reset_incompatible_cache = true` clears the active Worker's cached
+data and metadata, preserves its Worker ID, and retries startup once. The
+identity remains durable throughout cleanup, including interrupted resets.
+An explicit `node_id` that differs from the persisted identity aborts startup
+without deleting data; an operator must resolve the mismatch. Invalid identities
+and cluster mismatches also require operator intervention.
+Set reset to `false` to reject incompatible cache state without deleting it.
+When upgrading from the disabled default, explicitly
+set `small_object_threshold_bytes = 0` to retain the previous routing and avoid
+a reset caused by the new threshold. This prevents read-time probing for
 historical routing choices. Do not run two owners against the same cache root;
 use a fresh cache directory when rolling back to a binary with older routing.
 Legacy `MANIFEST`, `ring-*`, and per-segment index/data layouts are also
-rejected; journal format changes require a new empty cache directory.
+rejected and follow the same reset policy.
+
+## Exact range reads
+
+Rust `Client::read_exact(object, offset, length, known_stat, options)` reads an
+explicit range. Length is at most 1 MiB
+(1,048,576 bytes, inclusive); larger requests and arithmetic overflow fail in
+the client before metadata lookup or a data RPC. Zero length returns empty.
+Ranges beyond the supplied or resolved object size are errors, without EOF
+clamping.
+
+Every nonempty call sends exact-read RPCs. Workers require small storage to be
+enabled regardless of object size; a disabled engine returns `Internal` before
+origin access, with no fallback.
+
+For objects smaller than 1 MiB, placement and block splitting follow ordinary
+READ. After checking the engine, the worker uses ordinary version-pinned cache
+routing, reusing the supplied size and version without another HEAD. A miss may
+fetch the complete object; small-store admission still requires an object below
+its configured threshold and smaller than a block. Otherwise ordinary page or
+whole-block storage handles the read.
+
+For objects of 1 MiB or larger, misses fetch only the requested bytes and a
+range crossing a block boundary remains one request. Exact ranges bypass the
+ordinary object-size admission threshold, whole/page storage, and L1. Their
+record must fit the configured segment, including key metadata. The default
+64 MiB segment accommodates the maximum request. Ordinary READ and LOAD keep
+their existing routing and exclusive threshold semantics.
+
+Placement hashes the original object, version, unaligned offset, and requested
+length. Packed keys additionally distinguish exact ranges from ordinary small
+objects; namespace and credential scopes still select separate cache roots.
+Only identical coordinates and version hit: a shorter overlapping request must
+fetch again. Concurrent identical misses coalesce and use the source version
+precondition. Short origin responses are rejected before publication.
+
+Exact ranges share small-store capacity, reclamation, access snapshots and delta
+logs, recovery, and eviction. Access records preserve the distinction between
+whole objects and exact ranges. Hits retain segment descriptors for sendfile/splice. Existing
+ordinary-key encodings are unchanged; exact keys reserve the high bit of the
+backend tag. Older workers reject the new wire operations, and older binaries
+cannot recover a cache containing these keys. Use a fresh cache root when
+rolling back after admitting exact ranges.
 
 ## Files and identity
 

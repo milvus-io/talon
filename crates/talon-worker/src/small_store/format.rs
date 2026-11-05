@@ -1,16 +1,25 @@
 //! Versioned cache metadata. Payloads are raw bytes in a separate segment file.
+use super::SmallStoreKey;
+use crate::CacheUnit;
 use std::io::{self, Read, Write};
 use talon_core::{Backend, BlockId, ObjectId, Version};
 
 pub(super) const MAX_KEY: usize = 64 * 1024;
 
-pub(super) fn key(id: &BlockId) -> io::Result<Vec<u8>> {
+pub(super) fn key(unit: &(impl SmallStoreKey + ?Sized)) -> io::Result<Vec<u8>> {
+    let id = unit.block();
+    if unit.is_page() {
+        return Err(invalid("page is not a small-store key"));
+    }
+    let tag = if unit.exact_range() { 0x80 } else { 0 };
     let mut out = Vec::new();
-    out.push(match id.object.backend {
-        Backend::S3 => 0,
-        Backend::Gcs => 1,
-        Backend::Azure => 2,
-    });
+    out.push(
+        tag | match id.object.backend {
+            Backend::S3 => 0,
+            Backend::Gcs => 1,
+            Backend::Azure => 2,
+        },
+    );
     out.extend_from_slice(&id.offset.to_le_bytes());
     out.extend_from_slice(&id.block_size.to_le_bytes());
     for s in [&id.object.bucket, &id.object.object_path, &id.version.0] {
@@ -26,10 +35,11 @@ pub(super) fn key(id: &BlockId) -> io::Result<Vec<u8>> {
     Ok(out)
 }
 
-pub(super) fn id(mut bytes: &[u8]) -> io::Result<BlockId> {
+pub(super) fn id(mut bytes: &[u8]) -> io::Result<CacheUnit> {
     let mut backend = [0];
     bytes.read_exact(&mut backend)?;
-    let backend = match backend[0] {
+    let exact = backend[0] & 0x80 != 0;
+    let backend = match backend[0] & 0x7f {
         0 => Backend::S3,
         1 => Backend::Gcs,
         2 => Backend::Azure,
@@ -54,12 +64,17 @@ pub(super) fn id(mut bytes: &[u8]) -> io::Result<BlockId> {
     if !bytes.is_empty() {
         return Err(invalid("small object key trailing bytes"));
     }
-    Ok(BlockId::new(
+    let id = BlockId::new(
         ObjectId::new(backend, bucket, path),
         offset,
         size,
         Version::new(version),
-    ))
+    );
+    Ok(if exact {
+        CacheUnit::ExactRange(id)
+    } else {
+        CacheUnit::Whole(id)
+    })
 }
 
 pub(super) fn frame(file: &mut impl Write, body: &[u8]) -> io::Result<()> {

@@ -29,6 +29,8 @@ pub fn supports_v2(kind: MsgType) -> bool {
             | MsgType::GetCachedRangeNamespace
             | MsgType::GetVersionedRange
             | MsgType::GetVersionedRangeNamespace
+            | MsgType::GetExactRange
+            | MsgType::GetExactRangeNamespace
     )
 }
 

@@ -28,6 +28,46 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 use talon_core::{BlockHandle, BlockId};
 
+/// Borrowed identity accepted by packed storage. Ordinary callers keep using BlockId.
+pub trait SmallStoreKey: Sync {
+    fn block(&self) -> &BlockId;
+    fn exact_range(&self) -> bool;
+    fn is_page(&self) -> bool {
+        false
+    }
+    fn cache_unit(&self) -> CacheUnit {
+        if self.exact_range() {
+            CacheUnit::ExactRange(self.block().clone())
+        } else {
+            CacheUnit::Whole(self.block().clone())
+        }
+    }
+}
+
+impl SmallStoreKey for BlockId {
+    fn block(&self) -> &BlockId {
+        self
+    }
+    fn exact_range(&self) -> bool {
+        false
+    }
+}
+
+impl SmallStoreKey for CacheUnit {
+    fn cache_unit(&self) -> CacheUnit {
+        self.clone()
+    }
+    fn block(&self) -> &BlockId {
+        self.block()
+    }
+    fn exact_range(&self) -> bool {
+        matches!(self, Self::ExactRange(_))
+    }
+    fn is_page(&self) -> bool {
+        matches!(self, Self::Page(..))
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct Location {
     file: Arc<SegmentFile>,
@@ -199,8 +239,23 @@ pub struct SmallStoreStats {
 
 /// Only a complete short FIRST block proves this is a small object. A
 /// short last block of a large object must remain in the large-object store.
-fn accepts_object(threshold: u64, id: &BlockId, len: u64) -> bool {
-    threshold > 0 && id.offset == 0 && len > 0 && len < threshold && len < u64::from(id.block_size)
+fn accepts_object(threshold: u64, key: &(impl SmallStoreKey + ?Sized), len: u64) -> bool {
+    let id = key.block();
+    if key.is_page() {
+        return false;
+    }
+    if key.exact_range() {
+        len > 0
+            && len <= talon_core::MAX_EXACT_READ_LEN
+            && len == u64::from(id.block_size)
+            && id.offset.checked_add(len).is_some()
+    } else {
+        threshold > 0
+            && id.offset == 0
+            && len > 0
+            && len < threshold
+            && len < u64::from(id.block_size)
+    }
 }
 
 impl SegmentStore {
@@ -273,17 +328,17 @@ impl SegmentStore {
         }
     }
 
-    pub fn accepts(&self, id: &BlockId, len: u64) -> bool {
+    pub fn accepts(&self, id: &(impl SmallStoreKey + ?Sized), len: u64) -> bool {
         accepts_object(self.threshold, id, len)
     }
 
-    pub fn contains(&self, id: &BlockId) -> bool {
+    pub fn contains(&self, id: &(impl SmallStoreKey + ?Sized)) -> bool {
         format::key(id)
             .ok()
             .is_some_and(|k| self.entries.read().unwrap().contains_key(k.as_slice()))
     }
 
-    async fn lookup(&self, id: &BlockId) -> io::Result<Option<ReadLocation>> {
+    async fn lookup(&self, id: &(impl SmallStoreKey + ?Sized)) -> io::Result<Option<ReadLocation>> {
         let _readers = self.readers.read().await;
         let key = format::key(id)?;
         let loc = self.entries.read().unwrap().get(key.as_slice()).cloned();
@@ -294,7 +349,7 @@ impl SegmentStore {
     }
 
     #[cfg(test)]
-    pub async fn get(&self, id: &BlockId) -> io::Result<Option<BlockHandle>> {
+    pub async fn get(&self, id: &(impl SmallStoreKey + ?Sized)) -> io::Result<Option<BlockHandle>> {
         self.lookup(id)
             .await?
             .map(|loc| loc.range(0, loc.len()))
@@ -302,7 +357,7 @@ impl SegmentStore {
     }
 
     #[cfg(test)]
-    pub async fn read(&self, id: &BlockId) -> io::Result<Option<Bytes>> {
+    pub async fn read(&self, id: &(impl SmallStoreKey + ?Sized)) -> io::Result<Option<Bytes>> {
         let loc = self.lookup(id).await?;
         match loc {
             Some(loc) => Ok(Some(loc.read().await?)),
@@ -311,9 +366,13 @@ impl SegmentStore {
     }
 
     #[cfg(test)]
-    pub async fn put(self: &Arc<Self>, id: &BlockId, value: Bytes) -> io::Result<u64> {
+    pub async fn put(
+        self: &Arc<Self>,
+        id: &(impl SmallStoreKey + ?Sized),
+        value: Bytes,
+    ) -> io::Result<u64> {
         let store = self.clone();
-        let id = id.clone();
+        let id = id.cache_unit();
         self.tasks
             .run(async move { store.put_inner(&id, value, None).await })
             .await
@@ -323,15 +382,11 @@ impl SegmentStore {
     /// Different identities reserve briefly, then submit independent I/O.
     async fn put_inner(
         self: &Arc<Self>,
-        id: &BlockId,
+        id: &(impl SmallStoreKey + ?Sized),
         value: Bytes,
         policy: Option<Arc<Lru>>,
     ) -> io::Result<u64> {
-        if value.is_empty()
-            || value.len() > 128 << 20
-            || id.offset != 0
-            || value.len() as u64 >= u64::from(id.block_size)
-        {
+        if !accepts_object(u64::MAX, id, value.len() as u64) || value.len() > 128 << 20 {
             return Err(invalid("invalid small object extent"));
         }
         let key: Arc<[u8]> = format::key(id)?.into();
@@ -361,8 +416,7 @@ impl SegmentStore {
                     ));
                 }
                 if let Some(policy) = &policy {
-                    old.access =
-                        Some(policy.insert_with_policy(CacheUnit::Whole(id.clone()), charge, true));
+                    old.access = Some(policy.insert_with_policy(id.cache_unit(), charge, true));
                 }
                 return Ok(charge);
             }
@@ -489,8 +543,7 @@ impl SegmentStore {
         // eviction from retiring this admission before its mutation completes.
         let mut entries = self.entries.write().unwrap();
         if let Some(policy) = policy {
-            loc.access =
-                Some(policy.insert_with_policy(CacheUnit::Whole(id.clone()), charge, true));
+            loc.access = Some(policy.insert_with_policy(id.cache_unit(), charge, true));
         }
         entries.insert(key, loc);
         drop(entries);
@@ -508,15 +561,15 @@ impl SegmentStore {
     }
 
     #[cfg(test)]
-    pub async fn delete(self: &Arc<Self>, id: &BlockId) -> io::Result<()> {
+    pub async fn delete(self: &Arc<Self>, id: &(impl SmallStoreKey + ?Sized)) -> io::Result<()> {
         let store = self.clone();
-        let id = id.clone();
+        let id = id.cache_unit();
         self.tasks
             .run(async move { store.delete_inner(&id).await })
             .await
     }
 
-    async fn delete_inner(&self, id: &BlockId) -> io::Result<()> {
+    async fn delete_inner(&self, id: &(impl SmallStoreKey + ?Sized)) -> io::Result<()> {
         let key = format::key(id)?;
         // A tombstone must be either included in the sealing fsync or synced
         // after publication. Serialize logical publication with seal/relocation.
@@ -573,12 +626,17 @@ impl SegmentStore {
     fn restore_policy_units(
         &self,
         units: &mut Vec<crate::eviction::RecoveredUnit>,
+        shared_access: &HashMap<BlockId, AccessHandle>,
     ) -> io::Result<()> {
         units.reserve(self.entries.read().unwrap().len());
         for (key, loc) in self.entries.write().unwrap().iter_mut() {
-            let access = AccessHandle::default();
+            let unit = format::id(key)?;
+            let access = shared_access
+                .get(unit.block())
+                .map(AccessHandle::sibling)
+                .unwrap_or_default();
             units.push(crate::eviction::RecoveredUnit {
-                unit: CacheUnit::Whole(format::id(key)?).into(),
+                unit: unit.into(),
                 bytes: charge(key, loc.len),
                 independent: true,
                 access: access.clone(),

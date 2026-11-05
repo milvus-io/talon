@@ -74,6 +74,24 @@ validation, and caching retain their usual behavior. It does not mean "latest";
 overwriting a cached object can return stale or mixed data. Workers must support
 the token before clients use it.
 
+## Exact range reads (Rust)
+
+```rust,ignore
+let bytes = client.read_exact(&object, offset, length, Some(&stat), &options).await?;
+```
+
+`read_exact` accepts `length` up to `MAX_EXACT_READ_LEN` (1 MiB, inclusive) and
+rejects ranges past EOF. Objects smaller than 1 MiB use ordinary version-pinned
+reads; small-store admission follows the configured threshold and block size.
+Objects of 1 MiB or larger fetch only the requested bytes on a miss and cache
+that range in the packed small store. Both offset and length must match a cached
+entry; overlapping subranges miss, and cross-block requests remain one range.
+Pass `None` for `known_stat` to resolve size and version first.
+Namespace, credentials, replica fallback, and version guards follow ordinary
+Rust reads. Every nonempty call uses exact-read RPCs and requires worker support
+and enabled small storage, including the small-object fallback.
+The C, Python, and Java APIs are unchanged.
+
 ## Current scope
 
 All native SDKs support single-file and protocol-level batch prewarming:

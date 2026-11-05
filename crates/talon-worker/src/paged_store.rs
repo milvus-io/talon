@@ -474,7 +474,9 @@ impl PagedBlockStore {
             for entry in entries {
                 if !matches!(entry.meta.form, BlockForm::Paged { page_size, .. } if page_size == self.page_size)
                 {
-                    return Err(Error::Other("catalog page geometry mismatch".into()));
+                    return Err(
+                        crate::cache_reset::incompatible("catalog page geometry mismatch").into(),
+                    );
                 }
                 index.commit_stored(entry);
             }
@@ -495,7 +497,9 @@ impl PagedBlockStore {
         for entry in &entries {
             if !matches!(entry.meta.form, BlockForm::Paged { page_size, .. } if page_size == self.page_size)
             {
-                return Err(Error::Other("catalog page geometry mismatch".into()));
+                return Err(
+                    crate::cache_reset::incompatible("catalog page geometry mismatch").into(),
+                );
             }
         }
         index.restore_allocated(entries, crate::recovery::workers());

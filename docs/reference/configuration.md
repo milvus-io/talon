@@ -362,6 +362,14 @@ Colon-separated cache directories.
 - **Default:** `/var/cache/talon`
 - **CLI flag:** not settable via CLI (config file or environment only)
 
+### `reset_incompatible_cache`
+
+On incompatible cache geometry, layout, or metadata format, delete cached data and metadata in the first cache directory and start with an empty cache. Preserve the persisted Worker ID, including across interrupted resets, and update its cache geometry after cleanup. A conflicting explicit node_id, cluster mismatch, or invalid Worker identity aborts startup without deleting data and requires operator intervention. Compatible caches are retained. Keeps the directory lock and filesystem lost+found directory; does not change coordinator membership or origin data. Lock, permission, capacity and ordinary I/O failures still abort startup. Interrupted resets require this option to finish. Destructive; enabled by default. Set false to reject incompatible cache state without clearing it.
+
+- **Environment variable:** `TALON_WORKER_RESET_INCOMPATIBLE_CACHE`
+- **Default:** `true`
+- **CLI flag:** `--reset-incompatible-cache`
+
 ### `capacity_bytes`
 
 Worker cache capacity (bytes). Startup fails if this exceeds the total filesystem capacity of the first cache directory (the active cache root), or if capacity cannot be queried. This checks total size, not free space or per-directory quotas; leave headroom for metadata and other files.
@@ -516,10 +524,10 @@ L2 page size in bytes; 0 keeps whole-block L2, non-zero enables paged L2.
 
 ### `small_object_threshold_bytes`
 
-Upper exclusive object size for packed storage; 0 disables the engine. Changing this value requires a new empty cache directory.
+Upper exclusive object size for packed storage; defaults to 1 MiB. Zero disables the engine. Changing this value makes existing routing incompatible; reset_incompatible_cache controls whether startup clears it.
 
 - **Environment variable:** `TALON_WORKER_SMALL_OBJECT_THRESHOLD_BYTES`
-- **Default:** `0`
+- **Default:** `1048576`
 - **CLI flag:** not settable via CLI (config file or environment only)
 
 ### `small_object_segment_bytes`

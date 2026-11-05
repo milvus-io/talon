@@ -39,11 +39,33 @@ async fn put(store: &Arc<SmallObjectStore>, id: &BlockId) -> AccessHandle {
 async fn flush(store: &Arc<SmallObjectStore>) {
     store.checkpoint_access(None).await.unwrap();
 }
-fn log(root: &Path) -> HashMap<BlockId, u64> {
+fn log(root: &Path) -> HashMap<CacheUnit, u64> {
     let bytes = std::fs::read(root.join(LOG)).unwrap();
     let mut ages = HashMap::new();
     decode(&bytes[HEADER as usize..], &mut ages).unwrap();
     ages
+}
+
+#[test]
+fn access_records_preserve_whole_and_exact_range_identities() {
+    let whole = CacheUnit::Whole(id(0));
+    let exact = CacheUnit::ExactRange(id(0));
+    let mut shifted = id(0);
+    shifted.offset = 1;
+    let shifted = CacheUnit::ExactRange(shifted);
+    let mut bytes = Vec::new();
+    for (unit, age) in [(&whole, 10), (&exact, 20), (&shifted, 30), (&exact, 15)] {
+        encode(&mut bytes, &format::key(unit).unwrap(), age).unwrap();
+    }
+    let mut ages = HashMap::new();
+    decode(&bytes, &mut ages).unwrap();
+    assert_eq!(
+        ages,
+        HashMap::from([(whole, 10), (exact, 20), (shifted, 30)])
+    );
+    let mut deltas = HashMap::new();
+    assert!(!decode_log(&bytes, &mut deltas).unwrap());
+    assert_eq!(deltas, ages);
 }
 
 #[tokio::test]
@@ -68,7 +90,10 @@ async fn sparse_hits_append_once_and_clean_flush_does_not_rewrite() {
         HEADER as usize + 20 + format::key(&id(7)).unwrap().len()
     );
     assert_eq!(std::fs::read(dir.path().join(FILE)).unwrap(), baseline);
-    assert_eq!(log(dir.path())[&id(7)], access.last_access());
+    assert_eq!(
+        log(dir.path())[&CacheUnit::Whole(id(7))],
+        access.last_access()
+    );
     flush(&store).await;
     assert_eq!(std::fs::read(dir.path().join(LOG)).unwrap(), bytes);
     assert_eq!(
@@ -101,7 +126,7 @@ async fn late_reader_cannot_overwrite_readmitted_identity_or_resurrect_delete() 
     flush(&store).await;
     let ages = log(dir.path());
     assert_eq!(ages.len(), 1);
-    assert_eq!(ages[&id(0)], new.last_access());
+    assert_eq!(ages[&CacheUnit::Whole(id(0))], new.last_access());
     assert_eq!(
         format::frames(&std::fs::read(dir.path().join(LOG)).unwrap()[HEADER as usize..])
             .unwrap()
@@ -134,7 +159,10 @@ async fn hits_during_flush_survive_caller_cancellation() {
     flush(&store).await;
     let bytes = std::fs::read(dir.path().join(LOG)).unwrap();
     assert_eq!(format::frames(&bytes[HEADER as usize..]).unwrap().len(), 2);
-    assert_eq!(log(dir.path())[&id(0)], access.last_access());
+    assert_eq!(
+        log(dir.path())[&CacheUnit::Whole(id(0))],
+        access.last_access()
+    );
 }
 
 #[tokio::test]
@@ -276,7 +304,10 @@ async fn dirty_budget_overflow_falls_back_without_losing_live_ages() {
     assert_eq!(store.access_disk.lock().unwrap().generation, 2);
     access.touch();
     flush(&store).await;
-    assert_eq!(log(dir.path())[&id(0)], access.last_access());
+    assert_eq!(
+        log(dir.path())[&CacheUnit::Whole(id(0))],
+        access.last_access()
+    );
 }
 
 #[tokio::test]
@@ -388,7 +419,7 @@ async fn newly_recovered_key_without_age_is_saved_without_a_read() {
         &mut ages,
     )
     .unwrap();
-    assert_eq!(ages[&id(1)], recovered_age);
+    assert_eq!(ages[&CacheUnit::Whole(id(1))], recovered_age);
     drop(store);
     let store = open(dir.path());
     assert_eq!(store.access(&id(1)).unwrap().last_access(), recovered_age);

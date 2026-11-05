@@ -31,6 +31,8 @@ use versions::VersionIndex;
 pub enum CacheUnit {
     /// A whole block, evicted as one unit.
     Whole(BlockId),
+    /// One exact byte range; block offset and size are the requested coordinates.
+    ExactRange(BlockId),
     /// One page of a paged block.
     Page(BlockId, PageIndex),
 }
@@ -38,63 +40,64 @@ pub enum CacheUnit {
 impl CacheUnit {
     pub(crate) fn block(&self) -> &BlockId {
         match self {
-            Self::Whole(block) | Self::Page(block, _) => block,
-        }
-    }
-
-    pub(crate) fn page(&self) -> Option<PageIndex> {
-        match self {
-            Self::Whole(_) => None,
-            Self::Page(_, page) => Some(*page),
+            Self::Whole(block) | Self::ExactRange(block) | Self::Page(block, _) => block,
         }
     }
 }
 
 use crate::block_key::{BlockIdentity, BlockKey};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UnitKind {
+    Whole,
+    ExactRange,
+    Page(PageIndex),
+}
+
 pub(crate) trait UnitKey {
     fn block(&self) -> &dyn BlockIdentity;
-    fn page(&self) -> Option<PageIndex>;
+    fn kind(&self) -> UnitKind;
 }
 impl UnitKey for CacheUnit {
     fn block(&self) -> &dyn BlockIdentity {
         self.block()
     }
-    fn page(&self) -> Option<PageIndex> {
-        self.page()
+    fn kind(&self) -> UnitKind {
+        match self {
+            Self::Whole(_) => UnitKind::Whole,
+            Self::ExactRange(_) => UnitKind::ExactRange,
+            Self::Page(_, page) => UnitKind::Page(*page),
+        }
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SharedUnit {
     pub block: BlockKey,
-    pub page: Option<PageIndex>,
+    pub kind: UnitKind,
 }
 impl UnitKey for SharedUnit {
     fn block(&self) -> &dyn BlockIdentity {
         &self.block
     }
-    fn page(&self) -> Option<PageIndex> {
-        self.page
+    fn kind(&self) -> UnitKind {
+        self.kind
     }
 }
 impl SharedUnit {
     pub(crate) fn materialize(&self) -> CacheUnit {
-        match self.page {
-            Some(page) => CacheUnit::Page(self.block.materialize(), page),
-            None => CacheUnit::Whole(self.block.materialize()),
+        match self.kind {
+            UnitKind::Page(page) => CacheUnit::Page(self.block.materialize(), page),
+            UnitKind::Whole => CacheUnit::Whole(self.block.materialize()),
+            UnitKind::ExactRange => CacheUnit::ExactRange(self.block.materialize()),
         }
     }
 }
 impl From<CacheUnit> for SharedUnit {
     fn from(unit: CacheUnit) -> Self {
-        let (block, page) = match unit {
-            CacheUnit::Whole(block) => (block, None),
-            CacheUnit::Page(block, page) => (block, Some(page)),
-        };
         Self {
-            block: BlockKey::new(&block),
-            page,
+            block: BlockKey::new(unit.block()),
+            kind: unit.kind(),
         }
     }
 }
@@ -195,9 +198,15 @@ impl AccessHandle {
     }
 
     /// Separate second-chance bit, with the same block-wide idle clock.
-    #[cfg(test)]
     pub(crate) fn sibling(&self) -> Self {
-        Self::with_state(Arc::default(), self.clock.clone())
+        Self::with_state(
+            Arc::default(),
+            Some(
+                self.clock
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(AtomicU64::new(access_millis()))),
+            ),
+        )
     }
 
     /// Coalesce hits until the eviction hand consumes this second chance.
@@ -388,10 +397,10 @@ impl Inner {
                     .policy_units(block)
                     .into_iter()
                     .filter(|(_, state)| !state.independent && state.pins == 0)
-                    .map(|(page, _)| {
+                    .map(|(kind, _)| {
                         SharedUnit {
                             block: block.clone(),
-                            page,
+                            kind,
                         }
                         .materialize()
                     })
@@ -466,7 +475,8 @@ impl Lru {
         bytes: u64,
         independent: bool,
     ) -> AccessHandle {
-        assert!(!independent || matches!(unit, CacheUnit::Whole(_)));
+        let independent = independent || matches!(unit, CacheUnit::ExactRange(_));
+        assert!(!independent || matches!(unit, CacheUnit::Whole(_) | CacheUnit::ExactRange(_)));
         let mut g = self.inner.lock().unwrap();
         let position = g.clock;
         g.clock = g.clock.checked_add(1).expect("eviction sequence exhausted");
@@ -502,7 +512,7 @@ impl Lru {
                         .index
                         .shared_identity(unit.block())
                         .expect("tracked block"),
-                    page: unit.page(),
+                    kind: unit.kind(),
                 };
                 g.index.policy_insert(
                     &unit,
@@ -573,7 +583,7 @@ impl Lru {
                 .index
                 .shared_identity(block)
                 .unwrap_or_else(|| BlockKey::new(block)),
-            page: unit.page(),
+            kind: unit.kind(),
         };
         if !independent {
             g.versions.insert(unit.block.clone());
@@ -740,9 +750,10 @@ impl Lru {
             .index
             .policy_units(block)
             .into_iter()
-            .map(|(page, _)| match page {
-                None => CacheUnit::Whole(block.clone()),
-                Some(page) => CacheUnit::Page(block.clone(), page),
+            .map(|(kind, _)| match kind {
+                UnitKind::Whole => CacheUnit::Whole(block.clone()),
+                UnitKind::ExactRange => CacheUnit::ExactRange(block.clone()),
+                UnitKind::Page(page) => CacheUnit::Page(block.clone(), page),
             })
             .collect();
         units.into_iter().map(|unit| g.snapshot(unit)).collect()
@@ -886,10 +897,11 @@ impl Lru {
     /// Called under the block mutation gate after its complete on-disk deletion.
     pub(crate) fn remove_block(&self, block: &BlockId) {
         let mut g = self.inner.lock().unwrap();
-        for (page, _) in g.index.policy_units(block) {
-            let unit = match page {
-                Some(page) => CacheUnit::Page(block.clone(), page),
-                None => CacheUnit::Whole(block.clone()),
+        for (kind, _) in g.index.policy_units(block) {
+            let unit = match kind {
+                UnitKind::Page(page) => CacheUnit::Page(block.clone(), page),
+                UnitKind::Whole => CacheUnit::Whole(block.clone()),
+                UnitKind::ExactRange => CacheUnit::ExactRange(block.clone()),
             };
             g.remove(&unit);
         }
@@ -1028,6 +1040,46 @@ mod tests {
 
     fn whole(n: u64) -> CacheUnit {
         CacheUnit::Whole(blk(n))
+    }
+
+    #[test]
+    fn exact_ranges_coexist_with_regular_units_and_skip_version_eviction() {
+        for ordinary in [whole(1), CacheUnit::Page(blk(1), PageIndex(0))] {
+            for independent in [false, true] {
+                if independent && matches!(ordinary, CacheUnit::Page(..)) {
+                    continue;
+                }
+                let lru = Lru::new();
+                let block = blk(1);
+                let exact = CacheUnit::ExactRange(block.clone());
+                lru.insert(exact.clone(), 20);
+                lru.insert_with_policy(ordinary.clone(), 10, independent);
+                let candidates: HashSet<_> = lru
+                    .block_candidates(&block)
+                    .into_iter()
+                    .map(|candidate| candidate.unit)
+                    .collect();
+                assert_eq!(candidates, HashSet::from([exact.clone(), ordinary.clone()]));
+                let mut newer = block.clone();
+                newer.version = Version::new("v2");
+                assert!(lru
+                    .superseded_candidates(&newer)
+                    .iter()
+                    .all(|candidate| candidate.unit == ordinary));
+                lru.evict_superseded(&newer);
+                assert!(lru.inner.lock().unwrap().index.policy_get(&exact).is_some());
+                lru.remove_block(&block);
+                assert!(lru.is_empty());
+                assert_eq!(lru.total_bytes(), 0);
+                assert!(lru
+                    .inner
+                    .lock()
+                    .unwrap()
+                    .index
+                    .policy_block_get(&block)
+                    .is_none());
+            }
+        }
     }
 
     #[test]
@@ -1688,9 +1740,9 @@ mod tests {
                 g.index
                     .policy_units(&keep)
                     .iter()
-                    .map(|(page, _)| *page)
+                    .map(|(kind, _)| *kind)
                     .collect::<Vec<_>>(),
-                [None]
+                [UnitKind::Whole]
             );
         }
         // The same identities can be admitted again after either removal path.
@@ -1732,9 +1784,9 @@ mod tests {
                 g.index
                     .policy_units(&blk(n))
                     .iter()
-                    .map(|(page, _)| *page)
+                    .map(|(kind, _)| *kind)
                     .collect::<Vec<_>>(),
-                [Some(PageIndex(0))]
+                [UnitKind::Page(PageIndex(0))]
             );
         }
     }
@@ -1773,9 +1825,9 @@ mod tests {
                 g.index
                     .policy_units(&old)
                     .iter()
-                    .map(|(page, _)| *page)
+                    .map(|(kind, _)| *kind)
                     .collect::<Vec<_>>(),
-                [Some(PageIndex(0))]
+                [UnitKind::Page(PageIndex(0))]
             );
         }
 

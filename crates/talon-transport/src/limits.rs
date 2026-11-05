@@ -55,7 +55,9 @@ pub fn max_payload_for(msg_type: MsgType) -> u32 {
         | MsgType::GetRangeNamespace
         | MsgType::GetCachedRangeNamespace
         | MsgType::GetVersionedRange
-        | MsgType::GetVersionedRangeNamespace => MAX_CONTROL_PAYLOAD_LEN,
+        | MsgType::GetVersionedRangeNamespace
+        | MsgType::GetExactRange
+        | MsgType::GetExactRangeNamespace => MAX_CONTROL_PAYLOAD_LEN,
         MsgType::Get | MsgType::GetRange => MAX_PAYLOAD_LEN,
     }
 }

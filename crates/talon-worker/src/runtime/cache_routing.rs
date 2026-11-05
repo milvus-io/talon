@@ -3,9 +3,10 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::cache_reset::incompatible;
 use crate::page_access_store::CacheRootLock;
 use crate::small_store::SmallObjectStore;
-use talon_core::{Error, Result};
+use talon_core::Result;
 
 pub(super) fn open_small_store(
     root: &Path,
@@ -39,13 +40,13 @@ fn check_small_routing(root: &Path, threshold: u64) -> Result<()> {
     match std::fs::read(&path) {
         Ok(bytes) => {
             let stored: (u32, u64) = serde_json::from_slice(&bytes).map_err(|e| {
-                Error::Other(format!(
+                incompatible(format!(
                     "invalid small store routing at {}: {e}; use a new empty cache directory",
                     path.display()
                 ))
             })?;
             if stored != expected {
-                return Err(Error::Other(format!("incompatible small store routing at {}: stored {stored:?}, requested {expected:?}; use a new empty cache directory", path.display())));
+                return Err(incompatible(format!("incompatible small store routing at {}: stored {stored:?}, requested {expected:?}; use a new empty cache directory", path.display())).into());
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -56,7 +57,7 @@ fn check_small_routing(root: &Path, threshold: u64) -> Result<()> {
                     && name != ".worker.lock"
                     && name != "small-routing.json.tmp"
                 {
-                    return Err(Error::Other(format!("cache directory {} predates small store routing metadata; use a new empty cache directory", root.display())));
+                    return Err(incompatible(format!("cache directory {} predates small store routing metadata; use a new empty cache directory", root.display())).into());
                 }
             }
             let tmp = path.with_extension("json.tmp");
