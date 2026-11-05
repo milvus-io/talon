@@ -83,14 +83,26 @@ rejected; journal format changes require a new empty cache directory.
 
 ## Exact range reads
 
-Rust `Client::read_exact(object, offset, length, known_stat, options)` fetches
-only the requested bytes on a miss. Length is explicit and at most 1 MiB
+Rust `Client::read_exact(object, offset, length, known_stat, options)` reads an
+explicit range. Length is at most 1 MiB
 (1,048,576 bytes, inclusive); larger requests and arithmetic overflow fail in
 the client before metadata lookup or a data RPC. Zero length returns empty.
 Ranges beyond the supplied or resolved object size are errors, without EOF
-clamping. A range crossing a block boundary remains one request.
+clamping.
 
-Workers require small-object storage to be enabled. Exact ranges bypass the
+Every nonempty call sends exact-read RPCs. Workers require small storage to be
+enabled regardless of object size; a disabled engine returns `Internal` before
+origin access, with no fallback.
+
+For objects smaller than 1 MiB, placement and block splitting follow ordinary
+READ. After checking the engine, the worker uses ordinary version-pinned cache
+routing, reusing the supplied size and version without another HEAD. A miss may
+fetch the complete object; small-store admission still requires an object below
+its configured threshold and smaller than a block. Otherwise ordinary page or
+whole-block storage handles the read.
+
+For objects of 1 MiB or larger, misses fetch only the requested bytes and a
+range crossing a block boundary remains one request. Exact ranges bypass the
 ordinary object-size admission threshold, whole/page storage, and L1. Their
 record must fit the configured segment, including key metadata. The default
 64 MiB segment accommodates the maximum request. Ordinary READ and LOAD keep

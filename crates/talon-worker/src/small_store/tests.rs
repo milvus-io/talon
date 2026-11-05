@@ -578,7 +578,9 @@ async fn small_layout_probe() {
         .unwrap(),
     );
     let mut units = Vec::new();
-    store.restore_policy_units(&mut units).unwrap();
+    store
+        .restore_policy_units(&mut units, &HashMap::new())
+        .unwrap();
     let policy = crate::Lru::from_recovered(units, 10_000, true);
     let packed_restore = start.elapsed();
     assert_eq!(policy.len(), 10_000);

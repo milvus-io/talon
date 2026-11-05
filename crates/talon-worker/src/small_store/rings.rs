@@ -327,9 +327,16 @@ impl SmallObjectStore {
     /// Startup only. Attach access tokens to locators and contribute units to
     /// the shared bulk policy construction without registering in BlockIndex.
     pub(crate) fn restore_policy_units(&self, units: &mut Vec<crate::eviction::RecoveredUnit>) {
+        let shared_access = units
+            .iter()
+            .filter(|unit| {
+                u64::from(unit.unit.block().block_size) <= talon_core::MAX_EXACT_READ_LEN
+            })
+            .map(|unit| (unit.unit.block().clone(), unit.access.clone()))
+            .collect();
         for stream in self.streams() {
             stream
-                .restore_policy_units(units)
+                .restore_policy_units(units, &shared_access)
                 .expect("validated small object identity");
         }
     }

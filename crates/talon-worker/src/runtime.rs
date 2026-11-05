@@ -637,7 +637,8 @@ impl WorkerRuntime {
         self.serve_at(request, version, Some(object_len)).await
     }
 
-    /// Fetch and cache precisely one versioned range, without page rounding or L1 admission.
+    /// Require packed storage, using ordinary reads for objects smaller than 1 MiB.
+    /// Larger objects cache precisely one versioned range without page rounding or L1 admission.
     pub async fn serve_exact(
         &self,
         request: &RangeRequest,
@@ -660,9 +661,6 @@ impl WorkerRuntime {
                 .is_some_and(|end| end <= object_len),
             "exact read exceeds supplied object length"
         );
-        if request.len == 0 {
-            return Ok(ServeOutcome::Bytes(bytes::Bytes::new()));
-        }
         let small = self
             .small
             .as_ref()
@@ -670,6 +668,12 @@ impl WorkerRuntime {
                 anyhow::anyhow!("exact reads require small-object storage to be enabled")
             })?
             .clone();
+        if request.len == 0 {
+            return Ok(ServeOutcome::Bytes(bytes::Bytes::new()));
+        }
+        if object_len < talon_core::MAX_EXACT_READ_LEN {
+            return self.serve_at(request, version, Some(object_len)).await;
+        }
         let block = BlockId::new(
             request.object.clone(),
             request.offset,

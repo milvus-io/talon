@@ -362,21 +362,23 @@ impl BlockReader {
         .await
     }
 
-    /// Read a single exact range. The unaligned offset and length both select its owner.
-    pub async fn read_exact_range_into(
+    /// Send an exact-read RPC using `block` for placement and source identity.
+    /// Small objects use ordinary block keys; larger objects use the exact range as the key.
+    pub async fn read_exact_block_into(
         &self,
-        object: &ObjectId,
-        version: &Version,
-        offset: u64,
+        block: &BlockId,
+        offset_in_block: u32,
         dst: &mut [u8],
         object_len: u64,
         namespace: &talon_core::NamespaceId,
     ) -> Result<usize, BlockReadError> {
         if dst.len() as u64 > talon_core::MAX_EXACT_READ_LEN
-            || offset
-                .checked_add(dst.len() as u64)
+            || block
+                .offset
+                .checked_add(u64::from(offset_in_block))
+                .and_then(|offset| offset.checked_add(dst.len() as u64))
                 .map_or(true, |end| end > object_len)
-            || version.0.trim().is_empty()
+            || block.version.0.trim().is_empty()
         {
             return Err(WorkerError::from(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -387,10 +389,9 @@ impl BlockReader {
         if dst.is_empty() {
             return Ok(0);
         }
-        let key = BlockId::new(object.clone(), offset, dst.len() as u32, version.clone());
         self.read_block_into_with_mode(
-            &key,
-            0,
+            block,
+            offset_in_block,
             dst,
             OriginReadMode::ExactRange(object_len),
             namespace,

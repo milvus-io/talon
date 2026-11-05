@@ -80,13 +80,16 @@ the token before clients use it.
 let bytes = client.read_exact(&object, offset, length, Some(&stat), &options).await?;
 ```
 
-`read_exact` fetches only the requested bytes on a miss and stores them in the
-packed small store. `length` is at most `MAX_EXACT_READ_LEN` (1 MiB, inclusive).
-Both offset and length must match a cached entry; overlapping subranges miss.
-Requests crossing block boundaries remain one range. Ranges past EOF are
-rejected. Pass `None` for `known_stat` to resolve size and version first.
+`read_exact` accepts `length` up to `MAX_EXACT_READ_LEN` (1 MiB, inclusive) and
+rejects ranges past EOF. Objects smaller than 1 MiB use ordinary version-pinned
+reads; small-store admission follows the configured threshold and block size.
+Objects of 1 MiB or larger fetch only the requested bytes on a miss and cache
+that range in the packed small store. Both offset and length must match a cached
+entry; overlapping subranges miss, and cross-block requests remain one range.
+Pass `None` for `known_stat` to resolve size and version first.
 Namespace, credentials, replica fallback, and version guards follow ordinary
-Rust reads. Workers must support exact reads and have small storage enabled.
+Rust reads. Every nonempty call uses exact-read RPCs and requires worker support
+and enabled small storage, including the small-object fallback.
 The C, Python, and Java APIs are unchanged.
 
 ## Current scope

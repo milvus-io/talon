@@ -269,12 +269,16 @@ SDKs clamp reads at EOF. Missing or truncated size fields are rejected.
 
 `GetExactRange` (message type 12) uses the same `VersionedRangeRequest`
 layout above. `GetExactRangeNamespace` (message type 13) uses the same
-namespace wrapper as type 11. These operations fetch precisely `[offset,
+namespace wrapper as type 11. Workers require small storage to be enabled for
+every object size; a disabled engine returns `Internal` before origin access.
+For `object_len < 1,048,576`, workers use ordinary version-pinned cache routing;
+clients use ordinary block placement and splitting while retaining the exact
+operation code. For larger objects, these operations fetch precisely `[offset,
 offset + len)` on a miss and cache that complete range only in small storage.
-Both coordinates participate in placement and cache identity; overlaps do not
-hit. Length must be at most 1,048,576 bytes, addition must not overflow, the
+Both coordinates then participate in placement and cache identity; overlaps do
+not hit. Length must be at most 1,048,576 bytes, addition must not overflow, the
 version must be nonempty, and the range must fit `object_len`. Invalid wire
-requests return `InvalidRequest`. Workers require small storage to be enabled.
+requests return `InvalidRequest`.
 Replies use the ordinary `GetRange` response and support the same request
 metadata envelopes. Older workers reject these distinct operation codes;
 clients must not downgrade them to page reads.

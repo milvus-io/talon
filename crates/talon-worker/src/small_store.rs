@@ -625,12 +625,17 @@ impl SegmentStore {
     fn restore_policy_units(
         &self,
         units: &mut Vec<crate::eviction::RecoveredUnit>,
+        shared_access: &HashMap<BlockId, AccessHandle>,
     ) -> io::Result<()> {
         units.reserve(self.entries.read().unwrap().len());
         for (key, loc) in self.entries.write().unwrap().iter_mut() {
-            let access = AccessHandle::default();
+            let unit = format::id(key)?;
+            let access = shared_access
+                .get(unit.block())
+                .map(AccessHandle::sibling)
+                .unwrap_or_default();
             units.push(crate::eviction::RecoveredUnit {
-                unit: Arc::new(format::id(key)?),
+                unit: Arc::new(unit),
                 bytes: charge(key, loc.len),
                 independent: true,
                 access: access.clone(),

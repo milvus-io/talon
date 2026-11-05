@@ -407,13 +407,15 @@ impl Client {
         result
     }
 
-    /// Read exactly `[offset, offset + length)` through the packed small store.
+    /// Read exactly `[offset, offset + length)`.
     ///
-    /// Both coordinates are part of cache identity: overlapping ranges never hit.
-    /// A miss fetches only these bytes, even across a block boundary. Lengths above
-    /// 1 MiB, overflow, and ranges beyond EOF are errors. Zero length returns empty.
+    /// Objects smaller than 1 MiB use ordinary version-pinned reads and their
+    /// configured small-object caching. For larger objects, both coordinates are
+    /// part of cache identity: overlapping ranges never hit, and a miss fetches
+    /// only these bytes, even across a block boundary. Lengths above 1 MiB,
+    /// overflow, and ranges beyond EOF are errors. Zero length returns empty.
     /// `known_stat` and request options have the same semantics as [`read`](Self::read).
-    /// Workers must have small-object storage enabled and support exact reads.
+    /// Workers must have small storage enabled and support exact reads for all object sizes.
     pub async fn read_exact(
         &self,
         object: &ObjectId,
@@ -452,20 +454,24 @@ impl Client {
                     ));
                 }
                 let mut bytes = vec![0; length as usize];
+                if stat.size < talon_core::MAX_EXACT_READ_LEN {
+                    self.read_into_resolved(object, offset, &mut bytes, &stat, &namespace, true)
+                        .await?;
+                    return Ok(bytes);
+                }
                 let _permit = self
                     .block_read_permits
                     .acquire()
                     .await
                     .expect("client never closes its read budget");
+                let block = talon_core::BlockId::new(
+                    object.clone(),
+                    offset,
+                    length as u32,
+                    Version::new(stat.version),
+                );
                 self.reader
-                    .read_exact_range_into(
-                        object,
-                        &Version::new(stat.version),
-                        offset,
-                        &mut bytes,
-                        stat.size,
-                        &namespace,
-                    )
+                    .read_exact_block_into(&block, 0, &mut bytes, stat.size, &namespace)
                     .await?;
                 Ok(bytes)
             }))
@@ -506,7 +512,7 @@ impl Client {
 
         let mut bytes = vec![0_u8; planned];
         let written = self
-            .read_into_resolved(object, offset, &mut bytes, &stat, namespace)
+            .read_into_resolved(object, offset, &mut bytes, &stat, namespace, false)
             .await?;
         bytes.truncate(written);
         Ok(bytes)
@@ -553,7 +559,7 @@ impl Client {
             Some(stat) => stat.clone(),
             None => self.stat_inner(object, namespace).await?,
         };
-        self.read_into_resolved(object, offset, dst, &stat, namespace)
+        self.read_into_resolved(object, offset, dst, &stat, namespace, false)
             .await
     }
 
@@ -564,6 +570,7 @@ impl Client {
         dst: &mut [u8],
         stat: &ObjectStat,
         namespace: &talon_core::NamespaceId,
+        exact: bool,
     ) -> Result<usize, Error> {
         let requested = u64::try_from(dst.len())
             .map_err(|_| Error::InvalidArgument("destination length does not fit in u64".into()))?;
@@ -606,6 +613,7 @@ impl Client {
                 chunk,
                 stat.size,
                 namespace,
+                exact,
             ));
         }
 
@@ -622,6 +630,7 @@ impl Client {
                     chunk,
                     stat.size,
                     namespace,
+                    exact,
                 ));
             }
         }
@@ -636,11 +645,24 @@ async fn read_segment_into(
     dst: &mut [u8],
     object_len: u64,
     namespace: &talon_core::NamespaceId,
+    exact: bool,
 ) -> Result<usize, Error> {
     let _permit = permits
         .acquire()
         .await
         .expect("client never closes its read budget");
+    if exact {
+        return reader
+            .read_exact_block_into(
+                &segment.block,
+                segment.offset_in_block,
+                dst,
+                object_len,
+                namespace,
+            )
+            .await
+            .map_err(Error::from);
+    }
     reader
         .read_versioned_block_into(
             &segment.block,
@@ -1056,7 +1078,12 @@ mod tests {
                     socket.read_exact(&mut payload).await.unwrap();
                     let mut frame = header_bytes.to_vec();
                     frame.extend_from_slice(&payload);
-                    let (_, versioned) = decode_versioned_request(&frame).unwrap();
+                    let (_, versioned) =
+                        if header.msg_type == talon_transport::MsgType::GetExactRange {
+                            talon_transport::data::decode_exact_request(&frame).unwrap()
+                        } else {
+                            decode_versioned_request(&frame).unwrap()
+                        };
                     assert_eq!(versioned.version, Version::new("test-version"));
                     assert_eq!(versioned.object_len, size);
                     let request = versioned.request;
@@ -1351,6 +1378,127 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(stats.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn exact_read_keeps_exact_rpc_and_worker_errors_for_all_object_sizes() {
+        for size in [(1 << 20) - 1, 1 << 20, (1 << 20) + 1] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let worker = listener.local_addr().unwrap().to_string();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                for (named, reject) in [(true, false), (false, false), (false, true)] {
+                    let mut header = [0; HEADER_LEN];
+                    socket.read_exact(&mut header).await.unwrap();
+                    let h = FrameHeader::decode(&header).unwrap();
+                    let mut frame = header.to_vec();
+                    frame.resize(HEADER_LEN + h.length as usize, 0);
+                    socket.read_exact(&mut frame[HEADER_LEN..]).await.unwrap();
+                    let request = match named {
+                        true => {
+                            let (_, scoped) =
+                                talon_transport::data::decode_exact_namespace_request(&frame)
+                                    .unwrap();
+                            assert_eq!(
+                                scoped.namespace,
+                                talon_core::NamespaceId::named("analytics")
+                            );
+                            scoped.request
+                        }
+                        false => {
+                            talon_transport::data::decode_exact_request(&frame)
+                                .unwrap()
+                                .1
+                        }
+                    };
+                    assert_eq!(request.version, Version::new("test-version"));
+                    assert_eq!(request.object_len, size);
+                    assert_eq!((request.request.offset, request.request.len), (7, 33));
+                    if reject {
+                        socket
+                            .write_all(&talon_transport::data::encode_typed_error(
+                                h.request_id,
+                                talon_transport::DataErrorCode::Internal,
+                                "exact reads require small-object storage to be enabled",
+                            ))
+                            .await
+                            .unwrap();
+                        continue;
+                    }
+                    socket
+                        .write_all(&response_header_ok(h.request_id, 33))
+                        .await
+                        .unwrap();
+                    socket.write_all(&[42; 33]).await.unwrap();
+                }
+            });
+            let stats = Arc::new(AtomicUsize::new(0));
+            let coordinator = mock_read_coordinator(worker, size, stats.clone()).await;
+            let client = ClientBuilder::default()
+                .with_coordinator(coordinator)
+                .with_block_size(2 << 20)
+                .build()
+                .unwrap();
+            let object = parse_uri("s3://bucket/object").unwrap();
+            let stat = ObjectStat {
+                size,
+                version: "test-version".into(),
+            };
+            let options = RequestOptions::default().with_namespace("analytics");
+            assert_eq!(
+                client
+                    .read_exact(&object, 7, 33, Some(&stat), &options)
+                    .await
+                    .unwrap(),
+                [42; 33]
+            );
+            assert_eq!(stats.load(Ordering::SeqCst), 0);
+            assert!(matches!(
+                client
+                    .read_exact(&object, size, 1, Some(&stat), &options)
+                    .await,
+                Err(Error::InvalidArgument(_))
+            ));
+            let invalid = ObjectStat {
+                size,
+                version: String::new(),
+            };
+            assert!(matches!(
+                client
+                    .read_exact(&object, 7, 33, Some(&invalid), &options)
+                    .await,
+                Err(Error::InvalidArgument(_))
+            ));
+            assert_eq!(
+                client
+                    .read_exact(&object, 7, 33, None, &RequestOptions::default())
+                    .await
+                    .unwrap(),
+                [42; 33]
+            );
+            assert_eq!(stats.load(Ordering::SeqCst), 1);
+            let error = client
+                .read_exact(&object, 7, 33, Some(&stat), &RequestOptions::default())
+                .await
+                .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("exact reads require small-object storage to be enabled"));
+            assert_eq!(stats.load(Ordering::SeqCst), 1);
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_read_small_object_can_cross_ordinary_blocks() {
+        let (client, stats) = read_client(20).await;
+        let object = parse_uri("s3://bucket/object").unwrap();
+        let bytes = client
+            .read_exact(&object, 6, 10, None, &RequestOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(bytes, (6..16).collect::<Vec<u8>>());
+        assert_eq!(stats.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
