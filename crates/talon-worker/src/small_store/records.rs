@@ -95,17 +95,41 @@ impl Records {
     }
 
     pub fn before(&self, end: u64) -> impl Iterator<Item = (u64, RecordRef<'_>)> {
-        self.iter().filter(move |(offset, _)| *offset < end)
+        let limit = self
+            .rows
+            .partition_point(|row| u64::from(n32(&row[..4])) < end);
+        (0..limit).filter_map(|row| self.get(row))
     }
 
     pub fn overlaps(&self, offset: u64, len: u64) -> bool {
-        self.iter()
-            .any(|(other, record)| other < offset + len && offset < other + record.len)
+        let next = self
+            .rows
+            .partition_point(|row| u64::from(n32(&row[..4])) < offset);
+        let live = |row: &&[u8; WIDTH]| n32(&row[4..8]) & ((1 << 28) - 1) != 0;
+        self.rows[..next]
+            .iter()
+            .rev()
+            .find(live)
+            .is_some_and(|row| {
+                u64::from(n32(&row[..4])) + u64::from(n32(&row[4..8]) & ((1 << 28) - 1)) > offset
+            })
+            || self.rows[next..]
+                .iter()
+                .find(live)
+                .is_some_and(|row| u64::from(n32(&row[..4])) < offset + len)
     }
 
     pub fn crosses(&self, end: u64) -> bool {
-        self.before(end)
-            .any(|(offset, record)| offset + record.len > end)
+        let next = self
+            .rows
+            .partition_point(|row| u64::from(n32(&row[..4])) < end);
+        self.rows[..next]
+            .iter()
+            .rev()
+            .find(|row| n32(&row[4..8]) & ((1 << 28) - 1) != 0)
+            .is_some_and(|row| {
+                u64::from(n32(&row[..4])) + u64::from(n32(&row[4..8]) & ((1 << 28) - 1)) > end
+            })
     }
 
     pub fn insert(&mut self, offset: u64, record: Record) -> io::Result<usize> {
@@ -158,16 +182,22 @@ impl Records {
         self.text
             .extend_from_slice(key.object.object_path.as_bytes());
         self.text.extend_from_slice(key.version.as_bytes());
-        let index = self.rows.len();
-        self.rows.push(row);
+        let index = self
+            .rows
+            .partition_point(|row| u64::from(n32(&row[..4])) <= offset);
+        self.rows.insert(index, row);
         self.live += 1;
         Ok(index)
     }
 
     pub fn remove(&mut self, offset: &u64) -> Option<()> {
-        let row = self.rows.iter_mut().find(|row| {
-            u64::from(n32(&row[..4])) == *offset && n32(&row[4..8]) & ((1 << 28) - 1) != 0
-        })?;
+        let index = self
+            .rows
+            .partition_point(|row| u64::from(n32(&row[..4])) < *offset);
+        let row = self.rows[index..]
+            .iter_mut()
+            .take_while(|row| u64::from(n32(&row[..4])) == *offset)
+            .find(|row| n32(&row[4..8]) & ((1 << 28) - 1) != 0)?;
         row[4..8].fill(0);
         self.live -= 1;
         if (self.rows.len() - self.live) * 100 >= self.rows.len() {
@@ -240,10 +270,10 @@ mod tests {
     fn out_of_order_extents_preserve_identity_and_boundaries() {
         let mut records = Records::default();
         let expected = record("路径/é");
-        let slot = records.insert(20, expected.clone()).unwrap();
+        records.insert(20, expected.clone()).unwrap();
         records.insert(0, record("first")).unwrap();
-        assert_eq!(records.get(slot).unwrap().1.to_owned().key, expected.key);
-        assert_eq!(records.get(slot).unwrap().1.checksum, u64::MAX);
+        assert_eq!(records.get(1).unwrap().1.to_owned().key, expected.key);
+        assert_eq!(records.get(1).unwrap().1.checksum, u64::MAX);
         assert!(records.overlaps(15, 6));
         assert!(!records.overlaps(10, 10));
         assert!(records.crosses(25));
@@ -251,7 +281,7 @@ mod tests {
         assert_eq!(records.before(20).count(), 1);
         records.remove(&0).unwrap();
         assert_eq!(records.len(), 1);
-        assert_eq!(records.get(slot).unwrap().0, 20);
+        assert_eq!(records.get(0).unwrap().0, 20);
         records.retain_before(20);
         assert!(records.is_empty());
     }

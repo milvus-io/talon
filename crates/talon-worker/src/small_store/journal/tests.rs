@@ -3,6 +3,101 @@ use crate::small_store::{tests::files, SegmentStore};
 use std::time::Duration;
 use talon_core::{Backend, BlockId, ObjectId, Version, WorkerConfig};
 
+#[test]
+fn snapshot_keeps_rows_when_live_deletion_compacts_and_append_moves_them() {
+    use talon_journal::Machine;
+    let insert = |offset, key| Event::Insert {
+        slot: 0,
+        segment: 1,
+        offset,
+        record: Record {
+            key: crate::block_key::BlockKey::new(&id(key)),
+            len: 5,
+            checksum: offset,
+        },
+    };
+    let mut model = Model::default();
+    model.apply(insert(0, "first")).unwrap();
+    model.apply(insert(10, "last")).unwrap();
+    let mut snapshot = model.snapshot().unwrap();
+    let mut restored = Model::default();
+    for _ in 0..3 {
+        restored
+            .restore(Model::decode_snapshot(&snapshot.next().unwrap().unwrap()).unwrap())
+            .unwrap();
+    }
+    model
+        .apply(Event::Delete {
+            segment: 1,
+            offset: 0,
+        })
+        .unwrap();
+    model.apply(insert(5, "middle")).unwrap();
+    for bytes in snapshot {
+        restored
+            .restore(Model::decode_snapshot(&bytes.unwrap()).unwrap())
+            .unwrap();
+    }
+    assert_eq!(
+        restored.segments[&1]
+            .records
+            .iter()
+            .map(|(offset, _)| offset)
+            .collect::<Vec<_>>(),
+        [0, 10]
+    );
+    restored
+        .apply(Event::Delete {
+            segment: 1,
+            offset: 0,
+        })
+        .unwrap();
+    restored.apply(insert(5, "middle")).unwrap();
+    let rows = |model: &Model| {
+        model.segments[&1]
+            .records
+            .iter()
+            .map(|(offset, record)| (offset, record.to_owned().key))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(rows(&model), rows(&restored));
+}
+
+#[test]
+fn dense_segment_snapshot_restores_one_hundred_thousand_extents() {
+    use talon_journal::Machine;
+    let mut model = Model::default();
+    for offset in 0..100_000 {
+        model
+            .apply(Event::Insert {
+                slot: 0,
+                segment: 1,
+                offset,
+                record: Record {
+                    key: crate::block_key::BlockKey::new(&id(&offset.to_string())),
+                    len: 1,
+                    checksum: offset,
+                },
+            })
+            .unwrap();
+    }
+    model.apply(Event::Seal { segment: 1 }).unwrap();
+    let mut restored = Model::default();
+    for bytes in model.snapshot().unwrap() {
+        restored
+            .restore(Model::decode_snapshot(&bytes.unwrap()).unwrap())
+            .unwrap();
+    }
+    assert_eq!(restored.segments[&1].records.len(), 100_000);
+    for (offset, record) in restored.segments[&1].records.iter() {
+        assert_eq!(record.checksum, offset);
+        assert_eq!(
+            record.key,
+            crate::block_key::BlockIdentity::view(&id(&offset.to_string()))
+        );
+    }
+}
+
 #[tokio::test]
 async fn compact_journal_preserves_live_and_recovered_identity() {
     use crate::block_key::BlockIdentity;
