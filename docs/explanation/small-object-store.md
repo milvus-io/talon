@@ -17,17 +17,17 @@ See [the shared cache journal contract](cache-journal.md) for the catalog bounda
 ## Configuration and routing
 
 ```toml
-small_object_threshold_bytes = 0
+small_object_threshold_bytes = 1048576
 small_object_segment_bytes = 67108864
 ```
 
 The equivalent environment variables are
 `TALON_WORKER_SMALL_OBJECT_THRESHOLD_BYTES` and
-`TALON_WORKER_SMALL_OBJECT_SEGMENT_BYTES`. The engine is disabled by default
-(threshold zero). To enable it for a new cache directory, set the threshold
-explicitly, for example to `1048576` for objects smaller than 1 MiB. Segment size
-defaults to 64 MiB. An enabled engine requires capacity for four segments, and the LOAD
-payload budget must accommodate an entire eligible object.
+`TALON_WORKER_SMALL_OBJECT_SEGMENT_BYTES`. The engine is enabled by default for
+objects smaller than 1 MiB; exactly 1 MiB retains ordinary storage. Set the
+threshold to `0` to disable it. Segment size defaults to 64 MiB. An enabled
+engine requires capacity for four segments (256 MiB with the default segment
+size), and the LOAD payload budget must accommodate an entire eligible object.
 
 An eligible object has positive total size strictly below the threshold and
 fits in a short first block. Empty objects and full blocks retain existing
@@ -101,13 +101,21 @@ conflicting small and ordinary admissions are rejected under the block gate.
 Each namespace and credential scope owns its own store under its existing cache
 root. `small-routing.json` binds the routing format and small-object threshold
 to that root. A changed threshold (including enabling or disabling small storage),
-malformed marker, or an existing cache without the marker fails startup with an
-instruction to use a new empty cache directory. The worker neither migrates nor
-deletes incompatible data automatically. This prevents read-time probing for
+malformed marker, or an existing cache without the marker is incompatible.
+By default, `reset_incompatible_cache = true` clears the active Worker's cached
+data and metadata, preserves its Worker ID, and retries startup once. The
+identity remains durable throughout cleanup, including interrupted resets.
+An explicit `node_id` that differs from the persisted identity aborts startup
+without deleting data; an operator must resolve the mismatch. Invalid identities
+and cluster mismatches also require operator intervention.
+Set reset to `false` to reject incompatible cache state without deleting it.
+When upgrading from the disabled default, explicitly
+set `small_object_threshold_bytes = 0` to retain the previous routing and avoid
+a reset caused by the new threshold. This prevents read-time probing for
 historical routing choices. Do not run two owners against the same cache root;
 use a fresh cache directory when rolling back to a binary with older routing.
 Legacy `MANIFEST`, `ring-*`, and per-segment index/data layouts are also
-rejected; journal format changes require a new empty cache directory.
+rejected and follow the same reset policy.
 
 ## Files and identity
 

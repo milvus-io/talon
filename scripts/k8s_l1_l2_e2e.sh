@@ -425,8 +425,7 @@ previous_workers="$(python3 scripts/check_e2e_workers.py \
 # Direct reads below may populate any of the three workers, including a
 # non-primary. Retain all three placement candidates so startup ownership GC
 # does not remove the very L2 data that the restart/recovery checks exercise.
-# Keep the default-disabled small store consistent with the initial Helm install;
-# its routing threshold is persisted in the retained worker PVCs.
+# Fit four small-store segments within the four-block eviction capacity.
 kubectl -n "$NAMESPACE" set env "statefulset/$RELEASE-worker" \
   TALON_WORKER_BACKEND=s3 \
   TALON_WORKER_S3_REGION=us-east-1 \
@@ -435,6 +434,7 @@ kubectl -n "$NAMESPACE" set env "statefulset/$RELEASE-worker" \
   TALON_WORKER_S3_SECRET_ACCESS_KEY="$MINIO_SECRET_KEY" \
   TALON_WORKER_S3_PATH_STYLE=true \
   TALON_WORKER_BACKEND_DELAY_MS=50 \
+  "TALON_WORKER_SMALL_OBJECT_SEGMENT_BYTES=$BLOCK_SIZE" \
   TALON_WORKER_OWNERSHIP_GC_REPLICAS=3 \
   TALON_WORKER_ORIGIN_IO=tokio \
   TALON_WORKER_FORCE_TOKIO_DATA_PLANE=1 >/dev/null

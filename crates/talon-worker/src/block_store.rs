@@ -41,7 +41,11 @@ pub(crate) fn block_path(root: &Path, id: &BlockId) -> PathBuf {
 }
 
 fn catalog_error(error: anyhow::Error) -> Error {
-    Error::Other(format!("whole block catalog: {error:#}"))
+    let message = format!("whole block catalog: {error:#}");
+    match error.downcast::<std::io::Error>() {
+        Ok(error) => std::io::Error::new(error.kind(), message).into(),
+        Err(_) => Error::Other(message),
+    }
 }
 
 /// Run blocking filesystem work on Tokio's blocking pool, so a large read or
@@ -265,16 +269,17 @@ impl WholeBlockStore {
                 if name == "whole"
                     || (name.len() == 2 && name.bytes().all(|c| c.is_ascii_hexdigit()))
                 {
-                    return Err(Error::Other("whole cache has no journal; use a new empty cache directory (legacy migration is not supported)".into()));
+                    return Err(crate::cache_reset::incompatible("whole cache has no journal; use a new empty cache directory (legacy migration is not supported)").into());
                 }
             }
             catalog.register(&catalog_path, 0).map_err(catalog_error)?;
         }
         std::fs::create_dir_all(&data)?;
         if std::fs::symlink_metadata(&data)?.file_type().is_symlink() {
-            return Err(Error::Other(
-                "whole cache directory must not be a symlink".into(),
-            ));
+            return Err(crate::cache_reset::incompatible(
+                "whole cache directory must not be a symlink",
+            )
+            .into());
         }
         std::fs::File::open(&root)?.sync_all()?;
         Ok(Self {

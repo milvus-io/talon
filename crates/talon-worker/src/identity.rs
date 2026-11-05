@@ -5,9 +5,9 @@ use std::io::{Read, Write};
 use anyhow::{ensure, Context};
 use serde::{Deserialize, Serialize};
 
-use crate::page_access_store::CacheRootLock;
+use crate::{cache_reset::incompatible, page_access_store::CacheRootLock};
 
-const IDENTITY_FILE: &str = "worker_identity";
+pub(crate) const IDENTITY_FILE: &str = "worker_identity";
 
 /// The identity and cache geometry travel with the disk, never with a Pod IP.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,6 +25,22 @@ impl CacheRootLock {
     /// A nonempty legacy cache must be imported; silently changing owners would
     /// strand its contents. Temporary identity files left by a crash are ignored.
     pub fn load_identity(
+        &self,
+        cluster: &str,
+        configured_id: Option<&str>,
+        block_size: u32,
+        page_size: u64,
+    ) -> anyhow::Result<WorkerIdentity> {
+        let identity = self.load_identity_owner(cluster, configured_id, block_size, page_size)?;
+        self.check_reset_complete()?;
+        ensure!(
+            identity.block_size == block_size && identity.page_size == page_size,
+            incompatible("cache geometry conflicts with directory identity")
+        );
+        Ok(identity)
+    }
+
+    pub(crate) fn load_identity_owner(
         &self,
         cluster: &str,
         configured_id: Option<&str>,
@@ -52,6 +68,8 @@ impl CacheRootLock {
                     .context("corrupt worker_identity; refusing to replace directory identity")?
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.check_reset_complete()
+                    .context("cannot recover interrupted reset without worker_identity")?;
                 let has_cache =
                     std::fs::read_dir(&self.root)?.try_fold(false, |found, entry| {
                         let entry = entry?;
@@ -87,15 +105,7 @@ impl CacheRootLock {
                     block_size,
                     page_size,
                 };
-                let mut temporary = tempfile::Builder::new()
-                    .prefix(".worker_identity.tmp.")
-                    .tempfile_in(&self.root)?;
-                temporary.write_all(&serde_json::to_vec(&identity)?)?;
-                temporary.as_file().sync_all()?;
-                temporary
-                    .persist_noclobber(&path)
-                    .context("publish worker identity")?;
-                File::open(&self.root)?.sync_all()?;
+                self.persist_identity(&identity, false)?;
                 identity
             }
             Err(error) => return Err(error).context("read worker identity"),
@@ -117,11 +127,29 @@ impl CacheRootLock {
             configured_id.map_or(true, |id| id == identity.worker_id),
             "configured node_id conflicts with directory identity"
         );
-        ensure!(
-            identity.block_size == block_size && identity.page_size == page_size,
-            "cache geometry conflicts with directory identity"
-        );
         Ok(identity)
+    }
+
+    pub(crate) fn persist_identity(
+        &self,
+        identity: &WorkerIdentity,
+        replace: bool,
+    ) -> anyhow::Result<()> {
+        let mut temporary = tempfile::Builder::new()
+            .prefix(".worker_identity.tmp.")
+            .tempfile_in(&self.root)?;
+        temporary.write_all(&serde_json::to_vec(identity)?)?;
+        temporary.as_file().sync_all()?;
+        let path = self.root.join(IDENTITY_FILE);
+        if replace {
+            temporary.persist(&path).context("update worker identity")?;
+        } else {
+            temporary
+                .persist_noclobber(&path)
+                .context("publish worker identity")?;
+        }
+        File::open(&self.root)?.sync_all()?;
+        Ok(())
     }
 }
 
