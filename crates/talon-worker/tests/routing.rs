@@ -1,4 +1,5 @@
 //! Worker processes using independent AK/SK, IAM and Broker bucket routes.
+use std::net::SocketAddr;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -137,42 +138,13 @@ async fn exchange(stream: &mut TcpStream, request: &[u8]) -> (FrameHeader, Vec<u
     (header, body)
 }
 
-async fn three_bucket_worker(backend: Backend, small: bool) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let state = Fixture {
-        backend,
-        calls: Arc::new(Mutex::new(Vec::new())),
-    };
-    let app = Router::new().fallback(origin).with_state(state.clone());
-    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let coordinator = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let coord_addr = coordinator.local_addr().unwrap();
-    let control = tokio::spawn(async move {
-        loop {
-            let (mut stream, _) = coordinator.accept().await.unwrap();
-            let mut header = [0; HEADER_LEN];
-            stream.read_exact(&mut header).await.unwrap();
-            let header = FrameHeader::decode(&header).unwrap();
-            let mut body = vec![0; header.length as usize];
-            stream.read_exact(&mut body).await.unwrap();
-            stream
-                .write_all(
-                    &codec::encode(
-                        header.request_id,
-                        &ControlMessage::NodeStatusAck {
-                            accepted: true,
-                            serving: true,
-                            detail: None,
-                        },
-                    )
-                    .unwrap(),
-                )
-                .await
-                .unwrap();
-        }
-    });
-    let root = tempfile::tempdir().unwrap();
+fn start_worker(
+    backend: Backend,
+    small: bool,
+    address: SocketAddr,
+    coord_addr: SocketAddr,
+    root: &tempfile::TempDir,
+) -> (tokio::process::Child, SocketAddr, SocketAddr) {
     let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let listen = reservation.local_addr().unwrap();
     let admin_reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -222,9 +194,8 @@ credentials_source = "iam"
         ),
     )
     .unwrap();
-    drop(reservation);
-    drop(admin_reservation);
-    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_talon-worker"))
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_talon-worker"));
+    command
         .arg("--config")
         .arg(&config)
         .env_clear()
@@ -247,9 +218,57 @@ credentials_source = "iam"
         .env("TALON_AZURE_IMDS_ENDPOINT", format!("http://{address}"))
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .unwrap();
+        .kill_on_drop(true);
+    drop(reservation);
+    drop(admin_reservation);
+    (command.spawn().unwrap(), listen, admin)
+}
+
+async fn three_bucket_worker(backend: Backend, small: bool) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let state = Fixture {
+        backend,
+        calls: Arc::new(Mutex::new(Vec::new())),
+    };
+    let app = Router::new().fallback(origin).with_state(state.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let coordinator = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let coord_addr = coordinator.local_addr().unwrap();
+    let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
+    let control = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = coordinator.accept().await.unwrap();
+            let mut header = [0; HEADER_LEN];
+            stream.read_exact(&mut header).await.unwrap();
+            let header = FrameHeader::decode(&header).unwrap();
+            let mut frame = header.encode().to_vec();
+            frame.resize(HEADER_LEN + header.length as usize, 0);
+            stream.read_exact(&mut frame[HEADER_LEN..]).await.unwrap();
+            let ControlMessage::NodeStatusHeartbeat { status } = codec::decode(&frame).unwrap().1
+            else {
+                panic!("expected worker heartbeat");
+            };
+            stream
+                .write_all(
+                    &codec::encode(
+                        header.request_id,
+                        &ControlMessage::NodeStatusAck {
+                            accepted: true,
+                            serving: status.ready,
+                            detail: None,
+                        },
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            ready_tx.send_replace(status.ready);
+        }
+    });
+    let root = tempfile::tempdir().unwrap();
+    let (mut child, mut listen, mut admin) =
+        start_worker(backend, small, address, coord_addr, &root);
     tokio::time::timeout(Duration::from_secs(20), async {
         let mut stream = loop {
             if child.try_wait().unwrap().is_some() {
@@ -261,10 +280,20 @@ credentials_source = "iam"
                     .read_to_string(&mut error)
                     .await
                     .unwrap();
+                let address_in_use = std::io::Error::from_raw_os_error(libc::EADDRINUSE);
+                if error.trim() == format!("Error: {address_in_use}") {
+                    state.calls.lock().unwrap().clear();
+                    (child, listen, admin) =
+                        start_worker(backend, small, address, coord_addr, &root);
+                    continue;
+                }
                 panic!("worker failed to start: {error}");
             }
-            if let Ok(stream) = TcpStream::connect(listen).await {
-                break stream;
+            let ready = *ready_rx.borrow();
+            if ready {
+                if let Ok(stream) = TcpStream::connect(listen).await {
+                    break stream;
+                }
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         };

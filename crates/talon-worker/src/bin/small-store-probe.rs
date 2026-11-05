@@ -32,6 +32,9 @@ struct Args {
     /// JSON array of [size, count], expanded and deterministically shuffled.
     #[arg(long)]
     histogram: Option<std::path::PathBuf>,
+    /// Read at most this many bytes from each sampled object, preserving its identity.
+    #[arg(long)]
+    read_bytes: Option<u64>,
     #[arg(long, default_value_t = 1 << 20)]
     block_size: u32,
     /// Sample every Nth object from the same shuffled histogram for verification.
@@ -55,6 +58,10 @@ struct Args {
     prefix: String,
     #[arg(long, default_value = "probe")]
     name: String,
+}
+fn read_len(args: &Args) -> u64 {
+    args.read_bytes
+        .map_or(args.size, |bytes| bytes.min(args.size))
 }
 fn object(args: &Args, i: u64) -> ObjectId {
     ObjectId::new(
@@ -95,7 +102,7 @@ fn packet(args: &Args, i: u64) -> Vec<u8> {
                 object,
                 version,
                 offset: 0,
-                len: args.size,
+                len: read_len(args),
             },
         )
         .unwrap(),
@@ -133,7 +140,7 @@ async fn exchange(
     let expected = if args.mode == "fill" {
         0
     } else {
-        args.size as usize
+        read_len(args) as usize
     };
     if h.length as usize != expected {
         return Err(format!("reply size {} expected {}", h.length, expected));
@@ -150,6 +157,8 @@ async fn exchange(
 async fn main() {
     let mut args = Args::parse();
     assert!(args.sample_step > 0);
+    assert!(args.read_bytes.map_or(true, |bytes| bytes > 0
+        && matches!(args.mode.as_str(), "read" | "verify")));
     let mut sizes = Vec::new();
     if let Some(path) = &args.histogram {
         let histogram: Vec<(u64, usize)> =
@@ -194,13 +203,14 @@ async fn main() {
             barrier.wait().await;
             let mut socket = match socket {
                 Ok(s) => s,
-                Err(e) => return (0u64, 0u64, Vec::new(), vec![e.to_string()]),
+                Err(e) => return (0u64, 0u64, 0u64, Vec::new(), vec![e.to_string()]),
             };
             socket.set_nodelay(true).unwrap();
             let start: Instant = *start.get().unwrap();
             let mut rng = a.seed.wrapping_add(n as u64 + 1);
-            let mut body = vec![0; a.size as usize];
+            let mut body = vec![0; read_len(&a) as usize];
             let mut good = 0;
+            let mut good_bytes = 0;
             let mut warm = 0;
             let mut lat = Vec::new();
             let mut errors = Vec::new();
@@ -223,7 +233,7 @@ async fn main() {
                 let object_index = a.first + i * a.sample_step;
                 if !sizes.is_empty() {
                     a.size = sizes[object_index as usize];
-                    body.resize(a.size as usize, 0);
+                    body.resize(read_len(&a) as usize, 0);
                 }
                 let t = Instant::now();
                 match tokio::time::timeout(
@@ -246,6 +256,7 @@ async fn main() {
                                 && elapsed < (a.warmup + a.seconds) as f64)
                         {
                             good += 1;
+                            good_bytes += read_len(&a);
                             lat.push(t.elapsed().as_nanos() as u64);
                         } else {
                             warm += 1;
@@ -261,7 +272,7 @@ async fn main() {
                     }
                 }
             }
-            (good, warm, lat, errors)
+            (good, good_bytes, warm, lat, errors)
         }));
     }
     let wall = SystemTime::now()
@@ -271,13 +282,15 @@ async fn main() {
     start.set(Instant::now()).unwrap();
     barrier.wait().await;
     let mut good = 0;
+    let mut good_bytes = 0;
     let mut warm = 0;
     let mut lat = Vec::new();
     let mut errors = Vec::new();
     let mut served = 0;
     for t in tasks {
-        let (g, w, mut l, e) = t.await.unwrap();
+        let (g, bytes, w, mut l, e) = t.await.unwrap();
         good += g;
+        good_bytes += bytes;
         warm += w;
         served += usize::from(g > 0);
         lat.append(&mut l);
@@ -299,7 +312,7 @@ async fn main() {
     };
     println!(
         "{}",
-        json!({"name":args.name,"mode":args.mode,"size":args.size,"count":args.count,"concurrency":args.concurrency,"served":served,"started":wall,"elapsed":elapsed,"measured_seconds":seconds,"successes":good,"warmup_successes":warm,"qps":good as f64/seconds,"p50_us":pct(0.5),"p95_us":pct(0.95),"p99_us":pct(0.99),"p999_us":pct(0.999),"errors":errors.len(),"error_examples":errors.iter().take(4).collect::<Vec<_>>()})
+        json!({"name":args.name,"mode":args.mode,"size":args.size,"read_bytes":args.read_bytes,"count":args.count,"concurrency":args.concurrency,"served":served,"started":wall,"elapsed":elapsed,"measured_seconds":seconds,"successes":good,"measured_bytes":good_bytes,"warmup_successes":warm,"qps":good as f64/seconds,"p50_us":pct(0.5),"p95_us":pct(0.95),"p99_us":pct(0.99),"p999_us":pct(0.999),"errors":errors.len(),"error_examples":errors.iter().take(4).collect::<Vec<_>>()})
     );
     if !errors.is_empty() || (args.mode != "read" && good != args.count) {
         std::process::exit(1);

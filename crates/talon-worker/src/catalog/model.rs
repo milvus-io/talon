@@ -1,5 +1,9 @@
 //! File-cache residency state and codec; the shared journal owns ordering and I/O.
-use crate::index::StoredBlock;
+use crate::block_key::{BlockIdentity, BlockKey};
+use crate::{
+    index::{StoredBlock, StoredMeta},
+    page_table::PageMap,
+};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -8,14 +12,14 @@ use std::{
     path::Path,
     sync::Arc,
 };
-use talon_core::{BlockForm, BlockId, BlockMeta, PageIndex, PresentBitmap};
+use talon_core::{BlockForm, BlockId, PageIndex, PresentBitmap};
 use talon_journal::Machine;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct Block {
-    pub id: BlockId,
+    pub id: BlockKey,
     pub len: u64,
-    pub pages: BTreeMap<u32, u64>,
+    pub pages: PageMap<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -46,7 +50,7 @@ pub(super) enum Record {
 pub(super) struct Store {
     /// Zero denotes whole blocks, represented by one allocation at index zero.
     pub(super) page_size: u32,
-    pub(super) blocks: HashMap<BlockId, Arc<Block>>,
+    pub(super) blocks: HashMap<BlockKey, Arc<Block>>,
 }
 
 #[derive(Default)]
@@ -126,19 +130,21 @@ impl State {
                 let store = self.stores.get_mut(&intent.store).unwrap();
                 match intent.operation {
                     Operation::Put { page, .. } | Operation::DeletePage { page } => {
-                        if let Some(block) = store.blocks.get_mut(&intent.block) {
+                        if let Some(block) =
+                            store.blocks.get_mut(&intent.block as &dyn BlockIdentity)
+                        {
                             Arc::make_mut(block).pages.remove(&page);
                         }
                         if store
                             .blocks
-                            .get(&intent.block)
+                            .get(&intent.block as &dyn BlockIdentity)
                             .is_some_and(|b| b.pages.is_empty())
                         {
-                            store.blocks.remove(&intent.block);
+                            store.blocks.remove(&intent.block as &dyn BlockIdentity);
                         }
                     }
                     Operation::DeleteBlock | Operation::PutWhole { .. } => {
-                        store.blocks.remove(&intent.block);
+                        store.blocks.remove(&intent.block as &dyn BlockIdentity);
                     }
                 }
             }
@@ -153,41 +159,60 @@ impl State {
                 let store = self.stores.get_mut(&intent.store).unwrap();
                 match intent.operation {
                     Operation::PutWhole { len } => {
-                        store.blocks.insert(
-                            intent.block.clone(),
-                            Arc::new(Block {
-                                id: intent.block,
-                                len,
-                                pages: [(0, allocated)].into(),
-                            }),
-                        );
+                        let entry = store
+                            .blocks
+                            .entry(BlockKey::new(&intent.block as &dyn BlockIdentity));
+                        let id = entry.key().clone();
+                        let block = Arc::new(Block {
+                            id,
+                            len,
+                            pages: [(0, allocated)].into(),
+                        });
+                        match entry {
+                            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                                entry.insert(block);
+                            }
+                            std::collections::hash_map::Entry::Vacant(entry) => {
+                                entry.insert(block);
+                            }
+                        }
                     }
                     Operation::Put { page, len } => {
-                        let block = store.blocks.entry(intent.block.clone()).or_insert_with(|| {
-                            Arc::new(Block {
-                                id: intent.block,
-                                len,
-                                pages: BTreeMap::new(),
-                            })
-                        });
+                        use std::collections::hash_map::Entry;
+                        let block = match store
+                            .blocks
+                            .entry(BlockKey::new(&intent.block as &dyn BlockIdentity))
+                        {
+                            Entry::Occupied(entry) => entry.into_mut(),
+                            Entry::Vacant(entry) => {
+                                let id = entry.key().clone();
+                                entry.insert(Arc::new(Block {
+                                    id,
+                                    len,
+                                    pages: PageMap::default(),
+                                }))
+                            }
+                        };
                         let block = Arc::make_mut(block);
                         block.len = len;
                         block.pages.insert(page, allocated);
                     }
                     Operation::DeletePage { page } => {
-                        if let Some(block) = store.blocks.get_mut(&intent.block) {
+                        if let Some(block) =
+                            store.blocks.get_mut(&intent.block as &dyn BlockIdentity)
+                        {
                             Arc::make_mut(block).pages.remove(&page);
                         }
                         if store
                             .blocks
-                            .get(&intent.block)
+                            .get(&intent.block as &dyn BlockIdentity)
                             .is_some_and(|b| b.pages.is_empty())
                         {
-                            store.blocks.remove(&intent.block);
+                            store.blocks.remove(&intent.block as &dyn BlockIdentity);
                         }
                     }
                     Operation::DeleteBlock => {
-                        store.blocks.remove(&intent.block);
+                        store.blocks.remove(&intent.block as &dyn BlockIdentity);
                     }
                 }
             }
@@ -215,7 +240,7 @@ impl State {
         Ok(Some(crate::recovery::map(blocks, threads, |b| {
             if store.page_size == 0 {
                 return StoredBlock {
-                    meta: BlockMeta {
+                    meta: StoredMeta {
                         id: b.id.clone(),
                         len: b.len,
                         form: BlockForm::Whole,
@@ -223,12 +248,12 @@ impl State {
                     allocated: vec![(None, b.pages[&0])],
                 };
             }
-            let mut present = PresentBitmap::new(b.id.page_count(store.page_size));
+            let mut present = PresentBitmap::new(b.id.view().page_count(store.page_size));
             for page in b.pages.keys() {
                 present.set(PageIndex(*page));
             }
             StoredBlock {
-                meta: BlockMeta {
+                meta: StoredMeta {
                     id: b.id.clone(),
                     len: b.len,
                     form: BlockForm::Paged {
@@ -293,7 +318,7 @@ impl Iterator for Snapshot {
         use std::ops::Bound::{Excluded, Unbounded};
         let record = loop {
             if let Some((store, block, after)) = &mut self.block {
-                let pages: BTreeMap<_, _> = block
+                let pages: PageMap<_> = block
                     .pages
                     .range((after.map_or(Unbounded, Excluded), Unbounded))
                     .take(SNAPSHOT_PAGES)
@@ -418,7 +443,7 @@ impl Machine for State {
                     .stores
                     .get_mut(&store)
                     .ok_or_else(|| invalid("unknown snapshot store"))?;
-                if block.len > u64::from(block.id.block_size)
+                if block.len > u64::from(block.id.view().block_size)
                     || block.pages.is_empty()
                     || if store.page_size == 0 {
                         continuation || block.pages.len() != 1 || !block.pages.contains_key(&0)
@@ -426,7 +451,7 @@ impl Machine for State {
                         block
                             .pages
                             .keys()
-                            .any(|page| *page >= block.id.page_count(store.page_size))
+                            .any(|page| *page >= block.id.view().page_count(store.page_size))
                     }
                 {
                     return Err(invalid("invalid snapshot block"));
