@@ -1,13 +1,15 @@
 use super::catalog::{Address, Catalog};
 use super::lookup::{POLICY, REFERENCED, VISIBLE};
 use crate::eviction::{AccessHandle, PolicyEntry, PolicyState};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
 pub(crate) struct SmallAccess {
     catalog: Weak<RwLock<Catalog>>,
+    tickets: Weak<super::tickets::Tickets>,
     pub(super) address: Mutex<Address>,
-    position: Mutex<(u64, usize)>,
+    position: AtomicUsize,
+    epoch: AtomicU64,
     pub(crate) state: Mutex<PolicyState>,
     retired: AtomicBool,
 }
@@ -20,23 +22,11 @@ impl std::fmt::Debug for SmallAccess {
 
 impl Drop for SmallAccess {
     fn drop(&mut self) {
-        let Some(catalog) = self.catalog.upgrade() else {
-            return;
-        };
-        let Ok(mut catalog) = catalog.try_write() else {
+        let Some(tickets) = self.tickets.upgrade() else {
             return;
         };
         let address = *self.address.get_mut().unwrap();
-        if catalog
-            .tickets
-            .get(&address)
-            .is_some_and(|ticket| std::ptr::eq(ticket.as_ptr(), self))
-        {
-            catalog.tickets.remove(&address);
-            if catalog.tickets.capacity() > 4 * catalog.tickets.len().max(256) {
-                catalog.tickets.shrink_to(256);
-            }
-        }
+        tickets.remove_if(address, |ticket| std::ptr::eq(ticket.as_ptr(), self));
     }
 }
 
@@ -49,12 +39,13 @@ impl SmallAccess {
         if self.retired.load(Ordering::Acquire) {
             return None;
         }
-        let mut position = self.position.lock().unwrap();
-        let slot = if position.0 == catalog.lookup.epoch() {
-            position.1
+        let slot = if self.epoch.load(Ordering::Acquire) == catalog.lookup.epoch() {
+            self.position.load(Ordering::Relaxed)
         } else {
             let slot = catalog.at(*self.address.lock().unwrap())?;
-            *position = (catalog.lookup.epoch(), slot);
+            // The catalog read lock keeps the epoch fixed; concurrent refreshes publish the same slot.
+            self.position.store(slot, Ordering::Relaxed);
+            self.epoch.store(catalog.lookup.epoch(), Ordering::Release);
             slot
         };
         (catalog.lookup.flags(slot) & POLICY != 0).then_some(slot)
@@ -64,10 +55,9 @@ impl SmallAccess {
         let Some(catalog) = self.catalog.upgrade() else {
             return;
         };
-        let mut catalog = catalog.write().unwrap();
+        let catalog = catalog.read().unwrap();
         if let Some(slot) = self.slot(&catalog) {
-            let flags = catalog.lookup.flags(slot) | REFERENCED;
-            catalog.lookup.set_flags(slot, flags);
+            catalog.lookup.reference(slot);
         }
     }
 
@@ -84,13 +74,11 @@ impl SmallAccess {
         let Some(catalog) = self.catalog.upgrade() else {
             return false;
         };
-        let mut catalog = catalog.write().unwrap();
+        let catalog = catalog.read().unwrap();
         let Some(slot) = self.slot(&catalog) else {
             return false;
         };
-        let flags = catalog.lookup.flags(slot);
-        catalog.lookup.set_flags(slot, flags & !REFERENCED);
-        flags & REFERENCED != 0
+        catalog.lookup.take_reference(slot)
     }
 
     pub fn snapshot(&self) -> u64 {
@@ -121,15 +109,16 @@ impl SmallAccess {
 }
 
 impl Catalog {
-    pub(super) fn next_revision(&mut self) -> u64 {
-        self.revision = self
-            .revision
-            .checked_add(1)
-            .expect("small policy revision exhausted");
+    pub(super) fn next_revision(&self) -> u64 {
         self.revision
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |revision| {
+                revision.checked_add(1)
+            })
+            .expect("small policy revision exhausted")
+            + 1
     }
 
-    pub(super) fn compact_entry(&mut self, slot: usize) -> PolicyEntry {
+    pub(super) fn compact_entry(&self, slot: usize) -> PolicyEntry {
         let (address, record) = self
             .record(self.lookup.handle(slot))
             .expect("small policy record");
@@ -145,41 +134,27 @@ impl Catalog {
     }
 
     pub(super) fn compact_access(
-        &mut self,
+        &self,
         slot: usize,
         address: Address,
         charge: u64,
     ) -> AccessHandle {
         let bytes = self.charges.get(&address).copied().unwrap_or(charge);
-        let ticket = self
-            .tickets
-            .get(&address)
-            .and_then(Weak::upgrade)
-            .unwrap_or_else(|| {
-                self.ticket_creations += 1;
-                if self.ticket_creations >= self.tickets.len().max(256) {
-                    self.ticket_creations = 0;
-                    self.tickets.retain(|_, ticket| ticket.strong_count() != 0);
-                    if self.tickets.capacity() > 4 * self.tickets.len().max(256) {
-                        self.tickets.shrink_to(256);
-                    }
-                }
-                let ticket = Arc::new(SmallAccess {
-                    catalog: self.owner.clone(),
-                    address: Mutex::new(address),
-                    position: Mutex::new((self.lookup.epoch(), slot)),
-                    state: Mutex::new(PolicyState {
-                        independent: true,
-                        bytes,
-                        position: 0,
-                        revision: self.next_revision(),
-                        pins: 0,
-                    }),
-                    retired: AtomicBool::new(false),
-                });
-                self.tickets.insert(address, Arc::downgrade(&ticket));
-                ticket
-            });
+        let ticket = self.tickets.get_or_insert(address, || SmallAccess {
+            catalog: self.owner.clone(),
+            tickets: Arc::downgrade(&self.tickets),
+            address: Mutex::new(address),
+            position: AtomicUsize::new(slot),
+            epoch: AtomicU64::new(self.lookup.epoch()),
+            state: Mutex::new(PolicyState {
+                independent: true,
+                bytes,
+                position: 0,
+                revision: self.next_revision(),
+                pins: 0,
+            }),
+            retired: AtomicBool::new(false),
+        });
         self.access
             .get(&address)
             .cloned()
@@ -290,12 +265,15 @@ impl Catalog {
     }
 
     pub(super) fn relocate_policy(&mut self, old: Address, new: Address, slot: usize) {
-        if let Some(ticket) = self.tickets.remove(&old) {
-            if let Some(ticket) = ticket.upgrade() {
-                *ticket.address.lock().unwrap() = new;
-                *ticket.position.lock().unwrap() = (self.lookup.epoch(), slot);
-            }
-            self.tickets.insert(new, ticket);
+        if let Some(ticket) = self
+            .tickets
+            .remove(&old)
+            .and_then(|ticket| ticket.upgrade())
+        {
+            *ticket.address.lock().unwrap() = new;
+            ticket.position.store(slot, Ordering::Relaxed);
+            ticket.epoch.store(self.lookup.epoch(), Ordering::Release);
+            self.tickets.insert(new, Arc::downgrade(&ticket));
         }
         if let Some(pin) = self.pins.remove(&old) {
             self.pins.insert(new, pin);

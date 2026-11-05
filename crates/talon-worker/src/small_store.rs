@@ -16,6 +16,7 @@ mod format;
 mod journal;
 mod records;
 mod rings;
+mod tickets;
 pub use rings::SmallObjectStore;
 #[cfg(test)]
 pub(crate) mod tests;

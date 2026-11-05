@@ -126,7 +126,7 @@ impl Directory {
     }
 
     pub(super) fn segment_entries(&self, segment: u64) -> Vec<(SmallKey, Location)> {
-        let mut catalog = self.catalog.0.write().unwrap();
+        let catalog = self.catalog.0.read().unwrap();
         let entries: Vec<_> = catalog
             .segment(segment)
             .map(|meta| {
@@ -206,7 +206,7 @@ impl Directory {
         catalog.retired.get(id).map(|entry| entry.key.clone())
     }
     pub fn get(&self, id: &dyn SmallIdentity) -> Option<Location> {
-        let mut catalog = self.catalog.0.write().unwrap();
+        let catalog = self.catalog.0.read().unwrap();
         if let Some(slot) = self.find(&catalog, id, VISIBLE) {
             return catalog.location(slot);
         }
@@ -223,7 +223,7 @@ impl Directory {
         self.get(id).is_some()
     }
     pub fn iter(&self) -> std::vec::IntoIter<(SmallKey, Location)> {
-        let mut catalog = self.catalog.0.write().unwrap();
+        let catalog = self.catalog.0.read().unwrap();
         let slots: Vec<_> = catalog
             .lookup
             .iter()
@@ -375,7 +375,7 @@ impl Directory {
         Some(location)
     }
     pub fn policy_get(&self, id: &dyn SmallIdentity) -> Option<PolicyEntry> {
-        let mut catalog = self.catalog.0.write().unwrap();
+        let catalog = self.catalog.0.read().unwrap();
         if let Some(slot) = self.find(&catalog, id, POLICY) {
             if catalog.compact_streams.contains(&self.slot) {
                 return Some(catalog.compact_entry(slot));
@@ -518,6 +518,140 @@ mod tests {
     }
 
     #[test]
+    fn lookups_touches_and_token_reclamation_share_the_catalog_read_lock() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (directory, key) = fixture(2);
+        let model = directory.catalog.clone();
+        let held = model.0.read().unwrap();
+        let (done, completed) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let location = directory.catalog.lookup(&key(0)).unwrap();
+            location.touch();
+            assert!(location
+                .access
+                .as_ref()
+                .unwrap()
+                .small()
+                .unwrap()
+                .referenced());
+            assert!(directory
+                .policy_get(&key(0))
+                .unwrap()
+                .access
+                .small()
+                .is_some());
+            let other = directory.get(&key(1)).unwrap();
+            other.touch();
+            assert!(directory.catalog.lookup(&key(2)).is_none());
+            drop(location);
+            drop(other);
+            assert_eq!(directory.catalog.0.read().unwrap().tickets.len(), 0);
+            done.send(()).unwrap();
+        });
+        let result = completed.recv_timeout(Duration::from_secs(5));
+        drop(held);
+        worker.join().unwrap();
+        result.expect("reads and access updates must not require the catalog write lock");
+    }
+
+    #[test]
+    fn concurrent_same_key_readers_share_one_token_and_preserve_references() {
+        use std::sync::{mpsc, Barrier};
+        use std::time::Duration;
+
+        let (directory, key) = fixture(1);
+        let model = directory.catalog.clone();
+        let held = model.0.read().unwrap();
+        let start = Arc::new(Barrier::new(17));
+        let (send, receive) = mpsc::channel();
+        let workers: Vec<_> = (0..16)
+            .map(|_| {
+                let model = model.clone();
+                let id = key(0);
+                let start = start.clone();
+                let send = send.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    let access = model.lookup(&id).unwrap().access.unwrap();
+                    for _ in 0..128 {
+                        access.touch();
+                    }
+                    send.send(access).unwrap();
+                })
+            })
+            .collect();
+        start.wait();
+        let mut tokens = Vec::new();
+        for _ in 0..16 {
+            match receive.recv_timeout(Duration::from_secs(5)) {
+                Ok(token) => tokens.push(token),
+                Err(_) => break,
+            }
+        }
+        drop(held);
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(tokens.len(), 16);
+        let first = tokens[0].small().unwrap();
+        for token in &tokens {
+            assert!(Arc::ptr_eq(first, token.small().unwrap()));
+        }
+        assert!(first.referenced());
+        let revision = first.snapshot();
+        assert!(first.is_current(revision));
+        tokens[15].touch();
+        assert!(!first.is_current(revision));
+        drop(tokens);
+        assert_eq!(model.0.read().unwrap().tickets.len(), 0);
+    }
+
+    #[test]
+    fn concurrent_token_churn_preserves_other_live_tokens() {
+        let (directory, key) = fixture(1025);
+        let held = directory.get(&key(0)).unwrap().access.unwrap();
+        let model = directory.catalog.clone();
+        let keys: Vec<_> = (1..1025).map(key).collect();
+        std::thread::scope(|scope| {
+            for batch in keys.chunks(64) {
+                let model = &model;
+                let held = &held;
+                scope.spawn(move || {
+                    for _ in 0..16 {
+                        let tokens: Vec<_> = batch
+                            .iter()
+                            .map(|id| model.lookup(id).unwrap().access.unwrap())
+                            .collect();
+                        for (id, token) in batch.iter().zip(&tokens) {
+                            let again = model.lookup(id).unwrap().access.unwrap();
+                            assert!(Arc::ptr_eq(token.small().unwrap(), again.small().unwrap()));
+                            token.touch();
+                        }
+                        held.touch();
+                    }
+                });
+            }
+        });
+        assert!(held.small().unwrap().referenced());
+        assert_eq!(model.0.read().unwrap().tickets.len(), 1);
+        drop(held);
+        assert_eq!(model.0.read().unwrap().tickets.len(), 0);
+    }
+
+    #[test]
+    fn last_reader_releases_its_token_while_the_catalog_is_write_locked() {
+        let (directory, key) = fixture(1);
+        let access = directory.get(&key(0)).unwrap().access.unwrap();
+        let catalog = directory.catalog.0.write().unwrap();
+        assert_eq!(catalog.tickets.len(), 1);
+        drop(access);
+        assert_eq!(catalog.tickets.len(), 0);
+        assert_eq!(catalog.tickets.capacity(), 0);
+    }
+
+    #[test]
     fn compact_tickets_release_after_bulk_reads_and_repeated_hits() {
         let (directory, key) = fixture(1025);
         let tokens: Vec<_> = (0..1025).map(|n| directory.get(&key(n)).unwrap()).collect();
@@ -526,8 +660,8 @@ mod tests {
             directory.get(&key(0)).unwrap().access.unwrap().touch();
         }
         let catalog = directory.catalog.0.read().unwrap();
-        assert!(catalog.tickets.len() <= 256);
-        assert!(catalog.tickets.capacity() < 2048);
+        assert_eq!(catalog.tickets.len(), 0);
+        assert_eq!(catalog.tickets.capacity(), 0);
         assert!(catalog.policy.is_empty());
         assert!(catalog.access.is_empty());
         assert_eq!(std::mem::size_of::<AccessHandle>(), 32);

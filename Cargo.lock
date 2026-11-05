@@ -4111,6 +4111,7 @@ name = "talon-worker"
 version = "0.2.1"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "async-trait",
  "axum",
  "bytes",

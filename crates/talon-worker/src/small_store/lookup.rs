@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicU8, Ordering};
+
 const EMPTY: u32 = 0;
 const DELETED: u32 = u32::MAX;
 const FINGERPRINT: u8 = 31;
@@ -8,7 +10,7 @@ pub(super) const REFERENCED: u8 = 128;
 #[derive(Default)]
 pub(super) struct Lookup {
     handles: Vec<u32>,
-    control: Vec<u8>,
+    control: Vec<AtomicU8>,
     len: usize,
     deleted: usize,
     epoch: u64,
@@ -45,7 +47,7 @@ impl Lookup {
         let capacity = (target * 5).div_ceil(4).div_ceil(64) * 64;
         let mut next = Self {
             handles: vec![EMPTY; capacity],
-            control: vec![0; capacity],
+            control: (0..capacity).map(|_| AtomicU8::new(0)).collect(),
             len: 0,
             deleted: 0,
             epoch: self.epoch,
@@ -71,8 +73,8 @@ impl Lookup {
                 return None;
             }
             if handle != DELETED
-                && self.control[slot] & FINGERPRINT == fingerprint
-                && equal(handle, self.control[slot] & !FINGERPRINT)
+                && self.control[slot].load(Ordering::Relaxed) & FINGERPRINT == fingerprint
+                && equal(handle, self.flags(slot))
             {
                 return Some(slot);
             }
@@ -94,7 +96,7 @@ impl Lookup {
                     let slot = tombstone.unwrap_or(slot);
                     self.deleted -= usize::from(tombstone.is_some());
                     self.handles[slot] = handle;
-                    self.control[slot] = (hash >> 59) as u8 | (flags & !FINGERPRINT);
+                    *self.control[slot].get_mut() = (hash >> 59) as u8 | (flags & !FINGERPRINT);
                     self.len += 1;
                     self.changed();
                     return slot;
@@ -118,7 +120,7 @@ impl Lookup {
         self.len -= 1;
         self.deleted += 1;
         self.changed();
-        self.control[slot] & !FINGERPRINT
+        self.flags(slot)
     }
 
     pub fn handle(&self, slot: usize) -> u32 {
@@ -136,11 +138,20 @@ impl Lookup {
     }
 
     pub fn flags(&self, slot: usize) -> u8 {
-        self.control[slot] & !FINGERPRINT
+        self.control[slot].load(Ordering::Relaxed) & !FINGERPRINT
     }
 
     pub fn set_flags(&mut self, slot: usize, flags: u8) {
-        self.control[slot] = self.control[slot] & FINGERPRINT | flags & !FINGERPRINT;
+        let control = self.control[slot].get_mut();
+        *control = *control & FINGERPRINT | flags & !FINGERPRINT;
+    }
+
+    pub fn reference(&self, slot: usize) {
+        self.control[slot].fetch_or(REFERENCED, Ordering::Relaxed);
+    }
+
+    pub fn take_reference(&self, slot: usize) -> bool {
+        self.control[slot].fetch_and(!REFERENCED, Ordering::Relaxed) & REFERENCED != 0
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (usize, u32, u8)> + '_ {
@@ -148,11 +159,7 @@ impl Lookup {
             .iter()
             .enumerate()
             .filter_map(|(slot, &handle)| {
-                (handle != EMPTY && handle != DELETED).then_some((
-                    slot,
-                    handle,
-                    self.control[slot] & !FINGERPRINT,
-                ))
+                (handle != EMPTY && handle != DELETED).then_some((slot, handle, self.flags(slot)))
             })
     }
 }

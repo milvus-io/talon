@@ -45,6 +45,7 @@ prost.workspace = true
 talon-transport.workspace = true
 talon-backend = { path = "../talon-backend", features = ["uring"] }
 anyhow.workspace = true
+arc-swap = "1.9"
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

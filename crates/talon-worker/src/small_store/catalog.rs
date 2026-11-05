@@ -6,6 +6,7 @@ use crate::small_store::key::{SmallIdentity, SmallKey};
 use std::collections::{hash_map::RandomState, BTreeMap, HashMap, HashSet};
 use std::hash::BuildHasher;
 use std::io;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock, Weak};
 
 pub(super) type Address = (u64, u64);
@@ -33,11 +34,10 @@ pub(super) struct Catalog {
     pub live: HashMap<usize, usize>,
     pub compact_streams: HashSet<usize>,
     pub compact_totals: HashMap<usize, (u64, usize)>,
-    pub tickets: HashMap<Address, Weak<super::policy::SmallAccess>>,
+    pub tickets: Arc<super::tickets::Tickets>,
     pub pins: HashMap<Address, Arc<super::policy::SmallAccess>>,
     pub charges: HashMap<Address, u64>,
-    pub revision: u64,
-    pub ticket_creations: usize,
+    pub revision: AtomicU64,
     pub retired: HashMap<SmallKey, Retired>,
     retired_segments: BTreeMap<u64, Arc<SegmentMeta>>,
     active: bool,
@@ -59,7 +59,7 @@ impl Default for LiveModel {
 
 impl LiveModel {
     pub fn lookup(&self, id: &dyn SmallIdentity) -> Option<Location> {
-        self.0.write().unwrap().lookup_location(id)
+        self.0.read().unwrap().lookup_location(id)
     }
 }
 
@@ -119,7 +119,7 @@ impl Catalog {
             .find(self.hash(&record.key), |found, _| found == handle)
     }
 
-    fn lookup_location(&mut self, id: &dyn SmallIdentity) -> Option<Location> {
+    fn lookup_location(&self, id: &dyn SmallIdentity) -> Option<Location> {
         let mut resolved = None;
         let slot = self.lookup.find(self.hash(id), |handle, flags| {
             if flags & VISIBLE == 0 {
@@ -149,7 +149,7 @@ impl Catalog {
             .map(|entry| entry.location.clone())
     }
 
-    pub fn location(&mut self, slot: usize) -> Option<Location> {
+    pub fn location(&self, slot: usize) -> Option<Location> {
         let (address, record) = self.record(self.lookup.handle(slot))?;
         let resolved = ResolvedRecord {
             address,
@@ -161,7 +161,7 @@ impl Catalog {
         self.resolve_location(slot, resolved)
     }
 
-    fn resolve_location(&mut self, slot: usize, record: ResolvedRecord) -> Option<Location> {
+    fn resolve_location(&self, slot: usize, record: ResolvedRecord) -> Option<Location> {
         let access = if self.compact_streams.contains(&record.stream)
             && self.lookup.flags(slot) & super::lookup::POLICY != 0
         {
