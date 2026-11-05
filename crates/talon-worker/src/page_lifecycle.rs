@@ -469,14 +469,23 @@ impl Drop for BlockPageClaim {
 }
 
 impl BlockState {
+    fn retirement_ready(&self, state: &BlockPages, pages_empty: bool) -> bool {
+        (!state.work.track_access || pages_empty)
+            && !state.cleanup_pending
+            && state.retries.is_empty()
+            && Arc::strong_count(&self.gate) == 1
+    }
+
+    pub(crate) fn retirement_candidate(&self) -> bool {
+        let state = self.inner.lock().unwrap();
+        let pages = state.pages.read().unwrap();
+        self.retirement_ready(&state, pages.is_empty())
+    }
+
     pub(crate) fn retire_if_idle(&self) -> bool {
         let state = self.inner.lock().unwrap();
         let pages = state.pages.write().unwrap();
-        if (state.work.track_access && !pages.is_empty())
-            || state.cleanup_pending
-            || !state.retries.is_empty()
-            || Arc::strong_count(&self.gate) != 1
-        {
+        if !self.retirement_ready(&state, pages.is_empty()) {
             return false;
         }
         for page in pages.values() {

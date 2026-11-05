@@ -135,8 +135,8 @@ impl Lru {
                             pins: 0,
                             position,
                             revision: position,
-                            ownership_position: position,
-                            ownership_pending: true,
+                            ownership_position: AtomicU64::new(position),
+                            ownership_pending: AtomicBool::new(true),
                             access: u.access.clock().clone(),
                         },
                     );

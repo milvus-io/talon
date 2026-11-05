@@ -345,10 +345,19 @@ impl BlockIndex {
     pub(crate) fn policy_block_get(&self, id: &dyn BlockIdentity) -> Option<BlockActivity> {
         let entries = self.entries.read().unwrap();
         let entry = entries.get(id)?;
-        Some(BlockActivity {
-            state: entry.activity.as_deref()?.clone(),
-            units: entry.policy.len,
-        })
+        Some(entry.activity.as_deref()?.snapshot(entry.policy.len))
+    }
+
+    pub(crate) fn policy_block_observe_ownership(
+        &self,
+        id: &dyn BlockIdentity,
+        admission_limit: u64,
+    ) -> Option<BlockActivity> {
+        let entries = self.entries.read().unwrap();
+        let entry = entries.get(id)?;
+        let activity = entry.activity.as_deref()?;
+        activity.observe_ownership(admission_limit);
+        Some(activity.snapshot(entry.policy.len))
     }
 
     pub(crate) fn policy_block_update<T>(
@@ -686,6 +695,11 @@ impl BlockIndex {
     // Caller owns the lifecycle registry. Retirement checks maintenance work
     // while the directory and registry are the only remaining owners.
     pub(crate) fn retire_lifecycle(&self, id: &BlockId, block: &Arc<BlockState>) -> bool {
+        if Arc::strong_count(block) != 2 || !block.retirement_candidate() {
+            return false;
+        }
+        // The precheck releases local locks before the directory write lock.
+        // Recheck identity, owners and work before detaching the lifecycle.
         let mut entries = self.entries.write().unwrap();
         let Some(slot) = entries.get_mut(id) else {
             return false;
@@ -1289,6 +1303,127 @@ mod tests {
             form: BlockForm::Whole,
             len,
         }
+    }
+
+    fn with_directory_reader(index: &BlockIndex, scan: impl FnOnce() + Send) {
+        std::thread::scope(|scope| {
+            let reader = index.entries.read().unwrap();
+            let (done, finished) = std::sync::mpsc::channel();
+            let task = scope.spawn(move || {
+                scan();
+                done.send(()).unwrap();
+            });
+            let result = finished.recv_timeout(std::time::Duration::from_secs(5));
+            drop(reader);
+            task.join().unwrap();
+            assert!(result.is_ok(), "scan waited for the directory reader");
+        });
+    }
+
+    #[test]
+    fn tti_scan_preserves_concurrent_directory_readers() {
+        let index = Arc::new(BlockIndex::new());
+        let life = crate::page_lifecycle::PageLifecycle::with_index(index.clone(), true);
+        let id = block(1);
+        index.init_paged(id.clone(), 4096, 4096);
+        index.mark_page_allocated(&id, PageIndex(0), 4096);
+        life.block(&id)
+            .register(PageIndex(0), Some(100), 100, false);
+
+        with_directory_reader(&index, || {
+            let (candidates, report) = life.scan(
+                &mut crate::page_lifecycle::ScanCursor::default(),
+                100,
+                200,
+                Some(50),
+                100,
+            );
+            assert!(report.completed);
+            assert_eq!(report.checked, 1);
+            assert_eq!(candidates.len(), 1);
+        });
+        assert!(life.get(&id).is_some());
+        assert_eq!(index.page_count(), 1);
+    }
+
+    #[test]
+    fn pending_lifecycle_cleanup_preserves_concurrent_directory_readers() {
+        let index = Arc::new(BlockIndex::new());
+        let life = crate::page_lifecycle::PageLifecycle::with_index(index.clone(), false);
+        let id = block(1);
+        life.block(&id).inner.lock().unwrap().cleanup_pending = true;
+
+        with_directory_reader(&index, || {
+            let (_, report) = life.scan(
+                &mut crate::page_lifecycle::ScanCursor::default(),
+                100,
+                200,
+                None,
+                100,
+            );
+            assert!(report.completed);
+            assert_eq!(report.empty.len(), 1);
+        });
+        assert!(life.get(&id).is_some());
+        life.block(&id).inner.lock().unwrap().cleanup_pending = false;
+        life.retire_empty(&id);
+        assert!(life.get(&id).is_none());
+    }
+
+    #[test]
+    fn stale_and_idle_scans_preserve_concurrent_directory_readers() {
+        let index = Arc::new(BlockIndex::new());
+        let id = block(1);
+        index.commit(whole_meta(id.clone(), 4096));
+        let lru = index.restore_lru();
+        let access = lru.insert(CacheUnit::Whole(id.clone()), 4096);
+        access.clock().store(100, Ordering::Relaxed);
+
+        with_directory_reader(&index, || {
+            let candidates = lru.stale_gc_candidates(&mut (0, 0), 200, 50, 100, 100);
+            assert_eq!(candidates.len(), 1);
+            assert!(lru.stale_candidate_is_current(&candidates[0]));
+            lru.stale_verified(&id.object, 200);
+            assert!(lru
+                .stale_gc_candidates(&mut (0, 0), 200, 50, 100, 100)
+                .is_empty());
+            assert_eq!(lru.idle_candidates(&mut (0, 0), 200, 50, 100, 100).len(), 1);
+            access.touch();
+            assert!(!lru.stale_candidate_is_current(&candidates[0]));
+        });
+    }
+
+    #[test]
+    fn ownership_scan_and_deferral_preserve_concurrent_directory_readers() {
+        let index = Arc::new(BlockIndex::new());
+        let id = block(1);
+        index.commit(whole_meta(id.clone(), 4096));
+        let lru = index.restore_lru();
+        let limit = lru.ownership_admission_ceiling();
+        lru.insert(CacheUnit::Whole(id.clone()), 4096);
+        with_directory_reader(&index, || {
+            let (_, candidate) = lru.next_ownership_block(&mut (0, limit), limit).unwrap();
+            assert!(candidate.revision >= limit);
+            assert!(lru.next_ownership_block(&mut (0, limit), limit).is_none());
+            let next_limit = lru.ownership_admission_ceiling();
+            let (position, candidate) = lru
+                .next_ownership_block(&mut (limit, next_limit), next_limit)
+                .unwrap();
+            assert_eq!(candidate.block, id);
+            assert!(lru.stale_candidate_is_current(&candidate));
+            assert!(lru
+                .next_ownership_block(&mut (position, position + 1), next_limit)
+                .is_some());
+        });
+        let limit = lru.ownership_admission_ceiling();
+        lru.insert(CacheUnit::Whole(id.clone()), 4096);
+        with_directory_reader(&index, || {
+            let next_limit = lru.ownership_admission_ceiling();
+            let (_, candidate) = lru
+                .next_ownership_block(&mut (limit, next_limit), next_limit)
+                .unwrap();
+            assert_eq!(candidate.block, id);
+        });
     }
 
     #[test]

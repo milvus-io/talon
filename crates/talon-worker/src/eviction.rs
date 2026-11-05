@@ -12,9 +12,7 @@
 //! are deferred per DESIGN.md.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-#[cfg(test)]
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 #[cfg(test)]
@@ -241,26 +239,50 @@ pub(crate) struct StaleBlockCandidate {
     last_access: u64,
 }
 
-#[derive(Clone)]
 pub(crate) struct BlockPolicy {
     pins: usize,
     position: u64,
     revision: u64,
     // One notification coalesces admissions until ownership observes the block.
-    ownership_position: u64,
-    ownership_pending: bool,
+    ownership_position: AtomicU64,
+    ownership_pending: AtomicBool,
     access: Arc<AtomicU64>,
 }
 
 pub(crate) struct BlockActivity {
-    pub state: BlockPolicy,
     pub units: usize,
+    pins: usize,
+    position: u64,
+    revision: u64,
+    ownership_position: u64,
+    #[cfg(test)]
+    ownership_pending: bool,
+    access: Arc<AtomicU64>,
 }
 
-impl std::ops::Deref for BlockActivity {
-    type Target = BlockPolicy;
-    fn deref(&self) -> &Self::Target {
-        &self.state
+impl BlockPolicy {
+    pub(crate) fn snapshot(&self, units: usize) -> BlockActivity {
+        BlockActivity {
+            units,
+            pins: self.pins,
+            position: self.position,
+            revision: self.revision,
+            ownership_position: self.ownership_position.load(Ordering::Relaxed),
+            #[cfg(test)]
+            ownership_pending: self.ownership_pending.load(Ordering::Relaxed),
+            access: self.access.clone(),
+        }
+    }
+
+    // The LRU mutex serializes both fields with admissions and queue changes.
+    // Atomics let observation retain a shared directory lock.
+    pub(crate) fn observe_ownership(&self, admission_limit: u64) {
+        let pending = self.revision >= admission_limit;
+        if pending {
+            self.ownership_position
+                .store(self.revision, Ordering::Relaxed);
+        }
+        self.ownership_pending.store(pending, Ordering::Relaxed);
     }
 }
 
@@ -484,12 +506,12 @@ impl Lru {
         let requeue = g
             .index
             .policy_block_update(unit.block(), |activity| {
-                if activity.ownership_pending {
+                if *activity.ownership_pending.get_mut() {
                     return None;
                 }
-                let previous = activity.ownership_position;
-                activity.ownership_position = position;
-                activity.ownership_pending = true;
+                let previous = *activity.ownership_position.get_mut();
+                *activity.ownership_position.get_mut() = position;
+                *activity.ownership_pending.get_mut() = true;
                 Some(previous)
             })
             .flatten();
@@ -553,8 +575,8 @@ impl Lru {
                     pins: 0,
                     position,
                     revision: position,
-                    ownership_position: position,
-                    ownership_pending: true,
+                    ownership_position: AtomicU64::new(position),
+                    ownership_pending: AtomicBool::new(true),
                     access: Arc::new(AtomicU64::new(access_millis())),
                 },
             );
@@ -804,18 +826,20 @@ impl Lru {
             cursor.0 = position + 1;
             let activity = g.index.policy_block_get(block).expect("tracked block");
             let access = activity.access.load(Ordering::Relaxed);
-            let verified = g
-                .object_checks
-                .get(&block.view().object.materialize())
-                .and_then(|check| check.1);
-            if activity.pins != 0
-                || now.saturating_sub(access) <= age
-                || (consider_verified && verified.is_some_and(|at| now.saturating_sub(at) < age))
+            if activity.pins != 0 || now.saturating_sub(access) <= age {
+                continue;
+            }
+            let block = block.materialize();
+            if consider_verified
+                && g.object_checks
+                    .get(&block.object)
+                    .and_then(|check| check.1)
+                    .is_some_and(|at| now.saturating_sub(at) < age)
             {
                 continue;
             }
             out.push(StaleBlockCandidate {
-                block: block.materialize(),
+                block,
                 units: activity.units,
                 revision: activity.revision,
                 last_access: access,
@@ -846,18 +870,10 @@ impl Lru {
         let (&position, block) = g.ownership_queue.range(cursor.0..cursor.1).next()?;
         cursor.0 = position + 1;
         let block = block.clone();
-        g.index
-            .policy_block_update(&block, |activity| {
-                let revision = activity.revision;
-                if revision >= admission_limit {
-                    activity.ownership_position = revision;
-                    activity.ownership_pending = true;
-                } else {
-                    activity.ownership_pending = false;
-                }
-            })
+        let activity = g
+            .index
+            .policy_block_observe_ownership(&block, admission_limit)
             .expect("tracked block");
-        let activity = g.index.policy_block_get(&block).expect("tracked block");
         let candidate = StaleBlockCandidate {
             block: block.materialize(),
             units: activity.units,
