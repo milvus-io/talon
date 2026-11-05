@@ -57,6 +57,20 @@ impl Default for LiveModel {
     }
 }
 
+impl LiveModel {
+    pub fn lookup(&self, id: &dyn BlockIdentity) -> Option<Location> {
+        self.0.write().unwrap().lookup_location(id)
+    }
+}
+
+struct ResolvedRecord {
+    address: Address,
+    len: u64,
+    checksum: u64,
+    charge: u64,
+    stream: usize,
+}
+
 impl Catalog {
     pub fn hash(&self, key: &dyn BlockIdentity) -> u64 {
         self.hash.hash_one(key.view())
@@ -105,27 +119,65 @@ impl Catalog {
             .find(self.hash(&record.key), |found, _| found == handle)
     }
 
+    fn lookup_location(&mut self, id: &dyn BlockIdentity) -> Option<Location> {
+        let mut resolved = None;
+        let slot = self.lookup.find(self.hash(id), |handle, flags| {
+            if flags & VISIBLE == 0 {
+                return false;
+            }
+            let Some((address, record)) = self.record(handle) else {
+                return false;
+            };
+            if record.key != id.view() {
+                return false;
+            }
+            resolved = Some(ResolvedRecord {
+                address,
+                len: record.len,
+                checksum: record.checksum,
+                charge: super::charge(&record.key, record.len),
+                stream: self.segment(address.0).unwrap().slot,
+            });
+            true
+        });
+        if let Some(slot) = slot {
+            return self.resolve_location(slot, resolved.unwrap());
+        }
+        self.retired
+            .get(id)
+            .filter(|entry| entry.live)
+            .map(|entry| entry.location.clone())
+    }
+
     pub fn location(&mut self, slot: usize) -> Option<Location> {
         let (address, record) = self.record(self.lookup.handle(slot))?;
-        let len = record.len;
-        let checksum = record.checksum;
-        let compact = self
-            .compact_streams
-            .contains(&self.segment(address.0)?.slot);
-        let access = if compact && self.lookup.flags(slot) & super::lookup::POLICY != 0 {
-            Some(self.compact_entry(slot).access)
+        let resolved = ResolvedRecord {
+            address,
+            len: record.len,
+            checksum: record.checksum,
+            charge: super::charge(&record.key, record.len),
+            stream: self.segment(address.0)?.slot,
+        };
+        self.resolve_location(slot, resolved)
+    }
+
+    fn resolve_location(&mut self, slot: usize, record: ResolvedRecord) -> Option<Location> {
+        let access = if self.compact_streams.contains(&record.stream)
+            && self.lookup.flags(slot) & super::lookup::POLICY != 0
+        {
+            Some(self.compact_access(slot, record.address, record.charge))
         } else {
             self.policy
-                .get(&address)
+                .get(&record.address)
                 .map(|entry| entry.access.clone())
-                .or_else(|| self.access.get(&address).cloned())
+                .or_else(|| self.access.get(&record.address).cloned())
         };
         Some(Location {
-            file: self.files.get(&address.0)?.clone(),
-            segment: address.0,
-            offset: address.1,
-            len,
-            checksum,
+            file: self.files.get(&record.address.0)?.clone(),
+            segment: record.address.0,
+            offset: record.address.1,
+            len: record.len,
+            checksum: record.checksum,
             access,
         })
     }

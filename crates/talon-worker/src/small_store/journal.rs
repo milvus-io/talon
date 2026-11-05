@@ -27,6 +27,7 @@ pub(super) struct Journal {
     root: PathBuf,
     handle: Handle<LiveModel>,
     pub(super) model: LiveModel,
+    pub(super) readers: Arc<tokio::sync::RwLock<()>>,
     pub(super) next: Arc<AtomicU64>,
     #[cfg(test)]
     pub(super) control: Arc<TestControl>,
@@ -95,6 +96,7 @@ impl Journal {
                 root,
                 handle,
                 model: shared,
+                readers: Arc::default(),
                 next,
                 #[cfg(test)]
                 control: Default::default(),

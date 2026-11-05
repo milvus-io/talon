@@ -226,7 +226,7 @@ struct SegmentStore {
     entries: Arc<RwLock<directory::Directory>>,
     // Async opens run outside the directory lock, but must finish before GC
     // replaces locators and unlinks their source paths.
-    readers: tokio::sync::RwLock<()>,
+    readers: Arc<tokio::sync::RwLock<()>>,
     tasks: Arc<crate::page_gc::Mutations>,
     cached_stats: RwLock<SmallStoreStats>,
     retired: Mutex<Vec<(Weak<OwnedFd>, u64)>>,
@@ -329,7 +329,7 @@ impl SegmentStore {
                 journal.model.clone(),
                 slot,
             ))),
-            readers: tokio::sync::RwLock::new(()),
+            readers: journal.readers.clone(),
             tasks: Arc::new(crate::page_gc::Mutations::new(true)),
             cached_stats: RwLock::new(SmallStoreStats::default()),
             retired: Mutex::new(Vec::new()),
@@ -350,6 +350,7 @@ impl SegmentStore {
                 .contains_key(id as &dyn BlockIdentity)
     }
 
+    #[cfg(test)]
     async fn lookup(&self, id: &(impl SmallStoreKey + ?Sized)) -> io::Result<Option<ReadLocation>> {
         let _readers = self.readers.read().await;
         format::validate_key(id)?;
@@ -793,7 +794,10 @@ impl SegmentStore {
                 .await?;
             #[cfg(test)]
             tests::crash("compact_manifest");
-            let _readers = self.readers.write().await;
+            if let Some(budget) = &budget {
+                budget.delete().await;
+            }
+            let readers = self.readers.write().await;
             {
                 let mut directory = self.entries.write().unwrap();
                 for (key, loc) in moved {
@@ -804,11 +808,9 @@ impl SegmentStore {
                 state.active = None;
             }
             self.entries.write().unwrap().retire_segment(old);
+            drop(readers);
             let segment = state.segments.remove(&old).unwrap();
             let allocated = segment.allocated().await?;
-            if let Some(budget) = &budget {
-                budget.delete().await;
-            }
             disk_io::remove(self.path(old, "data")).await?;
             disk_io::sync_dir(self.path(old, "data").parent().unwrap().to_owned()).await?;
             let readers = segment.file.fd.lock().await.clone();

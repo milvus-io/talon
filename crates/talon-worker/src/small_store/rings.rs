@@ -221,41 +221,24 @@ impl SmallObjectStore {
         self.lookup_entry(id).ok().flatten().is_some()
     }
 
-    /// Resolve residency and physical placement in one directory lookup per
-    /// stream, borrowing both the identity and stream registry.
-    /// The worker validates routing compatibility at startup.
+    /// Resolve all ring-owned records through the namespace's shared index.
     pub(crate) fn lookup_entry(&self, id: &dyn BlockIdentity) -> io::Result<Option<Location>> {
         if id.view().offset != 0 {
             return Ok(None);
         }
         format::validate_key(id)?;
-        for stream in self
-            .streams
-            .read()
-            .unwrap()
-            .values()
-            .filter_map(|s| s.get())
-        {
-            if let Some(loc) = stream.entries.read().unwrap().get(id) {
-                return Ok(Some(loc));
-            }
-        }
-        Ok(None)
+        Ok(self.journal.model.lookup(id))
     }
 
     pub(crate) async fn lookup(
         &self,
         id: &(impl SmallStoreKey + ?Sized),
     ) -> io::Result<Option<ReadLocation>> {
-        if !id.exact_range() && id.block().offset != 0 {
-            return Ok(None);
+        let _readers = self.journal.readers.read().await;
+        match self.lookup_entry(id)? {
+            Some(location) => Ok(Some(location.retain().await?)),
+            None => Ok(None),
         }
-        for stream in self.streams() {
-            if let Some(loc) = stream.lookup(id).await? {
-                return Ok(Some(loc));
-            }
-        }
-        Ok(None)
     }
 
     pub async fn get(&self, id: &(impl SmallStoreKey + ?Sized)) -> io::Result<Option<BlockHandle>> {
@@ -851,6 +834,81 @@ mod recovery_tests {
     }
     fn open(root: &std::path::Path) -> io::Result<SmallObjectStore> {
         SmallObjectStore::open(root.to_owned(), 128 << 10, 256 << 10, 4 << 20, None)
+    }
+
+    #[tokio::test]
+    async fn shared_lookup_protects_async_open_and_releases_the_gate_on_cancellation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(open(dir.path()).unwrap());
+        let stream = store.writer(1).await.unwrap();
+        stream
+            .put(&id(0), Bytes::from_static(b"data"))
+            .await
+            .unwrap();
+        let other = store.writer(2).await.unwrap();
+        let location = store.lookup_entry(&id(0)).unwrap().unwrap();
+        let held = location.file.fd.lock().await;
+        let reader_store = store.clone();
+        let task = tokio::spawn(async move { reader_store.lookup(&id(0)).await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while stream.readers.try_write().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(other.readers.try_write().is_err());
+        assert!(!task.is_finished());
+        task.abort();
+        assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+        assert!(stream.readers.try_write().is_ok());
+        drop(held);
+        let retained = store.lookup(&id(0)).await.unwrap().unwrap();
+        assert!(stream.readers.try_write().is_ok());
+        store.delete(&id(0)).await.unwrap();
+        store.maintain(true).await.unwrap();
+        assert!(!store.contains(&id(0)));
+        assert_eq!(retained.read().await.unwrap(), Bytes::from_static(b"data"));
+    }
+
+    #[tokio::test]
+    async fn shared_lookup_stays_available_while_another_ring_waits_for_delete_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(open(dir.path()).unwrap());
+        let first = store.writer(1).await.unwrap();
+        let second = store.writer(2).await.unwrap();
+        first.put(&id(0), Bytes::from_static(b"old")).await.unwrap();
+        second
+            .put(&id(1), Bytes::from_static(b"live"))
+            .await
+            .unwrap();
+        store.delete(&id(0)).await.unwrap();
+        let budget = crate::background::BackgroundBudget::new(&talon_core::WorkerConfig {
+            background_io_max_mb_per_sec: 0,
+            background_delete_max_per_sec: 1,
+            ..Default::default()
+        });
+        let task_budget = budget.clone();
+        let task =
+            tokio::spawn(
+                async move { first.maintain_inner(false, false, Some(task_budget)).await },
+            );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while budget.charged_deletes() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!task.is_finished());
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(200), store.read(&id(1)))
+                .await
+                .unwrap()
+                .unwrap(),
+            Some(Bytes::from_static(b"live"))
+        );
+        assert!(task.await.unwrap().unwrap());
     }
 
     #[tokio::test]

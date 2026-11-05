@@ -10,6 +10,8 @@ pub(crate) struct Directory {
     slot: usize,
     staged: Option<super::catalog::Address>,
     clock: usize,
+    #[cfg(test)]
+    before_relocation_publish: Option<Box<dyn FnOnce() + Send + Sync>>,
 }
 
 impl Directory {
@@ -152,6 +154,8 @@ impl Directory {
             slot,
             staged: None,
             clock: 0,
+            #[cfg(test)]
+            before_relocation_publish: None,
         }
     }
     pub fn reserve(&mut self, _: usize) {
@@ -245,12 +249,27 @@ impl Directory {
         self.iter().map(|(_, location)| location)
     }
     pub fn insert(&mut self, key: BlockKey, location: Location) -> Option<Location> {
-        let old = self.stage(key.clone(), location);
-        self.publish(&key);
+        let model = self.catalog.clone();
+        let mut catalog = model.0.write().unwrap();
+        let old = self.stage_in(&mut catalog, key.clone(), location);
+        #[cfg(test)]
+        if let Some(pause) = self.before_relocation_publish.take() {
+            pause();
+        }
+        self.publish_in(&mut catalog, &key);
         old
     }
     pub fn stage(&mut self, key: BlockKey, location: Location) -> Option<Location> {
-        let mut catalog = self.catalog.0.write().unwrap();
+        let model = self.catalog.clone();
+        let mut catalog = model.0.write().unwrap();
+        self.stage_in(&mut catalog, key, location)
+    }
+    fn stage_in(
+        &mut self,
+        catalog: &mut Catalog,
+        key: BlockKey,
+        location: Location,
+    ) -> Option<Location> {
         catalog.activate().expect("validated small catalog");
         catalog
             .files
@@ -273,7 +292,7 @@ impl Directory {
                 .expect("test locator metadata");
         }
         let slot = catalog.at(address).expect("journaled small object");
-        let old_slot = self.find(&catalog, &key, VISIBLE);
+        let old_slot = self.find(catalog, &key, VISIBLE);
         let old = old_slot.and_then(|slot| catalog.location(slot));
         if let Some(old_slot) = old_slot.filter(|old| *old != slot) {
             let old_address = catalog.record(catalog.lookup.handle(old_slot)).unwrap().0;
@@ -305,8 +324,12 @@ impl Directory {
         old
     }
     pub fn publish(&mut self, id: &dyn BlockIdentity) {
-        let mut catalog = self.catalog.0.write().unwrap();
-        let slot = self.pending(&catalog, id).expect("staged small object");
+        let model = self.catalog.clone();
+        let mut catalog = model.0.write().unwrap();
+        self.publish_in(&mut catalog, id);
+    }
+    fn publish_in(&mut self, catalog: &mut Catalog, id: &dyn BlockIdentity) {
+        let slot = self.pending(catalog, id).expect("staged small object");
         let flags = catalog.lookup.flags(slot);
         if flags & VISIBLE == 0 {
             *catalog.live.entry(self.slot).or_default() += 1;
@@ -653,6 +676,48 @@ mod tests {
         assert!(token.small().unwrap().is_current(candidate));
         token.touch();
         assert!(!token.small().unwrap().is_current(candidate));
+    }
+
+    #[test]
+    fn shared_lookup_cannot_observe_partial_relocation() {
+        let (mut directory, key) = fixture(1);
+        let id = key(0);
+        let old = directory.get(&id).unwrap();
+        let model = directory.catalog.clone();
+        let (entered, paused) = mpsc::channel();
+        let (resume, resumed) = mpsc::channel();
+        let resumed = std::sync::Mutex::new(resumed);
+        directory.before_relocation_publish = Some(Box::new(move || {
+            entered.send(()).unwrap();
+            resumed.lock().unwrap().recv().unwrap();
+        }));
+        let publish_id = id.clone();
+        let writer = std::thread::spawn(move || {
+            directory.insert(
+                BlockKey::new(&publish_id),
+                Location {
+                    segment: 2,
+                    offset: 0,
+                    ..old
+                },
+            )
+        });
+        paused.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (attempt, attempted) = mpsc::channel();
+        let (found, result) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            attempt.send(()).unwrap();
+            found
+                .send(model.lookup(&id).map(|location| location.segment))
+                .unwrap();
+        });
+        attempted.recv_timeout(Duration::from_secs(5)).unwrap();
+        let blocked = result.recv_timeout(Duration::from_millis(20)).is_err();
+        resume.send(()).unwrap();
+        writer.join().unwrap();
+        reader.join().unwrap();
+        assert!(blocked, "a lookup must not observe stage without publish");
+        assert_eq!(result.recv().unwrap(), Some(2));
     }
 
     #[test]

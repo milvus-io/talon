@@ -133,11 +133,24 @@ impl Catalog {
         let (address, record) = self
             .record(self.lookup.handle(slot))
             .expect("small policy record");
-        let bytes = self
-            .charges
-            .get(&address)
-            .copied()
-            .unwrap_or_else(|| super::charge(&record.key, record.len));
+        let charge = super::charge(&record.key, record.len);
+        let access = self.compact_access(slot, address, charge);
+        let state = *access
+            .small()
+            .expect("compact access token")
+            .state
+            .lock()
+            .unwrap();
+        PolicyEntry { state, access }
+    }
+
+    pub(super) fn compact_access(
+        &mut self,
+        slot: usize,
+        address: Address,
+        charge: u64,
+    ) -> AccessHandle {
+        let bytes = self.charges.get(&address).copied().unwrap_or(charge);
         let ticket = self
             .tickets
             .get(&address)
@@ -167,13 +180,10 @@ impl Catalog {
                 self.tickets.insert(address, Arc::downgrade(&ticket));
                 ticket
             });
-        let state = *ticket.state.lock().unwrap();
-        let access = self
-            .access
+        self.access
             .get(&address)
             .cloned()
-            .unwrap_or_else(|| AccessHandle::for_small(ticket));
-        PolicyEntry { state, access }
+            .unwrap_or_else(|| AccessHandle::for_small(ticket))
     }
 
     pub(super) fn enable_compact(&mut self, stream: usize) {

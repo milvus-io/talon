@@ -59,7 +59,7 @@ impl Lookup {
         *self = next;
     }
 
-    pub fn find(&self, hash: u64, equal: impl Fn(u32, u8) -> bool) -> Option<usize> {
+    pub fn find(&self, hash: u64, mut equal: impl FnMut(u32, u8) -> bool) -> Option<usize> {
         if self.capacity() == 0 {
             return None;
         }
