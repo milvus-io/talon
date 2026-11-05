@@ -1,0 +1,241 @@
+--- a/src/node.rs
++++ b/src/node.rs
+@@ -60,11 +60,11 @@
+     ///
+     /// # Safety
+     ///  - label len must not exceed 255
+-    ///  - children len must not exceed 255
++    ///  - children len must not exceed 256
+     pub fn new<const N: usize>(label: &[u8], children: [Node<V>; N], value: Option<V>) -> Self {
+         // known at compile time
+-        if N > u8::MAX as usize {
+-            panic!("children_len {} exceeds the max {}", N, u8::MAX);
++        if N > 256 {
++            panic!("children_len {} exceeds the max {}", N, 256);
+         }
+         assert!(
+             label.len() <= crate::node_common::MAX_LABEL_LEN,
+@@ -73,7 +73,7 @@
+ 
+         let header = NodeHeader {
+             label_len: label.len() as u8,
+-            children_len: children.len() as u8,
++            children_len: children.len() as u16,
+         };
+         let mut ptr = header.ptr_data().allocate();
+         // Safety:
+@@ -137,7 +137,7 @@
+     /// child index must be at i <= len, len can be 0
+     // Safety:
+     // - `i` must be a valid index to insert at, i.e. `i <= self.children_len()`
+-    // - `self.children_len()` must be less than `u8::MAX`
++    // - `self.children_len()` must be less than 256
+     pub(crate) unsafe fn add_child(&mut self, new_child: Node<V>, i: usize) {
+         debug_assert!(
+             i <= self.children_len(),
+@@ -145,13 +145,13 @@
+             self.children_len()
+         );
+         debug_assert!(
+-            self.children_len() < u8::MAX as usize,
+-            "nodes can have max 255 children",
++            self.children_len() < 256,
++            "nodes can have max 256 children",
+         );
+ 
+         let new_header = NodeHeader {
+             label_len: self.label_len() as u8,
+-            children_len: self.children_len() as u8 + 1,
++            children_len: self.children_len() as u16 + 1,
+         };
+         let old_children_len = self.children_len();
+         let new_ptr_data = new_header.ptr_data();
+@@ -221,7 +221,7 @@
+             } else {
+                 new_label.len()
+             } as u8,
+-            children_len: self.children_len() as u8,
++            children_len: self.children_len() as u16,
+         };
+         let old_label_len = self.label_len();
+         let value = self.take_value();
+@@ -309,7 +309,7 @@
+ 
+         let new_header = NodeHeader {
+             label_len: self.label_len() as u8,
+-            children_len: self.children_len() as u8 - 1,
++            children_len: self.children_len() as u16 - 1,
+         };
+         let old_children_len = self.children_len();
+         let new_ptr_data = new_header.ptr_data::<V>();
+@@ -399,7 +399,7 @@
+             let old_children_len = self.children_len();
+             let child_hdr = NodeHeader {
+                 label_len: suffix.len() as u8,
+-                children_len: old_children_len as u8,
++                children_len: old_children_len as u16,
+             };
+             let ptr_data = child_hdr.ptr_data();
+             let mut ptr = ptr_data.allocate();
+@@ -419,7 +419,7 @@
+         // resize old allocation
+         let new_hdr = NodeHeader {
+             label_len: position as u8,
+-            children_len: 1 + new_child.is_some() as u8,
++            children_len: 1 + new_child.is_some() as u16,
+         };
+ 
+         let new_data = new_hdr.ptr_data::<V>();
+--- a/src/node_alloc/node.rs
++++ b/src/node_alloc/node.rs
+@@ -61,11 +61,11 @@
+ impl<V> Node<V> {
+     /// Makes a new node.
+     /// SAFETY: - label len must not exceed 255
+-    ///         - children len must not exceed 255
++    ///         - children len must not exceed 256
+     pub fn new<const N: usize>(label: &[u8], children: [Node<V>; N], value: Option<V>) -> Self {
+         // known at compile time
+-        if N > u8::MAX as usize {
+-            panic!("children_len {} exceeds the max {}", N, u8::MAX);
++        if N > 256 {
++            panic!("children_len {} exceeds the max {}", N, 256);
+         }
+         assert!(
+             label.len() <= crate::node_common::MAX_LABEL_LEN,
+@@ -79,7 +79,7 @@
+         let header = NodeHeader {
+             flags,
+             label_len: label.len() as u8,
+-            children_len: children.len() as u8,
++            children_len: children.len() as u16,
+         };
+         let mut ptr = header.ptr_data().allocate();
+         // Safety:
+@@ -174,7 +174,7 @@
+         let new_header = NodeHeader {
+             flags: self.flags(),
+             label_len: self.label_len() as u8,
+-            children_len: self.children_len() as u8 + 1,
++            children_len: self.children_len() as u16 + 1,
+         };
+         let old_children_len = self.children_len();
+         let mut new_ptr = new_header.ptr_data().allocate();
+@@ -242,7 +242,7 @@
+             } else {
+                 new_label.len()
+             } as u8,
+-            children_len: self.children_len() as u8,
++            children_len: self.children_len() as u16,
+         };
+ 
+         let old_label_len = self.label_len();
+@@ -312,7 +312,7 @@
+         let new_header = NodeHeader {
+             flags: self.flags(),
+             label_len: self.label_len() as u8,
+-            children_len: self.children_len() as u8 - 1,
++            children_len: self.children_len() as u16 - 1,
+         };
+         let old_children_len = self.children_len();
+ 
+@@ -454,7 +454,7 @@
+             let child_hdr = NodeHeader {
+                 flags,
+                 label_len: suffix.len() as u8,
+-                children_len: old_children_len as u8,
++                children_len: old_children_len as u16,
+             };
+ 
+             let mut ptr = child_hdr.ptr_data().allocate();
+@@ -477,7 +477,7 @@
+         let new_hdr = NodeHeader {
+             flags: Flags::empty(),
+             label_len: position as u8,
+-            children_len: 1 + new_child.is_some() as u8,
++            children_len: 1 + new_child.is_some() as u16,
+         };
+ 
+         let mut new_ptr = new_hdr.ptr_data().allocate();
+--- a/src/node_alloc/node_header.rs
++++ b/src/node_alloc/node_header.rs
+@@ -74,7 +74,7 @@
+ pub(crate) struct NodeHeader {
+     pub(crate) flags: Flags,
+     pub(crate) label_len: u8,
+-    pub(crate) children_len: u8,
++    pub(crate) children_len: u16,
+ }
+ 
+ pub(crate) struct PtrData<V> {
+--- a/src/node_common.rs
++++ b/src/node_common.rs
+@@ -705,7 +705,7 @@
+                                     let child: Node<V> = Node::new(&key[..MAX_LABEL_LEN], [], None);
+                                     // Safety:
+                                     // - `insert_index <= children_len()` (from the computation above)
+-                                    // - `add_child` is safe when i <= children_len() and children_len() < u8::MAX
++                                    // - `add_child` is safe when i <= children_len() and children_len() < 256
+                                     // - `get_unchecked_mut(insert_index)` is safe because add_child guarantees the child exists at insert_index
+                                     unsafe {
+                                         cur.add_child(child, insert_index);
+@@ -717,7 +717,7 @@
+                                     let child = Node::new(key, [], None);
+                                     // Safety:
+                                     // - `insert_index <= children_len()` (from the computation above)
+-                                    // - `add_child` is safe when i <= children_len() and children_len() < u8::MAX
++                                    // - `add_child` is safe when i <= children_len() and children_len() < 256
+                                     // - `get_unchecked_mut(insert_index)` is safe because add_child guarantees the child exists at insert_index
+                                     unsafe {
+                                         cur.add_child(child, insert_index);
+@@ -820,7 +820,7 @@
+                                     let child: Node<V> = Node::new(&key[..MAX_LABEL_LEN], [], None);
+                                     // Safety:
+                                     // - `insert_index <= children_len()` (from the computation above)
+-                                    // - `add_child` is safe when i <= children_len() and children_len() < u8::MAX
++                                    // - `add_child` is safe when i <= children_len() and children_len() < 256
+                                     // - `get_unchecked_mut(insert_index)` is safe because add_child guarantees the child exists at insert_index
+                                     unsafe {
+                                         cur.add_child(child, insert_index);
+@@ -832,7 +832,7 @@
+                                     let child = Node::new(key, [], Some(value));
+                                     // Safety:
+                                     // - `insert_index <= children_len()` (from the computation above)
+-                                    // - `add_child` is safe when i <= children_len() and children_len() < u8::MAX
++                                    // - `add_child` is safe when i <= children_len() and children_len() < 256
+                                     unsafe {
+                                         cur.add_child(child, insert_index);
+                                     }
+@@ -1940,12 +1940,19 @@
+     }
+ 
+     #[test]
+-    #[should_panic]
+-    fn test_children_push_more_than_255_items() {
++    fn test_children_support_all_256_byte_values() {
+         let mut node = Node::root();
+         for i in 0..=255_u8 {
+             node.insert(&i.to_be_bytes()[..], i);
+         }
++        assert_eq!(node.children_len(), 256);
++        for i in 0..=255_u8 {
++            assert_eq!(node.get(&i.to_be_bytes()[..]), Some(&i));
++        }
++        for i in 0..=255_u8 {
++            assert_eq!(node.remove(&i.to_be_bytes()[..]), Some(i));
++        }
++        assert_eq!(node.children_len(), 0);
+     }
+ 
+     /// Creates a standard test tree with the following structure:
+--- a/src/node_header.rs
++++ b/src/node_header.rs
+@@ -18,7 +18,7 @@
+ #[derive(Clone, Copy, Debug)]
+ pub(crate) struct NodeHeader {
+     pub(crate) label_len: u8,
+-    pub(crate) children_len: u8,
++    pub(crate) children_len: u16,
+ }
+ 
+ pub(crate) struct PtrData<V> {

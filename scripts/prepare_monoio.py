@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare Talon's patch-only Monoio, monoio-http and rustls dependencies. Requires Python 3 and Git."""
+"""Prepare Talon's patch-only Monoio, monoio-http, rustls and radix trie dependencies. Requires Python 3 and Git."""
 
 import argparse
 import fcntl
@@ -77,7 +77,9 @@ if __name__ == "__main__":
     parser.add_argument("--archive", help="Use a local .crate archive (offline)")
     parser.add_argument("--monoio-http-archive", help="Offline monoio-http 0.3.12 archive")
     parser.add_argument("--rustls-archive", help="Offline rustls 0.23.46 archive")
+    parser.add_argument("--radix-archive", help="Offline fast_radix_trie 1.2.0 archive")
     args = parser.parse_args()
     prepare(args.archive)
     prepare(args.monoio_http_archive, "monoio-http", "0.3.12", "ff36c863e7bdb03358cda0d3df26a86382176a89d819d2ae652265695a55be96")
     prepare(args.rustls_archive, "rustls", "0.23.46", "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf")
+    prepare(args.radix_archive, "fast_radix_trie", "1.2.0", "7701a4d392aaead14b674de1c69f43ce2432d903981d851f7034bc1b0ba63983")

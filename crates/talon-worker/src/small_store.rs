@@ -14,6 +14,7 @@ mod disk_io;
 mod flush;
 mod format;
 mod journal;
+mod key_codec;
 mod records;
 mod rings;
 mod tickets;
@@ -1086,14 +1087,15 @@ impl SegmentStore {
             fd: tokio::sync::Mutex::new(Weak::new()),
         });
         let allocated = metadata.blocks() * 512;
-        let records = meta.records.before(meta.durable_end).count();
+        let mut records = 0;
         let mut live = 0;
         let mut live_payload = 0;
         for (offset, record) in meta.records.before(meta.durable_end) {
+            records += 1;
             live += charge(&record.key, record.len);
             live_payload += record.len;
             self.entries.write().unwrap().restore(
-                SmallKey::new(&record.key),
+                &record.key,
                 Location {
                     file: file.clone(),
                     segment: id,

@@ -92,7 +92,7 @@ fn dense_segment_snapshot_restores_one_hundred_thousand_extents() {
     for (offset, record) in restored.segments[&1].records.iter() {
         assert_eq!(record.checksum, offset);
         assert_eq!(
-            record.key,
+            crate::small_store::key::SmallIdentity::view(&record.key),
             crate::small_store::key::SmallIdentity::view(&id(&offset.to_string()))
         );
     }

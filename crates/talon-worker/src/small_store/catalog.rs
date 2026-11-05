@@ -3,8 +3,7 @@ use super::lookup::{Lookup, VISIBLE};
 use super::{Location, SegmentFile};
 use crate::eviction::{AccessHandle, PolicyEntry};
 use crate::small_store::key::{SmallIdentity, SmallKey};
-use std::collections::{hash_map::RandomState, BTreeMap, HashMap, HashSet};
-use std::hash::BuildHasher;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock, Weak};
@@ -24,7 +23,6 @@ pub(super) struct Catalog {
     pub owner: Weak<RwLock<Catalog>>,
     pub model: Model,
     pub lookup: Lookup,
-    hash: RandomState,
     chunks: Vec<(u64, usize)>,
     free_chunks: Vec<u32>,
     segment_chunks: BTreeMap<u64, Vec<u32>>,
@@ -59,7 +57,12 @@ impl Default for LiveModel {
 
 impl LiveModel {
     pub fn lookup(&self, id: &dyn SmallIdentity) -> Option<Location> {
-        self.0.read().unwrap().lookup_location(id)
+        let hash = super::records::key_hash(id);
+        let mut encoded = super::key_codec::encode(id);
+        self.0
+            .read()
+            .unwrap()
+            .lookup_location(id, hash, &mut encoded)
     }
 }
 
@@ -73,7 +76,7 @@ struct ResolvedRecord {
 
 impl Catalog {
     pub fn hash(&self, key: &dyn SmallIdentity) -> u64 {
-        self.hash.hash_one(key.view())
+        super::records::key_hash(key)
     }
 
     pub fn segment(&self, id: u64) -> Option<&SegmentMeta> {
@@ -84,14 +87,30 @@ impl Catalog {
             .map(AsRef::as_ref)
     }
 
-    pub fn record(&self, handle: u32) -> Option<(Address, super::records::RecordRef<'_>)> {
+    pub fn record(&self, handle: u32) -> Option<(Address, super::journal::Record)> {
+        let (segment, row) = self.row(handle)?;
+        let (offset, record) = self.segment(segment)?.records.get(row)?;
+        Some(((segment, offset), record))
+    }
+
+    fn row(&self, handle: u32) -> Option<(u64, usize)> {
         let handle = handle.checked_sub(1)?;
         let (segment, base) = *self.chunks.get((handle >> 10) as usize)?;
-        let (offset, record) = self
-            .segment(segment)?
-            .records
-            .get(base + (handle & 1023) as usize)?;
-        Some(((segment, offset), record))
+        Some((segment, base + (handle & 1023) as usize))
+    }
+
+    pub fn metadata(&self, handle: u32) -> Option<(Address, super::records::Metadata)> {
+        let (segment, row) = self.row(handle)?;
+        let meta = self.segment(segment)?.records.metadata(row)?;
+        Some(((segment, meta.offset), meta))
+    }
+
+    pub fn matches(&self, handle: u32, key: &mut Vec<u8>) -> bool {
+        let Some((segment, row)) = self.row(handle) else {
+            return false;
+        };
+        self.segment(segment)
+            .is_some_and(|meta| meta.records.matches(row, key))
     }
 
     fn handle(&self, segment: u64, row: usize) -> u32 {
@@ -99,49 +118,65 @@ impl Catalog {
     }
 
     pub fn find(&self, key: &dyn SmallIdentity, flags: u8) -> Option<usize> {
-        self.lookup.find(self.hash(key), |handle, state| {
-            state & flags == flags
-                && self
-                    .record(handle)
-                    .is_some_and(|(_, record)| record.key == key.view())
-        })
+        let mut encoded = super::key_codec::encode(key);
+        self.find_record(self.hash(key), &mut encoded, flags)
+            .map(|(slot, _)| slot)
+    }
+
+    fn find_record(
+        &self,
+        hash: u64,
+        encoded: &mut Vec<u8>,
+        flags: u8,
+    ) -> Option<(usize, ResolvedRecord)> {
+        let mut resolved = None;
+        let slot = self.lookup.find(hash, |handle, state| {
+            if state & flags != flags {
+                return false;
+            }
+            let Some((segment, row)) = self.row(handle) else {
+                return false;
+            };
+            let Some(meta) = self.segment(segment) else {
+                return false;
+            };
+            let Some(record) = meta.records.metadata(row) else {
+                return false;
+            };
+            if record.hash != hash || !meta.records.matches(row, encoded) {
+                return false;
+            }
+            resolved = Some(ResolvedRecord {
+                address: (segment, record.offset),
+                len: record.len,
+                checksum: record.checksum,
+                charge: record.charge,
+                stream: meta.slot,
+            });
+            true
+        })?;
+        Some((slot, resolved.unwrap()))
     }
 
     pub fn at(&self, address: Address) -> Option<usize> {
         let records = &self.segment(address.0)?.records;
         let row = records.position(address.1);
-        let (offset, record) = records.get(row)?;
-        if offset != address.1 {
+        let record = records.metadata(row)?;
+        if record.offset != address.1 {
             return None;
         }
         let handle = self.handle(address.0, row);
-        self.lookup
-            .find(self.hash(&record.key), |found, _| found == handle)
+        self.lookup.find(record.hash, |found, _| found == handle)
     }
 
-    fn lookup_location(&self, id: &dyn SmallIdentity) -> Option<Location> {
-        let mut resolved = None;
-        let slot = self.lookup.find(self.hash(id), |handle, flags| {
-            if flags & VISIBLE == 0 {
-                return false;
-            }
-            let Some((address, record)) = self.record(handle) else {
-                return false;
-            };
-            if record.key != id.view() {
-                return false;
-            }
-            resolved = Some(ResolvedRecord {
-                address,
-                len: record.len,
-                checksum: record.checksum,
-                charge: super::charge(&record.key, record.len),
-                stream: self.segment(address.0).unwrap().slot,
-            });
-            true
-        });
-        if let Some(slot) = slot {
-            return self.resolve_location(slot, resolved.unwrap());
+    fn lookup_location(
+        &self,
+        id: &dyn SmallIdentity,
+        hash: u64,
+        encoded: &mut Vec<u8>,
+    ) -> Option<Location> {
+        if let Some((slot, record)) = self.find_record(hash, encoded, VISIBLE) {
+            return self.resolve_location(slot, record);
         }
         self.retired
             .get(id)
@@ -150,12 +185,12 @@ impl Catalog {
     }
 
     pub fn location(&self, slot: usize) -> Option<Location> {
-        let (address, record) = self.record(self.lookup.handle(slot))?;
+        let (address, record) = self.metadata(self.lookup.handle(slot))?;
         let resolved = ResolvedRecord {
             address,
             len: record.len,
             checksum: record.checksum,
-            charge: super::charge(&record.key, record.len),
+            charge: record.charge,
             stream: self.segment(address.0)?.slot,
         };
         self.resolve_location(slot, resolved)
@@ -187,7 +222,7 @@ impl Catalog {
             let mut lookup = std::mem::take(&mut self.lookup);
             let growth = additional.max(lookup.len() / 16);
             lookup.rebuild(growth, |handle| {
-                self.hash(&self.record(handle).expect("indexed small record").1.key)
+                self.metadata(handle).expect("indexed small record").1.hash
             });
             self.lookup = lookup;
         }
@@ -231,10 +266,11 @@ impl Catalog {
         let end = slots.min(limit);
         self.reserve(end.saturating_sub(start));
         for row in start..end {
-            let Some((offset, record)) = self.segment(segment).unwrap().records.get(row) else {
+            let Some(record) = self.segment(segment).unwrap().records.metadata(row) else {
                 continue;
             };
-            let hash = self.hash(&record.key);
+            let offset = record.offset;
+            let hash = record.hash;
             let state = flags
                 .binary_search_by_key(&offset, |(offset, _)| *offset)
                 .ok()
@@ -251,10 +287,11 @@ impl Catalog {
         let end = meta.records.slots().min(limit);
         let mut flags = Vec::with_capacity(end.saturating_sub(start));
         for row in start..end {
-            let Some((offset, record)) = self.segment(segment).unwrap().records.get(row) else {
+            let Some(record) = self.segment(segment).unwrap().records.metadata(row) else {
                 continue;
             };
-            let hash = self.hash(&record.key);
+            let offset = record.offset;
+            let hash = record.hash;
             let handle = self.handle(segment, row);
             if let Some(slot) = self.lookup.find(hash, |found, _| found == handle) {
                 flags.push((offset, self.lookup.remove(slot)));
@@ -299,7 +336,7 @@ impl Catalog {
         if self.lookup.capacity() > 64 && self.lookup.len() * 4 < self.lookup.capacity() * 3 {
             let mut lookup = std::mem::take(&mut self.lookup);
             lookup.rebuild(0, |handle| {
-                self.hash(&self.record(handle).expect("indexed small record").1.key)
+                self.metadata(handle).expect("indexed small record").1.hash
             });
             self.lookup = lookup;
         }
@@ -327,8 +364,7 @@ impl Catalog {
                 let address = (*segment, *offset);
                 if let Some(slot) = self.at(address) {
                     if let Some(location) = self.location(slot) {
-                        let key =
-                            SmallKey::new(&self.record(self.lookup.handle(slot)).unwrap().1.key);
+                        let key = self.record(self.lookup.handle(slot)).unwrap().1.key;
                         let policy = self.policy.remove(&address).or_else(|| {
                             let access = location.access.as_ref()?;
                             let state = *access.small()?.state.lock().unwrap();
@@ -381,12 +417,12 @@ impl Catalog {
         if let Some(segment) = replaced {
             let published = self.segment(segment).is_some_and(|meta| {
                 (0..meta.records.slots()).any(|row| {
-                    let Some((_, record)) = meta.records.get(row) else {
+                    let Some(record) = meta.records.metadata(row) else {
                         return false;
                     };
                     let handle = self.handle(segment, row);
                     self.lookup
-                        .find(self.hash(&record.key), |found, _| found == handle)
+                        .find(record.hash, |found, _| found == handle)
                         .is_some_and(|slot| {
                             self.lookup.flags(slot) & (VISIBLE | super::lookup::POLICY) != 0
                         })

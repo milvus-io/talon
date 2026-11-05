@@ -313,6 +313,7 @@ pub(crate) struct Snapshot {
     next: Option<u64>,
     segments: std::collections::btree_map::IntoIter<u64, Arc<SegmentMeta>>,
     current: Option<(u64, Arc<SegmentMeta>, usize)>,
+    batch: std::vec::IntoIter<(u64, Record)>,
 }
 pub(crate) enum SnapshotRecord {
     Next(u64),
@@ -328,16 +329,20 @@ impl Iterator for Snapshot {
             return Some(Ok(b.into()));
         }
         if let Some((id, s, after)) = &mut self.current {
-            while *after < s.records.slots() {
-                let record = s.records.get(*after);
-                *after += 1;
-                let Some((offset, r)) = record else { continue };
+            while *after < s.records.slots() || self.batch.len() != 0 {
+                if self.batch.len() == 0 {
+                    self.batch = s.records.batch(*after).into_iter();
+                    *after += super::super::records::KEY_GROUP;
+                }
+                let Some((offset, r)) = self.batch.next() else {
+                    continue;
+                };
                 return Some(
                     Event::Insert {
                         slot: s.slot,
                         segment: *id,
                         offset,
-                        record: r.to_owned(),
+                        record: r,
                     }
                     .encode()
                     .map(Bytes::from),
@@ -381,6 +386,7 @@ impl talon_journal::Machine for Model {
             next: Some(self.next),
             segments: self.segments.clone().into_iter(),
             current: None,
+            batch: Vec::new().into_iter(),
         })
     }
     fn decode_snapshot(bytes: &[u8]) -> io::Result<SnapshotRecord> {
