@@ -65,7 +65,7 @@ the resident slot. The policy lock precedes directory, entry and page-table lock
 Unbound policy-only nodes are reclaimed on removal, even while a sibling remains.
 The third layer passed 654 Worker tests (8 ignored) and Clippy. Regressions cover
 pin and token preservation, delayed index retirement, policy-only residency
-isolation and bounded page churn. Independent concurrency and cleaness reviews
+isolation and bounded page churn. Independent concurrency and cleanness reviews
 found no remaining defect in this layer.
 
 
@@ -77,7 +77,7 @@ runtime's lifecycle and policy state while retaining metadata and allocation.
 The previous runtime must be stopped before this startup-only initialization.
 
 The complete local code passed 654 Worker library tests (8 ignored), Clippy with
-warnings denied, and a release build. Independent cleaness and concurrency reviews
+warnings denied, and a release build. Independent cleanness and concurrency reviews
 covered policy removal, retained incarnations, shared identity retirement, and
 runtime reinitialization. The work remains local and has not been published.
 
