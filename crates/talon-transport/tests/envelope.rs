@@ -116,6 +116,27 @@ fn read_variants_roundtrip_and_responses_remain_raw() {
             },
         )
         .unwrap(),
+        data::encode_exact_request(
+            7,
+            &data::VersionedRangeRequest {
+                request: req.clone(),
+                version: cached.version.clone(),
+                object_len: 100_000,
+            },
+        )
+        .unwrap(),
+        data::encode_exact_namespace_request(
+            7,
+            &data::NamespaceScopedVersionedRange {
+                namespace: NamespaceId::named("acme"),
+                request: data::VersionedRangeRequest {
+                    request: req.clone(),
+                    version: cached.version.clone(),
+                    object_len: 100_000,
+                },
+            },
+        )
+        .unwrap(),
         data::encode_cached_request(7, &cached).unwrap(),
         data::encode_cached_namespace_request(
             7,
@@ -160,6 +181,19 @@ fn read_variants_roundtrip_and_responses_remain_raw() {
             }
             MsgType::GetVersionedRangeNamespace => {
                 let decoded = data::decode_versioned_namespace_request(&frame).unwrap().1;
+                assert_eq!(decoded.namespace, NamespaceId::named("acme"));
+                assert_eq!(decoded.request.request, req);
+                assert_eq!(decoded.request.object_len, 100_000);
+                assert_eq!(decoded.request.version, cached.version);
+            }
+            MsgType::GetExactRange => {
+                let decoded = data::decode_exact_request(&frame).unwrap().1;
+                assert_eq!(decoded.request, req);
+                assert_eq!(decoded.version, cached.version);
+                assert_eq!(decoded.object_len, 100_000);
+            }
+            MsgType::GetExactRangeNamespace => {
+                let decoded = data::decode_exact_namespace_request(&frame).unwrap().1;
                 assert_eq!(decoded.namespace, NamespaceId::named("acme"));
                 assert_eq!(decoded.request.request, req);
                 assert_eq!(decoded.request.object_len, 100_000);

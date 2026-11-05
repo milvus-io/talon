@@ -32,7 +32,9 @@ pub use control_identity::{
     ControlTlsConfig, ControlTlsConfigPatch, WorkloadIdentity, WorkloadIdentityError, WorkloadRole,
 };
 pub use error::{Error, Result};
-pub use key::{Backend, BlockId, ObjectId, PageIndex, Version, UNCHECKED_VERSION};
+pub use key::{
+    Backend, BlockId, ObjectId, PageIndex, Version, MAX_EXACT_READ_LEN, UNCHECKED_VERSION,
+};
 pub use metrics::{Counter, Gauge, Histogram, Metrics};
 pub use namespace::{
     NamespaceContext, NamespaceId, NamespaceIdError, DEFAULT_NAMESPACE, MAX_NAMESPACE_ID_BYTES,

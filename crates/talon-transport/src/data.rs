@@ -360,6 +360,84 @@ pub fn decode_versioned_namespace_request(
     Ok((header, scoped))
 }
 
+/// Encode a version-pinned exact range request.
+///
+/// The reply is an ordinary [`MsgType::GetRange`] frame.
+pub fn encode_exact_request(
+    request_id: u32,
+    req: &VersionedRangeRequest,
+) -> Result<Vec<u8>, DataError> {
+    let body = bincode::serialize(req)?;
+    let header = FrameHeader::new(MsgType::GetExactRange, request_id, body.len() as u32);
+    let mut buf = Vec::with_capacity(HEADER_LEN + body.len() + crate::envelope::outbound_reserve());
+    buf.extend_from_slice(&header.encode());
+    buf.extend_from_slice(&body);
+    Ok(buf)
+}
+
+/// Decode a framed exact range request.
+pub fn decode_exact_request(buf: &[u8]) -> Result<(FrameHeader, VersionedRangeRequest), DataError> {
+    let header = FrameHeader::decode(buf)?;
+    if header.msg_type != MsgType::GetExactRange {
+        return Err(DataError::NotGetRange(header.msg_type));
+    }
+    let declared = header.length as usize;
+    let body = &buf[HEADER_LEN..];
+    if body.len() != declared {
+        return Err(DataError::LengthMismatch {
+            declared,
+            actual: body.len(),
+        });
+    }
+    let (_, body) = crate::envelope::decode(&header, body)?;
+    let req = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_limit(body.len() as u64)
+        .deserialize(body)?;
+    Ok((header, req))
+}
+
+/// Encode a namespace-attributed exact range request.
+pub fn encode_exact_namespace_request(
+    request_id: u32,
+    scoped: &NamespaceScopedVersionedRange,
+) -> Result<Vec<u8>, DataError> {
+    let body = bincode::serialize(scoped)?;
+    let header = FrameHeader::new(
+        MsgType::GetExactRangeNamespace,
+        request_id,
+        body.len() as u32,
+    );
+    let mut buf = Vec::with_capacity(HEADER_LEN + body.len() + crate::envelope::outbound_reserve());
+    buf.extend_from_slice(&header.encode());
+    buf.extend_from_slice(&body);
+    Ok(buf)
+}
+
+/// Decode a namespace-attributed exact range request.
+pub fn decode_exact_namespace_request(
+    buf: &[u8],
+) -> Result<(FrameHeader, NamespaceScopedVersionedRange), DataError> {
+    let header = FrameHeader::decode(buf)?;
+    if header.msg_type != MsgType::GetExactRangeNamespace {
+        return Err(DataError::NotGetRange(header.msg_type));
+    }
+    let declared = header.length as usize;
+    let body = &buf[HEADER_LEN..];
+    if body.len() != declared {
+        return Err(DataError::LengthMismatch {
+            declared,
+            actual: body.len(),
+        });
+    }
+    let (_, body) = crate::envelope::decode(&header, body)?;
+    let scoped = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_limit(body.len() as u64)
+        .deserialize(body)?;
+    Ok((header, scoped))
+}
+
 /// Encode a cache-only range probe. Older workers reject its distinct message
 /// type instead of accidentally treating it as an origin-backed read.
 pub fn encode_cached_request(
@@ -660,6 +738,42 @@ mod tests {
             decode_request(&encoded),
             Err(DataError::NotGetRange(MsgType::GetVersionedRange))
         ));
+    }
+
+    #[test]
+    fn exact_requests_are_distinct_and_preserve_coordinates_in_envelopes() {
+        let request = VersionedRangeRequest {
+            request: req(),
+            version: Version::new("v1"),
+            object_len: 100_000,
+        };
+        let scoped = NamespaceScopedVersionedRange {
+            namespace: NamespaceId::named("acme"),
+            request: request.clone(),
+        };
+        for namespace in [false, true] {
+            for envelope in [false, true] {
+                let mut frame = if namespace {
+                    encode_exact_namespace_request(17, &scoped).unwrap()
+                } else {
+                    encode_exact_request(17, &request).unwrap()
+                };
+                if envelope {
+                    crate::envelope::encode(&mut frame, None, None).unwrap();
+                }
+                if namespace {
+                    assert_eq!(decode_exact_namespace_request(&frame).unwrap().1, scoped);
+                } else {
+                    assert_eq!(decode_exact_request(&frame).unwrap().1, request);
+                }
+                assert!(decode_versioned_request(&frame).is_err());
+                assert!(decode_versioned_namespace_request(&frame).is_err());
+                assert!(decode_request(&frame).is_err());
+                frame.push(0);
+                assert!(decode_exact_request(&frame).is_err());
+                assert!(decode_exact_namespace_request(&frame).is_err());
+            }
+        }
     }
 
     #[test]

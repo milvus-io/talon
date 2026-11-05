@@ -30,7 +30,7 @@ pub(super) struct DirtyQueue {
     enabled: AtomicBool,
 }
 
-/// Attached only to packed whole-object read tokens when TTI is enabled. The
+/// Attached to packed read tokens when TTI is enabled. The
 /// queue owns metadata, never a payload pin; the weak back-reference avoids a cycle.
 pub(crate) struct DirtyAccess {
     key: Arc<[u8]>,
@@ -101,7 +101,7 @@ fn header(magic: &[u8; 8], generation: u64) -> Vec<u8> {
     bytes
 }
 
-fn decode(bytes: &[u8], ages: &mut HashMap<BlockId, u64>) -> io::Result<()> {
+fn decode(bytes: &[u8], ages: &mut HashMap<CacheUnit, u64>) -> io::Result<()> {
     for mut record in format::frames(bytes)? {
         let last = format::u64(&mut record)?;
         let id = format::id(record)?;
@@ -115,7 +115,7 @@ fn decode(bytes: &[u8], ages: &mut HashMap<BlockId, u64>) -> io::Result<()> {
 // An interrupted append can leave an incomplete final frame. Keep the validated
 // prefix, but force compaction before writing again. Complete corrupt frames
 // still invalidate advisory ages rather than guessing at subsequent boundaries.
-fn decode_log(mut bytes: &[u8], ages: &mut HashMap<BlockId, u64>) -> io::Result<bool> {
+fn decode_log(mut bytes: &[u8], ages: &mut HashMap<CacheUnit, u64>) -> io::Result<bool> {
     while !bytes.is_empty() {
         if bytes.len() < 12 {
             return Ok(true);
@@ -218,7 +218,7 @@ impl SmallObjectStore {
         Ok(())
     }
 
-    pub(crate) fn track_access(&self, id: &BlockId) -> io::Result<()> {
+    pub(crate) fn track_access(&self, id: &(impl SmallStoreKey + ?Sized)) -> io::Result<()> {
         let encoded = format::key(id)?;
         for stream in self.streams() {
             let mut entries = stream.entries.write().unwrap();

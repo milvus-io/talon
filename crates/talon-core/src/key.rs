@@ -11,6 +11,9 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 
+/// Maximum payload for an exact-range read (1 MiB, inclusive).
+pub const MAX_EXACT_READ_LEN: u64 = 1 << 20;
+
 /// Reserved read version that skips origin ETag matching.
 /// Callers must keep the object immutable while cached. Metadata lookups,
 /// required size arguments, and cache behavior are unchanged.
@@ -172,6 +175,9 @@ pub struct PageIndex(pub u32);
 /// This is the logical addressing unit for placement, the worker block index,
 /// and the cache. Two blocks are equal iff they share object, offset, block
 /// size, and version — so a version change produces a distinct key.
+/// Exact reads also use these placement coordinates: `offset` is the unaligned
+/// request offset and `block_size` is its length. Packed storage distinguishes
+/// exact ranges from ordinary blocks with a separate key kind.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BlockId {
     /// The source object this block belongs to.

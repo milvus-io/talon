@@ -593,6 +593,7 @@ impl BlockIndex {
     /// handle. Capacity pinning and byte accounting remain owned by the policy.
     pub(crate) fn set_access(&self, unit: &CacheUnit, access: AccessHandle) {
         let (block, page) = match unit {
+            CacheUnit::ExactRange(_) => return,
             CacheUnit::Whole(block) => (block, None),
             CacheUnit::Page(block, page) => (block, Some(*page)),
         };

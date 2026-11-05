@@ -69,7 +69,7 @@ checkpoint when a resident key has no saved age, or an age needed clock repair,
 so repeated restarts do not keep granting that key a fresh idle window.
 Deleted identities disappear
 at compaction; until then recovery ignores them. Each delta contains the full
-encoded BlockId and a Unix-millisecond access time, with length and checksum
+encoded cache-unit key and a Unix-millisecond access time, with length and checksum
 framing (20 bytes plus the encoded key). There is no persistent item-ID map.
 
 The pending queue is capped at 262,144 tokens and an estimated 64 MiB of retained
@@ -116,6 +116,48 @@ historical routing choices. Do not run two owners against the same cache root;
 use a fresh cache directory when rolling back to a binary with older routing.
 Legacy `MANIFEST`, `ring-*`, and per-segment index/data layouts are also
 rejected and follow the same reset policy.
+
+## Exact range reads
+
+Rust `Client::read_exact(object, offset, length, known_stat, options)` reads an
+explicit range. Length is at most 1 MiB
+(1,048,576 bytes, inclusive); larger requests and arithmetic overflow fail in
+the client before metadata lookup or a data RPC. Zero length returns empty.
+Ranges beyond the supplied or resolved object size are errors, without EOF
+clamping.
+
+Every nonempty call sends exact-read RPCs. Workers require small storage to be
+enabled regardless of object size; a disabled engine returns `Internal` before
+origin access, with no fallback.
+
+For objects smaller than 1 MiB, placement and block splitting follow ordinary
+READ. After checking the engine, the worker uses ordinary version-pinned cache
+routing, reusing the supplied size and version without another HEAD. A miss may
+fetch the complete object; small-store admission still requires an object below
+its configured threshold and smaller than a block. Otherwise ordinary page or
+whole-block storage handles the read.
+
+For objects of 1 MiB or larger, misses fetch only the requested bytes and a
+range crossing a block boundary remains one request. Exact ranges bypass the
+ordinary object-size admission threshold, whole/page storage, and L1. Their
+record must fit the configured segment, including key metadata. The default
+64 MiB segment accommodates the maximum request. Ordinary READ and LOAD keep
+their existing routing and exclusive threshold semantics.
+
+Placement hashes the original object, version, unaligned offset, and requested
+length. Packed keys additionally distinguish exact ranges from ordinary small
+objects; namespace and credential scopes still select separate cache roots.
+Only identical coordinates and version hit: a shorter overlapping request must
+fetch again. Concurrent identical misses coalesce and use the source version
+precondition. Short origin responses are rejected before publication.
+
+Exact ranges share small-store capacity, reclamation, access snapshots and delta
+logs, recovery, and eviction. Access records preserve the distinction between
+whole objects and exact ranges. Hits retain segment descriptors for sendfile/splice. Existing
+ordinary-key encodings are unchanged; exact keys reserve the high bit of the
+backend tag. Older workers reject the new wire operations, and older binaries
+cannot recover a cache containing these keys. Use a fresh cache root when
+rolling back after admitting exact ranges.
 
 ## Files and identity
 
