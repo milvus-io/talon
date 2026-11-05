@@ -3,6 +3,7 @@
 mod model;
 #[cfg(test)]
 mod tests;
+use super::catalog::LiveModel;
 use super::{format, invalid};
 use bytes::Bytes;
 pub(super) use model::{Event, Model, Record, SegmentMeta};
@@ -24,7 +25,8 @@ pub(super) struct TestControl {
 }
 pub(super) struct Journal {
     root: PathBuf,
-    handle: Handle<Model>,
+    handle: Handle<LiveModel>,
+    pub(super) model: LiveModel,
     pub(super) next: Arc<AtomicU64>,
     #[cfg(test)]
     pub(super) control: Arc<TestControl>,
@@ -69,18 +71,21 @@ impl Journal {
         std::fs::File::open(root.join("data"))?.sync_all()?;
         std::fs::File::open(&root)?.sync_all()?;
         let replay_started = std::time::Instant::now();
+        let shared = LiveModel::default();
+        shared.0.write().unwrap().model.next = 1;
         let handle = service.open_stream_with_maintenance(
             relative_metadata,
-            Model {
-                next: 1,
-                ..Default::default()
-            },
+            shared.clone(),
             StreamOptions::default(),
             maintenance.map(|budget| budget as Arc<dyn talon_journal::Maintenance>),
         )?;
         let replay_ms = replay_started.elapsed().as_secs_f64() * 1000.0;
         let clone_started = std::time::Instant::now();
-        let model = handle.query_blocking(|m| Ok(m.clone()))?;
+        let model = handle.query_blocking(|m| {
+            let mut catalog = m.0.write().unwrap();
+            catalog.activate()?;
+            Ok(catalog.model.clone())
+        })?;
         let clone_ms = clone_started.elapsed().as_secs_f64() * 1000.0;
         tracing::info!(root = %root.display(), segments = model.segments.len(),
             replay_ms, clone_ms, "small journal model restored");
@@ -89,6 +94,7 @@ impl Journal {
             Arc::new(Self {
                 root,
                 handle,
+                model: shared,
                 next,
                 #[cfg(test)]
                 control: Default::default(),

@@ -212,10 +212,12 @@ impl SmallObjectStore {
             .policy()
             .map_or(true, |policy| policy.enable_small_clock());
         for stream in self.streams() {
-            for (key, loc) in stream.entries.write().unwrap().iter_mut() {
-                if let Some(access) = loc.access.take() {
-                    loc.access =
-                        Some(self.attach_access(key.clone(), access.enable_clock(), false));
+            let mut directory = stream.entries.write().unwrap();
+            let entries: Vec<_> = directory.iter().collect();
+            for (key, loc) in entries {
+                if let Some(access) = loc.access {
+                    let access = self.attach_access(key.clone(), access.enable_clock(), false);
+                    directory.attach_access(&key, access);
                 }
             }
         }
@@ -233,9 +235,10 @@ impl SmallObjectStore {
                 .get_key_value(id as &dyn BlockIdentity)
                 .map(|(key, _)| key.clone());
             if let Some(key) = key {
-                let loc = entries.get_mut(&key).unwrap();
-                if let Some(access) = loc.access.take() {
-                    loc.access = Some(self.attach_access(key, access, true));
+                let loc = entries.get(&key).unwrap();
+                if let Some(access) = loc.access {
+                    let access = self.attach_access(key.clone(), access, true);
+                    entries.attach_access(&key, access);
                 }
                 break;
             }

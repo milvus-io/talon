@@ -4,6 +4,8 @@
 //! namespace metadata log and snapshots. Durable prefixes survive before sealing.
 //! Relocation commits are durable before old payload files are unlinked.
 mod access;
+mod catalog;
+mod lookup;
 pub(crate) use access::DirtyAccess;
 pub(crate) mod directory;
 mod disk_io;
@@ -167,7 +169,7 @@ struct Segment {
     live: u64,
     live_payload: u64,
     allocated: u64,
-    records: BTreeMap<u64, BlockKey>,
+    records: usize,
     sealed: bool,
 }
 impl Segment {
@@ -303,7 +305,7 @@ impl SegmentStore {
             #[cfg(test)]
             flush_pause: Mutex::new(None),
             slot,
-            journal,
+            journal: journal.clone(),
             threshold,
             segment_size,
             state: tokio::sync::Mutex::new(State {
@@ -322,7 +324,10 @@ impl SegmentStore {
             pipeline_changed: tokio::sync::Notify::new(),
             appends_drained: tokio::sync::Notify::new(),
             append_slots: tokio::sync::Semaphore::new(32),
-            entries: Arc::default(),
+            entries: Arc::new(RwLock::new(directory::Directory::new(
+                journal.model.clone(),
+                slot,
+            ))),
             readers: tokio::sync::RwLock::new(()),
             tasks: Arc::new(crate::page_gc::Mutations::new(true)),
             cached_stats: RwLock::new(SmallStoreStats::default()),
@@ -347,12 +352,7 @@ impl SegmentStore {
     async fn lookup(&self, id: &(impl SmallStoreKey + ?Sized)) -> io::Result<Option<ReadLocation>> {
         let _readers = self.readers.read().await;
         format::validate_key(id)?;
-        let loc = self
-            .entries
-            .read()
-            .unwrap()
-            .get(id as &dyn BlockIdentity)
-            .cloned();
+        let loc = self.entries.read().unwrap().get(id as &dyn BlockIdentity);
         match loc {
             Some(loc) => Ok(Some(loc.retain().await?)),
             None => Ok(None),
@@ -427,7 +427,7 @@ impl SegmentStore {
             changed.as_mut().enable();
             let mut state = self.state.lock().await;
             self.healthy(&state)?;
-            let existing = self.entries.read().unwrap().get(&key).cloned();
+            let existing = self.entries.read().unwrap().get(&key);
             if let Some(old) = existing {
                 if old.len != len || old.checksum != checksum {
                     return Err(invalid(
@@ -555,7 +555,7 @@ impl SegmentStore {
         segment.allocated = segment.allocated.max(allocated);
         segment.live += charge;
         segment.live_payload += loc.len;
-        segment.records.insert(loc.offset, key.clone());
+        segment.records += 1;
         state.allocated += added;
         state.live += charge;
         // Publish policy and locator together. The runtime's block gate keeps
@@ -594,13 +594,7 @@ impl SegmentStore {
         let _publication = self.publication.lock().await;
         let mut state = self.state.lock().await;
         self.healthy(&state)?;
-        let Some(loc) = self
-            .entries
-            .read()
-            .unwrap()
-            .get(id as &dyn BlockIdentity)
-            .cloned()
-        else {
+        let Some(loc) = self.entries.read().unwrap().get(id as &dyn BlockIdentity) else {
             return Ok(());
         };
         let result = async {
@@ -620,7 +614,7 @@ impl SegmentStore {
             let removed = charge(id, loc.len);
             segment.live -= removed;
             segment.live_payload -= loc.len;
-            segment.records.remove(&loc.offset);
+            segment.records -= 1;
             let allocated = segment.allocated().await?;
             let added = allocated.saturating_sub(segment.allocated);
             segment.allocated = allocated;
@@ -657,7 +651,9 @@ impl SegmentStore {
         track_clock: bool,
     ) -> io::Result<()> {
         units.reserve(self.entries.read().unwrap().len());
-        for (key, loc) in self.entries.write().unwrap().iter_mut() {
+        let mut directory = self.entries.write().unwrap();
+        let entries: Vec<_> = directory.iter().collect();
+        for (key, loc) in entries {
             let access = shared_access
                 .get(&key.materialize())
                 .map(AccessHandle::sibling)
@@ -667,11 +663,11 @@ impl SegmentStore {
                     block: key.clone(),
                     page: None,
                 },
-                bytes: charge(key, loc.len),
+                bytes: charge(&key, loc.len),
                 independent: true,
                 access: access.clone(),
             });
-            loc.access = Some(access);
+            directory.attach_access(&key, access);
         }
         Ok(())
     }
@@ -726,7 +722,7 @@ impl SegmentStore {
                         id,
                         s.live_payload.saturating_mul(2)
                             + (s.live - s.live_payload)
-                            + 36 * s.records.len() as u64
+                            + 36 * s.records as u64
                             + 49,
                     )
                 })
@@ -750,16 +746,7 @@ impl SegmentStore {
             };
             let entries: Vec<_> = {
                 let directory = self.entries.read().unwrap();
-                state.segments[&old]
-                    .records
-                    .values()
-                    .map(|key| {
-                        (
-                            key.clone(),
-                            directory.get(key).expect("live segment record").clone(),
-                        )
-                    })
-                    .collect()
+                directory.segment_entries(old)
             };
             let replacement = if entries.is_empty() {
                 None
@@ -815,6 +802,7 @@ impl SegmentStore {
             if state.active == Some(old) {
                 state.active = None;
             }
+            self.entries.write().unwrap().retire_segment(old);
             let segment = state.segments.remove(&old).unwrap();
             let allocated = segment.allocated().await?;
             if let Some(budget) = &budget {
@@ -887,7 +875,7 @@ impl SegmentStore {
             live: 0,
             live_payload: 0,
             allocated,
-            records: BTreeMap::new(),
+            records: 0,
             sealed: false,
         })
     }
@@ -928,7 +916,7 @@ impl SegmentStore {
         segment.metadata += frame_len;
         segment.live += charge(key, len);
         segment.live_payload += len;
-        segment.records.insert(offset, key.clone());
+        segment.records += 1;
         let allocated = segment.allocated().await?;
         state.allocated += allocated.saturating_sub(segment.allocated);
         segment.allocated = allocated;
@@ -1006,7 +994,7 @@ impl SegmentStore {
             let Some(id) = state.sealing else { break None };
             let s = &state.segments[&id];
             if s.in_flight.is_empty() {
-                break Some((id, s.data().await?, s.records.is_empty()));
+                break Some((id, s.data().await?, s.records == 0));
             }
             drop(state);
             drained.await;
@@ -1085,12 +1073,7 @@ impl SegmentStore {
         }
     }
 
-    fn recover<'a>(
-        &mut self,
-        id: u64,
-        meta: &'a journal::SegmentMeta,
-        keys: &mut Vec<(u64, crate::block_key::BlockRef<'a>)>,
-    ) -> io::Result<()> {
+    fn recover(&mut self, id: u64, meta: &journal::SegmentMeta) -> io::Result<()> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -1105,39 +1088,23 @@ impl SegmentStore {
             fd: tokio::sync::Mutex::new(Weak::new()),
         });
         let allocated = metadata.blocks() * 512;
-        let records = meta
-            .records
-            .before(meta.durable_end)
-            .map(|(offset, record)| (offset, BlockKey::new(&record.key)))
-            .collect();
+        let records = meta.records.before(meta.durable_end).count();
         let mut live = 0;
         let mut live_payload = 0;
         for (offset, record) in meta.records.before(meta.durable_end) {
             live += charge(&record.key, record.len);
             live_payload += record.len;
-            use std::hash::{Hash, Hasher};
-            let mut hash = xxhash_rust::xxh3::Xxh3::new();
-            record.key.hash(&mut hash);
-            keys.push((hash.finish(), record.key));
-            if self
-                .entries
-                .write()
-                .unwrap()
-                .insert(
-                    BlockKey::new(&record.key),
-                    Location {
-                        file: file.clone(),
-                        segment: id,
-                        offset,
-                        len: record.len,
-                        checksum: record.checksum,
-                        access: None,
-                    },
-                )
-                .is_some()
-            {
-                return Err(invalid("duplicate small object identity"));
-            }
+            self.entries.write().unwrap().restore(
+                BlockKey::new(&record.key),
+                Location {
+                    file: file.clone(),
+                    segment: id,
+                    offset,
+                    len: record.len,
+                    checksum: record.checksum,
+                    access: None,
+                },
+            )?;
         }
         let state = self.state.get_mut();
         state.allocated += allocated;

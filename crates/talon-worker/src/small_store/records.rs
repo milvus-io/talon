@@ -38,7 +38,6 @@ fn n16(bytes: &[u8]) -> usize {
 }
 
 impl Records {
-    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.live
     }
@@ -218,6 +217,15 @@ impl Records {
 
     pub fn slots(&self) -> usize {
         self.rows.len()
+    }
+
+    pub fn position(&self, offset: u64) -> usize {
+        self.rows
+            .partition_point(|row| u64::from(n32(&row[..4])) < offset)
+    }
+
+    pub fn compacts_after_remove(&self) -> bool {
+        (self.rows.len() - self.live + 1) * 100 >= self.rows.len()
     }
 
     pub fn shrink_to_fit(&mut self) {

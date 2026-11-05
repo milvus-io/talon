@@ -110,9 +110,6 @@ impl SmallObjectStore {
         for meta in model.segments.values().filter(|meta| meta.durable_end > 0) {
             *counts.entry(meta.slot).or_default() += meta.records.before(meta.durable_end).count();
         }
-        // Only borrow key bytes already retained by the model. Hashes speed up
-        // sorting; comparing full bytes on collisions keeps validation exact.
-        let mut keys = Vec::with_capacity(counts.values().sum());
         let mut recovered = BTreeMap::new();
         recovered.insert(
             0,
@@ -144,9 +141,8 @@ impl SmallObjectStore {
             let stream = recovered
                 .get_mut(&meta.slot)
                 .expect("reserved recovery stream");
-            stream.recover(id, meta, &mut keys)?;
+            stream.recover(id, meta)?;
         }
-        validate_recovered_keys(&mut keys)?;
         for (id, allocated) in journal.finish_recovery(model)? {
             let state = recovered
                 .get_mut(&model.segments[&id].slot)
@@ -240,7 +236,7 @@ impl SmallObjectStore {
             .values()
             .filter_map(|s| s.get())
         {
-            if let Some(loc) = stream.entries.read().unwrap().get(id).cloned() {
+            if let Some(loc) = stream.entries.read().unwrap().get(id) {
                 return Ok(Some(loc));
             }
         }
@@ -817,6 +813,7 @@ mod tests {
     }
 }
 
+#[cfg(test)]
 fn validate_recovered_keys(keys: &mut [(u64, crate::block_key::BlockRef<'_>)]) -> io::Result<()> {
     fn parts(key: crate::block_key::BlockRef<'_>) -> (&str, &str, &str, u64, u32, &str) {
         (

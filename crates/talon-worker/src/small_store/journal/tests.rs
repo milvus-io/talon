@@ -129,7 +129,11 @@ async fn compact_journal_preserves_live_and_recovered_identity() {
             .journal
             .handle
             .query_blocking(|m| {
-                Ok(m.segments
+                Ok(m.0
+                    .read()
+                    .unwrap()
+                    .model
+                    .segments
                     .values()
                     .flat_map(|s| s.records.values())
                     .next()
