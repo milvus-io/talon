@@ -383,7 +383,7 @@ impl PageState {
 }
 
 pub(crate) struct PageEntry {
-    pub(crate) unit: crate::index::UnitSlot,
+    pub(crate) unit: crate::index::PageUnit,
     pub handle: Arc<PageState>,
     // Only candidate selection changes this counter. It prevents one selection
     // from making an older candidate valid by consuming the ACCESSED bit again.
