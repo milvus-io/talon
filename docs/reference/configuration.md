@@ -524,10 +524,10 @@ L2 page size in bytes; 0 keeps whole-block L2, non-zero enables paged L2.
 
 ### `small_object_threshold_bytes`
 
-Upper exclusive object size for packed storage; 0 disables the engine. Changing this value requires a new empty cache directory.
+Upper exclusive object size for packed storage; defaults to 1 MiB. Zero disables the engine. Changing this value makes existing routing incompatible; reset_incompatible_cache controls whether startup clears it.
 
 - **Environment variable:** `TALON_WORKER_SMALL_OBJECT_THRESHOLD_BYTES`
-- **Default:** `0`
+- **Default:** `1048576`
 - **CLI flag:** not settable via CLI (config file or environment only)
 
 ### `small_object_segment_bytes`

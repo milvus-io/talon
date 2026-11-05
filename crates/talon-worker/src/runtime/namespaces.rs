@@ -895,6 +895,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn default_small_store_resets_previously_disabled_routing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = WorkerConfig {
+            block_size: 16,
+            l2_page_size_bytes: 4,
+            backend: Some("s3".into()),
+            capacity_bytes: 256 << 20,
+            ..Default::default()
+        };
+        cfg.validate().unwrap();
+        let old = WorkerConfig {
+            small_object_threshold_bytes: 0,
+            ..cfg.clone()
+        };
+        let root = open_with_reset(dir.path(), &old, false).await.unwrap();
+        root.commit_fetched_page(&block(16), PageIndex(0), 16, Bytes::from_static(b"data"))
+            .await
+            .unwrap();
+        drop(root);
+
+        cfg.reset_incompatible_cache = false;
+        let error = open_with_reset(dir.path(), &cfg, cfg.reset_incompatible_cache)
+            .await
+            .err()
+            .unwrap();
+        assert!(error.is::<crate::cache_reset::IncompatibleCache>());
+        let retained = open_with_reset(dir.path(), &old, false).await.unwrap();
+        assert!(retained
+            .paged
+            .as_ref()
+            .unwrap()
+            .has_page(&block(16), PageIndex(0)));
+        drop(retained);
+
+        cfg.reset_incompatible_cache = WorkerConfig::default().reset_incompatible_cache;
+        let worker = open_with_reset(dir.path(), &cfg, cfg.reset_incompatible_cache)
+            .await
+            .unwrap();
+        assert!(worker.small.is_some());
+        assert!(worker.accepts_small(&block(16), 8));
+        assert!(!worker
+            .paged
+            .as_ref()
+            .unwrap()
+            .has_page(&block(16), PageIndex(0)));
+        assert_eq!(
+            serde_json::from_slice::<(u32, u64)>(
+                &std::fs::read(dir.path().join("default/shared/small-routing.json")).unwrap()
+            )
+            .unwrap(),
+            (1, 1 << 20)
+        );
+    }
+
+    #[tokio::test]
     async fn compatible_cache_reset_mode_preserves_identity_and_cached_payload() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = config();

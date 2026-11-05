@@ -269,8 +269,9 @@ pub struct WorkerConfig {
     pub capacity_bytes: u64,
     /// Target packed segment size, including its index.
     pub small_object_segment_bytes: u64,
-    /// Upper exclusive object size for packed storage; 0 disables the engine.
-    /// Changing this value requires a new empty cache directory.
+    /// Upper exclusive object size for packed storage; defaults to 1 MiB.
+    /// Zero disables the engine. Changing this value makes existing routing
+    /// incompatible; `reset_incompatible_cache` controls whether startup clears it.
     pub small_object_threshold_bytes: u64,
     /// Worker-wide whole-block cached descriptor limit, shared by namespaces.
     /// Zero disables caching. Startup-only; active readers and sockets hold extra FDs.
@@ -605,7 +606,7 @@ impl Default for WorkerConfig {
             reset_incompatible_cache: true,
             capacity_bytes: 64 << 30,
             small_object_segment_bytes: 67108864,
-            small_object_threshold_bytes: 0,
+            small_object_threshold_bytes: 1 << 20,
             whole_fd_cache_capacity: 1024,
             page_fd_cache_capacity: 16384,
             background_task_concurrency: 2,
@@ -1143,7 +1144,7 @@ pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
         secret: false,
         help: "L2 page size in bytes; 0 keeps whole-block L2, non-zero enables paged L2.",
     },
-    ConfigVar { env: "TALON_WORKER_SMALL_OBJECT_THRESHOLD_BYTES", key: "small_object_threshold_bytes", default: Some("0"), cli: false, secret: false, help: "Upper exclusive object size for packed storage; 0 disables the engine. Changing this value requires a new empty cache directory." },
+    ConfigVar { env: "TALON_WORKER_SMALL_OBJECT_THRESHOLD_BYTES", key: "small_object_threshold_bytes", default: Some("1048576"), cli: false, secret: false, help: "Upper exclusive object size for packed storage; defaults to 1 MiB. Zero disables the engine. Changing this value makes existing routing incompatible; reset_incompatible_cache controls whether startup clears it." },
     ConfigVar { env: "TALON_WORKER_SMALL_OBJECT_SEGMENT_BYTES", key: "small_object_segment_bytes", default: Some("67108864"), cli: false, secret: false, help: "Target packed segment size, including its index." },
     ConfigVar { env: "TALON_WORKER_OWNERSHIP_GC_ENABLED", key: "ownership_gc_enabled", default: Some("true"), cli: false, secret: false, help: "Reclaim misplaced cache blocks on membership changes and hourly admission checks." },
     ConfigVar { env: "TALON_WORKER_OWNERSHIP_GC_REPLICAS", key: "ownership_gc_replicas", default: Some("1"), cli: false, secret: false, help: "Number of placement candidates to retain; must cover every reader replica count." },
@@ -2685,7 +2686,14 @@ mod tests {
         let defaults =
             WorkerConfig::resolve(Default::default(), Default::default(), Default::default())
                 .unwrap();
-        assert_eq!(defaults.small_object_threshold_bytes, 0);
+        assert_eq!(defaults.small_object_threshold_bytes, 1 << 20);
+        let disabled = WorkerConfig::resolve(
+            WorkerConfigPatch::from_toml("small_object_threshold_bytes = 0").unwrap(),
+            Default::default(),
+            Default::default(),
+        )
+        .unwrap();
+        assert_eq!(disabled.small_object_threshold_bytes, 0);
         let file = WorkerConfigPatch::from_toml(
             "small_object_threshold_bytes = 131072\nsmall_object_segment_bytes = 4194304",
         )
@@ -2704,6 +2712,11 @@ mod tests {
         assert_eq!(disabled.small_object_threshold_bytes, 0);
         assert_eq!(disabled.small_object_segment_bytes, 8388608);
         for patch in [
+            WorkerConfigPatch {
+                block_size: Some(1 << 20),
+                capacity_bytes: Some(128 << 20),
+                ..Default::default()
+            },
             WorkerConfigPatch {
                 small_object_threshold_bytes: Some(131072),
                 small_object_segment_bytes: Some(131072),

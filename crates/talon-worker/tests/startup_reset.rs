@@ -22,7 +22,7 @@ fn command(root: &Path) -> tokio::process::Command {
         .env("TALON_WORKER_NODE_ID", "new-worker")
         .env("TALON_WORKER_BLOCK_SIZE", "16")
         .env("TALON_WORKER_L2_PAGE_SIZE_BYTES", "4")
-        .env("TALON_WORKER_CAPACITY_BYTES", "1048576")
+        .env("TALON_WORKER_CAPACITY_BYTES", "268435456")
         .env("TALON_WORKER_BACKEND", "s3")
         // Stop after local identity initialization, before networking/store rings.
         .env("TALON_WORKER_ORIGIN_IO", "invalid")
