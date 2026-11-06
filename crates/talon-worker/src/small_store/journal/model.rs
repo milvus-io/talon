@@ -243,7 +243,7 @@ impl Model {
                 );
                 s.durable_end = s.bytes;
                 s.sealed = true;
-                s.records.shrink_to_fit();
+                s.records.seal();
             }
             Event::Flush {
                 segment,
@@ -277,7 +277,7 @@ impl Model {
                 s.records.retain_before(s.durable_end);
                 s.bytes = s.durable_end;
                 s.sealed = true;
-                s.records.shrink_to_fit();
+                s.records.seal();
             }
             Event::Replace { old, new } => {
                 if let Some(new) = new {
@@ -291,7 +291,7 @@ impl Model {
                     );
                     s.durable_end = s.bytes;
                     s.sealed = true;
-                    s.records.shrink_to_fit();
+                    s.records.seal();
                 }
                 // Empty standby/active files have no Insert record.
                 self.segments.remove(&old);
@@ -329,15 +329,17 @@ impl Iterator for Snapshot {
         }
         if let Some((id, s, after)) = &mut self.current {
             while *after < s.records.slots() {
-                let record = s.records.get(*after);
+                let row = *after;
                 *after += 1;
-                let Some((offset, r)) = record else { continue };
+                let Some((offset, r)) = s.records.get(row) else {
+                    continue;
+                };
                 return Some(
                     Event::Insert {
                         slot: s.slot,
                         segment: *id,
                         offset,
-                        record: r.to_owned(),
+                        record: r,
                     }
                     .encode()
                     .map(Bytes::from),
@@ -440,6 +442,12 @@ impl talon_journal::Machine for Model {
                 self.next = next;
             }
             SnapshotRecord::Segment(id, s) => {
+                // The snapshot encoder emits one segment at a time.
+                if let Some(mut previous) = self.segments.last_entry() {
+                    if previous.get().sealed {
+                        Arc::make_mut(previous.get_mut()).records.seal();
+                    }
+                }
                 if id == 0 || id >= self.next || self.segments.insert(id, Arc::new(s)).is_some() {
                     return Err(invalid("snapshot segment"));
                 }

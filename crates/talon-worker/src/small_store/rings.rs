@@ -106,10 +106,6 @@ impl SmallObjectStore {
         segment_size: u64,
         root_lock: Option<Arc<crate::page_access_store::CacheRootLock>>,
     ) -> io::Result<BTreeMap<usize, SegmentStore>> {
-        let mut counts = BTreeMap::<usize, usize>::new();
-        for meta in model.segments.values().filter(|meta| meta.durable_end > 0) {
-            *counts.entry(meta.slot).or_default() += meta.records.before(meta.durable_end).count();
-        }
         let mut recovered = BTreeMap::new();
         recovered.insert(
             0,
@@ -121,26 +117,20 @@ impl SmallObjectStore {
                 journal.clone(),
             ),
         );
-        for (slot, count) in counts {
-            let stream = recovered.entry(slot).or_insert_with(|| {
-                SegmentStore::empty(
-                    threshold,
-                    segment_size,
-                    root_lock.clone(),
-                    slot,
-                    journal.clone(),
-                )
-            });
-            stream.entries.write().unwrap().reserve(count);
-        }
         for (&id, meta) in model
             .segments
             .iter()
             .filter(|(_, meta)| meta.durable_end > 0)
         {
-            let stream = recovered
-                .get_mut(&meta.slot)
-                .expect("reserved recovery stream");
+            let stream = recovered.entry(meta.slot).or_insert_with(|| {
+                SegmentStore::empty(
+                    threshold,
+                    segment_size,
+                    root_lock.clone(),
+                    meta.slot,
+                    journal.clone(),
+                )
+            });
             stream.recover(id, meta)?;
         }
         for (id, allocated) in journal.finish_recovery(model)? {
@@ -994,6 +984,42 @@ mod recovery_tests {
         validate_recovered_keys(&mut distinct).unwrap();
         let mut duplicate = [(0, a.view()), (0, b.view()), (0, same.view())];
         assert!(validate_recovered_keys(&mut duplicate).is_err());
+    }
+
+    #[tokio::test]
+    async fn recovered_compact_policy_accepts_first_fallback_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = open(dir.path()).unwrap();
+            let stream = store.writer(1).await.unwrap();
+            stream
+                .put(&id(0), Bytes::from_static(b"data"))
+                .await
+                .unwrap();
+            stream.maintain(true).await.unwrap();
+        }
+        let store = Arc::new(open(dir.path()).unwrap());
+        let index = Arc::new(crate::BlockIndex::new());
+        let mut units = Vec::new();
+        store.restore_policy_units(&index, &mut units, false);
+        assert!(units.is_empty());
+        let policy = Arc::new(crate::Lru::from_recovered(index, units, 0, false, false));
+        store.bind_policy(policy.clone());
+        assert_eq!(policy.len(), 1);
+        assert_eq!(policy.total_bytes(), charge(&id(0), 4));
+
+        store.put(&id(1), Bytes::from_static(b"new")).await.unwrap();
+        assert_eq!(policy.len(), 2);
+        assert_eq!(policy.total_bytes(), charge(&id(0), 4) + charge(&id(1), 3));
+        assert_eq!(store.read(&id(1)).await.unwrap().unwrap(), &b"new"[..]);
+        store.delete(&id(0)).await.unwrap();
+        policy.remove(&crate::eviction::CacheUnit::Whole(id(0)));
+        assert_eq!(policy.len(), 1);
+        assert_eq!(policy.total_bytes(), charge(&id(1), 3));
+        store.delete(&id(1)).await.unwrap();
+        policy.remove(&crate::eviction::CacheUnit::Whole(id(1)));
+        assert!(policy.is_empty());
+        assert_eq!(policy.total_bytes(), 0);
     }
 
     #[tokio::test]

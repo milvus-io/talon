@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare Talon's patch-only Monoio, monoio-http and rustls dependencies. Requires Python 3 and Git."""
+"""Prepare Talon's patch-only Monoio, monoio-http, rustls dependencies. Requires Python 3 and Git."""
 
 import argparse
 import fcntl

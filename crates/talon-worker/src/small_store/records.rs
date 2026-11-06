@@ -1,43 +1,35 @@
-use super::{format, journal::Record};
-use crate::block_key::{BlockRef, ObjectRef};
-use crate::eviction::UnitKind;
-use crate::small_store::key::{SmallIdentity, SmallKey, SmallRef};
+use super::{format, journal::Record, key_codec, keys::Keys};
+use crate::small_store::key::SmallIdentity;
+use std::collections::hash_map::RandomState;
+use std::hash::BuildHasher;
 use std::io;
-use talon_core::Backend;
+use std::sync::OnceLock;
 
-const WIDTH: usize = 30;
+const WIDTH: usize = 26;
 
 #[derive(Clone, Default)]
 pub(super) struct Records {
     rows: Vec<[u8; WIDTH]>,
-    text: String,
+    keys: Keys,
     live: usize,
-    exact_offsets: std::collections::HashMap<u32, u64>,
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct RecordRef<'a> {
-    pub key: SmallRef<'a>,
+pub(super) struct Metadata {
+    pub offset: u64,
     pub len: u64,
     pub checksum: u64,
+    pub hash: u64,
+    pub charge: u64,
 }
 
-impl RecordRef<'_> {
-    pub fn to_owned(self) -> Record {
-        Record {
-            key: SmallKey::new(&self.key),
-            len: self.len,
-            checksum: self.checksum,
-        }
-    }
+pub(super) fn key_hash(key: &dyn SmallIdentity) -> u64 {
+    static HASH: OnceLock<RandomState> = OnceLock::new();
+    HASH.get_or_init(RandomState::new).hash_one(key.view())
 }
 
 fn n32(bytes: &[u8]) -> u32 {
     u32::from_le_bytes(bytes.try_into().unwrap())
-}
-
-fn n16(bytes: &[u8]) -> usize {
-    u16::from_le_bytes(bytes.try_into().unwrap()) as usize
 }
 
 impl Records {
@@ -50,79 +42,68 @@ impl Records {
         self.live == 0
     }
 
-    pub fn get(&self, row: usize) -> Option<(u64, RecordRef<'_>)> {
+    pub fn metadata(&self, row: usize) -> Option<Metadata> {
         let row = self.rows.get(row)?;
-        let length = n32(&row[4..8]);
-        let len = length & ((1 << 28) - 1);
-        if len == 0 {
-            return None;
+        let len = u64::from(n32(&row[4..8]));
+        (len != 0).then(|| Metadata {
+            offset: u64::from(n32(&row[..4])),
+            len,
+            checksum: u64::from_le_bytes(row[8..16].try_into().unwrap()),
+            hash: u64::from_le_bytes(row[16..24].try_into().unwrap()),
+            charge: len + u64::from(u16::from_le_bytes(row[24..26].try_into().unwrap())) + 25 + 37,
+        })
+    }
+
+    pub fn matches(&self, row: usize, key: &[u8]) -> bool {
+        if self.metadata(row).is_none() {
+            return false;
         }
-        let backend = match length >> 28 {
-            0 => Backend::S3,
-            1 => Backend::Gcs,
-            2 => Backend::Azure,
-            _ => unreachable!("validated small-object backend"),
+        let Some((prefix, suffix)) = self.keys.get(row) else {
+            return false;
         };
-        let exact_offset = self.exact_offsets.get(&n32(&row[..4])).copied();
-        let start = n32(&row[16..20]) as usize;
-        let end = start + n16(&row[24..26]);
-        let bucket = start + n16(&row[26..28]);
-        let path = start + n16(&row[28..30]);
-        let string = |a, b| &self.text[a..b];
+        key.len() == prefix.len() + suffix.len()
+            && key.starts_with(prefix)
+            && &key[prefix.len()..] == suffix
+    }
+
+    pub fn get(&self, row: usize) -> Option<(u64, Record)> {
+        let meta = self.metadata(row)?;
         Some((
-            u64::from(n32(&row[..4])),
-            RecordRef {
-                key: SmallRef {
-                    kind: if exact_offset.is_some() {
-                        UnitKind::ExactRange
-                    } else {
-                        UnitKind::Whole
-                    },
-                    block: BlockRef {
-                        object: ObjectRef {
-                            backend,
-                            bucket: string(start, bucket),
-                            object_path: string(bucket, path),
-                        },
-                        offset: exact_offset.unwrap_or(0),
-                        block_size: n32(&row[20..24]),
-                        version: string(path, end),
-                    },
+            meta.offset,
+            Record {
+                key: {
+                    let (prefix, suffix) = self.keys.get(row).expect("small-object key");
+                    key_codec::decode(&[prefix, suffix].concat())
                 },
-                len: u64::from(len),
-                checksum: u64::from_le_bytes(row[8..16].try_into().unwrap()),
+                len: meta.len,
+                checksum: meta.checksum,
             },
         ))
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (u64, RecordRef<'_>)> {
+    pub fn iter(&self) -> impl Iterator<Item = (u64, Record)> + '_ {
         (0..self.rows.len()).filter_map(|row| self.get(row))
     }
 
     #[cfg(test)]
-    pub fn values(&self) -> impl Iterator<Item = RecordRef<'_>> {
+    pub fn values(&self) -> impl Iterator<Item = Record> + '_ {
         self.iter().map(|(_, record)| record)
     }
 
-    pub fn before(&self, end: u64) -> impl Iterator<Item = (u64, RecordRef<'_>)> {
-        let limit = self
-            .rows
-            .partition_point(|row| u64::from(n32(&row[..4])) < end);
-        (0..limit).filter_map(|row| self.get(row))
+    pub fn before(&self, end: u64) -> impl Iterator<Item = (u64, Record)> + '_ {
+        self.iter().take_while(move |(offset, _)| *offset < end)
     }
 
     pub fn overlaps(&self, offset: u64, len: u64) -> bool {
         let next = self
             .rows
             .partition_point(|row| u64::from(n32(&row[..4])) < offset);
-        let live = |row: &&[u8; WIDTH]| n32(&row[4..8]) & ((1 << 28) - 1) != 0;
+        let live = |row: &&[u8; WIDTH]| n32(&row[4..8]) != 0;
         self.rows[..next]
             .iter()
             .rev()
             .find(live)
-            .is_some_and(|row| {
-                u64::from(n32(&row[..4])) + u64::from(n32(&row[4..8]) & ((1 << 28) - 1)) > offset
-            })
+            .is_some_and(|row| u64::from(n32(&row[..4])) + u64::from(n32(&row[4..8])) > offset)
             || self.rows[next..]
                 .iter()
                 .find(live)
@@ -136,10 +117,8 @@ impl Records {
         self.rows[..next]
             .iter()
             .rev()
-            .find(|row| n32(&row[4..8]) & ((1 << 28) - 1) != 0)
-            .is_some_and(|row| {
-                u64::from(n32(&row[..4])) + u64::from(n32(&row[4..8]) & ((1 << 28) - 1)) > end
-            })
+            .find(|row| n32(&row[4..8]) != 0)
+            .is_some_and(|row| u64::from(n32(&row[..4])) + u64::from(n32(&row[4..8])) > end)
     }
 
     pub fn insert(&mut self, offset: u64, record: Record) -> io::Result<usize> {
@@ -153,50 +132,31 @@ impl Records {
         {
             return Err(format::invalid("invalid small-object record extent"));
         }
-        let backend = match key.object.backend {
-            Backend::S3 => 0,
-            Backend::Gcs => 1,
-            Backend::Azure => 2,
-        };
-        let length = key.object.bucket.len() + key.object.object_path.len() + key.version.len();
-        let start = u32::try_from(self.text.len())
-            .map_err(|_| format::invalid("small-object key arena exhausted"))?;
-        if self
-            .text
-            .len()
-            .checked_add(length)
-            .map_or(true, |end| end > u32::MAX as usize)
-        {
-            return Err(format::invalid("small-object key arena exhausted"));
-        }
         let mut row = [0; WIDTH];
         row[..4].copy_from_slice(&(offset as u32).to_le_bytes());
-        row[4..8].copy_from_slice(&((record.len as u32) | (backend << 28)).to_le_bytes());
+        row[4..8].copy_from_slice(&(record.len as u32).to_le_bytes());
         row[8..16].copy_from_slice(&record.checksum.to_le_bytes());
-        row[16..20].copy_from_slice(&start.to_le_bytes());
-        row[20..24].copy_from_slice(&key.block_size.to_le_bytes());
-        row[24..26].copy_from_slice(&(length as u16).to_le_bytes());
-        row[26..28].copy_from_slice(&(key.object.bucket.len() as u16).to_le_bytes());
-        row[28..30].copy_from_slice(
-            &((key.object.bucket.len() + key.object.object_path.len()) as u16).to_le_bytes(),
-        );
-        let needed = self.text.len() + length;
-        if needed > self.text.capacity() {
-            self.text
-                .reserve_exact(needed.div_ceil(4096) * 4096 - self.text.len());
+        row[16..24].copy_from_slice(&key_hash(&record.key).to_le_bytes());
+        row[24..26].copy_from_slice(&((format::key_len(&record.key) - 25) as u16).to_le_bytes());
+        let key = key_codec::encode(&record.key);
+        let vacant = self.position(offset);
+        if self
+            .rows
+            .get(vacant)
+            .is_some_and(|row| u64::from(n32(&row[..4])) == offset && n32(&row[4..8]) == 0)
+        {
+            self.keys.insert(vacant, &key, true)?;
+            self.rows[vacant] = row;
+            self.live += 1;
+            return Ok(vacant);
         }
-        if self.rows.len() == self.rows.capacity() {
-            self.rows.reserve_exact(64);
-        }
-        self.text.push_str(key.object.bucket);
-        self.text.push_str(key.object.object_path);
-        self.text.push_str(key.version);
         let index = self
             .rows
             .partition_point(|row| u64::from(n32(&row[..4])) <= offset);
-        if key.kind == UnitKind::ExactRange {
-            self.exact_offsets.insert(offset as u32, key.offset);
+        if self.rows.len() == self.rows.capacity() {
+            self.rows.reserve_exact(64);
         }
+        self.keys.insert(index, &key, false)?;
         self.rows.insert(index, row);
         self.live += 1;
         Ok(index)
@@ -206,12 +166,11 @@ impl Records {
         let index = self
             .rows
             .partition_point(|row| u64::from(n32(&row[..4])) < *offset);
-        let row = self.rows[index..]
-            .iter_mut()
-            .take_while(|row| u64::from(n32(&row[..4])) == *offset)
-            .find(|row| n32(&row[4..8]) & ((1 << 28) - 1) != 0)?;
-        row[4..8].fill(0);
-        self.exact_offsets.remove(&(*offset as u32));
+        let index = (index..self.rows.len())
+            .take_while(|&i| u64::from(n32(&self.rows[i][..4])) == *offset)
+            .find(|&i| n32(&self.rows[i][4..8]) != 0)?;
+        self.keys.remove(index);
+        self.rows[index][4..8].fill(0);
         self.live -= 1;
         if (self.rows.len() - self.live) * 100 >= self.rows.len() {
             self.compact();
@@ -221,13 +180,11 @@ impl Records {
 
     pub fn retain_before(&mut self, end: u64) {
         for row in &mut self.rows {
-            if u64::from(n32(&row[..4])) >= end && n32(&row[4..8]) & ((1 << 28) - 1) != 0 {
+            if u64::from(n32(&row[..4])) >= end && n32(&row[4..8]) != 0 {
                 row[4..8].fill(0);
                 self.live -= 1;
             }
         }
-        self.exact_offsets
-            .retain(|offset, _| u64::from(*offset) < end);
         self.compact();
     }
 
@@ -246,37 +203,26 @@ impl Records {
 
     pub fn shrink_to_fit(&mut self) {
         self.rows.shrink_to_fit();
-        self.text.shrink_to_fit();
-        self.exact_offsets.shrink_to_fit();
+        self.keys.shrink_to_fit();
+    }
+
+    pub fn seal(&mut self) {
+        self.keys.seal();
+        self.shrink_to_fit();
     }
 
     fn compact(&mut self) {
-        let live = |row: &&[u8; WIDTH]| n32(&row[4..8]) & ((1 << 28) - 1) != 0;
-        let bytes = self
-            .rows
-            .iter()
-            .filter(live)
-            .map(|row| n16(&row[24..26]))
-            .sum();
-        let mut rows = Vec::with_capacity(self.live);
-        let mut text = String::with_capacity(bytes);
-        for row in self.rows.iter().filter(live) {
-            let start = n32(&row[16..20]) as usize;
-            let end = start + n16(&row[24..26]);
-            let mut row = *row;
-            row[16..20].copy_from_slice(&(text.len() as u32).to_le_bytes());
-            text.push_str(&self.text[start..end]);
-            rows.push(row);
-        }
-        self.rows = rows;
-        self.text = text;
+        self.keys.retain(|row| n32(&self.rows[row][4..8]) != 0);
+        self.rows.retain(|row| n32(&row[4..8]) != 0);
+        self.shrink_to_fit();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use talon_core::{BlockId, ObjectId, Version};
+    use crate::small_store::key::SmallKey;
+    use talon_core::{Backend, BlockId, ObjectId, Version};
 
     fn record(path: &str) -> Record {
         Record {
@@ -333,14 +279,15 @@ mod tests {
                     },
                 )
                 .unwrap();
+            records.seal();
             let snapshot = records.clone();
             assert_ne!(records.get(0).unwrap().1.key, records.get(1).unwrap().1.key);
             records.remove(&0).unwrap();
-            assert_eq!(records.get(0).unwrap().1.key.cache_unit(), exact);
-            assert_eq!(snapshot.get(1).unwrap().1.key.cache_unit(), exact);
+            assert_eq!(records.get(0).unwrap().1.key.view().cache_unit(), exact);
+            assert_eq!(snapshot.get(1).unwrap().1.key.view().cache_unit(), exact);
             assert_eq!(snapshot.get(0).unwrap().1.to_owned().key, ordinary.key);
             records.retain_before(16);
-            assert!(records.exact_offsets.is_empty());
+            assert!(records.is_empty());
             records.insert(16, ordinary.clone()).unwrap();
             assert_eq!(records.get(0).unwrap().1.to_owned().key, ordinary.key);
         }
@@ -348,18 +295,117 @@ mod tests {
 
     #[test]
     fn maximum_key_and_extent_are_lossless() {
+        for byte in ["x", "\0"] {
+            let mut records = Records::default();
+            let mut value = record("");
+            let key = value.key.view();
+            let path = byte.repeat(format::MAX_KEY - format::key_len(&key));
+            value = record(&path);
+            value.len = 128 << 20;
+            let slot = records
+                .insert((1 << 30) - value.len, value.clone())
+                .unwrap();
+            records.seal();
+            let restored = records.get(slot).unwrap().1.to_owned();
+            assert_eq!(restored.key, value.key);
+            assert_eq!(restored.len, value.len);
+            assert!(records.insert(1 << 30, record("bad")).is_err());
+        }
+    }
+
+    #[test]
+    fn compressed_keys_survive_reordering_deletion_and_snapshot_clones() {
         let mut records = Records::default();
-        let mut value = record("");
-        let key = value.key.view();
-        let path = "x".repeat(format::MAX_KEY - format::key_len(&key));
-        value = record(&path);
-        value.len = 128 << 20;
-        let slot = records
-            .insert((1 << 30) - value.len, value.clone())
-            .unwrap();
-        let restored = records.get(slot).unwrap().1.to_owned();
-        assert_eq!(restored.key, value.key);
-        assert_eq!(restored.len, value.len);
-        assert!(records.insert(1 << 30, record("bad")).is_err());
+        let mut expected = std::collections::BTreeMap::new();
+        for i in (0..401_u64).rev() {
+            let value = record(&format!("路径/{:012}", i));
+            records.insert(i * 20, value.clone()).unwrap();
+            expected.insert(i * 20, value);
+        }
+        records.seal();
+        let snapshot = records.clone();
+        for i in (0..401_u64).step_by(7) {
+            records.remove(&(i * 20)).unwrap();
+            expected.remove(&(i * 20));
+        }
+        for i in (0..401_u64).step_by(7) {
+            let value = record(&format!("replacement/{i:012}"));
+            records.insert(i * 20, value.clone()).unwrap();
+            expected.insert(i * 20, value);
+        }
+        for (row, ((offset, actual), (&want_offset, want))) in
+            records.iter().zip(&expected).enumerate()
+        {
+            assert_eq!(offset, want_offset);
+            assert_eq!(actual.key, want.key);
+            assert_eq!(records.get(row).unwrap().1.key, want.key);
+            assert!(records.matches(row, &key_codec::encode(&want.key)));
+            assert_eq!(records.metadata(row).unwrap().hash, key_hash(&want.key));
+            assert_eq!(
+                records.metadata(row).unwrap().charge,
+                super::super::charge(&want.key, want.len)
+            );
+        }
+        assert_eq!(records.len(), expected.len());
+        assert_eq!(snapshot.len(), 401);
+        assert_eq!(
+            snapshot.get(0).unwrap().1.key,
+            record("路径/000000000000").key
+        );
+        records.retain_before(1000);
+        assert_eq!(records.len(), 50);
+        assert_eq!(records.iter().count(), 50);
+    }
+
+    #[test]
+    fn duplicate_keys_remain_distinct_by_extent() {
+        let mut records = Records::default();
+        let value = record("same");
+        for i in 0..300 {
+            records.insert(i * 10, value.clone()).unwrap();
+        }
+        records.seal();
+        assert_eq!(records.len(), 300);
+        for (row, (offset, actual)) in records.iter().enumerate() {
+            assert_eq!(offset, row as u64 * 10);
+            assert_eq!(actual.key, value.key);
+        }
+        records.remove(&1280).unwrap();
+        assert_eq!(records.len(), 299);
+        assert_eq!(records.iter().count(), 299);
+    }
+
+    #[test]
+    fn path_prefixes_are_shared_across_range_offsets_sizes_and_versions() {
+        let mut records = Records::default();
+        let prefix = "路径/".repeat(100);
+        let mut expected = Vec::new();
+        for i in 0..64_u64 {
+            let key = crate::eviction::CacheUnit::ExactRange(BlockId::new(
+                ObjectId::new(Backend::Azure, "桶\0", format!("{prefix}{i}")),
+                i << 40,
+                i as u32 + 1,
+                Version::new(format!("版本\0{i}")),
+            ));
+            let value = Record {
+                key: SmallKey::new(&key),
+                len: i + 1,
+                checksum: i,
+            };
+            records.insert(i * 100, value.clone()).unwrap();
+            expected.push(value);
+        }
+        records.seal();
+        for (row, value) in expected.iter().enumerate() {
+            assert!(records.keys.get(row).unwrap().0.len() >= prefix.len());
+            assert_eq!(records.get(row).unwrap().1.key, value.key);
+            assert!(records.matches(row, &key_codec::encode(&value.key)));
+            assert!(!records.matches(
+                row,
+                &key_codec::encode(&expected[(row + 1) % expected.len()].key)
+            ));
+        }
+        records.remove(&100).unwrap();
+        assert!(!records.matches(1, &key_codec::encode(&expected[1].key)));
     }
 }

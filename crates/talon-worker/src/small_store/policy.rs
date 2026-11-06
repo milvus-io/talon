@@ -120,9 +120,9 @@ impl Catalog {
 
     pub(super) fn compact_entry(&self, slot: usize) -> PolicyEntry {
         let (address, record) = self
-            .record(self.lookup.handle(slot))
+            .metadata(self.lookup.handle(slot))
             .expect("small policy record");
-        let charge = super::charge(&record.key, record.len);
+        let charge = record.charge;
         let access = self.compact_access(slot, address, charge);
         let state = *access
             .small()
@@ -165,6 +165,10 @@ impl Catalog {
         if !self.compact_streams.insert(stream) {
             return;
         }
+        if self.live.get(&stream).copied().unwrap_or(0) == 0 {
+            self.compact_totals.insert(stream, (0, 0));
+            return;
+        }
         let mut total = (0_u64, 0_usize);
         for slot in 0..self.lookup.capacity() {
             let Some((handle, flags)) = self.lookup.entry(slot) else {
@@ -173,7 +177,7 @@ impl Catalog {
             if flags & VISIBLE == 0 {
                 continue;
             }
-            let (address, record) = self.record(handle).unwrap();
+            let (address, record) = self.metadata(handle).unwrap();
             if self.segment(address.0).unwrap().slot != stream {
                 continue;
             }
@@ -181,7 +185,7 @@ impl Catalog {
                 !self.policy.contains_key(&address),
                 "generic policy already installed"
             );
-            total.0 += super::charge(&record.key, record.len);
+            total.0 += record.charge;
             total.1 += 1;
             self.lookup.set_flags(slot, flags | POLICY);
         }
@@ -189,9 +193,9 @@ impl Catalog {
     }
 
     pub(super) fn compact_admit(&mut self, slot: usize, bytes: u64, clock: bool) -> AccessHandle {
-        let (address, record) = self.record(self.lookup.handle(slot)).unwrap();
+        let (address, record) = self.metadata(self.lookup.handle(slot)).unwrap();
         let stream = self.segment(address.0).unwrap().slot;
-        let charge = super::charge(&record.key, record.len);
+        let charge = record.charge;
         let flags = self.lookup.flags(slot);
         let old = if flags & POLICY != 0 {
             self.charges.get(&address).copied().unwrap_or(charge)
@@ -242,7 +246,7 @@ impl Catalog {
 
     pub(super) fn compact_remove(&mut self, slot: usize) -> PolicyEntry {
         let entry = self.compact_entry(slot);
-        let (address, _) = self.record(self.lookup.handle(slot)).unwrap();
+        let (address, _) = self.metadata(self.lookup.handle(slot)).unwrap();
         let stream = self.segment(address.0).unwrap().slot;
         self.compact_forget(address, stream, &entry);
         let flags = self.lookup.flags(slot) & !(POLICY | REFERENCED);

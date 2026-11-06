@@ -54,6 +54,10 @@ use talon_worker::{
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 const CONTROL_OPERATION_TIMEOUT: Duration = Duration::from_secs(3);
 const CONTROL_TLS_RELOAD_INTERVAL: Duration = Duration::from_secs(5);
 

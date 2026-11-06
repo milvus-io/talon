@@ -92,7 +92,7 @@ impl Directory {
             if catalog.segment(address.0).unwrap().slot != self.slot {
                 continue;
             }
-            let unit = record.key.cache_unit();
+            let unit = record.key.view().cache_unit();
             if excluded.contains(&unit) || selected.contains(&unit) {
                 continue;
             }
@@ -117,11 +117,22 @@ impl Directory {
         }
         out
     }
-    pub(super) fn restore(&mut self, key: SmallKey, location: Location) -> std::io::Result<()> {
-        if self.catalog.0.read().unwrap().find(&key, VISIBLE).is_some() {
+    pub(super) fn restore(
+        &mut self,
+        key: &dyn SmallIdentity,
+        location: Location,
+    ) -> std::io::Result<()> {
+        let mut catalog = self.catalog.0.write().unwrap();
+        if catalog.find(key, VISIBLE).is_some() {
             return Err(super::format::invalid("duplicate recovered object"));
         }
-        self.insert(key, location);
+        let slot = catalog
+            .at((location.segment, location.offset))
+            .expect("journaled small object");
+        let flags = catalog.lookup.flags(slot);
+        catalog.files.insert(location.segment, location.file);
+        catalog.lookup.set_flags(slot, flags | VISIBLE);
+        *catalog.live.entry(self.slot).or_default() += 1;
         Ok(())
     }
 
@@ -132,7 +143,7 @@ impl Directory {
             .map(|meta| {
                 meta.records
                     .iter()
-                    .map(|(offset, record)| (offset, SmallKey::new(&record.key)))
+                    .map(|(offset, record)| (offset, record.key))
                     .collect()
             })
             .unwrap_or_default();
@@ -158,28 +169,23 @@ impl Directory {
             before_relocation_publish: None,
         }
     }
-    pub fn reserve(&mut self, _: usize) {
-        self.catalog
-            .0
-            .write()
-            .unwrap()
-            .activate()
-            .expect("validated small catalog");
-    }
     fn find(&self, catalog: &Catalog, id: &dyn SmallIdentity, flags: u8) -> Option<usize> {
+        let encoded = super::key_codec::encode(id);
         catalog.lookup.find(catalog.hash(id), |handle, state| {
             state & flags == flags
-                && catalog.record(handle).is_some_and(|(address, record)| {
-                    record.key == id.view()
-                        && catalog
-                            .segment(address.0)
-                            .is_some_and(|segment| segment.slot == self.slot)
+                && catalog.metadata(handle).is_some_and(|(address, _)| {
+                    catalog
+                        .segment(address.0)
+                        .is_some_and(|segment| segment.slot == self.slot)
                 })
+                && catalog.matches(handle, &encoded)
         })
     }
     fn pending(&self, catalog: &Catalog, id: &dyn SmallIdentity) -> Option<usize> {
         let slot = catalog.at(self.staged?)?;
-        (catalog.record(catalog.lookup.handle(slot))?.1.key == id.view()).then_some(slot)
+        catalog
+            .matches(catalog.lookup.handle(slot), &super::key_codec::encode(id))
+            .then_some(slot)
     }
     pub fn len(&self) -> usize {
         self.catalog
@@ -194,14 +200,13 @@ impl Directory {
 
     pub fn identity(&self, id: &dyn SmallIdentity) -> Option<SmallKey> {
         let catalog = self.catalog.0.read().unwrap();
-        if let Some(slot) = self
+        if self
             .find(&catalog, id, VISIBLE)
             .or_else(|| self.find(&catalog, id, POLICY))
             .or_else(|| self.pending(&catalog, id))
+            .is_some()
         {
-            return Some(SmallKey::new(
-                &catalog.record(catalog.lookup.handle(slot))?.1.key,
-            ));
+            return Some(SmallKey::new(id));
         }
         catalog.retired.get(id).map(|entry| entry.key.clone())
     }
@@ -224,21 +229,24 @@ impl Directory {
     }
     pub fn iter(&self) -> std::vec::IntoIter<(SmallKey, Location)> {
         let catalog = self.catalog.0.read().unwrap();
-        let slots: Vec<_> = catalog
-            .lookup
-            .iter()
-            .filter_map(|(slot, handle, flags)| {
-                if flags & VISIBLE == 0 {
-                    return None;
-                }
-                let (address, _) = catalog.record(handle)?;
-                (catalog.segment(address.0)?.slot == self.slot).then_some(slot)
+        let entries: Vec<_> = catalog
+            .files
+            .keys()
+            .filter_map(|&segment| {
+                let meta = catalog.segment(segment)?;
+                (meta.slot == self.slot).then_some((segment, meta))
+            })
+            .flat_map(|(segment, meta)| {
+                meta.records
+                    .iter()
+                    .map(move |(offset, record)| ((segment, offset), record.key))
             })
             .collect();
-        slots
+        entries
             .into_iter()
-            .filter_map(|slot| {
-                let key = SmallKey::new(&catalog.record(catalog.lookup.handle(slot))?.1.key);
+            .filter_map(|(address, key)| {
+                let slot = catalog.at(address)?;
+                (catalog.lookup.flags(slot) & VISIBLE != 0).then_some(())?;
                 Some((key, catalog.location(slot)?))
             })
             .collect::<Vec<_>>()
@@ -295,7 +303,7 @@ impl Directory {
         let old_slot = self.find(catalog, &key, VISIBLE);
         let old = old_slot.and_then(|slot| catalog.location(slot));
         if let Some(old_slot) = old_slot.filter(|old| *old != slot) {
-            let old_address = catalog.record(catalog.lookup.handle(old_slot)).unwrap().0;
+            let old_address = catalog.metadata(catalog.lookup.handle(old_slot)).unwrap().0;
             let flags = catalog.lookup.flags(old_slot);
             catalog
                 .lookup
@@ -346,7 +354,7 @@ impl Directory {
             .pending(&catalog, id)
             .or_else(|| self.find(&catalog, id, VISIBLE))
             .expect("staged small object");
-        let address = catalog.record(catalog.lookup.handle(slot)).unwrap().0;
+        let address = catalog.metadata(catalog.lookup.handle(slot)).unwrap().0;
         if let Some(policy) = catalog.policy.get_mut(&address) {
             policy.access = access;
         } else {
@@ -380,7 +388,7 @@ impl Directory {
             if catalog.compact_streams.contains(&self.slot) {
                 return Some(catalog.compact_entry(slot));
             }
-            let address = catalog.record(catalog.lookup.handle(slot))?.0;
+            let address = catalog.metadata(catalog.lookup.handle(slot))?.0;
             return catalog.policy.get(&address).cloned();
         }
         let mut entry = catalog.retired.get(id)?.policy.clone()?;
@@ -398,7 +406,7 @@ impl Directory {
         let slot = self
             .pending(&catalog, id)
             .or_else(|| self.find(&catalog, id, VISIBLE))?;
-        let address = catalog.record(catalog.lookup.handle(slot))?.0;
+        let address = catalog.metadata(catalog.lookup.handle(slot))?.0;
         let flags = catalog.lookup.flags(slot) | POLICY;
         catalog.lookup.set_flags(slot, flags);
         catalog.access.remove(&address);
@@ -416,7 +424,7 @@ impl Directory {
             if catalog.compact_streams.contains(&self.slot) {
                 return Some(catalog.compact_update(slot, update));
             }
-            let address = catalog.record(catalog.lookup.handle(slot))?.0;
+            let address = catalog.metadata(catalog.lookup.handle(slot))?.0;
             return Some(update(&mut catalog.policy.get_mut(&address)?.state));
         }
         if let Some(ticket) = catalog
@@ -449,7 +457,7 @@ impl Directory {
             if catalog.compact_streams.contains(&self.slot) {
                 return Some(catalog.compact_remove(slot));
             }
-            let address = catalog.record(catalog.lookup.handle(slot))?.0;
+            let address = catalog.metadata(catalog.lookup.handle(slot))?.0;
             let flags = catalog.lookup.flags(slot) & !POLICY;
             catalog.lookup.set_flags(slot, flags);
             let policy = catalog.policy.remove(&address)?;
