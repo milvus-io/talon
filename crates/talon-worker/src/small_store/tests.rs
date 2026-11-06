@@ -209,7 +209,7 @@ async fn pending_open_retains_old_inode_before_compaction_unlinks() {
         .entries
         .read()
         .unwrap()
-        .get(format::key(&id("held")).unwrap().as_slice())
+        .get(&id("held") as &dyn SmallIdentity)
         .unwrap()
         .clone();
     assert!(loc.file.fd.lock().await.upgrade().is_none());
@@ -579,7 +579,7 @@ async fn small_layout_probe() {
     );
     let mut units = Vec::new();
     store
-        .restore_policy_units(&mut units, &HashMap::new())
+        .restore_policy_units(&mut units, &HashMap::new(), true)
         .unwrap();
     let policy = crate::Lru::from_recovered(
         Arc::new(crate::BlockIndex::new()),

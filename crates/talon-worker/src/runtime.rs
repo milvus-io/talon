@@ -248,7 +248,7 @@ impl WorkerRuntime {
         let mut units = index.restore_policy_units(track_blocks);
         let blocks = index.len() + small.as_ref().map_or(0, |small| small.len());
         if let Some(small) = &small {
-            small.restore_policy_units(&mut units);
+            small.restore_policy_units(&index, &mut units, track_blocks);
         }
         let lru = Arc::new(Lru::from_recovered(
             index.clone(),

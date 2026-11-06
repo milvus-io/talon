@@ -4,6 +4,163 @@ use std::time::Duration;
 use talon_core::{Backend, BlockId, ObjectId, Version, WorkerConfig};
 
 #[test]
+fn snapshot_keeps_rows_when_live_deletion_compacts_and_append_moves_them() {
+    use talon_journal::Machine;
+    let insert = |offset, key| Event::Insert {
+        slot: 0,
+        segment: 1,
+        offset,
+        record: Record {
+            key: crate::small_store::key::SmallKey::new(&id(key)),
+            len: 5,
+            checksum: offset,
+        },
+    };
+    let mut model = Model::default();
+    model.apply(insert(0, "first")).unwrap();
+    model.apply(insert(10, "last")).unwrap();
+    let mut snapshot = model.snapshot().unwrap();
+    let mut restored = Model::default();
+    for _ in 0..3 {
+        restored
+            .restore(Model::decode_snapshot(&snapshot.next().unwrap().unwrap()).unwrap())
+            .unwrap();
+    }
+    model
+        .apply(Event::Delete {
+            segment: 1,
+            offset: 0,
+        })
+        .unwrap();
+    model.apply(insert(5, "middle")).unwrap();
+    for bytes in snapshot {
+        restored
+            .restore(Model::decode_snapshot(&bytes.unwrap()).unwrap())
+            .unwrap();
+    }
+    assert_eq!(
+        restored.segments[&1]
+            .records
+            .iter()
+            .map(|(offset, _)| offset)
+            .collect::<Vec<_>>(),
+        [0, 10]
+    );
+    restored
+        .apply(Event::Delete {
+            segment: 1,
+            offset: 0,
+        })
+        .unwrap();
+    restored.apply(insert(5, "middle")).unwrap();
+    let rows = |model: &Model| {
+        model.segments[&1]
+            .records
+            .iter()
+            .map(|(offset, record)| (offset, record.to_owned().key))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(rows(&model), rows(&restored));
+}
+
+#[test]
+fn dense_segment_snapshot_restores_one_hundred_thousand_extents() {
+    use talon_journal::Machine;
+    let mut model = Model::default();
+    for offset in 0..100_000 {
+        model
+            .apply(Event::Insert {
+                slot: 0,
+                segment: 1,
+                offset,
+                record: Record {
+                    key: crate::small_store::key::SmallKey::new(&id(&offset.to_string())),
+                    len: 1,
+                    checksum: offset,
+                },
+            })
+            .unwrap();
+    }
+    model.apply(Event::Seal { segment: 1 }).unwrap();
+    let mut restored = Model::default();
+    for bytes in model.snapshot().unwrap() {
+        restored
+            .restore(Model::decode_snapshot(&bytes.unwrap()).unwrap())
+            .unwrap();
+    }
+    assert_eq!(restored.segments[&1].records.len(), 100_000);
+    for (offset, record) in restored.segments[&1].records.iter() {
+        assert_eq!(record.checksum, offset);
+        assert_eq!(
+            record.key,
+            crate::small_store::key::SmallIdentity::view(&id(&offset.to_string()))
+        );
+    }
+}
+
+#[tokio::test]
+async fn compact_journal_preserves_live_and_recovered_identity() {
+    use crate::small_store::key::SmallIdentity;
+    use crate::{small_store::SmallObjectStore, Lru};
+    let dir = tempfile::tempdir().unwrap();
+    let block = id("shared/路径");
+    for recovered in [false, true] {
+        let store = Arc::new(
+            SmallObjectStore::open(dir.path().to_owned(), 128 << 10, 256 << 10, 4 << 20, None)
+                .unwrap(),
+        );
+        let mut units = Vec::new();
+        let index = Arc::new(crate::BlockIndex::new());
+        store.restore_policy_units(&index, &mut units, true);
+        let policy = Arc::new(Lru::from_recovered(index, units, store.len(), true, true));
+        store.bind_policy(policy.clone());
+        if !recovered {
+            store
+                .put(&block, Bytes::from_static(b"shared"))
+                .await
+                .unwrap();
+        }
+        let stream = store
+            .streams()
+            .into_iter()
+            .find(|s| s.contains(&block))
+            .unwrap();
+        let journal_key = stream
+            .journal
+            .handle
+            .query_blocking(|m| {
+                Ok(m.0
+                    .read()
+                    .unwrap()
+                    .model
+                    .segments
+                    .values()
+                    .flat_map(|s| s.records.values())
+                    .next()
+                    .unwrap()
+                    .to_owned()
+                    .key)
+            })
+            .unwrap();
+        let locator_key = stream
+            .entries
+            .read()
+            .unwrap()
+            .get_key_value(&block as &dyn SmallIdentity)
+            .unwrap()
+            .0
+            .clone();
+        assert_eq!(journal_key, locator_key);
+        assert_eq!(journal_key.0.block, policy.shared_identity(&block));
+        assert_eq!(
+            store.read(&block).await.unwrap().unwrap(),
+            Bytes::from_static(b"shared")
+        );
+        store.maintain(true).await.unwrap();
+    }
+}
+
+#[test]
 fn legacy_snapshot_headers_preserve_the_original_durability_boundary() {
     use talon_journal::Machine;
     for sealed in [false, true] {
@@ -32,7 +189,7 @@ fn flush_boundaries_reject_record_splits_and_regression() {
                 segment: 1,
                 offset,
                 record: Record {
-                    key: format::key(&id(key)).unwrap().into(),
+                    key: crate::small_store::key::SmallKey::new(&id(key)),
                     len: 5,
                     checksum: 0,
                 },
@@ -242,7 +399,7 @@ async fn recovered_small_store_tail_uses_initial_snapshot_budget() {
             },
         )
         .unwrap();
-    let key: Arc<[u8]> = format::key(&id(&"k".repeat(60 << 10))).unwrap().into();
+    let key = crate::small_store::key::SmallKey::new(&id(&"k".repeat(60 << 10)));
     let log = root.join("metadata/journal.00000000000000000001");
     let mut offset = 0;
     // Build a valid large tail without checkpointing it, as can remain after

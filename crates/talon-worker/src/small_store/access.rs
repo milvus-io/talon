@@ -33,12 +33,15 @@ pub(super) struct DirtyQueue {
 /// Attached to packed read tokens when TTI is enabled. The
 /// queue owns metadata, never a payload pin; the weak back-reference avoids a cycle.
 pub(crate) struct DirtyAccess {
-    key: Arc<[u8]>,
+    key: SmallKey,
     clock: Arc<AtomicU64>,
     queue: Weak<DirtyQueue>,
     pending: AtomicBool,
 }
 impl DirtyAccess {
+    pub(crate) fn clock(&self) -> &Arc<AtomicU64> {
+        &self.clock
+    }
     pub(crate) fn touch(self: &Arc<Self>) {
         // Every hit publishes its timestamp even when already pending. The
         // consumer resets before sampling, so a racing hit belongs to this or
@@ -52,7 +55,7 @@ impl DirtyAccess {
         let mut pending = queue.pending.lock().unwrap();
         let identity = Arc::as_ptr(self) as usize;
         if !pending.keys.contains_key(&identity) {
-            let bytes = self.key.len() + std::mem::size_of::<Self>() + 64;
+            let bytes = format::key_len(&self.key) + std::mem::size_of::<Self>() + 64;
             if pending.keys.len() >= MAX_DIRTY_KEYS || pending.bytes + bytes > MAX_DIRTY_BYTES {
                 queue.overflow.store(true, Ordering::Release);
                 return;
@@ -133,9 +136,9 @@ fn decode_log(mut bytes: &[u8], ages: &mut HashMap<CacheUnit, u64>) -> io::Resul
     Ok(false)
 }
 
-fn encode(bytes: &mut Vec<u8>, key: &[u8], last: u64) -> io::Result<()> {
+fn encode(bytes: &mut Vec<u8>, key: &dyn SmallIdentity, last: u64) -> io::Result<()> {
     let mut record = last.to_le_bytes().to_vec();
-    record.extend_from_slice(key);
+    format::encode_key(&mut record, key)?;
     format::frame(bytes, &record)
 }
 
@@ -208,27 +211,37 @@ impl SmallObjectStore {
         if self.access_dirty.enabled.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
+        let restore = self
+            .policy()
+            .map_or(true, |policy| policy.enable_small_clock());
         for stream in self.streams() {
-            for (key, loc) in stream.entries.write().unwrap().iter_mut() {
-                if let Some(access) = loc.access.take() {
-                    loc.access = Some(self.attach_access(key.clone(), access, false));
+            let mut directory = stream.entries.write().unwrap();
+            let entries: Vec<_> = directory.iter().collect();
+            for (key, loc) in entries {
+                if let Some(access) = loc.access {
+                    let access = self.attach_access(key.clone(), access.enable_clock(), false);
+                    directory.attach_access(&key, access);
                 }
             }
+        }
+        if restore {
+            self.restore_access();
         }
         Ok(())
     }
 
     pub(crate) fn track_access(&self, id: &(impl SmallStoreKey + ?Sized)) -> io::Result<()> {
-        let encoded = format::key(id)?;
+        format::validate_key(&id.view())?;
         for stream in self.streams() {
             let mut entries = stream.entries.write().unwrap();
             let key = entries
-                .get_key_value(encoded.as_slice())
+                .get_key_value(&id.view())
                 .map(|(key, _)| key.clone());
             if let Some(key) = key {
-                let loc = entries.get_mut(key.as_ref()).unwrap();
-                if let Some(access) = loc.access.take() {
-                    loc.access = Some(self.attach_access(key, access, true));
+                let loc = entries.get(&key).unwrap();
+                if let Some(access) = loc.access {
+                    let access = self.attach_access(key.clone(), access, true);
+                    entries.attach_access(&key, access);
                 }
                 break;
             }
@@ -236,7 +249,7 @@ impl SmallObjectStore {
         Ok(())
     }
 
-    fn attach_access(&self, key: Arc<[u8]>, access: AccessHandle, dirty: bool) -> AccessHandle {
+    fn attach_access(&self, key: SmallKey, access: AccessHandle, dirty: bool) -> AccessHandle {
         let token = Arc::new(DirtyAccess {
             key,
             clock: access.clock().clone(),
@@ -296,9 +309,8 @@ impl SmallObjectStore {
                         } else {
                             for token in pending.keys.values() {
                                 token.consume();
-                                let id = format::id(&token.key)?;
                                 if let Some(access) =
-                                    prepare.lookup_entry(&id)?.and_then(|loc| loc.access)
+                                    prepare.lookup_entry(&token.key)?.and_then(|loc| loc.access)
                                 {
                                     // Deleted/re-admitted keys have a different clock.
                                     if Arc::ptr_eq(access.clock(), &token.clock) {

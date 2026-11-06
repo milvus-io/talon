@@ -1,18 +1,42 @@
 //! Versioned cache metadata. Payloads are raw bytes in a separate segment file.
-use super::SmallStoreKey;
-use crate::CacheUnit;
+use crate::block_key::{BlockRef, ObjectRef};
+use crate::eviction::{CacheUnit, UnitKind};
+use crate::small_store::key::{SmallIdentity, SmallRef};
 use std::io::{self, Read, Write};
-use talon_core::{Backend, BlockId, ObjectId, Version};
+use talon_core::Backend;
 
 pub(super) const MAX_KEY: usize = 64 * 1024;
 
-pub(super) fn key(unit: &(impl SmallStoreKey + ?Sized)) -> io::Result<Vec<u8>> {
-    let id = unit.block();
-    if unit.is_page() {
+pub(super) fn key_len(id: &dyn SmallIdentity) -> usize {
+    let id = id.view();
+    25 + id.object.bucket.len() + id.object.object_path.len() + id.version.len()
+}
+
+pub(super) fn validate_key(id: &dyn SmallIdentity) -> io::Result<()> {
+    if matches!(id.view().kind, UnitKind::Page(_)) {
         return Err(invalid("page is not a small-store key"));
     }
-    let tag = if unit.exact_range() { 0x80 } else { 0 };
-    let mut out = Vec::new();
+    if key_len(id) > MAX_KEY {
+        return Err(invalid("small object key too long"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn key(id: &dyn SmallIdentity) -> io::Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(key_len(id));
+    encode_key(&mut out, id)?;
+    Ok(out)
+}
+
+pub(super) fn encode_key(out: &mut Vec<u8>, id: &dyn SmallIdentity) -> io::Result<()> {
+    validate_key(id)?;
+    let id = id.view();
+    let tag = if id.kind == UnitKind::ExactRange {
+        0x80
+    } else {
+        0
+    };
     out.push(
         tag | match id.object.backend {
             Backend::S3 => 0,
@@ -22,20 +46,21 @@ pub(super) fn key(unit: &(impl SmallStoreKey + ?Sized)) -> io::Result<Vec<u8>> {
     );
     out.extend_from_slice(&id.offset.to_le_bytes());
     out.extend_from_slice(&id.block_size.to_le_bytes());
-    for s in [&id.object.bucket, &id.object.object_path, &id.version.0] {
-        if s.len() > MAX_KEY {
-            return Err(invalid("small object key too long"));
-        }
+    for s in [id.object.bucket, id.object.object_path, id.version] {
         out.extend_from_slice(&(s.len() as u32).to_le_bytes());
         out.extend_from_slice(s.as_bytes());
     }
-    if out.len() > MAX_KEY {
-        return Err(invalid("small object key too long"));
-    }
-    Ok(out)
+    Ok(())
 }
 
-pub(super) fn id(mut bytes: &[u8]) -> io::Result<CacheUnit> {
+pub(super) fn id(bytes: &[u8]) -> io::Result<CacheUnit> {
+    Ok(view(bytes)?.cache_unit())
+}
+
+pub(super) fn view(mut bytes: &[u8]) -> io::Result<SmallRef<'_>> {
+    if bytes.len() > MAX_KEY {
+        return Err(invalid("small object key too long"));
+    }
     let mut backend = [0];
     bytes.read_exact(&mut backend)?;
     let exact = backend[0] & 0x80 != 0;
@@ -47,14 +72,13 @@ pub(super) fn id(mut bytes: &[u8]) -> io::Result<CacheUnit> {
     };
     let offset = u64(&mut bytes)?;
     let size = u32(&mut bytes)?;
-    let mut string = || -> io::Result<String> {
+    let mut string = || -> io::Result<&str> {
         let len = u32(&mut bytes)? as usize;
         if len > bytes.len() {
             return Err(invalid("small object key length"));
         }
-        let s = std::str::from_utf8(&bytes[..len])
-            .map_err(|_| invalid("small object key UTF-8"))?
-            .to_owned();
+        let s =
+            std::str::from_utf8(&bytes[..len]).map_err(|_| invalid("small object key UTF-8"))?;
         bytes = &bytes[len..];
         Ok(s)
     };
@@ -64,16 +88,22 @@ pub(super) fn id(mut bytes: &[u8]) -> io::Result<CacheUnit> {
     if !bytes.is_empty() {
         return Err(invalid("small object key trailing bytes"));
     }
-    let id = BlockId::new(
-        ObjectId::new(backend, bucket, path),
-        offset,
-        size,
-        Version::new(version),
-    );
-    Ok(if exact {
-        CacheUnit::ExactRange(id)
-    } else {
-        CacheUnit::Whole(id)
+    Ok(SmallRef {
+        kind: if exact {
+            UnitKind::ExactRange
+        } else {
+            UnitKind::Whole
+        },
+        block: BlockRef {
+            object: ObjectRef {
+                backend,
+                bucket,
+                object_path: path,
+            },
+            offset,
+            block_size: size,
+            version,
+        },
     })
 }
 
@@ -113,4 +143,51 @@ pub(super) fn u64(bytes: &mut &[u8]) -> io::Result<u64> {
 }
 pub(super) fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::small_store::key::SmallKey;
+    use talon_core::{BlockId, ObjectId, Version};
+
+    #[test]
+    fn shared_keys_preserve_disk_bytes_and_reject_invalid_identity() {
+        let block = BlockId::new(
+            ObjectId::new(Backend::Azure, "桶", "bc"),
+            17,
+            1234,
+            Version::new("v"),
+        );
+        let encoded = vec![
+            2, 17, 0, 0, 0, 0, 0, 0, 0, 0xd2, 4, 0, 0, 3, 0, 0, 0, 0xe6, 0xa1, 0xb6, 2, 0, 0, 0,
+            b'b', b'c', 1, 0, 0, 0, b'v',
+        ];
+        let shared = SmallKey::new(&view(&encoded).unwrap());
+        assert_eq!(shared.materialize(), block);
+        assert_eq!(key(&shared).unwrap(), encoded);
+        assert_eq!(key_len(&shared), encoded.len());
+        let exact = CacheUnit::ExactRange(block.clone());
+        let mut exact_bytes = encoded.clone();
+        exact_bytes[0] |= 0x80;
+        assert_eq!(key(&exact).unwrap(), exact_bytes);
+        assert_eq!(id(&exact_bytes).unwrap(), exact);
+        assert_eq!(
+            key(&SmallKey::new(&view(&exact_bytes).unwrap())).unwrap(),
+            exact_bytes
+        );
+        assert_ne!(view(&encoded).unwrap(), view(&exact_bytes).unwrap());
+        for len in 0..encoded.len() {
+            assert!(view(&encoded[..len]).is_err());
+        }
+        let mut invalid_utf8 = encoded.clone();
+        invalid_utf8[17] = 0xff;
+        assert!(view(&invalid_utf8).is_err());
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert!(view(&trailing).is_err());
+        let mut oversized = block;
+        oversized.object.object_path = "x".repeat(MAX_KEY);
+        assert!(key(&oversized).is_err());
+    }
 }

@@ -1,10 +1,12 @@
 //! The writer's checkpointable metadata state. Segment maps use copy-on-write
 //! so a snapshot can be encoded off the I/O thread while mutations continue.
+use super::super::records::Records;
 use super::*;
+use crate::small_store::key::SmallKey;
 
 #[derive(Clone)]
 pub(crate) struct Record {
-    pub key: Arc<[u8]>,
+    pub key: SmallKey,
     pub len: u64,
     pub checksum: u64,
 }
@@ -16,7 +18,7 @@ pub(crate) struct SegmentMeta {
     pub durable_end: u64,
     pub metadata: u64,
     pub sealed: bool,
-    pub records: BTreeMap<u64, Record>,
+    pub records: Records,
 }
 
 impl SegmentMeta {
@@ -26,8 +28,8 @@ impl SegmentMeta {
         } else {
             8 + self
                 .records
-                .range(..self.durable_end)
-                .map(|(_, r)| 37 + r.key.len() as u64)
+                .before(self.durable_end)
+                .map(|(_, r)| 37 + format::key_len(&r.key) as u64)
                 .sum::<u64>()
         }
     }
@@ -87,7 +89,7 @@ impl Event {
                 for n in [*slot as u64, *segment, *offset, record.len, record.checksum] {
                     b.extend_from_slice(&n.to_le_bytes());
                 }
-                b.extend_from_slice(&record.key);
+                format::encode_key(&mut b, &record.key)?;
             }
             Self::Delete { segment, offset } => {
                 b.push(1);
@@ -132,11 +134,11 @@ impl Event {
                 let offset = format::u64(&mut b)?;
                 let len = format::u64(&mut b)?;
                 let checksum = format::u64(&mut b)?;
-                let id = format::id(b)?;
-                if len > 128 << 20 || !crate::small_store::accepts_object(u64::MAX, &id, len) {
+                let id = format::view(b)?;
+                if len > 128 << 20 || !id.valid_extent(len) {
                     return Err(invalid("journal extent"));
                 }
-                let key = Arc::from(b);
+                let key = SmallKey::new(&id);
                 b = &[];
                 Self::Insert {
                     slot,
@@ -206,7 +208,7 @@ impl Model {
                         durable_end: 0,
                         metadata: 8,
                         sealed: false,
-                        records: BTreeMap::new(),
+                        records: Records::default(),
                     })
                 }));
                 if s.slot != slot || s.sealed || offset < s.durable_end {
@@ -215,20 +217,12 @@ impl Model {
                 let end = offset
                     .checked_add(record.len)
                     .ok_or_else(|| invalid("extent overflow"))?;
-                if s.records
-                    .range(..=offset)
-                    .next_back()
-                    .is_some_and(|(o, r)| o + r.len > offset)
-                    || s.records
-                        .range(offset..)
-                        .next()
-                        .is_some_and(|(o, _)| *o < end)
-                {
+                if s.records.overlaps(offset, record.len) {
                     return Err(invalid("overlapping journal extent"));
                 }
                 s.bytes = s.bytes.max(end);
-                s.metadata += 37 + record.key.len() as u64;
-                s.records.insert(offset, record);
+                s.metadata += 37 + format::key_len(&record.key) as u64;
+                s.records.insert(offset, record)?;
             }
             Event::Delete { segment, offset } => {
                 let s = Arc::make_mut(
@@ -249,6 +243,7 @@ impl Model {
                 );
                 s.durable_end = s.bytes;
                 s.sealed = true;
+                s.records.shrink_to_fit();
             }
             Event::Flush {
                 segment,
@@ -263,10 +258,7 @@ impl Model {
                     || durable_end == 0
                     || durable_end < s.durable_end
                     || durable_end > s.bytes
-                    || s.records
-                        .range(..durable_end)
-                        .next_back()
-                        .is_some_and(|(offset, record)| offset + record.len > durable_end)
+                    || s.records.crosses(durable_end)
                 {
                     return Err(invalid("invalid durable segment boundary"));
                 }
@@ -282,9 +274,10 @@ impl Model {
                     return Err(invalid("invalid segment recovery"));
                 }
                 s.metadata = s.recovered_metadata();
-                s.records.retain(|offset, _| *offset < s.durable_end);
+                s.records.retain_before(s.durable_end);
                 s.bytes = s.durable_end;
                 s.sealed = true;
+                s.records.shrink_to_fit();
             }
             Event::Replace { old, new } => {
                 if let Some(new) = new {
@@ -298,6 +291,7 @@ impl Model {
                     );
                     s.durable_end = s.bytes;
                     s.sealed = true;
+                    s.records.shrink_to_fit();
                 }
                 // Empty standby/active files have no Insert record.
                 self.segments.remove(&old);
@@ -318,7 +312,7 @@ fn take_byte(b: &mut &[u8]) -> io::Result<u8> {
 pub(crate) struct Snapshot {
     next: Option<u64>,
     segments: std::collections::btree_map::IntoIter<u64, Arc<SegmentMeta>>,
-    current: Option<(u64, Arc<SegmentMeta>, Option<u64>)>,
+    current: Option<(u64, Arc<SegmentMeta>, usize)>,
 }
 pub(crate) enum SnapshotRecord {
     Next(u64),
@@ -334,19 +328,16 @@ impl Iterator for Snapshot {
             return Some(Ok(b.into()));
         }
         if let Some((id, s, after)) = &mut self.current {
-            use std::ops::Bound::{Excluded, Unbounded};
-            let record = match after {
-                Some(offset) => s.records.range((Excluded(*offset), Unbounded)).next(),
-                None => s.records.first_key_value(),
-            };
-            if let Some((&offset, r)) = record {
-                *after = Some(offset);
+            while *after < s.records.slots() {
+                let record = s.records.get(*after);
+                *after += 1;
+                let Some((offset, r)) = record else { continue };
                 return Some(
                     Event::Insert {
                         slot: s.slot,
                         segment: *id,
                         offset,
-                        record: r.clone(),
+                        record: r.to_owned(),
                     }
                     .encode()
                     .map(Bytes::from),
@@ -361,7 +352,7 @@ impl Iterator for Snapshot {
         }
         b.push(u8::from(s.sealed));
         b.extend_from_slice(&s.durable_end.to_le_bytes());
-        self.current = Some((id, s, None));
+        self.current = Some((id, s, 0));
         Some(Ok(b.into()))
     }
 }
@@ -371,7 +362,7 @@ impl talon_journal::Machine for Model {
     type Snapshot = Snapshot;
     fn encoded_len(event: &Event) -> io::Result<usize> {
         Ok(match event {
-            Event::Insert { record, .. } => 41 + record.key.len(),
+            Event::Insert { record, .. } => 41 + format::key_len(&record.key),
             Event::Delete { .. } | Event::Replace { .. } | Event::Flush { .. } => 17,
             Event::Seal { .. } | Event::SetNext { .. } | Event::Recover { .. } => 9,
         })
@@ -432,7 +423,7 @@ impl talon_journal::Machine for Model {
                         durable_end,
                         metadata,
                         sealed,
-                        records: BTreeMap::new(),
+                        records: Records::default(),
                     },
                 ))
             }
@@ -469,18 +460,11 @@ impl talon_journal::Machine for Model {
                         .checked_add(record.len)
                         .map_or(true, |end| end > s.bytes)
                     || (offset < s.durable_end && offset + record.len > s.durable_end)
-                    || s.records
-                        .range(..=offset)
-                        .next_back()
-                        .is_some_and(|(o, r)| o + r.len > offset)
-                    || s.records
-                        .range(offset..)
-                        .next()
-                        .is_some_and(|(o, _)| *o < offset + record.len)
+                    || s.records.overlaps(offset, record.len)
                 {
                     return Err(invalid("snapshot extent"));
                 }
-                s.records.insert(offset, record);
+                s.records.insert(offset, record)?;
             }
             _ => return Err(invalid("snapshot insert")),
         }

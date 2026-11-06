@@ -11,6 +11,70 @@ fn id(n: usize) -> BlockId {
         Version::new("v1"),
     )
 }
+
+#[tokio::test]
+async fn clocks_are_allocated_only_when_enabled_and_restore_persisted_ages() {
+    fn untracked(root: &Path) -> (Arc<SmallObjectStore>, Arc<Lru>) {
+        let store = Arc::new(
+            SmallObjectStore::open(root.to_owned(), 128 << 10, 256 << 10, 16 << 20, None).unwrap(),
+        );
+        let index = Arc::new(crate::BlockIndex::new());
+        let mut units = Vec::new();
+        store.restore_policy_units(&index, &mut units, false);
+        let policy = Arc::new(Lru::from_recovered(index, units, store.len(), false, false));
+        store.bind_policy(policy.clone());
+        (store, policy)
+    }
+    let root = tempfile::tempdir().unwrap();
+    let age;
+    {
+        let (store, policy) = untracked(root.path());
+        store
+            .put(&id(1), Bytes::from_static(b"payload"))
+            .await
+            .unwrap();
+        assert_eq!(store.access(&id(1)).unwrap().last_access(), 0);
+        store.enable_access_tracking().unwrap();
+        let access = store.access(&id(1)).unwrap();
+        let indexed = policy
+            .index()
+            .policy_get(&crate::CacheUnit::Whole(id(1)))
+            .unwrap()
+            .access;
+        assert!(Arc::ptr_eq(access.clock(), indexed.clock()));
+        age = access_millis().saturating_sub(10_000);
+        access.restore(age);
+        store
+            .put(&id(2), Bytes::from_static(b"payload"))
+            .await
+            .unwrap();
+        assert!(store.access(&id(2)).unwrap().last_access() > 0);
+        store.maintain(true).await.unwrap();
+        store.checkpoint_access(None).await.unwrap();
+    }
+    let (store, policy) = untracked(root.path());
+    assert_eq!(store.access(&id(1)).unwrap().last_access(), 0);
+    assert_eq!(
+        policy
+            .index()
+            .policy_get(&crate::CacheUnit::Whole(id(1)))
+            .unwrap()
+            .access
+            .last_access(),
+        0
+    );
+    store.enable_access_tracking().unwrap();
+    assert_eq!(store.access(&id(1)).unwrap().last_access(), age);
+    assert_eq!(
+        policy
+            .index()
+            .policy_get(&crate::CacheUnit::Whole(id(1)))
+            .unwrap()
+            .access
+            .last_access(),
+        age
+    );
+}
 fn open(root: &Path) -> Arc<SmallObjectStore> {
     open_with_policy(root).0
 }
@@ -19,9 +83,10 @@ fn open_with_policy(root: &Path) -> (Arc<SmallObjectStore>, Arc<Lru>) {
         SmallObjectStore::open(root.to_owned(), 128 << 10, 256 << 10, 16 << 20, None).unwrap(),
     );
     let mut units = Vec::new();
-    store.restore_policy_units(&mut units);
+    let index = Arc::new(crate::BlockIndex::new());
+    store.restore_policy_units(&index, &mut units, true);
     let policy = Arc::new(crate::Lru::from_recovered(
-        Arc::new(crate::BlockIndex::new()),
+        index,
         units,
         store.len(),
         true,
@@ -55,7 +120,7 @@ fn access_records_preserve_whole_and_exact_range_identities() {
     let shifted = CacheUnit::ExactRange(shifted);
     let mut bytes = Vec::new();
     for (unit, age) in [(&whole, 10), (&exact, 20), (&shifted, 30), (&exact, 15)] {
-        encode(&mut bytes, &format::key(unit).unwrap(), age).unwrap();
+        encode(&mut bytes, unit, age).unwrap();
     }
     let mut ages = HashMap::new();
     decode(&bytes, &mut ages).unwrap();
@@ -242,7 +307,7 @@ async fn legacy_snapshot_migrates_and_log_threshold_compacts() {
     store.maintain(true).await.unwrap();
     let cold = access_millis() - 30_000;
     let mut bytes = LEGACY.to_vec();
-    encode(&mut bytes, &format::key(&id(0)).unwrap(), cold).unwrap();
+    encode(&mut bytes, &id(0), cold).unwrap();
     std::fs::write(dir.path().join(FILE), bytes).unwrap();
     drop(store);
     let store = open(dir.path());
@@ -367,7 +432,7 @@ async fn million_item_sparse_access_probe() {
     for n in 0..count {
         let mut block = id(n);
         block.object.object_path = format!("{n:092}"); // bucket + path + version = 100 bytes
-        let key: Arc<[u8]> = Arc::from(format::key(&block).unwrap());
+        let key = SmallKey::new(&block);
         stream.entries.write().unwrap().insert(
             key.clone(),
             Location {

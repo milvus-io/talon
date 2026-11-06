@@ -313,6 +313,8 @@ pub(crate) struct BackgroundBudget {
     deletes: Rate,
     #[cfg(test)]
     charged_bytes: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    charged_deletes: std::sync::atomic::AtomicU64,
 }
 impl BackgroundBudget {
     pub fn new(config: &WorkerConfig) -> Arc<Self> {
@@ -322,6 +324,8 @@ impl BackgroundBudget {
             deletes: Rate::new(config.background_delete_max_per_sec),
             #[cfg(test)]
             charged_bytes: Default::default(),
+            #[cfg(test)]
+            charged_deletes: Default::default(),
         })
     }
     #[cfg(test)]
@@ -331,6 +335,12 @@ impl BackgroundBudget {
     #[cfg(test)]
     pub fn charged_bytes(&self) -> u64 {
         self.charged_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub fn charged_deletes(&self) -> u64 {
+        self.charged_deletes
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -346,6 +356,9 @@ impl BackgroundBudget {
     }
     /// Charge each resident page even when a stale block is removed as a directory.
     pub async fn delete_units(&self, units: u64) {
+        #[cfg(test)]
+        self.charged_deletes
+            .fetch_add(units, std::sync::atomic::Ordering::Relaxed);
         // Never reserve an entire large block ahead of every other task. Bound
         // each reservation to about 10 ms (one item at very low rates), then
         // rejoin the shared clock so small deletions can make progress.

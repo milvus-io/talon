@@ -4,18 +4,26 @@
 //! namespace metadata log and snapshots. Durable prefixes survive before sealing.
 //! Relocation commits are durable before old payload files are unlinked.
 mod access;
+mod catalog;
+pub(crate) mod key;
+mod lookup;
+pub(crate) mod policy;
 pub(crate) use access::DirtyAccess;
+pub(crate) mod directory;
 mod disk_io;
 mod flush;
 mod format;
 mod journal;
+mod records;
 mod rings;
+mod tickets;
 pub use rings::SmallObjectStore;
 #[cfg(test)]
 pub(crate) mod tests;
 
-use crate::eviction::AccessHandle;
-use crate::{CacheUnit, Lru};
+use crate::eviction::{AccessHandle, CacheUnit, SharedUnit};
+use crate::small_store::key::{SmallIdentity, SmallKey};
+use crate::Lru;
 use bytes::Bytes;
 use format::invalid;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -164,7 +172,7 @@ struct Segment {
     live: u64,
     live_payload: u64,
     allocated: u64,
-    records: BTreeMap<u64, Arc<[u8]>>,
+    records: usize,
     sealed: bool,
 }
 impl Segment {
@@ -197,8 +205,8 @@ struct State {
 }
 
 /// One independently appended and sealed stream within a namespace/credential scope.
-/// The compact encoded identity is stored once here, without separate String
-/// allocations. Locators own access tokens shared with the eviction policy;
+/// The compact identity is shared with the journal and eviction policy.
+/// Locators own access tokens shared with the eviction policy;
 /// small objects are never registered in the generic BlockIndex.
 struct SegmentStore {
     #[cfg(test)]
@@ -217,10 +225,10 @@ struct SegmentStore {
     pipeline_changed: tokio::sync::Notify,
     appends_drained: tokio::sync::Notify,
     append_slots: tokio::sync::Semaphore,
-    entries: RwLock<HashMap<Arc<[u8]>, Location>>,
+    entries: Arc<RwLock<directory::Directory>>,
     // Async opens run outside the directory lock, but must finish before GC
     // replaces locators and unlinks their source paths.
-    readers: tokio::sync::RwLock<()>,
+    readers: Arc<tokio::sync::RwLock<()>>,
     tasks: Arc<crate::page_gc::Mutations>,
     cached_stats: RwLock<SmallStoreStats>,
     retired: Mutex<Vec<(Weak<OwnedFd>, u64)>>,
@@ -300,7 +308,7 @@ impl SegmentStore {
             #[cfg(test)]
             flush_pause: Mutex::new(None),
             slot,
-            journal,
+            journal: journal.clone(),
             threshold,
             segment_size,
             state: tokio::sync::Mutex::new(State {
@@ -319,8 +327,11 @@ impl SegmentStore {
             pipeline_changed: tokio::sync::Notify::new(),
             appends_drained: tokio::sync::Notify::new(),
             append_slots: tokio::sync::Semaphore::new(32),
-            entries: RwLock::new(HashMap::new()),
-            readers: tokio::sync::RwLock::new(()),
+            entries: Arc::new(RwLock::new(directory::Directory::new(
+                journal.model.clone(),
+                slot,
+            ))),
+            readers: journal.readers.clone(),
             tasks: Arc::new(crate::page_gc::Mutations::new(true)),
             cached_stats: RwLock::new(SmallStoreStats::default()),
             retired: Mutex::new(Vec::new()),
@@ -333,15 +344,15 @@ impl SegmentStore {
     }
 
     pub fn contains(&self, id: &(impl SmallStoreKey + ?Sized)) -> bool {
-        format::key(id)
-            .ok()
-            .is_some_and(|k| self.entries.read().unwrap().contains_key(k.as_slice()))
+        format::validate_key(&id.view()).is_ok()
+            && self.entries.read().unwrap().contains_key(&id.view())
     }
 
+    #[cfg(test)]
     async fn lookup(&self, id: &(impl SmallStoreKey + ?Sized)) -> io::Result<Option<ReadLocation>> {
         let _readers = self.readers.read().await;
-        let key = format::key(id)?;
-        let loc = self.entries.read().unwrap().get(key.as_slice()).cloned();
+        format::validate_key(&id.view())?;
+        let loc = self.entries.read().unwrap().get(&id.view());
         match loc {
             Some(loc) => Ok(Some(loc.retain().await?)),
             None => Ok(None),
@@ -389,7 +400,17 @@ impl SegmentStore {
         if !accepts_object(u64::MAX, id, value.len() as u64) || value.len() > 128 << 20 {
             return Err(invalid("invalid small object extent"));
         }
-        let key: Arc<[u8]> = format::key(id)?.into();
+        format::validate_key(&id.view())?;
+        let view = id.view();
+        let block = policy.as_ref().map_or_else(
+            || crate::block_key::BlockKey::new(&view.block),
+            |p| p.shared_identity(&view.block),
+        );
+        let unit = SharedUnit {
+            block,
+            kind: view.kind,
+        };
+        let key = SmallKey(unit.clone());
         let len = value.len() as u64;
         let charge = charge(&key, len);
         if charge > self.segment_size {
@@ -403,20 +424,21 @@ impl SegmentStore {
             .acquire()
             .await
             .expect("append slots stay open");
-        let (mut loc, data) = loop {
+        let (loc, data) = loop {
             let changed = self.pipeline_changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
             let mut state = self.state.lock().await;
             self.healthy(&state)?;
-            if let Some(old) = self.entries.write().unwrap().get_mut(key.as_ref()) {
+            let existing = self.entries.read().unwrap().get(&key);
+            if let Some(old) = existing {
                 if old.len != len || old.checksum != checksum {
                     return Err(invalid(
                         "different bytes for immutable small object identity",
                     ));
                 }
                 if let Some(policy) = &policy {
-                    old.access = Some(policy.insert_with_policy(id.cache_unit(), charge, true));
+                    policy.insert_with_policy(unit.clone(), charge, true);
                 }
                 return Ok(charge);
             }
@@ -466,7 +488,7 @@ impl SegmentStore {
             };
             let data = s.data().await?;
             s.bytes += len;
-            s.metadata += 37 + key.len() as u64;
+            s.metadata += 37 + format::key_len(&key) as u64;
             s.in_flight.insert(loc.offset);
             state.written += charge;
             break (loc, data);
@@ -536,17 +558,16 @@ impl SegmentStore {
         segment.allocated = segment.allocated.max(allocated);
         segment.live += charge;
         segment.live_payload += loc.len;
-        segment.records.insert(loc.offset, key.clone());
+        segment.records += 1;
         state.allocated += added;
         state.live += charge;
         // Publish policy and locator together. The runtime's block gate keeps
         // eviction from retiring this admission before its mutation completes.
-        let mut entries = self.entries.write().unwrap();
         if let Some(policy) = policy {
-            loc.access = Some(policy.insert_with_policy(id.cache_unit(), charge, true));
+            policy.publish_small(unit, charge, &self.entries, loc);
+        } else {
+            self.entries.write().unwrap().insert(key, loc);
         }
-        entries.insert(key, loc);
-        drop(entries);
         self.refresh_stats(&state);
         Ok(charge)
     }
@@ -570,13 +591,13 @@ impl SegmentStore {
     }
 
     async fn delete_inner(&self, id: &(impl SmallStoreKey + ?Sized)) -> io::Result<()> {
-        let key = format::key(id)?;
+        format::validate_key(&id.view())?;
         // A tombstone must be either included in the sealing fsync or synced
         // after publication. Serialize logical publication with seal/relocation.
         let _publication = self.publication.lock().await;
         let mut state = self.state.lock().await;
         self.healthy(&state)?;
-        let Some(loc) = self.entries.read().unwrap().get(key.as_slice()).cloned() else {
+        let Some(loc) = self.entries.read().unwrap().get(&id.view()) else {
             return Ok(());
         };
         let result = async {
@@ -593,10 +614,10 @@ impl SegmentStore {
             segment.metadata += 21;
             #[cfg(test)]
             tests::crash("delete_sync");
-            let removed = charge(&key, loc.len);
+            let removed = charge(&id.view(), loc.len);
             segment.live -= removed;
             segment.live_payload -= loc.len;
-            segment.records.remove(&loc.offset);
+            segment.records -= 1;
             let allocated = segment.allocated().await?;
             let added = allocated.saturating_sub(segment.allocated);
             segment.allocated = allocated;
@@ -604,7 +625,7 @@ impl SegmentStore {
             state.live -= removed;
             state.written += 21;
             self.refresh_stats(&state);
-            self.entries.write().unwrap().remove(key.as_slice());
+            self.entries.write().unwrap().remove(&id.view());
             Ok(())
         }
         .await;
@@ -627,21 +648,23 @@ impl SegmentStore {
         &self,
         units: &mut Vec<crate::eviction::RecoveredUnit>,
         shared_access: &HashMap<BlockId, AccessHandle>,
+        track_clock: bool,
     ) -> io::Result<()> {
         units.reserve(self.entries.read().unwrap().len());
-        for (key, loc) in self.entries.write().unwrap().iter_mut() {
-            let unit = format::id(key)?;
+        let mut directory = self.entries.write().unwrap();
+        let entries: Vec<_> = directory.iter().collect();
+        for (key, loc) in entries {
             let access = shared_access
-                .get(unit.block())
+                .get(&key.materialize())
                 .map(AccessHandle::sibling)
-                .unwrap_or_default();
+                .unwrap_or_else(|| AccessHandle::new(track_clock));
             units.push(crate::eviction::RecoveredUnit {
-                unit: unit.into(),
-                bytes: charge(key, loc.len),
+                unit: key.0.clone(),
+                bytes: charge(&key, loc.len),
                 independent: true,
                 access: access.clone(),
             });
-            loc.access = Some(access);
+            directory.attach_access(&key, access);
         }
         Ok(())
     }
@@ -696,7 +719,7 @@ impl SegmentStore {
                         id,
                         s.live_payload.saturating_mul(2)
                             + (s.live - s.live_payload)
-                            + 36 * s.records.len() as u64
+                            + 36 * s.records as u64
                             + 49,
                     )
                 })
@@ -720,19 +743,7 @@ impl SegmentStore {
             };
             let entries: Vec<_> = {
                 let directory = self.entries.read().unwrap();
-                state.segments[&old]
-                    .records
-                    .values()
-                    .map(|key| {
-                        (
-                            key.clone(),
-                            directory
-                                .get(key.as_ref())
-                                .expect("live segment record")
-                                .clone(),
-                        )
-                    })
-                    .collect()
+                directory.segment_entries(old)
             };
             let replacement = if entries.is_empty() {
                 None
@@ -778,7 +789,10 @@ impl SegmentStore {
                 .await?;
             #[cfg(test)]
             tests::crash("compact_manifest");
-            let _readers = self.readers.write().await;
+            if let Some(budget) = &budget {
+                budget.delete().await;
+            }
+            let readers = self.readers.write().await;
             {
                 let mut directory = self.entries.write().unwrap();
                 for (key, loc) in moved {
@@ -788,11 +802,10 @@ impl SegmentStore {
             if state.active == Some(old) {
                 state.active = None;
             }
+            self.entries.write().unwrap().retire_segment(old);
+            drop(readers);
             let segment = state.segments.remove(&old).unwrap();
             let allocated = segment.allocated().await?;
-            if let Some(budget) = &budget {
-                budget.delete().await;
-            }
             disk_io::remove(self.path(old, "data")).await?;
             disk_io::sync_dir(self.path(old, "data").parent().unwrap().to_owned()).await?;
             let readers = segment.file.fd.lock().await.clone();
@@ -860,7 +873,7 @@ impl SegmentStore {
             live: 0,
             live_payload: 0,
             allocated,
-            records: BTreeMap::new(),
+            records: 0,
             sealed: false,
         })
     }
@@ -868,7 +881,7 @@ impl SegmentStore {
         &self,
         state: &mut State,
         id: u64,
-        key: &Arc<[u8]>,
+        key: &SmallKey,
         value: Bytes,
         publish: bool,
     ) -> io::Result<Location> {
@@ -894,14 +907,14 @@ impl SegmentStore {
                 false,
             )
             .await?;
-        let frame_len = 37 + key.len() as u64;
+        let frame_len = 37 + format::key_len(key) as u64;
         #[cfg(test)]
         tests::crash("append_index");
         segment.bytes += len;
         segment.metadata += frame_len;
         segment.live += charge(key, len);
         segment.live_payload += len;
-        segment.records.insert(offset, key.clone());
+        segment.records += 1;
         let allocated = segment.allocated().await?;
         state.allocated += allocated.saturating_sub(segment.allocated);
         segment.allocated = allocated;
@@ -979,7 +992,7 @@ impl SegmentStore {
             let Some(id) = state.sealing else { break None };
             let s = &state.segments[&id];
             if s.in_flight.is_empty() {
-                break Some((id, s.data().await?, s.records.is_empty()));
+                break Some((id, s.data().await?, s.records == 0));
             }
             drop(state);
             drained.await;
@@ -1058,12 +1071,7 @@ impl SegmentStore {
         }
     }
 
-    fn recover<'a>(
-        &mut self,
-        id: u64,
-        meta: &'a journal::SegmentMeta,
-        keys: &mut Vec<(u64, &'a [u8])>,
-    ) -> io::Result<()> {
+    fn recover(&mut self, id: u64, meta: &journal::SegmentMeta) -> io::Result<()> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -1078,36 +1086,23 @@ impl SegmentStore {
             fd: tokio::sync::Mutex::new(Weak::new()),
         });
         let allocated = metadata.blocks() * 512;
-        let records = meta
-            .records
-            .range(..meta.durable_end)
-            .map(|(&offset, record)| (offset, record.key.clone()))
-            .collect();
+        let records = meta.records.before(meta.durable_end).count();
         let mut live = 0;
         let mut live_payload = 0;
-        for (&offset, record) in meta.records.range(..meta.durable_end) {
+        for (offset, record) in meta.records.before(meta.durable_end) {
             live += charge(&record.key, record.len);
             live_payload += record.len;
-            keys.push((xxhash_rust::xxh3::xxh3_64(&record.key), &record.key));
-            if self
-                .entries
-                .get_mut()
-                .unwrap()
-                .insert(
-                    record.key.clone(),
-                    Location {
-                        file: file.clone(),
-                        segment: id,
-                        offset,
-                        len: record.len,
-                        checksum: record.checksum,
-                        access: None,
-                    },
-                )
-                .is_some()
-            {
-                return Err(invalid("duplicate small object identity"));
-            }
+            self.entries.write().unwrap().restore(
+                SmallKey::new(&record.key),
+                Location {
+                    file: file.clone(),
+                    segment: id,
+                    offset,
+                    len: record.len,
+                    checksum: record.checksum,
+                    access: None,
+                },
+            )?;
         }
         let state = self.state.get_mut();
         state.allocated += allocated;
@@ -1197,8 +1192,8 @@ fn reclaimable(state: &State, id: u64) -> bool {
         })
 }
 
-fn charge(key: &[u8], len: u64) -> u64 {
-    len + key.len() as u64 + 37
+fn charge(key: &dyn SmallIdentity, len: u64) -> u64 {
+    len + format::key_len(key) as u64 + 37
 }
 fn validate_geometry(threshold: u64, segment_size: u64, capacity: u64) -> io::Result<()> {
     if segment_size < threshold.saturating_add(format::MAX_KEY as u64 + 64)

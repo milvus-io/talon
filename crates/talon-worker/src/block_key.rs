@@ -47,6 +47,12 @@ pub(crate) trait BlockIdentity: Send + Sync {
     fn view(&self) -> BlockRef<'_>;
 }
 
+impl BlockIdentity for BlockRef<'_> {
+    fn view(&self) -> BlockRef<'_> {
+        *self
+    }
+}
+
 impl BlockIdentity for BlockId {
     fn view(&self) -> BlockRef<'_> {
         BlockRef {

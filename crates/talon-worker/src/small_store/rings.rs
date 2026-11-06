@@ -2,8 +2,8 @@
 //! Slot zero serves non-ring callers. Native ring N owns slot N+1. Every
 //! stream shares a metadata writer and globally unique sharded payload paths.
 use super::*;
-use crate::block_key::BlockIdentity;
 use crate::miss::{InFlightGuard, InFlightLoads, LoadKey};
+use crate::small_store::key::SmallIdentity;
 use tokio::sync::OnceCell;
 
 type Stream = Arc<OnceCell<Arc<SegmentStore>>>;
@@ -21,6 +21,7 @@ pub struct SmallObjectStore {
     pub(super) access_bytes: std::sync::atomic::AtomicU64,
     streams: RwLock<BTreeMap<usize, Stream>>,
     policy: std::sync::OnceLock<Arc<Lru>>,
+    index: std::sync::OnceLock<Weak<crate::BlockIndex>>,
     // Only in-flight identities are retained; no second resident-object index.
     mutations: Arc<InFlightLoads>,
     pub(super) tasks: Arc<crate::page_gc::Mutations>,
@@ -92,6 +93,7 @@ impl SmallObjectStore {
             journal,
             streams: RwLock::new(streams),
             policy: std::sync::OnceLock::new(),
+            index: std::sync::OnceLock::new(),
             mutations: Arc::new(InFlightLoads::new()),
             tasks: Arc::new(crate::page_gc::Mutations::new(true)),
         })
@@ -106,12 +108,8 @@ impl SmallObjectStore {
     ) -> io::Result<BTreeMap<usize, SegmentStore>> {
         let mut counts = BTreeMap::<usize, usize>::new();
         for meta in model.segments.values().filter(|meta| meta.durable_end > 0) {
-            *counts.entry(meta.slot).or_default() +=
-                meta.records.len() - meta.records.range(meta.durable_end..).count();
+            *counts.entry(meta.slot).or_default() += meta.records.before(meta.durable_end).count();
         }
-        // Only borrow key bytes already retained by the model. Hashes speed up
-        // sorting; comparing full bytes on collisions keeps validation exact.
-        let mut keys = Vec::with_capacity(counts.values().sum());
         let mut recovered = BTreeMap::new();
         recovered.insert(
             0,
@@ -133,7 +131,7 @@ impl SmallObjectStore {
                     journal.clone(),
                 )
             });
-            stream.entries.get_mut().unwrap().reserve(count);
+            stream.entries.write().unwrap().reserve(count);
         }
         for (&id, meta) in model
             .segments
@@ -143,9 +141,8 @@ impl SmallObjectStore {
             let stream = recovered
                 .get_mut(&meta.slot)
                 .expect("reserved recovery stream");
-            stream.recover(id, meta, &mut keys)?;
+            stream.recover(id, meta)?;
         }
-        validate_recovered_keys(&mut keys)?;
         for (id, allocated) in journal.finish_recovery(model)? {
             let state = recovered
                 .get_mut(&model.segments[&id].slot)
@@ -179,13 +176,17 @@ impl SmallObjectStore {
                 .clone()
         });
         cell.get_or_try_init(|| async {
-            Ok(Arc::new(SegmentStore::empty(
+            let stream = Arc::new(SegmentStore::empty(
                 self.fallback.threshold,
                 self.fallback.segment_size,
                 self.fallback._root_lock.clone(),
                 slot,
                 self.journal.clone(),
-            )))
+            ));
+            if let Some(index) = self.index.get().and_then(Weak::upgrade) {
+                index.register_small_directory(&stream.entries);
+            }
+            Ok(stream)
         })
         .await
         .cloned()
@@ -217,47 +218,27 @@ impl SmallObjectStore {
         self.fallback.accepts(id, len)
     }
     pub fn contains(&self, id: &(impl SmallStoreKey + ?Sized)) -> bool {
-        self.lookup_entry(id).ok().flatten().is_some()
+        self.lookup_entry(&id.view()).ok().flatten().is_some()
     }
 
-    /// Resolve residency and physical placement in one directory lookup per
-    /// stream. Encode once and borrow the stream registry without allocating a
-    /// temporary Vec. The worker validates routing compatibility at startup.
-    pub(crate) fn lookup_entry(
-        &self,
-        id: &(impl SmallStoreKey + ?Sized),
-    ) -> io::Result<Option<Location>> {
-        if !id.exact_range() && id.block().offset != 0 {
+    /// Resolve all ring-owned records through the namespace's shared index.
+    pub(crate) fn lookup_entry(&self, id: &dyn SmallIdentity) -> io::Result<Option<Location>> {
+        if id.view().kind != crate::eviction::UnitKind::ExactRange && id.view().offset != 0 {
             return Ok(None);
         }
-        let key = format::key(id)?;
-        for stream in self
-            .streams
-            .read()
-            .unwrap()
-            .values()
-            .filter_map(|s| s.get())
-        {
-            if let Some(loc) = stream.entries.read().unwrap().get(key.as_slice()).cloned() {
-                return Ok(Some(loc));
-            }
-        }
-        Ok(None)
+        format::validate_key(&id.view())?;
+        Ok(self.journal.model.lookup(&id.view()))
     }
 
     pub(crate) async fn lookup(
         &self,
         id: &(impl SmallStoreKey + ?Sized),
     ) -> io::Result<Option<ReadLocation>> {
-        if !id.exact_range() && id.block().offset != 0 {
-            return Ok(None);
+        let _readers = self.journal.readers.read().await;
+        match self.lookup_entry(&id.view())? {
+            Some(location) => Ok(Some(location.retain().await?)),
+            None => Ok(None),
         }
-        for stream in self.streams() {
-            if let Some(loc) = stream.lookup(id).await? {
-                return Ok(Some(loc));
-            }
-        }
-        Ok(None)
     }
 
     pub async fn get(&self, id: &(impl SmallStoreKey + ?Sized)) -> io::Result<Option<BlockHandle>> {
@@ -331,28 +312,61 @@ impl SmallObjectStore {
 
     /// Startup only. Attach access tokens to locators and contribute units to
     /// the shared bulk policy construction without registering in BlockIndex.
-    pub(crate) fn restore_policy_units(&self, units: &mut Vec<crate::eviction::RecoveredUnit>) {
+    pub(crate) fn restore_policy_units(
+        &self,
+        index: &Arc<crate::BlockIndex>,
+        units: &mut Vec<crate::eviction::RecoveredUnit>,
+        track_clock: bool,
+    ) {
+        self.bind_index(index);
         let shared_access = units
             .iter()
             .filter(|unit| {
-                u64::from(unit.unit.block.view().block_size) <= talon_core::MAX_EXACT_READ_LEN
+                u64::from(crate::block_key::BlockIdentity::view(&unit.unit.block).block_size)
+                    <= talon_core::MAX_EXACT_READ_LEN
             })
             .map(|unit| (unit.unit.block.materialize(), unit.access.clone()))
             .collect();
         for stream in self.streams() {
+            if !track_clock {
+                stream.entries.write().unwrap().enable_compact();
+                continue;
+            }
             stream
-                .restore_policy_units(units, &shared_access)
+                .restore_policy_units(units, &shared_access, track_clock)
                 .expect("validated small object identity");
         }
     }
 
     /// Bind the policy built from both stores, then restore persisted access ages.
+    fn bind_index(&self, index: &Arc<crate::BlockIndex>) {
+        if let Some(bound) = self.index.get() {
+            assert!(
+                bound.ptr_eq(&Arc::downgrade(index)),
+                "small store index changed"
+            );
+            return;
+        }
+        assert!(self.index.set(Arc::downgrade(index)).is_ok());
+        for stream in self.streams() {
+            index.register_small_directory(&stream.entries);
+        }
+    }
+
     pub(crate) fn bind_policy(&self, policy: Arc<Lru>) {
+        self.bind_index(&policy.index());
+        let track_clock = policy.tracks_small_clock();
         assert!(
             self.policy.set(policy).is_ok(),
             "small store already bound to a runtime"
         );
-        self.restore_access();
+        if track_clock {
+            self.restore_access();
+        }
+    }
+
+    pub(super) fn policy(&self) -> Option<&Arc<Lru>> {
+        self.policy.get()
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -385,7 +399,7 @@ impl SmallObjectStore {
 
     #[cfg(test)]
     pub(crate) fn access(&self, id: &(impl SmallStoreKey + ?Sized)) -> Option<AccessHandle> {
-        self.lookup_entry(id).ok().flatten()?.access
+        self.lookup_entry(&id.view()).ok().flatten()?.access
     }
 
     /// Only threshold-eligible segments provide planning credit. Garbage in a
@@ -789,8 +803,24 @@ mod tests {
     }
 }
 
-fn validate_recovered_keys(keys: &mut [(u64, &[u8])]) -> io::Result<()> {
-    keys.sort_unstable();
+#[cfg(test)]
+fn validate_recovered_keys(
+    keys: &mut [(u64, crate::small_store::key::SmallRef<'_>)],
+) -> io::Result<()> {
+    fn parts(
+        key: crate::small_store::key::SmallRef<'_>,
+    ) -> (&str, &str, &str, u64, u32, &str, bool) {
+        (
+            key.object.backend.prefix(),
+            key.object.bucket,
+            key.object.object_path,
+            key.offset,
+            key.block_size,
+            key.version,
+            key.kind == crate::eviction::UnitKind::ExactRange,
+        )
+    }
+    keys.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| parts(a.1).cmp(&parts(b.1))));
     if keys.windows(2).any(|pair| pair[0].1 == pair[1].1) {
         return Err(invalid("duplicate recovered object"));
     }
@@ -814,15 +844,155 @@ mod recovery_tests {
         SmallObjectStore::open(root.to_owned(), 128 << 10, 256 << 10, 4 << 20, None)
     }
 
+    #[tokio::test]
+    async fn shared_lookup_protects_async_open_and_releases_the_gate_on_cancellation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(open(dir.path()).unwrap());
+        let stream = store.writer(1).await.unwrap();
+        stream
+            .put(&id(0), Bytes::from_static(b"data"))
+            .await
+            .unwrap();
+        let other = store.writer(2).await.unwrap();
+        let location = store.lookup_entry(&id(0)).unwrap().unwrap();
+        let held = location.file.fd.lock().await;
+        let reader_store = store.clone();
+        let task = tokio::spawn(async move { reader_store.lookup(&id(0)).await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while stream.readers.try_write().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(other.readers.try_write().is_err());
+        assert!(!task.is_finished());
+        task.abort();
+        assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+        assert!(stream.readers.try_write().is_ok());
+        drop(held);
+        let retained = store.lookup(&id(0)).await.unwrap().unwrap();
+        assert!(stream.readers.try_write().is_ok());
+        store.delete(&id(0)).await.unwrap();
+        store.maintain(true).await.unwrap();
+        assert!(!store.contains(&id(0)));
+        assert_eq!(retained.read().await.unwrap(), Bytes::from_static(b"data"));
+    }
+
+    #[tokio::test]
+    async fn shared_lookup_stays_available_while_another_ring_waits_for_delete_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(open(dir.path()).unwrap());
+        let first = store.writer(1).await.unwrap();
+        let second = store.writer(2).await.unwrap();
+        first.put(&id(0), Bytes::from_static(b"old")).await.unwrap();
+        second
+            .put(&id(1), Bytes::from_static(b"live"))
+            .await
+            .unwrap();
+        store.delete(&id(0)).await.unwrap();
+        let budget = crate::background::BackgroundBudget::new(&talon_core::WorkerConfig {
+            background_io_max_mb_per_sec: 0,
+            background_delete_max_per_sec: 1,
+            ..Default::default()
+        });
+        let task_budget = budget.clone();
+        let task =
+            tokio::spawn(
+                async move { first.maintain_inner(false, false, Some(task_budget)).await },
+            );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while budget.charged_deletes() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!task.is_finished());
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(200), store.read(&id(1)))
+                .await
+                .unwrap()
+                .unwrap(),
+            Some(Bytes::from_static(b"live"))
+        );
+        assert!(task.await.unwrap().unwrap());
+    }
+
+    #[tokio::test]
+    async fn compact_policy_survives_relocation_pins_and_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = Arc::new(open(dir.path()).unwrap());
+            let index = Arc::new(crate::BlockIndex::new());
+            let mut units = Vec::new();
+            store.restore_policy_units(&index, &mut units, false);
+            let policy = Arc::new(crate::Lru::from_recovered(index, units, 0, false, false));
+            store.bind_policy(policy.clone());
+            for n in 0..6 {
+                store
+                    .put(&id(n), Bytes::from(vec![n as u8; 48 << 10]))
+                    .await
+                    .unwrap();
+            }
+            let unit = crate::eviction::CacheUnit::Whole(id(3));
+            let before = store.lookup_entry(&id(3)).unwrap().unwrap();
+            let token = before.access.clone().unwrap();
+            assert!(policy.pin(&unit));
+            assert!(policy.pin(&unit));
+            for n in 0..3 {
+                store.delete(&id(n)).await.unwrap();
+                policy.remove(&crate::eviction::CacheUnit::Whole(id(n)));
+            }
+            store.maintain(true).await.unwrap();
+            let after = store.lookup_entry(&id(3)).unwrap().unwrap();
+            assert_ne!(before.segment, after.segment);
+            assert!(Arc::ptr_eq(
+                token.small().unwrap(),
+                after.access.unwrap().small().unwrap()
+            ));
+            token.touch();
+            assert!(token.small().unwrap().referenced());
+            assert!(policy
+                .candidates_to_fit(0, &Default::default())
+                .iter()
+                .all(|c| c.unit != unit));
+            policy.unpin(&unit);
+            assert!(policy
+                .candidates_to_fit(0, &Default::default())
+                .iter()
+                .all(|c| c.unit != unit));
+            policy.unpin(&unit);
+            let candidates = policy.candidates_to_fit(0, &Default::default());
+            assert!(candidates
+                .iter()
+                .any(|c| c.unit == unit && policy.candidate_is_current(c)));
+        }
+        let store = Arc::new(open(dir.path()).unwrap());
+        let index = Arc::new(crate::BlockIndex::new());
+        let mut units = Vec::new();
+        store.restore_policy_units(&index, &mut units, false);
+        assert!(units.is_empty());
+        let policy = Arc::new(crate::Lru::from_recovered(index, units, 0, false, false));
+        store.bind_policy(policy.clone());
+        assert_eq!(policy.len(), 3);
+        for n in 0..6 {
+            let actual = store.read(&id(n)).await.unwrap();
+            assert_eq!(
+                actual,
+                (n >= 3).then(|| Bytes::from(vec![n as u8; 48 << 10]))
+            );
+        }
+    }
+
     #[test]
     fn fingerprint_collisions_compare_complete_keys() {
-        let mut distinct = [(0, b"b".as_slice()), (0, b"a".as_slice())];
+        let a = SmallKey::new(&id(1));
+        let b = SmallKey::new(&id(2));
+        let same = SmallKey::new(&id(1));
+        let mut distinct = [(0, b.view()), (0, a.view())];
         validate_recovered_keys(&mut distinct).unwrap();
-        let mut duplicate = [
-            (0, b"a".as_slice()),
-            (0, b"b".as_slice()),
-            (0, b"a".as_slice()),
-        ];
+        let mut duplicate = [(0, a.view()), (0, b.view()), (0, same.view())];
         assert!(validate_recovered_keys(&mut duplicate).is_err());
     }
 
@@ -905,7 +1075,7 @@ mod recovery_tests {
             index.init_paged(block.clone(), 4096, 4096);
             index.mark_page_allocated(&block, talon_core::PageIndex(0), 4096);
             let mut units = index.restore_policy_units(tracking);
-            store.restore_policy_units(&mut units);
+            store.restore_policy_units(&index, &mut units, true);
             let policy = Arc::new(crate::Lru::from_recovered(
                 index.clone(),
                 units,
@@ -953,13 +1123,14 @@ mod recovery_tests {
         drop(store);
         let store = Arc::new(open(dir.path()).unwrap());
         let mut units = Vec::new();
-        store.restore_policy_units(&mut units);
+        let index = Arc::new(crate::BlockIndex::new());
+        store.restore_policy_units(&index, &mut units, true);
         let serial = crate::Lru::new();
         for unit in &units {
             serial.insert_with_policy(unit.unit.materialize(), unit.bytes, true);
         }
         let policy = Arc::new(crate::Lru::from_recovered(
-            Arc::new(crate::BlockIndex::new()),
+            index,
             units,
             store.len(),
             true,
