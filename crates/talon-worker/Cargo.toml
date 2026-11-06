@@ -36,7 +36,6 @@ name = "talon-serve-probe"
 path = "src/bin/serve_probe.rs"
 
 [dependencies]
-fast_radix_trie = { version = "=1.2.0", default-features = false, features = ["std"] }
 mimalloc = { version = "0.1", optional = true }
 talon-journal.workspace = true
 talon-uring.workspace = true

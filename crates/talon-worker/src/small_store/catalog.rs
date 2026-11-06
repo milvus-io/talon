@@ -58,11 +58,8 @@ impl Default for LiveModel {
 impl LiveModel {
     pub fn lookup(&self, id: &dyn SmallIdentity) -> Option<Location> {
         let hash = super::records::key_hash(id);
-        let mut encoded = super::key_codec::encode(id);
-        self.0
-            .read()
-            .unwrap()
-            .lookup_location(id, hash, &mut encoded)
+        let encoded = super::key_codec::encode(id);
+        self.0.read().unwrap().lookup_location(id, hash, &encoded)
     }
 }
 
@@ -105,7 +102,7 @@ impl Catalog {
         Some(((segment, meta.offset), meta))
     }
 
-    pub fn matches(&self, handle: u32, key: &mut Vec<u8>) -> bool {
+    pub fn matches(&self, handle: u32, key: &[u8]) -> bool {
         let Some((segment, row)) = self.row(handle) else {
             return false;
         };
@@ -118,17 +115,12 @@ impl Catalog {
     }
 
     pub fn find(&self, key: &dyn SmallIdentity, flags: u8) -> Option<usize> {
-        let mut encoded = super::key_codec::encode(key);
-        self.find_record(self.hash(key), &mut encoded, flags)
+        let encoded = super::key_codec::encode(key);
+        self.find_record(self.hash(key), &encoded, flags)
             .map(|(slot, _)| slot)
     }
 
-    fn find_record(
-        &self,
-        hash: u64,
-        encoded: &mut Vec<u8>,
-        flags: u8,
-    ) -> Option<(usize, ResolvedRecord)> {
+    fn find_record(&self, hash: u64, encoded: &[u8], flags: u8) -> Option<(usize, ResolvedRecord)> {
         let mut resolved = None;
         let slot = self.lookup.find(hash, |handle, state| {
             if state & flags != flags {
@@ -173,7 +165,7 @@ impl Catalog {
         &self,
         id: &dyn SmallIdentity,
         hash: u64,
-        encoded: &mut Vec<u8>,
+        encoded: &[u8],
     ) -> Option<Location> {
         if let Some((slot, record)) = self.find_record(hash, encoded, VISIBLE) {
             return self.resolve_location(slot, record);
@@ -305,7 +297,12 @@ impl Catalog {
             return Ok(());
         }
         for meta in self.model.segments.values_mut() {
-            Arc::make_mut(meta).records.shrink_to_fit();
+            let meta = Arc::make_mut(meta);
+            if meta.sealed {
+                meta.records.seal();
+            } else {
+                meta.records.shrink_to_fit();
+            }
         }
         let count = self
             .model

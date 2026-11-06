@@ -1,18 +1,16 @@
-use super::{format, journal::Record, key_codec};
+use super::{format, journal::Record, key_codec, keys::Keys};
 use crate::small_store::key::SmallIdentity;
-use fast_radix_trie::RadixMap;
 use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
 use std::io;
 use std::sync::OnceLock;
 
 const WIDTH: usize = 26;
-pub(super) const KEY_GROUP: usize = 128;
 
 #[derive(Clone, Default)]
 pub(super) struct Records {
     rows: Vec<[u8; WIDTH]>,
-    keys: Vec<RadixMap<()>>,
+    keys: Keys,
     live: usize,
 }
 
@@ -56,21 +54,16 @@ impl Records {
         })
     }
 
-    pub fn matches(&self, row: usize, key: &mut Vec<u8>) -> bool {
-        let Some(keys) = self.keys.get(row / KEY_GROUP) else {
+    pub fn matches(&self, row: usize, key: &[u8]) -> bool {
+        if self.metadata(row).is_none() {
+            return false;
+        }
+        let Some((prefix, suffix)) = self.keys.get(row) else {
             return false;
         };
-        key.push((row % KEY_GROUP) as u8);
-        let found = keys.contains_key(&*key);
-        key.pop();
-        found
-    }
-
-    fn encoded(&self, row: usize) -> Option<Vec<u8>> {
-        self.keys
-            .get(row / KEY_GROUP)?
-            .keys()
-            .find_map(|mut key| (key.pop()? as usize == row % KEY_GROUP).then_some(key))
+        key.len() == prefix.len() + suffix.len()
+            && key.starts_with(prefix)
+            && &key[prefix.len()..] == suffix
     }
 
     pub fn get(&self, row: usize) -> Option<(u64, Record)> {
@@ -78,45 +71,18 @@ impl Records {
         Some((
             meta.offset,
             Record {
-                key: key_codec::decode(&self.encoded(row).expect("small-object key")),
+                key: {
+                    let (prefix, suffix) = self.keys.get(row).expect("small-object key");
+                    key_codec::decode(&[prefix, suffix].concat())
+                },
                 len: meta.len,
                 checksum: meta.checksum,
             },
         ))
     }
 
-    pub fn batch(&self, start: usize) -> Vec<(u64, Record)> {
-        assert_eq!(start % KEY_GROUP, 0);
-        let Some(keys) = self.keys.get(start / KEY_GROUP) else {
-            return Vec::new();
-        };
-        let mut records: Vec<_> = keys
-            .keys()
-            .filter_map(|mut key| {
-                let row = start + usize::from(key.pop().unwrap());
-                let meta = self.metadata(row)?;
-                Some((
-                    row,
-                    meta.offset,
-                    Record {
-                        key: key_codec::decode(&key),
-                        len: meta.len,
-                        checksum: meta.checksum,
-                    },
-                ))
-            })
-            .collect();
-        records.sort_unstable_by_key(|(row, _, _)| *row);
-        records
-            .into_iter()
-            .map(|(_, offset, record)| (offset, record))
-            .collect()
-    }
-
     pub fn iter(&self) -> impl Iterator<Item = (u64, Record)> + '_ {
-        (0..self.rows.len())
-            .step_by(KEY_GROUP)
-            .flat_map(|start| self.batch(start))
+        (0..self.rows.len()).filter_map(|row| self.get(row))
     }
 
     #[cfg(test)]
@@ -179,8 +145,8 @@ impl Records {
             .get(vacant)
             .is_some_and(|row| u64::from(n32(&row[..4])) == offset && n32(&row[4..8]) == 0)
         {
+            self.keys.insert(vacant, &key, true)?;
             self.rows[vacant] = row;
-            self.insert_key(vacant, key);
             self.live += 1;
             return Ok(vacant);
         }
@@ -190,46 +156,10 @@ impl Records {
         if self.rows.len() == self.rows.capacity() {
             self.rows.reserve_exact(64);
         }
-        if index == self.rows.len() {
-            self.rows.push(row);
-            self.insert_key(index, key);
-        } else {
-            let start = index / KEY_GROUP * KEY_GROUP;
-            let mut keys = self.encoded_from(start);
-            keys.insert(index - start, Some(key));
-            self.rows.insert(index, row);
-            self.replace_keys(start, keys);
-        }
+        self.keys.insert(index, &key, false)?;
+        self.rows.insert(index, row);
         self.live += 1;
         Ok(index)
-    }
-
-    fn insert_key(&mut self, row: usize, mut key: Vec<u8>) {
-        while self.keys.len() <= row / KEY_GROUP {
-            self.keys.push(RadixMap::new());
-        }
-        key.push((row % KEY_GROUP) as u8);
-        assert!(self.keys[row / KEY_GROUP].insert(key, ()).is_none());
-    }
-
-    fn encoded_from(&self, start: usize) -> Vec<Option<Vec<u8>>> {
-        let mut keys = vec![None; self.rows.len() - start];
-        for (group, trie) in self.keys.iter().enumerate().skip(start / KEY_GROUP) {
-            for mut key in trie.keys() {
-                let row = group * KEY_GROUP + usize::from(key.pop().unwrap());
-                keys[row - start] = Some(key);
-            }
-        }
-        keys
-    }
-
-    fn replace_keys(&mut self, start: usize, keys: Vec<Option<Vec<u8>>>) {
-        self.keys.truncate(start / KEY_GROUP);
-        for (row, key) in keys.into_iter().enumerate() {
-            if let Some(key) = key {
-                self.insert_key(start + row, key);
-            }
-        }
     }
 
     pub fn remove(&mut self, offset: &u64) -> Option<()> {
@@ -239,14 +169,11 @@ impl Records {
         let index = (index..self.rows.len())
             .take_while(|&i| u64::from(n32(&self.rows[i][..4])) == *offset)
             .find(|&i| n32(&self.rows[i][4..8]) != 0)?;
+        self.keys.remove(index);
         self.rows[index][4..8].fill(0);
         self.live -= 1;
         if (self.rows.len() - self.live) * 100 >= self.rows.len() {
             self.compact();
-        } else {
-            let mut key = self.encoded(index).expect("small-object key");
-            key.push((index % KEY_GROUP) as u8);
-            self.keys[index / KEY_GROUP].remove(key);
         }
         Some(())
     }
@@ -279,15 +206,14 @@ impl Records {
         self.keys.shrink_to_fit();
     }
 
+    pub fn seal(&mut self) {
+        self.keys.seal();
+        self.shrink_to_fit();
+    }
+
     fn compact(&mut self) {
-        let keys = self
-            .encoded_from(0)
-            .into_iter()
-            .zip(&self.rows)
-            .filter_map(|(key, row)| (n32(&row[4..8]) != 0).then_some(key))
-            .collect();
+        self.keys.retain(|row| n32(&self.rows[row][4..8]) != 0);
         self.rows.retain(|row| n32(&row[4..8]) != 0);
-        self.replace_keys(0, keys);
         self.shrink_to_fit();
     }
 }
@@ -353,6 +279,7 @@ mod tests {
                     },
                 )
                 .unwrap();
+            records.seal();
             let snapshot = records.clone();
             assert_ne!(records.get(0).unwrap().1.key, records.get(1).unwrap().1.key);
             records.remove(&0).unwrap();
@@ -368,23 +295,26 @@ mod tests {
 
     #[test]
     fn maximum_key_and_extent_are_lossless() {
-        let mut records = Records::default();
-        let mut value = record("");
-        let key = value.key.view();
-        let path = "x".repeat(format::MAX_KEY - format::key_len(&key));
-        value = record(&path);
-        value.len = 128 << 20;
-        let slot = records
-            .insert((1 << 30) - value.len, value.clone())
-            .unwrap();
-        let restored = records.get(slot).unwrap().1.to_owned();
-        assert_eq!(restored.key, value.key);
-        assert_eq!(restored.len, value.len);
-        assert!(records.insert(1 << 30, record("bad")).is_err());
+        for byte in ["x", "\0"] {
+            let mut records = Records::default();
+            let mut value = record("");
+            let key = value.key.view();
+            let path = byte.repeat(format::MAX_KEY - format::key_len(&key));
+            value = record(&path);
+            value.len = 128 << 20;
+            let slot = records
+                .insert((1 << 30) - value.len, value.clone())
+                .unwrap();
+            records.seal();
+            let restored = records.get(slot).unwrap().1.to_owned();
+            assert_eq!(restored.key, value.key);
+            assert_eq!(restored.len, value.len);
+            assert!(records.insert(1 << 30, record("bad")).is_err());
+        }
     }
 
     #[test]
-    fn grouped_keys_survive_reordering_deletion_and_snapshot_clones() {
+    fn compressed_keys_survive_reordering_deletion_and_snapshot_clones() {
         let mut records = Records::default();
         let mut expected = std::collections::BTreeMap::new();
         for i in (0..401_u64).rev() {
@@ -392,6 +322,7 @@ mod tests {
             records.insert(i * 20, value.clone()).unwrap();
             expected.insert(i * 20, value);
         }
+        records.seal();
         let snapshot = records.clone();
         for i in (0..401_u64).step_by(7) {
             records.remove(&(i * 20)).unwrap();
@@ -408,7 +339,7 @@ mod tests {
             assert_eq!(offset, want_offset);
             assert_eq!(actual.key, want.key);
             assert_eq!(records.get(row).unwrap().1.key, want.key);
-            assert!(records.matches(row, &mut key_codec::encode(&want.key)));
+            assert!(records.matches(row, &key_codec::encode(&want.key)));
             assert_eq!(records.metadata(row).unwrap().hash, key_hash(&want.key));
             assert_eq!(
                 records.metadata(row).unwrap().charge,
@@ -433,6 +364,7 @@ mod tests {
         for i in 0..300 {
             records.insert(i * 10, value.clone()).unwrap();
         }
+        records.seal();
         assert_eq!(records.len(), 300);
         for (row, (offset, actual)) in records.iter().enumerate() {
             assert_eq!(offset, row as u64 * 10);
@@ -441,5 +373,39 @@ mod tests {
         records.remove(&1280).unwrap();
         assert_eq!(records.len(), 299);
         assert_eq!(records.iter().count(), 299);
+    }
+
+    #[test]
+    fn path_prefixes_are_shared_across_range_offsets_sizes_and_versions() {
+        let mut records = Records::default();
+        let prefix = "路径/".repeat(100);
+        let mut expected = Vec::new();
+        for i in 0..64_u64 {
+            let key = crate::eviction::CacheUnit::ExactRange(BlockId::new(
+                ObjectId::new(Backend::Azure, "桶\0", format!("{prefix}{i}")),
+                i << 40,
+                i as u32 + 1,
+                Version::new(format!("版本\0{i}")),
+            ));
+            let value = Record {
+                key: SmallKey::new(&key),
+                len: i + 1,
+                checksum: i,
+            };
+            records.insert(i * 100, value.clone()).unwrap();
+            expected.push(value);
+        }
+        records.seal();
+        for (row, value) in expected.iter().enumerate() {
+            assert!(records.keys.get(row).unwrap().0.len() >= prefix.len());
+            assert_eq!(records.get(row).unwrap().1.key, value.key);
+            assert!(records.matches(row, &key_codec::encode(&value.key)));
+            assert!(!records.matches(
+                row,
+                &key_codec::encode(&expected[(row + 1) % expected.len()].key)
+            ));
+        }
+        records.remove(&100).unwrap();
+        assert!(!records.matches(1, &key_codec::encode(&expected[1].key)));
     }
 }

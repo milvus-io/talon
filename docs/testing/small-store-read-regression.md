@@ -1,5 +1,9 @@
 # Compact small-store read regression
 
+The trie measurements below are historical. The current segment key layout and
+its local measurements are described in
+[small-store-prefix-dictionary.md](small-store-prefix-dictionary.md).
+
 The first 40-byte implementation introduced redundant metadata work on cache hits.
 On the QTP 2-vCPU Worker, C128 reads of up to 4 KiB fell from 51,197 to 45,625 QPS
 (-10.88%), while non-key requested heap fell from 378.00 to 37.94 bytes per item.

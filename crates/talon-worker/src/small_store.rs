@@ -15,6 +15,7 @@ mod flush;
 mod format;
 mod journal;
 mod key_codec;
+mod keys;
 mod records;
 mod rings;
 mod tickets;

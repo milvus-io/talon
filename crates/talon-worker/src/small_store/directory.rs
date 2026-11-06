@@ -170,7 +170,7 @@ impl Directory {
         }
     }
     fn find(&self, catalog: &Catalog, id: &dyn SmallIdentity, flags: u8) -> Option<usize> {
-        let mut encoded = super::key_codec::encode(id);
+        let encoded = super::key_codec::encode(id);
         catalog.lookup.find(catalog.hash(id), |handle, state| {
             state & flags == flags
                 && catalog.metadata(handle).is_some_and(|(address, _)| {
@@ -178,16 +178,13 @@ impl Directory {
                         .segment(address.0)
                         .is_some_and(|segment| segment.slot == self.slot)
                 })
-                && catalog.matches(handle, &mut encoded)
+                && catalog.matches(handle, &encoded)
         })
     }
     fn pending(&self, catalog: &Catalog, id: &dyn SmallIdentity) -> Option<usize> {
         let slot = catalog.at(self.staged?)?;
         catalog
-            .matches(
-                catalog.lookup.handle(slot),
-                &mut super::key_codec::encode(id),
-            )
+            .matches(catalog.lookup.handle(slot), &super::key_codec::encode(id))
             .then_some(slot)
     }
     pub fn len(&self) -> usize {

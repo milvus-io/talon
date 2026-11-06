@@ -243,7 +243,7 @@ impl Model {
                 );
                 s.durable_end = s.bytes;
                 s.sealed = true;
-                s.records.shrink_to_fit();
+                s.records.seal();
             }
             Event::Flush {
                 segment,
@@ -277,7 +277,7 @@ impl Model {
                 s.records.retain_before(s.durable_end);
                 s.bytes = s.durable_end;
                 s.sealed = true;
-                s.records.shrink_to_fit();
+                s.records.seal();
             }
             Event::Replace { old, new } => {
                 if let Some(new) = new {
@@ -291,7 +291,7 @@ impl Model {
                     );
                     s.durable_end = s.bytes;
                     s.sealed = true;
-                    s.records.shrink_to_fit();
+                    s.records.seal();
                 }
                 // Empty standby/active files have no Insert record.
                 self.segments.remove(&old);
@@ -313,7 +313,6 @@ pub(crate) struct Snapshot {
     next: Option<u64>,
     segments: std::collections::btree_map::IntoIter<u64, Arc<SegmentMeta>>,
     current: Option<(u64, Arc<SegmentMeta>, usize)>,
-    batch: std::vec::IntoIter<(u64, Record)>,
 }
 pub(crate) enum SnapshotRecord {
     Next(u64),
@@ -329,12 +328,10 @@ impl Iterator for Snapshot {
             return Some(Ok(b.into()));
         }
         if let Some((id, s, after)) = &mut self.current {
-            while *after < s.records.slots() || self.batch.len() != 0 {
-                if self.batch.len() == 0 {
-                    self.batch = s.records.batch(*after).into_iter();
-                    *after += super::super::records::KEY_GROUP;
-                }
-                let Some((offset, r)) = self.batch.next() else {
+            while *after < s.records.slots() {
+                let row = *after;
+                *after += 1;
+                let Some((offset, r)) = s.records.get(row) else {
                     continue;
                 };
                 return Some(
@@ -386,7 +383,6 @@ impl talon_journal::Machine for Model {
             next: Some(self.next),
             segments: self.segments.clone().into_iter(),
             current: None,
-            batch: Vec::new().into_iter(),
         })
     }
     fn decode_snapshot(bytes: &[u8]) -> io::Result<SnapshotRecord> {
@@ -446,6 +442,12 @@ impl talon_journal::Machine for Model {
                 self.next = next;
             }
             SnapshotRecord::Segment(id, s) => {
+                // The snapshot encoder emits one segment at a time.
+                if let Some(mut previous) = self.segments.last_entry() {
+                    if previous.get().sealed {
+                        Arc::make_mut(previous.get_mut()).records.seal();
+                    }
+                }
                 if id == 0 || id >= self.next || self.segments.insert(id, Arc::new(s)).is_some() {
                     return Err(invalid("snapshot segment"));
                 }

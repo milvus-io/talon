@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-exclude = [".patched-deps/monoio", ".patched-deps/rustls", ".patched-deps/fast_radix_trie"]
+exclude = [".patched-deps/monoio", ".patched-deps/rustls"]
 members = [
     "crates/talon-uring",
     "crates/talon-journal",
@@ -101,6 +101,3 @@ path = ".patched-deps/monoio-http"
 
 [patch.crates-io.rustls]
 path = ".patched-deps/rustls"
-
-[patch.crates-io.fast_radix_trie]
-path = ".patched-deps/fast_radix_trie"

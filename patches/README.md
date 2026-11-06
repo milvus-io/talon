@@ -103,18 +103,3 @@ upstream license files. Offline preparation accepts
 Remove this extension when upstream offers equivalent borrowed plaintext delivery.
 `crates/talon-worker/tests/unbuffered_tls.rs` checks pointer containment, six
 AEAD suites, key updates, fragmented messages, and ciphertext authentication.
-
-## Radix trie full byte fanout
-
-The small-store key index uses fast_radix_trie 1.2.0 with the normal global allocator
-and without its optional realloc layout. The upstream child counter is u8,
-which wraps at 256 distinct byte branches and can underallocate a node.
-`fast_radix_trie-1.2.0.patch` widens the counter to u16 in both layouts and
-checks insertion, lookup and deletion across all 256 byte values. It does not
-change the allocator or add a packed header. Remove this patch once an upstream
-release fixes full byte fanout.
-
-The existing preparation script verifies release SHA-256
-`7701a4d392aaead14b674de1c69f43ce2432d903981d851f7034bc1b0ba63983`
-and preserves the MIT license in `.patched-deps/fast_radix_trie`. Offline
-preparation accepts `--radix-archive /path/to/fast_radix_trie-1.2.0.crate`.

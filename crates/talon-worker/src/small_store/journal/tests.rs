@@ -98,6 +98,68 @@ fn dense_segment_snapshot_restores_one_hundred_thousand_extents() {
     }
 }
 
+#[test]
+fn sealed_snapshot_preserves_deleted_rows_and_frozen_prefix_dictionaries() {
+    use talon_journal::Machine;
+    let mut model = Model::default();
+    for segment in 1..=2 {
+        for offset in 0..300 {
+            model
+                .apply(Event::Insert {
+                    slot: 0,
+                    segment,
+                    offset,
+                    record: Record {
+                        key: crate::small_store::key::SmallKey::new(&id(&format!(
+                            "{}/{segment}/{offset}",
+                            "path/".repeat(40)
+                        ))),
+                        len: 1,
+                        checksum: offset,
+                    },
+                })
+                .unwrap();
+        }
+        model.apply(Event::Seal { segment }).unwrap();
+        model.apply(Event::Delete { segment, offset: 7 }).unwrap();
+    }
+    let snapshot = model.snapshot().unwrap();
+    model
+        .apply(Event::Delete {
+            segment: 1,
+            offset: 8,
+        })
+        .unwrap();
+    model
+        .apply(Event::Delete {
+            segment: 1,
+            offset: 9,
+        })
+        .unwrap();
+    let mut restored = Model::default();
+    for bytes in snapshot {
+        restored
+            .restore(Model::decode_snapshot(&bytes.unwrap()).unwrap())
+            .unwrap();
+    }
+    for segment in 1..=2 {
+        let records = &restored.segments[&segment].records;
+        assert_eq!(records.len(), 299);
+        for (offset, record) in records.iter() {
+            assert_ne!(offset, 7);
+            assert_eq!(record.checksum, offset);
+            assert_eq!(
+                record.key,
+                crate::small_store::key::SmallKey::new(&id(&format!(
+                    "{}/{segment}/{offset}",
+                    "path/".repeat(40)
+                )))
+            );
+        }
+    }
+    assert_eq!(model.segments[&1].records.len(), 297);
+}
+
 #[tokio::test]
 async fn compact_journal_preserves_live_and_recovered_identity() {
     use crate::small_store::key::SmallIdentity;
