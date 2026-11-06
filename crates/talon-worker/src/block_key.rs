@@ -16,6 +16,66 @@ impl ObjectRef<'_> {
     }
 }
 
+pub(crate) trait ObjectIdentity {
+    fn object_view(&self) -> ObjectRef<'_>;
+}
+impl ObjectIdentity for ObjectId {
+    fn object_view(&self) -> ObjectRef<'_> {
+        ObjectRef {
+            backend: self.backend,
+            bucket: &self.bucket,
+            object_path: &self.object_path,
+        }
+    }
+}
+impl ObjectIdentity for ObjectRef<'_> {
+    fn object_view(&self) -> ObjectRef<'_> {
+        *self
+    }
+}
+impl Hash for dyn ObjectIdentity + '_ {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.object_view().hash(state);
+    }
+}
+impl PartialEq for dyn ObjectIdentity + '_ {
+    fn eq(&self, other: &Self) -> bool {
+        self.object_view() == other.object_view()
+    }
+}
+impl Eq for dyn ObjectIdentity + '_ {}
+
+/// Retains one metadata identity per checked object, until its last unit leaves.
+#[derive(Clone)]
+pub(crate) struct ObjectKey(pub BlockKey);
+
+impl ObjectIdentity for ObjectKey {
+    fn object_view(&self) -> ObjectRef<'_> {
+        self.0.view().object
+    }
+}
+impl<'a> Borrow<dyn ObjectIdentity + 'a> for ObjectKey {
+    fn borrow(&self) -> &(dyn ObjectIdentity + 'a) {
+        self
+    }
+}
+impl Hash for ObjectKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.object_view().hash(state);
+    }
+}
+impl PartialEq for ObjectKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.object_view() == other.object_view()
+    }
+}
+impl Eq for ObjectKey {}
+impl std::fmt::Debug for ObjectKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.object_view().fmt(f)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
 pub(crate) struct BlockRef<'a> {
     pub object: ObjectRef<'a>,

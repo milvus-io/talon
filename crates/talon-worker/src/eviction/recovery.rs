@@ -93,13 +93,12 @@ impl Lru {
             );
             let mut checks = HashMap::with_capacity(if track_checks { blocks } else { 0 });
             for u in &units {
-                let block = u.unit.block();
                 if !u.independent {
                     versions.insert(u.unit.block.clone());
                 }
                 if track_checks {
                     checks
-                        .entry(block.view().object.materialize())
+                        .entry(ObjectKey(u.unit.block.clone()))
                         .or_insert((0, None))
                         .0 += 1;
                 }

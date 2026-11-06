@@ -1,4 +1,4 @@
-//! Shared resident-page storage. Single-page blocks need no tree allocation.
+//! Shared resident-page storage: inline one page, sorted arrays up to four.
 use crate::page_lifecycle::PageEntry;
 use std::collections::BTreeMap;
 use std::ops::{Index, RangeBounds};
@@ -6,6 +6,7 @@ use std::ops::{Index, RangeBounds};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PageMap<V = PageEntry> {
     One(Option<(u32, V)>),
+    Few(Vec<(u32, V)>),
     Many(BTreeMap<u32, V>),
 }
 impl<V> Default for PageMap<V> {
@@ -25,18 +26,21 @@ impl<V> PageMap<V> {
     pub fn first_key_value(&self) -> Option<(&u32, &V)> {
         match self {
             Self::One(one) => one.as_ref().map(|(k, v)| (k, v)),
+            Self::Few(few) => few.first().map(|(k, v)| (k, v)),
             Self::Many(many) => many.first_key_value(),
         }
     }
     pub fn last_key_value(&self) -> Option<(&u32, &V)> {
         match self {
             Self::One(one) => one.as_ref().map(|(k, v)| (k, v)),
+            Self::Few(few) => few.last().map(|(k, v)| (k, v)),
             Self::Many(many) => many.last_key_value(),
         }
     }
     pub fn len(&self) -> usize {
         match self {
             Self::One(one) => usize::from(one.is_some()),
+            Self::Few(few) => few.len(),
             Self::Many(many) => many.len(),
         }
     }
@@ -49,24 +53,53 @@ impl<V> PageMap<V> {
     pub fn get(&self, key: &u32) -> Option<&V> {
         match self {
             Self::One(one) => one.as_ref().filter(|(k, _)| k == key).map(|(_, v)| v),
+            Self::Few(few) => few
+                .binary_search_by_key(key, |(k, _)| *k)
+                .ok()
+                .map(|i| &few[i].1),
             Self::Many(many) => many.get(key),
         }
     }
     pub fn get_mut(&mut self, key: &u32) -> Option<&mut V> {
         match self {
             Self::One(one) => one.as_mut().filter(|(k, _)| k == key).map(|(_, v)| v),
+            Self::Few(few) => few
+                .binary_search_by_key(key, |(k, _)| *k)
+                .ok()
+                .map(|i| &mut few[i].1),
             Self::Many(many) => many.get_mut(key),
         }
     }
     pub fn get_or_insert_with(&mut self, key: u32, create: impl FnOnce() -> V) -> &mut V {
         if matches!(self, Self::One(Some((old, _))) if *old != key) {
-            let Self::One(Some((old, value))) = std::mem::take(self) else {
+            let mut few = Vec::with_capacity(2);
+            let Self::One(Some(old)) = std::mem::take(self) else {
                 unreachable!()
             };
-            *self = Self::Many(BTreeMap::from([(old, value)]));
+            few.push(old);
+            *self = Self::Few(few);
+        }
+        if matches!(self, Self::Few(few) if few.len() == 4 && few.binary_search_by_key(&key, |(k, _)| *k).is_err())
+        {
+            let Self::Few(few) = std::mem::take(self) else {
+                unreachable!()
+            };
+            *self = Self::Many(few.into_iter().collect());
         }
         match self {
             Self::One(one) => &mut one.get_or_insert_with(|| (key, create())).1,
+            Self::Few(few) => {
+                let i = match few.binary_search_by_key(&key, |(k, _)| *k) {
+                    Ok(i) => i,
+                    Err(i) => {
+                        let value = create();
+                        few.reserve_exact(1);
+                        few.insert(i, (key, value));
+                        i
+                    }
+                };
+                &mut few[i].1
+            }
             Self::Many(many) => many.entry(key).or_insert_with(create),
         }
     }
@@ -79,40 +112,68 @@ impl<V> PageMap<V> {
                     None
                 }
             }
+            Self::Few(few) => few
+                .binary_search_by_key(key, |(k, _)| *k)
+                .ok()
+                .map(|i| few.remove(i).1),
             Self::Many(many) => many.remove(key),
         };
-        if let Self::Many(many) = self {
-            if many.len() <= 1 {
-                *self = Self::One(many.pop_first());
+        if matches!(self, Self::Many(many) if many.len() <= 4) {
+            let Self::Many(many) = std::mem::take(self) else {
+                unreachable!()
+            };
+            *self = Self::Few(many.into_iter().collect());
+        }
+        if let Self::Few(few) = self {
+            if few.len() <= 1 {
+                *self = Self::One(few.pop());
+            } else if removed.is_some() {
+                few.shrink_to_fit();
             }
         }
         removed
     }
     pub fn iter(&self) -> impl Iterator<Item = (&u32, &V)> {
-        let (one, many) = match self {
-            Self::One(one) => (one.as_ref().map(|(k, v)| (k, v)), None),
-            Self::Many(many) => (None, Some(many.iter())),
+        let (one, few, many) = match self {
+            Self::One(one) => (one.as_ref().map(|(k, v)| (k, v)), None, None),
+            Self::Few(few) => (None, Some(few.iter()), None),
+            Self::Many(many) => (None, None, Some(many.iter())),
         };
-        one.into_iter().chain(many.into_iter().flatten())
+        one.into_iter()
+            .chain(few.into_iter().flatten().map(|(k, v)| (k, v)))
+            .chain(many.into_iter().flatten())
     }
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (&u32, &mut V)> {
-        let (one, many) = match self {
-            Self::One(one) => (one.as_mut().map(|(k, v)| (&*k, v)), None),
-            Self::Many(many) => (None, Some(many.iter_mut())),
+        let (one, few, many) = match self {
+            Self::One(one) => (one.as_mut().map(|(k, v)| (&*k, v)), None, None),
+            Self::Few(few) => (None, Some(few.iter_mut()), None),
+            Self::Many(many) => (None, None, Some(many.iter_mut())),
         };
-        one.into_iter().chain(many.into_iter().flatten())
+        one.into_iter()
+            .chain(few.into_iter().flatten().map(|(k, v)| (&*k, v)))
+            .chain(many.into_iter().flatten())
     }
     pub fn range(&self, range: impl RangeBounds<u32>) -> impl Iterator<Item = (&u32, &V)> {
-        let (one, many) = match self {
+        let bounds = (range.start_bound().cloned(), range.end_bound().cloned());
+        let (one, few, many) = match self {
             Self::One(one) => (
                 one.as_ref()
                     .filter(|(k, _)| range.contains(k))
                     .map(|(k, v)| (k, v)),
                 None,
+                None,
             ),
-            Self::Many(many) => (None, Some(many.range(range))),
+            Self::Few(few) => (None, Some(few.iter()), None),
+            Self::Many(many) => (None, None, Some(many.range(bounds))),
         };
-        one.into_iter().chain(many.into_iter().flatten())
+        one.into_iter()
+            .chain(
+                few.into_iter()
+                    .flatten()
+                    .filter(move |(k, _)| range.contains(k))
+                    .map(|(k, v)| (k, v)),
+            )
+            .chain(many.into_iter().flatten())
     }
     pub fn keys(&self) -> impl Iterator<Item = &u32> {
         self.iter().map(|(k, _)| k)
@@ -149,6 +210,7 @@ impl<V> Extend<(u32, V)> for PageMap<V> {
 }
 pub(crate) enum PageIntoIter<V> {
     One(std::option::IntoIter<(u32, V)>),
+    Few(std::vec::IntoIter<(u32, V)>),
     Many(std::collections::btree_map::IntoIter<u32, V>),
 }
 impl<V> Iterator for PageIntoIter<V> {
@@ -156,6 +218,7 @@ impl<V> Iterator for PageIntoIter<V> {
     fn next(&mut self) -> Option<Self::Item> {
         match self {
             Self::One(one) => one.next(),
+            Self::Few(few) => few.next(),
             Self::Many(many) => many.next(),
         }
     }
@@ -166,6 +229,7 @@ impl<V> IntoIterator for PageMap<V> {
     fn into_iter(self) -> Self::IntoIter {
         match self {
             Self::One(one) => PageIntoIter::One(one.into_iter()),
+            Self::Few(few) => PageIntoIter::Few(few.into_iter()),
             Self::Many(many) => PageIntoIter::Many(many.into_iter()),
         }
     }
@@ -201,6 +265,64 @@ impl<'de, V: serde::Deserialize<'de>> serde::Deserialize<'de> for PageMap<V> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sparse_transitions_preserve_order_ranges_mutation_and_encoding() {
+        let mut pages = PageMap::default();
+        let mut reference = BTreeMap::new();
+        let keys = [u32::MAX, 4, 200, 0, 31, 8, 1000, 2];
+        for _ in 0..3 {
+            for key in keys {
+                assert_eq!(
+                    pages.insert(key, u64::from(key)),
+                    reference.insert(key, u64::from(key))
+                );
+                assert_eq!(
+                    *pages.get_or_insert_with(key, || panic!("existing key")),
+                    reference[&key]
+                );
+                assert_eq!(pages.first_key_value(), reference.first_key_value());
+                assert_eq!(pages.last_key_value(), reference.last_key_value());
+                assert_eq!(
+                    pages.range(4..=200).collect::<Vec<_>>(),
+                    reference.range(4..=200).collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    serde_json::to_vec(&pages).unwrap(),
+                    serde_json::to_vec(&reference).unwrap()
+                );
+            }
+            for (_, value) in pages.iter_mut() {
+                *value += 1;
+            }
+            for value in reference.values_mut() {
+                *value += 1;
+            }
+            for key in keys {
+                *pages.get_mut(&key).unwrap() += 1;
+                *reference.get_mut(&key).unwrap() += 1;
+                assert_eq!(pages.remove(&key), reference.remove(&key));
+                assert_eq!(
+                    pages.iter().collect::<Vec<_>>(),
+                    reference.iter().collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    pages.clone().into_iter().collect::<Vec<_>>(),
+                    reference.clone().into_iter().collect::<Vec<_>>()
+                );
+                let json = serde_json::to_vec(&pages).unwrap();
+                assert_eq!(json, serde_json::to_vec(&reference).unwrap());
+                assert_eq!(
+                    serde_json::from_slice::<PageMap<u64>>(&json).unwrap(),
+                    pages
+                );
+                if let PageMap::Few(few) = &pages {
+                    assert_eq!(few.capacity(), few.len());
+                }
+            }
+            assert!(pages.is_empty());
+        }
+    }
     #[test]
     fn catalog_encoding_matches_legacy_maps_across_sparse_transitions() {
         let mut pages = PageMap::<u64>::default();

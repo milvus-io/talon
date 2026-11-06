@@ -150,31 +150,22 @@ pub(crate) struct UnitSlot {
     policy: Option<PolicyState>,
 }
 
+#[derive(Default)]
+pub(crate) struct PageUnit {
+    allocated: u64,
+    access: crate::eviction::PageAccessSlot,
+    policy: Option<PolicyState>,
+}
+
 impl IndexedUnits {
-    fn read<T>(&self, page: Option<PageIndex>, f: impl FnOnce(&UnitSlot) -> T) -> Option<T> {
-        match (self, page) {
-            (Self::Whole(slot), None) => Some(f(&slot.read().unwrap())),
-            (Self::Paged(pages), Some(page)) => pages
+    fn resident(&self, page: PageIndex) -> bool {
+        match self {
+            Self::Paged(pages) => pages
                 .read()
                 .unwrap()
                 .get(&page.0)
-                .map(|entry| f(&entry.unit)),
-            _ => None,
-        }
-    }
-    fn write<T>(
-        &mut self,
-        page: Option<PageIndex>,
-        f: impl FnOnce(&mut UnitSlot) -> T,
-    ) -> Option<T> {
-        match (self, page) {
-            (Self::Whole(slot), None) => Some(f(&mut slot.write().unwrap())),
-            (Self::Paged(pages), Some(page)) => pages
-                .write()
-                .unwrap()
-                .get_mut(&page.0)
-                .map(|entry| f(&mut entry.unit)),
-            _ => None,
+                .is_some_and(|entry| entry.unit.access.resident()),
+            Self::Whole(_) => false,
         }
     }
     fn allocated_bytes(&self) -> u64 {
@@ -216,7 +207,7 @@ impl From<StoredMeta> for IndexedBlock {
                 for page in 0..present.len() {
                     if present.is_present(PageIndex(page)) {
                         let mut entry = PageEntry::unbound();
-                        entry.unit.resident = true;
+                        entry.unit.access.set_resident(true);
                         pages.insert(page, entry);
                     }
                 }
@@ -287,7 +278,7 @@ impl IndexedBlock {
             IndexedUnits::Paged(pages) => {
                 let mut present = PresentBitmap::new(self.meta.page_count);
                 for (&page, slot) in pages.read().unwrap().iter() {
-                    if slot.unit.resident {
+                    if slot.unit.access.resident() {
                         present.set(PageIndex(page));
                     }
                 }
@@ -331,7 +322,8 @@ impl BlockIndex {
                             let page = PageIndex(page);
                             entry
                                 .unit
-                                .resident
+                                .access
+                                .resident()
                                 .then_some((Some(page), entry.unit.allocated))
                         })
                         .collect(),
@@ -436,7 +428,12 @@ impl BlockIndex {
             UnitKind::Whole => read(&policy.whole.as_ref()?.read().unwrap()),
             UnitKind::ExactRange => policy.exact.as_deref().cloned(),
             UnitKind::Page(page) => {
-                read(&policy.pages.as_ref()?.read().unwrap().get(&page.0)?.unit)
+                let pages = policy.pages.as_ref()?.read().unwrap();
+                let slot = &pages.get(&page.0)?.unit;
+                Some(PolicyEntry {
+                    state: slot.policy?,
+                    access: slot.access.get()?,
+                })
             }
         }
     }
@@ -568,7 +565,9 @@ impl BlockIndex {
                     PageEntry::with_handle(entry.access.page_state().clone())
                 });
                 let access = entry.access.bind_state(page.handle.clone());
-                put(&mut page.unit, access)
+                let fresh = page.unit.policy.replace(entry.state).is_none();
+                page.unit.access.set(access.clone());
+                (fresh, access)
             }
         };
         directory.policy.len += usize::from(fresh);
@@ -648,15 +647,13 @@ impl BlockIndex {
                 let present = resident
                     .as_ref()
                     .and_then(|entry| entry.as_ref())
-                    .is_some_and(|entry| {
-                        entry
-                            .units
-                            .read(Some(page), |slot| slot.resident)
-                            .unwrap_or(false)
-                    });
+                    .is_some_and(|entry| entry.units.resident(page));
                 let mut pages = directory.policy.pages.as_ref()?.write().unwrap();
                 let entry = pages.get_mut(&page.0)?;
-                let removed = take(&mut entry.unit)?;
+                let removed = PolicyEntry {
+                    state: entry.unit.policy.take()?,
+                    access: entry.unit.access.get().expect("policy access token"),
+                };
                 if !present && entry.unit.allocated == 0 && !entry.handle.is_bound() {
                     pages.remove(&page.0);
                 }
@@ -927,12 +924,11 @@ impl BlockIndex {
             let pages = pages.read().unwrap();
             let acquire = |page| {
                 let state = pages.get(&page)?;
-                if !state.unit.resident {
+                if !state.unit.access.resident() || state.unit.access.is_none() {
                     return None;
                 }
-                let access = state.unit.access.as_ref()?;
                 let guard = state.handle.acquire()?;
-                access.touch();
+                state.unit.access.touch()?;
                 Some(guard)
             };
             let first = acquire(start.0)?;
@@ -968,32 +964,31 @@ impl BlockIndex {
             let entry = guard.as_mut().expect("live directory entry");
             let clock =
                 track_clock.then(|| Arc::new(AtomicU64::new(crate::eviction::access_millis())));
-            let mut add =
-                |page: Option<PageIndex>,
-                 slot: &mut UnitSlot,
-                 handle: Option<Arc<crate::page_lifecycle::PageState>>| {
-                    let access =
-                        AccessHandle::with_state(handle.unwrap_or_default(), clock.clone());
-                    slot.access = Some(access.clone());
-                    units.push(RecoveredUnit {
-                        independent: false,
-                        unit: crate::eviction::SharedUnit {
-                            block: entry.meta.id.clone(),
-                            kind: page.map_or(UnitKind::Whole, UnitKind::Page),
-                        },
-                        bytes: slot.allocated,
-                        access,
-                    });
-                };
+            let mut add = |page: Option<PageIndex>, bytes, access| {
+                units.push(RecoveredUnit {
+                    independent: false,
+                    unit: crate::eviction::SharedUnit {
+                        block: entry.meta.id.clone(),
+                        kind: page.map_or(UnitKind::Whole, UnitKind::Page),
+                    },
+                    bytes,
+                    access,
+                });
+            };
             match &entry.units {
-                IndexedUnits::Whole(_) => {
-                    entry.units.write(None, |slot| add(None, slot, None));
+                IndexedUnits::Whole(slot) => {
+                    let mut slot = slot.write().unwrap();
+                    let access = AccessHandle::with_state(Arc::default(), clock.clone());
+                    slot.access = Some(access.clone());
+                    add(None, slot.allocated, access);
                 }
                 IndexedUnits::Paged(pages) => {
                     for (&page, state) in pages.write().unwrap().iter_mut() {
-                        let page = PageIndex(page);
-                        if state.unit.resident {
-                            add(Some(page), &mut state.unit, Some(state.handle.clone()));
+                        if state.unit.access.resident() {
+                            let access =
+                                AccessHandle::with_state(state.handle.clone(), clock.clone());
+                            state.unit.access.set(access.clone());
+                            add(Some(PageIndex(page)), state.unit.allocated, access);
                         }
                     }
                 }
@@ -1081,11 +1076,11 @@ impl BlockIndex {
     /// Resolve metadata and mark a whole-block read in the same index lookup.
     pub(crate) fn get_and_touch(&self, id: &BlockId) -> Option<BlockMeta> {
         self.read_entry(id, |entry| {
-            entry.units.read(None, |slot| {
-                if let Some(access) = &slot.access {
+            if let IndexedUnits::Whole(slot) = &entry.units {
+                if let Some(access) = &slot.read().unwrap().access {
                     access.touch();
                 }
-            });
+            }
             entry.metadata().into()
         })
     }
@@ -1096,11 +1091,11 @@ impl BlockIndex {
             if !matches!(entry.units, IndexedUnits::Whole(_)) {
                 return false;
             }
-            entry.units.read(None, |slot| {
-                if let Some(access) = &slot.access {
+            if let IndexedUnits::Whole(slot) = &entry.units {
+                if let Some(access) = &slot.read().unwrap().access {
                     access.touch();
                 }
-            });
+            }
             true
         })
         .unwrap_or(false)
@@ -1114,12 +1109,21 @@ impl BlockIndex {
             CacheUnit::Whole(block) => (block, None),
             CacheUnit::Page(block, page) => (block, Some(*page)),
         };
-        self.write_entry(block, |entry| {
-            entry.units.write(page, |slot| {
+        self.write_entry(block, |entry| match (&entry.units, page) {
+            (IndexedUnits::Whole(slot), None) => {
+                let mut slot = slot.write().unwrap();
                 if slot.resident {
                     slot.access = Some(access);
                 }
-            });
+            }
+            (IndexedUnits::Paged(pages), Some(page)) => {
+                if let Some(slot) = pages.write().unwrap().get_mut(&page.0) {
+                    if slot.unit.access.resident() {
+                        slot.unit.access.set(access);
+                    }
+                }
+            }
+            _ => {}
         });
     }
 
@@ -1157,7 +1161,7 @@ impl BlockIndex {
                     }
                     IndexedUnits::Paged(pages) => {
                         for (&page, slot) in pages.read().unwrap().iter() {
-                            if slot.unit.resident {
+                            if slot.unit.access.resident() {
                                 out.push((
                                     meta.id.materialize(),
                                     Some(PageIndex(page)),
@@ -1314,7 +1318,7 @@ impl BlockIndex {
             }
             let mut pages = pages.write().unwrap();
             let slot = pages.get_or_insert_with(page.0, PageEntry::unbound);
-            let fresh = !std::mem::replace(&mut slot.unit.resident, true);
+            let fresh = !slot.unit.access.set_resident(true);
             let old = std::mem::replace(&mut slot.unit.allocated, allocated);
             entry.charged_bytes = entry
                 .charged_bytes
@@ -1348,14 +1352,14 @@ impl BlockIndex {
             let Some(slot) = pages.get_mut(&page.0) else {
                 return false;
             };
-            if !std::mem::replace(&mut slot.unit.resident, false) {
+            if !slot.unit.access.set_resident(false) {
                 return false;
             }
             let bytes = std::mem::take(&mut slot.unit.allocated);
             entry.charged_bytes = entry.charged_bytes.saturating_sub(bytes);
             entry.charged_pages -= 1;
             if slot.unit.policy.is_none() {
-                slot.unit.access = None;
+                slot.unit.access.clear();
             }
             if !slot.handle.is_bound() && slot.unit.policy.is_none() {
                 pages.remove(&page.0);
@@ -1376,9 +1380,11 @@ impl BlockIndex {
             IndexedUnits::Whole(_) => Presence::Whole,
             IndexedUnits::Paged(pages) => {
                 let pages = pages.read().unwrap();
-                if (start_page.0..end_page.0)
-                    .all(|page| pages.get(&page).is_some_and(|slot| slot.unit.resident))
-                {
+                if (start_page.0..end_page.0).all(|page| {
+                    pages
+                        .get(&page)
+                        .is_some_and(|slot| slot.unit.access.resident())
+                }) {
                     Presence::PageHit
                 } else {
                     Presence::PageMiss
@@ -2215,10 +2221,16 @@ mod tests {
         assert_eq!(lru.evict_to_fit(4096), vec![p1.clone()]);
         idx.clear_page(&id, PageIndex(1));
         assert!(idx
-            .read_entry(&id, |entry| entry
-                .units
-                .read(Some(PageIndex(1)), |slot| slot.access.is_none())
-                .unwrap_or(true))
+            .read_entry(&id, |entry| {
+                let IndexedUnits::Paged(pages) = &entry.units else {
+                    panic!("paged block")
+                };
+                pages
+                    .read()
+                    .unwrap()
+                    .get(&1)
+                    .is_none_or(|slot| slot.unit.access.get().is_none())
+            })
             .unwrap());
         lru.remove(&p0);
         idx.clear_page(&id, PageIndex(0));

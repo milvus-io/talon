@@ -11,6 +11,7 @@
 //! is done by the caller with the returned unit list. Segmented-LRU / TinyLFU
 //! are deferred per DESIGN.md.
 
+use crate::block_key::{ObjectIdentity, ObjectKey};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -278,12 +279,7 @@ impl AccessHandle {
         )
     }
     pub fn touch(&self) {
-        if let Some(clock) = self.clock_opt() {
-            let now = access_millis();
-            if clock.load(Ordering::Relaxed) < now {
-                clock.fetch_max(now, Ordering::Relaxed);
-            }
-        }
+        touch_clock(self.clock_opt());
         if let Some(dirty) = self.dirty() {
             dirty.touch();
         }
@@ -375,6 +371,64 @@ pub(crate) struct PolicyEntry {
     pub access: AccessHandle,
 }
 
+#[derive(Default)]
+pub(crate) struct PageAccessSlot {
+    state: Option<Arc<crate::page_lifecycle::PageState>>,
+    clock: Option<Arc<AtomicU64>>,
+    // Policy generations are even; the low bit records residency independently.
+    generation_and_resident: u64,
+}
+
+impl PageAccessSlot {
+    pub(crate) fn is_none(&self) -> bool {
+        self.state.is_none()
+    }
+    pub(crate) fn resident(&self) -> bool {
+        self.generation_and_resident & 1 != 0
+    }
+    pub(crate) fn set_resident(&mut self, resident: bool) -> bool {
+        let old = self.resident();
+        self.generation_and_resident = (self.generation_and_resident & !1) | u64::from(resident);
+        old
+    }
+    pub(crate) fn set(&mut self, access: AccessHandle) {
+        let Access::Page(state, clock, generation) = access.0 else {
+            unreachable!("paged entries require a page access token")
+        };
+        debug_assert_eq!(generation & 1, 0);
+        self.generation_and_resident = generation | (self.generation_and_resident & 1);
+        self.state = Some(state);
+        self.clock = clock;
+    }
+    pub(crate) fn clear(&mut self) {
+        self.state = None;
+        self.clock = None;
+        self.generation_and_resident &= 1;
+    }
+    pub(crate) fn get(&self) -> Option<AccessHandle> {
+        Some(AccessHandle(Access::Page(
+            self.state.as_ref()?.clone(),
+            self.clock.clone(),
+            self.generation_and_resident & !1,
+        )))
+    }
+    pub(crate) fn touch(&self) -> Option<()> {
+        let state = self.state.as_ref()?;
+        touch_clock(self.clock.as_ref());
+        state.reference(self.generation_and_resident & !1);
+        Some(())
+    }
+}
+
+fn touch_clock(clock: Option<&Arc<AtomicU64>>) {
+    if let Some(clock) = clock {
+        let now = access_millis();
+        if clock.load(Ordering::Relaxed) < now {
+            clock.fetch_max(now, Ordering::Relaxed);
+        }
+    }
+}
+
 impl std::ops::Deref for PolicyEntry {
     type Target = PolicyState;
     fn deref(&self) -> &Self::Target {
@@ -408,7 +462,7 @@ struct Inner {
     versions: VersionIndex,
     block_queue: BTreeMap<u64, BlockKey>,
     ownership_queue: BTreeMap<u64, BlockKey>,
-    object_checks: HashMap<ObjectId, (usize, Option<u64>)>,
+    object_checks: HashMap<ObjectKey, (usize, Option<u64>)>,
     track_checks: bool,
     track_blocks: bool,
     track_small_clock: bool,
@@ -484,10 +538,14 @@ impl Inner {
                 self.block_queue.remove(&activity.position);
             }
         }
-        if let Some(check) = self.object_checks.get_mut(&block.object) {
+        if let Some(check) = self
+            .object_checks
+            .get_mut(&block.object as &dyn ObjectIdentity)
+        {
             check.0 -= 1;
             if check.0 == 0 {
-                self.object_checks.remove(&block.object);
+                self.object_checks
+                    .remove(&block.object as &dyn ObjectIdentity);
             }
         }
         if !entry.independent {
@@ -754,12 +812,6 @@ impl Lru {
         if let Some(clock) = access.clock_opt() {
             clock.fetch_max(access_millis(), Ordering::Relaxed);
         }
-        if g.track_checks {
-            g.object_checks
-                .entry(block.view().object.materialize())
-                .or_insert((0, None))
-                .0 += 1;
-        }
         let unit = SharedUnit {
             block: g
                 .index
@@ -767,6 +819,12 @@ impl Lru {
                 .unwrap_or_else(|| unit.shared_block()),
             kind: unit.kind(),
         };
+        if g.track_checks {
+            g.object_checks
+                .entry(ObjectKey(unit.block.clone()))
+                .or_insert((0, None))
+                .0 += 1;
+        }
         if !independent {
             g.versions.insert(unit.block.clone());
         }
@@ -1041,17 +1099,16 @@ impl Lru {
             if activity.pins != 0 || now.saturating_sub(access) <= age {
                 continue;
             }
-            let block = block.materialize();
             if consider_verified
                 && g.object_checks
-                    .get(&block.object)
+                    .get(&block.view().object as &dyn ObjectIdentity)
                     .and_then(|check| check.1)
                     .is_some_and(|at| now.saturating_sub(at) < age)
             {
                 continue;
             }
             out.push(StaleBlockCandidate {
-                block,
+                block: block.materialize(),
                 units: activity.units,
                 revision: activity.revision,
                 last_access: access,
@@ -1140,12 +1197,18 @@ impl Lru {
             .lock()
             .unwrap()
             .object_checks
-            .get(object)
+            .get(object as &dyn ObjectIdentity)
             .is_some_and(|(_, at)| at.map_or(true, |at| now.saturating_sub(at) >= age))
     }
 
     pub(crate) fn stale_verified(&self, object: &ObjectId, now: u64) {
-        if let Some(check) = self.inner.lock().unwrap().object_checks.get_mut(object) {
+        if let Some(check) = self
+            .inner
+            .lock()
+            .unwrap()
+            .object_checks
+            .get_mut(object as &dyn ObjectIdentity)
+        {
             check.1 = Some(now);
         }
     }
@@ -1236,6 +1299,75 @@ impl Default for Lru {
 mod tests {
     use super::*;
     use talon_core::{Backend, ObjectId, Version};
+
+    #[test]
+    fn page_access_residency_preserves_generations_and_releases_tokens() {
+        let mut slot = PageAccessSlot::default();
+        let first = AccessHandle::new(true);
+        let state = first.page_state().clone();
+        let clock = Arc::downgrade(first.clock());
+        assert!(!slot.set_resident(true));
+        slot.set(first.clone());
+        assert!(slot.resident());
+        slot.touch().unwrap();
+        assert!(first.take_reference());
+        first.retire();
+        let second = AccessHandle::with_state(state, None);
+        slot.touch().unwrap();
+        assert!(
+            !second.referenced(),
+            "retired token touched a later admission"
+        );
+        slot.set(second.clone());
+        assert!(slot.set_resident(false));
+        slot.touch().unwrap();
+        assert!(
+            second.take_reference(),
+            "nonresident policy still owns its token"
+        );
+        slot.set_resident(true);
+        slot.clear();
+        assert!(
+            slot.resident(),
+            "access retirement must not clear residency"
+        );
+        assert!(slot.get().is_none());
+        drop(first);
+        assert!(clock.upgrade().is_none());
+    }
+
+    #[test]
+    fn object_checks_share_identity_across_versions_and_release_the_last_unit() {
+        let lru = Lru::new();
+        let first = CacheUnit::Page(blk(9), PageIndex(0));
+        lru.insert(first.clone(), 4096);
+        let alive = lru
+            .index()
+            .shared_identity(first.block())
+            .unwrap()
+            .downgrade();
+        lru.stale_verified(&first.block().object, 100);
+        let mut other = blk(9);
+        other.offset = 4096;
+        other.version = Version::new("v2");
+        let second = CacheUnit::Page(other, PageIndex(1));
+        lru.insert(second.clone(), 0);
+        {
+            let g = lru.inner.lock().unwrap();
+            assert_eq!(g.object_checks.len(), 1);
+            assert_eq!(
+                g.object_checks
+                    .get(&first.block().object as &dyn ObjectIdentity),
+                Some(&(2, Some(100)))
+            );
+        }
+        lru.remove(&first);
+        assert!(alive());
+        assert!(!lru.stale_check_due(&second.block().object, 101, 10));
+        lru.remove(&second);
+        assert!(!alive());
+        assert!(lru.inner.lock().unwrap().object_checks.is_empty());
+    }
 
     fn blk(n: u64) -> BlockId {
         BlockId::new(
