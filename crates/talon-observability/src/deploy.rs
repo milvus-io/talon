@@ -324,11 +324,42 @@ mod tests {
             assert!(e.get("value").is_none(), "{key} must not be inline");
             assert!(!e["valueFrom"]["secretKeyRef"].is_null());
         }
-        // The worker must point at the coordinator Service.
-        let args = c["args"].as_sequence().unwrap();
-        assert!(args
+        let config_path = envs
             .iter()
-            .any(|a| a.as_str() == Some("talon-coordinator:7000")));
+            .find(|e| e["name"].as_str() == Some("TALON_WORKER_CONFIG"))
+            .expect("worker configuration file")["value"]
+            .as_str()
+            .unwrap();
+        let mount = c["volumeMounts"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .find(|m| m["name"].as_str() == Some("dynamic-config"))
+            .expect("projected configuration directory");
+        assert_eq!(mount["readOnly"].as_bool(), Some(true));
+        assert!(mount.get("subPath").is_none());
+        assert_eq!(
+            config_path,
+            format!("{}/worker.toml", mount["mountPath"].as_str().unwrap())
+        );
+        let volume = spec["volumes"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .find(|v| v["name"] == mount["name"])
+            .expect("configuration volume");
+        let config = docs
+            .iter()
+            .find(|d| {
+                d["kind"].as_str() == Some("ConfigMap")
+                    && d["metadata"]["name"] == volume["configMap"]["name"]
+            })
+            .expect("mounted worker ConfigMap");
+        assert!(config["data"]["worker.toml"]
+            .as_str()
+            .unwrap()
+            .lines()
+            .any(|line| line.trim() == "coordinator = \"talon-coordinator:7000\""));
     }
 
     #[test]
