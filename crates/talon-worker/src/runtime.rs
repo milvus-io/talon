@@ -95,6 +95,7 @@ pub enum ServeOutcome {
 #[derive(Clone)]
 pub struct WorkerRuntime {
     /// Latest control-plane observation, shared by runtime clones.
+    dynamic_settings: Arc<arc_swap::ArcSwapOption<talon_core::dynamic_config::WorkerDynamicConfig>>,
     membership: Arc<Mutex<Option<Arc<MembershipSnapshot>>>>,
     membership_changed: tokio::sync::watch::Sender<()>,
     namespace: talon_core::NamespaceId,
@@ -302,6 +303,7 @@ impl WorkerRuntime {
             metrics,
             lru,
             capacity_bytes,
+            dynamic_settings: Arc::new(arc_swap::ArcSwapOption::empty()),
             paged_miss_run_concurrency: DEFAULT_PAGED_MISS_RUN_CONCURRENCY,
             version_cache: Arc::new(Mutex::new(HashMap::new())),
             version_ttl: DEFAULT_VERSION_TTL,
@@ -454,6 +456,123 @@ impl WorkerRuntime {
     pub fn with_paged_miss_run_concurrency(mut self, concurrency: usize) -> Self {
         self.paged_miss_run_concurrency = concurrency.max(1);
         self
+    }
+
+    /// Publish tuning shared by existing and future namespace runtimes.
+    pub(crate) fn update_dynamic_settings(
+        &self,
+        config: talon_core::dynamic_config::WorkerDynamicConfig,
+    ) {
+        if let Some(registry) = self.registry() {
+            registry.publish_settings(config);
+        } else {
+            if let Some(budget) = &self.background_budget {
+                budget.update(&config);
+            }
+            self.dynamic_settings.store(Some(Arc::new(config)));
+        }
+        self.page_gc_metrics
+            .tti_seconds
+            .set(self.current_tti_ms() as f64 / 1000.0);
+        if let Some(registry) = self.registry() {
+            for runtime in registry.snapshot() {
+                runtime
+                    .page_gc_metrics
+                    .tti_seconds
+                    .set(runtime.current_tti_ms() as f64 / 1000.0);
+            }
+        }
+    }
+
+    pub fn effective_namespace_settings(
+        &self,
+        namespace: &talon_core::NamespaceId,
+        config: Option<&talon_core::dynamic_config::WorkerDynamicConfig>,
+    ) -> Result<talon_core::dynamic_config::NamespaceDynamicConfig, String> {
+        let startup = self
+            .registry()
+            .ok_or("namespace registry unavailable")?
+            .namespace_config(namespace)?;
+        let tuning = config
+            .map(|config| config.settings_for(namespace.effective_name()))
+            .unwrap_or_default();
+        let policy = config.map_or_else(
+            || startup.rate_limits.clone(),
+            |config| config.effective_rate_limits(&startup.rate_limits),
+        );
+        Ok(talon_core::dynamic_config::NamespaceDynamicConfig {
+            rate_limits: Some(if policy.enabled {
+                policy.limits_for(namespace)
+            } else {
+                Default::default()
+            }),
+            page_tti_hours: Some(tuning.page_tti_hours.unwrap_or(startup.page_tti_hours)),
+        })
+    }
+
+    fn current_tti_ms(&self) -> u64 {
+        self.dynamic_settings
+            .load()
+            .as_ref()
+            .and_then(|c| {
+                c.settings_for(self.namespace.effective_name())
+                    .page_tti_hours
+            })
+            .map(|hours| hours * 3_600_000)
+            .unwrap_or(self.page_gc_config.tti_ms)
+    }
+
+    pub(crate) fn validate_dynamic_tti(
+        &self,
+        config: &talon_core::dynamic_config::WorkerDynamicConfig,
+    ) -> Result<(), String> {
+        if let Some(registry) = self.registry() {
+            registry.validate_settings(config)?;
+        }
+        let validate = |runtime: &Self| {
+            if let Some(hours) = config
+                .settings_for(runtime.namespace.effective_name())
+                .page_tti_hours
+                .filter(|hours| *hours > 0)
+            {
+                if runtime.paged.is_none() && runtime.small.is_none() {
+                    return Err("TTI requires paged L2 or small-object storage".to_string());
+                }
+                if runtime.page_gc_config.checkpoint_interval_ms > hours * 3_600_000 {
+                    return Err("checkpoint interval exceeds TTI".to_string());
+                }
+            }
+            Ok(())
+        };
+        validate(self)?;
+        if let Some(registry) = self.registry() {
+            for runtime in registry.snapshot() {
+                validate(&runtime)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn current_paged_miss_run_concurrency(&self) -> usize {
+        self.dynamic_settings
+            .load()
+            .as_ref()
+            .and_then(|c| c.paged_miss_run_concurrency)
+            .unwrap_or(self.paged_miss_run_concurrency)
+    }
+
+    fn maintenance_batch_limits(&self) -> (usize, usize) {
+        let config = self.dynamic_settings.load();
+        (
+            config
+                .as_ref()
+                .and_then(|c| c.background_scan_batch_size)
+                .unwrap_or(self.page_gc_config.scan_batch_size),
+            config
+                .as_ref()
+                .and_then(|c| c.background_delete_batch_size)
+                .unwrap_or(self.page_gc_config.delete_batch_size),
+        )
     }
 
     /// Attach a per-namespace rate limiter. Without this the runtime admits every
@@ -747,9 +866,7 @@ impl WorkerRuntime {
                         let state = runtime.page_lifecycle.block(&block);
                         let gate = state.gate.lock().await;
                         small.put(&unit, bytes.clone()).await?;
-                        if runtime.page_gc_config.tti_ms > 0 {
-                            small.track_access(&unit)?;
-                        }
+                        small.track_access(&unit)?;
                         let _pin = runtime.lru.pin_guard(unit.clone());
                         drop(gate);
                         drop(state);
@@ -1469,7 +1586,7 @@ impl WorkerRuntime {
         let mut pending = FuturesUnordered::new();
         let mut first_error = None;
         loop {
-            while pending.len() < self.paged_miss_run_concurrency {
+            while pending.len() < self.current_paged_miss_run_concurrency() {
                 let Some(leader_run) = leader_runs.next() else {
                     break;
                 };
@@ -1559,7 +1676,7 @@ impl WorkerRuntime {
     /// TTI-disabled hits need only read/delete arbitration, not timestamps or
     /// checkpoint dirtiness. Configuration is immutable while serving.
     fn page_access_time(&self) -> Option<u64> {
-        (self.page_gc_config.tti_ms > 0).then(|| self.page_clock.now())
+        Some(self.page_clock.now())
     }
 
     /// Return a page from L1 or the on-disk page file, promoting L2 hits to L1.
@@ -2343,9 +2460,7 @@ impl WorkerRuntime {
                                 .expect("small store enabled")
                                 .put(&id, bytes.into_bytes())
                                 .await?;
-                            if runtime.page_gc_config.tti_ms > 0 {
-                                runtime.small.as_ref().unwrap().track_access(&id)?;
-                            }
+                            runtime.small.as_ref().unwrap().track_access(&id)?;
                         } else {
                             let allocated = runtime.store.put_payload(&id, bytes).await?;
                             runtime.index.commit_allocated(
@@ -2684,9 +2799,6 @@ impl WorkerRuntime {
     }
 
     async fn checkpoint_small_access(&self) {
-        if self.page_gc_config.tti_ms == 0 {
-            return;
-        }
         if let Some(small) = self.small.as_ref() {
             if let Err(error) = small
                 .checkpoint_access(self.background_budget.clone())
@@ -2728,15 +2840,16 @@ impl WorkerRuntime {
         let Some(small) = self.small.as_ref().cloned() else {
             return;
         };
-        let age = self.page_gc_config.tti_ms;
+        let age = self.current_tti_ms();
         if age == 0 {
             return;
         }
         let mut cursor = self.small_idle_cursor.lock().await;
         let mut position = *cursor;
         let lru = self.lru.clone();
-        let scan = self.page_gc_config.scan_batch_size.min(4096);
-        let deletes = self.page_gc_config.delete_batch_size.min(256);
+        let (scan, deletes) = self.maintenance_batch_limits();
+        let scan = scan.min(4096);
+        let deletes = deletes.min(256);
         let (next, candidates) = tokio::task::spawn_blocking(move || {
             let candidates = lru.idle_candidates(&mut position, now, age, scan, deletes);
             (
@@ -2754,7 +2867,7 @@ impl WorkerRuntime {
         .expect("small object idle scan panicked");
         *cursor = next;
         for candidate in candidates {
-            self.unlink_stale_block_for(candidate, None).await;
+            self.unlink_idle_block(candidate, now).await;
         }
     }
 
@@ -5653,7 +5766,19 @@ mod tests {
             0,
             WorkerMetrics::new(1024),
         )
-        .with_paged_miss_run_concurrency(2);
+        .with_paged_miss_run_concurrency(8);
+        let clone = runtime.clone();
+        let mut dynamic = crate::dynamic_config::DynamicConfig::default();
+        assert!(dynamic.apply_runtime(
+            r#""rate_limits" = { "enabled" = false }
+"paged_miss_run_concurrency" = 2
+"background_scan_batch_size" = 7
+"background_delete_batch_size" = 3
+"#,
+            &runtime
+        ));
+        assert_eq!(clone.current_paged_miss_run_concurrency(), 2);
+        assert_eq!(clone.maintenance_batch_limits(), (7, 3));
         let object = ObjectId::new(Backend::Azure, "bucket", "fragmented-obj");
 
         // Warm every other page. The seven-page read below therefore has four

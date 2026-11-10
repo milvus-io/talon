@@ -150,3 +150,13 @@ and 5-second HTTP request timeout. Lookup failure leaves the zone unknown;
 affinity stays enabled and cache reads/loads fail closed. Explicit Rust/Java
 `ZoneOptions` bypass environment settings and automatic discovery. FUSE still
 requires explicit `TALON_ZONE`.
+
+### Worker configuration
+
+`worker.yaml` includes `talon-worker-config`, projected as a directory into every
+Worker. Ordinary startup settings and hot tuning share `worker.toml`; credentials
+remain in the backend Secret, and Pod identity comes from the Downward API.
+Kubelet propagation plus polling applies hot fields without restarting Pods.
+Other changes require an explicit restart and appear in `pending_restart_fields`. Inspect `GET /api/v1/config` on each Worker admin port
+for the applied SHA-256 and errors. See
+[Worker dynamic configuration](../../docs/reference/worker-dynamic-config.md).

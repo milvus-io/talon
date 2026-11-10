@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -686,6 +686,7 @@ impl WorkerReadiness {
 
 /// Shared worker observability state exposed to HTTP and heartbeats.
 pub struct WorkerObservability {
+    config_reload: std::sync::RwLock<crate::dynamic_config::ConfigReloadStatus>,
     namespace_runtime: std::sync::OnceLock<std::sync::Weak<crate::WorkerRuntime>>,
     node: NodeInfo,
     cluster_id: String,
@@ -736,6 +737,7 @@ impl WorkerObservability {
         inflight: Arc<InFlightLoads>,
     ) -> std::io::Result<Self> {
         Ok(Self {
+            config_reload: Default::default(),
             namespace_runtime: std::sync::OnceLock::new(),
             node,
             cluster_id,
@@ -752,6 +754,13 @@ impl WorkerObservability {
             inflight,
             zone: None,
         })
+    }
+
+    pub fn set_config_reload_status(&self, status: crate::dynamic_config::ConfigReloadStatus) {
+        *self.config_reload.write().unwrap() = status;
+    }
+    pub fn config_reload_status(&self) -> crate::dynamic_config::ConfigReloadStatus {
+        self.config_reload.read().unwrap().clone()
     }
 
     /// Set the deployment zone reported in status labels (ADR 0006).
@@ -872,11 +881,24 @@ impl WorkerObservability {
             metrics: self
                 .metrics
                 .snapshot(inflight_loads, block_count, page_count, resident_bytes),
-            labels: self
-                .zone
-                .iter()
-                .map(|zone| (talon_core::NODE_ZONE_LABEL.to_string(), zone.clone()))
-                .collect(),
+            labels: {
+                let mut labels: BTreeMap<_, _> = self
+                    .zone
+                    .iter()
+                    .map(|zone| (talon_core::NODE_ZONE_LABEL.to_string(), zone.clone()))
+                    .collect();
+                let config = self.config_reload.read().unwrap();
+                if let Some(hash) = &config.applied_hash {
+                    labels.insert("config_hash".into(), hash.clone());
+                }
+                if config.restart_required {
+                    labels.insert("config_restart_required".into(), "true".into());
+                }
+                if let Some(error) = &config.last_error {
+                    labels.insert("config_error".into(), error.chars().take(64).collect());
+                }
+                labels
+            },
         }
     }
 
@@ -908,7 +930,38 @@ fn admin_router(observability: Arc<WorkerObservability>) -> Router {
         .route("/healthz", get(health_handler))
         .route("/readyz", get(readiness_handler))
         .route("/api/v1/status", get(status_handler))
+        .route("/api/v1/config", get(config_handler))
+        .route(
+            "/api/v1/namespaces/{namespace}/config",
+            get(namespace_config_handler),
+        )
         .with_state(observability)
+}
+
+async fn config_handler(State(state): State<Arc<WorkerObservability>>) -> impl IntoResponse {
+    Json(state.config_reload_status())
+}
+async fn namespace_config_handler(
+    State(state): State<Arc<WorkerObservability>>,
+    Path(namespace): Path<String>,
+) -> Response {
+    let name = talon_core::NamespaceId::named(&namespace);
+    if let Err(error) = name.validate() {
+        return (StatusCode::BAD_REQUEST, error.to_string()).into_response();
+    }
+    let Some(runtime) = state
+        .namespace_runtime
+        .get()
+        .and_then(std::sync::Weak::upgrade)
+    else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "runtime unavailable").into_response();
+    };
+    let status = state.config_reload_status();
+    match runtime.effective_namespace_settings(&name, status.config.as_ref()) {
+        Ok(settings) => Json(serde_json::json!({"namespace": name.effective_name(), "applied_hash":status.applied_hash,
+            "last_error":status.last_error,"settings":settings})).into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, error).into_response(),
+    }
 }
 
 async fn metrics_handler(State(state): State<Arc<WorkerObservability>>) -> impl IntoResponse {

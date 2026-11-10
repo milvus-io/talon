@@ -18,7 +18,7 @@
 //!
 //! [`validate`]: WorkerConfig::validate
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use crate::status::MAX_STATUS_FIELD_BYTES;
@@ -125,7 +125,7 @@ pub struct ConfigVar {
 }
 
 /// An explicit bucket/container origin; credentials never inherit from worker defaults.
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BucketConfig {
     pub name: String,
@@ -133,16 +133,24 @@ pub struct BucketConfig {
     pub s3_region: Option<String>,
     pub s3_endpoint: Option<String>,
     pub s3_path_style: Option<bool>,
+    #[serde(skip_serializing)]
     pub s3_access_key_id: Option<String>,
+    #[serde(skip_serializing)]
     pub s3_secret_access_key: Option<Sensitive<String>>,
+    #[serde(skip_serializing)]
     pub s3_session_token: Option<Sensitive<String>>,
     pub gcs_endpoint: Option<String>,
+    #[serde(skip_serializing)]
     pub gcs_access_key_id: Option<String>,
+    #[serde(skip_serializing)]
     pub gcs_secret_access_key: Option<Sensitive<String>>,
     pub azure_account: Option<String>,
     pub azure_endpoint: Option<String>,
+    #[serde(skip_serializing)]
     pub azure_shared_key: Option<Sensitive<String>>,
+    #[serde(skip_serializing)]
     pub credential_broker_url: Option<Sensitive<String>>,
+    #[serde(skip_serializing)]
     pub credential_broker_request: Option<Sensitive<serde_json::Value>>,
     /// Per-attempt Broker timeout in milliseconds; omitted uses the default of 3000.
     pub credential_broker_timeout_ms: Option<u64>,
@@ -231,7 +239,7 @@ impl BucketConfig {
 }
 
 /// Fully-resolved worker configuration.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct WorkerConfig {
     /// Address the worker's RPC service binds to.
     pub listen: String,
@@ -252,7 +260,9 @@ pub struct WorkerConfig {
     /// Optional mTLS material for the privileged coordinator-worker channel.
     pub control_tls: Option<ControlTlsConfig>,
     /// Operator-owned grants loaded from mounted static policy data.
+    #[serde(skip_serializing)]
     pub namespace_policy: Option<ObjectNamespacePolicy>,
+    pub namespace_policy_path: Option<PathBuf>,
     /// Stable node identity; defaults to the RPC listen address when unset.
     pub node_id: Option<String>,
     /// Control-plane heartbeat interval in milliseconds. After a detected failure,
@@ -388,22 +398,30 @@ pub struct WorkerConfig {
     /// AWS regional endpoint. A value with an `http://` scheme selects plaintext.
     pub s3_endpoint: Option<String>,
     /// S3 access key id.
+    #[serde(skip_serializing)]
     pub s3_access_key_id: Option<String>,
     /// Origin credential source: `aksk`, `iam`, or `broker`.
     pub credentials_source: Option<String>,
     /// S3 secret access key.
+    #[serde(skip_serializing)]
     pub s3_secret_access_key: Option<Sensitive<String>>,
     /// Optional session token for temporary S3 credentials.
+    #[serde(skip_serializing)]
     pub s3_session_token: Option<Sensitive<String>>,
     /// GCS HMAC access key id.
+    #[serde(skip_serializing)]
     pub gcs_access_key_id: Option<String>,
     /// GCS HMAC secret access key.
+    #[serde(skip_serializing)]
     pub gcs_secret_access_key: Option<Sensitive<String>>,
     /// Azure Storage Shared Key.
+    #[serde(skip_serializing)]
     pub azure_shared_key: Option<Sensitive<String>>,
     /// Credential broker URL, which may contain authentication parameters.
+    #[serde(skip_serializing)]
     pub credential_broker_url: Option<Sensitive<String>>,
     /// Credential broker JSON request body, parsed from a TOML table or JSON env value.
+    #[serde(skip_serializing)]
     pub credential_broker_request: Option<Sensitive<serde_json::Value>>,
     /// Per-attempt Broker timeout in milliseconds; omitted uses the default of 3000.
     pub credential_broker_timeout_ms: Option<u64>,
@@ -442,7 +460,7 @@ pub struct WorkerConfig {
 }
 
 /// Per-namespace cache overrides. Omitted fields inherit the worker defaults.
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NamespaceCacheConfig {
     pub l2_page_size_bytes: Option<u64>,
@@ -451,6 +469,7 @@ pub struct NamespaceCacheConfig {
     pub page_access_checkpoint_interval_minutes: Option<u64>,
     pub page_gc_interval_minutes: Option<u64>,
     pub paged_miss_run_concurrency: Option<usize>,
+    pub rate_limits: Option<crate::MetricLimits>,
 }
 
 impl WorkerConfig {
@@ -599,6 +618,7 @@ impl Default for WorkerConfig {
             cluster_id: "default".into(),
             control_tls: None,
             namespace_policy: None,
+            namespace_policy_path: None,
             node_id: None,
             heartbeat_interval_ms: 5_000,
             block_size: 256 << 20,
@@ -1741,7 +1761,7 @@ impl WorkerConfig {
             .as_deref()
             .map(ObjectNamespacePolicy::from_file)
             .transpose()?;
-        let cfg = WorkerConfig {
+        let mut cfg = WorkerConfig {
             // Advertise the routable address if set, else fall back to the bind
             // address (issue #118: never silently advertise a wildcard bind).
             advertise_addr,
@@ -1752,6 +1772,7 @@ impl WorkerConfig {
             cluster_id: merged.cluster_id.unwrap_or(d.cluster_id),
             control_tls,
             namespace_policy,
+            namespace_policy_path: merged.namespace_policy_path,
             node_id: merged.node_id.or(d.node_id),
             heartbeat_interval_ms: merged
                 .heartbeat_interval_ms
@@ -1888,6 +1909,18 @@ impl WorkerConfig {
             rate_limits: merged.rate_limits.unwrap_or(d.rate_limits),
             namespaces: merged.namespaces.unwrap_or(d.namespaces),
         };
+        if cfg.namespaces.values().any(|own| own.rate_limits.is_some()) {
+            if !cfg.rate_limits.enabled {
+                cfg.rate_limits.default = Default::default();
+                cfg.rate_limits.overrides.clear();
+            }
+            cfg.rate_limits.enabled = true;
+            for (name, own) in &cfg.namespaces {
+                if let Some(limits) = own.rate_limits {
+                    cfg.rate_limits.overrides.insert(name.clone(), limits);
+                }
+            }
+        }
         cfg.validate()?;
         Ok(cfg)
     }

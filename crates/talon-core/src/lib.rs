@@ -63,3 +63,5 @@ pub mod worker_membership;
 /// Maximum business payload of a control frame. Persistent membership admission
 /// and transport readers share this bound so every legal registry is discoverable.
 pub const MAX_CONTROL_PAYLOAD_BYTES: usize = 1 << 20;
+
+pub mod dynamic_config;

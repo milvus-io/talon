@@ -524,13 +524,31 @@ async fn main() -> anyhow::Result<()> {
 
 async fn run() -> anyhow::Result<()> {
     let args = Args::parse();
-    let file = match &args.config {
-        Some(path) => WorkerConfigPatch::from_file(path)?,
-        None => WorkerConfigPatch::default(),
+    let unified_path = std::env::var_os("TALON_WORKER_CONFIG").map(PathBuf::from);
+    let document = if let Some(path) = &unified_path {
+        let text = tokio::time::timeout(
+            Duration::from_secs(3),
+            talon_worker::dynamic_config::read_snapshot(path),
+        )
+        .await??;
+        Some(
+            talon_core::dynamic_config::WorkerConfigDocument::parse(&text)
+                .map_err(anyhow::Error::msg)?,
+        )
+    } else {
+        None
+    };
+    let file = if let Some(document) = &document {
+        document.patch.clone()
+    } else {
+        match &args.config {
+            Some(path) => WorkerConfigPatch::from_file(path)?,
+            None => WorkerConfigPatch::default(),
+        }
     };
     let env = WorkerConfigPatch::from_env()?;
     let cli = args.into_patch();
-    let cfg = WorkerConfig::resolve(file, env, cli)?;
+    let cfg = WorkerConfig::resolve(file, env.clone(), cli.clone())?;
 
     tracing::info!(
         listen = %cfg.listen,
@@ -566,7 +584,7 @@ async fn run() -> anyhow::Result<()> {
         &root,
     )?);
     talon_worker::cache_reset::open_or_reset(cache_root_lock, &cfg, |lock| {
-        run_worker(cfg.clone(), lock)
+        run_worker(cfg.clone(), lock, env.clone(), cli.clone())
     })
     .await
 }
@@ -574,7 +592,10 @@ async fn run() -> anyhow::Result<()> {
 async fn run_worker(
     mut cfg: WorkerConfig,
     cache_root_lock: Arc<talon_worker::page_access_store::CacheRootLock>,
+    config_env: WorkerConfigPatch,
+    config_cli: WorkerConfigPatch,
 ) -> anyhow::Result<()> {
+    let startup_config = cfg.clone();
     let identity = cache_root_lock
         .load_identity(
             &cfg.cluster_id,
@@ -903,6 +924,22 @@ async fn run_worker(
     .map_err(talon_worker::cache_reset::classify_open_error)?;
     let worker = Arc::new(runtime);
     observability.attach_namespace_runtime(&worker);
+    let mut state =
+        talon_worker::dynamic_config::DynamicConfig::new(startup_config, config_env, config_cli);
+    observability.set_config_reload_status(state.status());
+    let config_reload = if let Some(path) = std::env::var_os("TALON_WORKER_CONFIG") {
+        let path = PathBuf::from(path);
+        talon_worker::dynamic_config::reload_once(&path, &mut state, &worker, &observability).await;
+        Some(talon_worker::dynamic_config::spawn_reload(
+            path,
+            state,
+            worker.clone(),
+            observability.clone(),
+        ))
+    } else {
+        None
+    };
+
     tracing::info!(
         elapsed_ms = recovery_started.elapsed().as_millis() as u64,
         "worker cache recovery complete"
@@ -972,6 +1009,11 @@ async fn run_worker(
     observability.begin_shutdown();
     tracing::info!("worker draining");
     background.begin_shutdown();
+    if let Some(task) = config_reload {
+        task.abort();
+        let _ = task.await;
+    }
+
     stop.store(true, std::sync::atomic::Ordering::Release);
     // Join the producer before publishing not-ready: an older ready heartbeat
     // must never follow the final report from this process.

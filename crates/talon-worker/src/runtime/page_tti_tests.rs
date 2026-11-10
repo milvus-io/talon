@@ -140,20 +140,17 @@ async fn scheduled_page_scan_keeps_a_cursor_and_bounded_candidates() {
 }
 
 #[tokio::test]
-async fn disabled_tti_hits_leave_access_and_dirtiness_unchanged() {
+async fn disabled_tti_still_records_access_and_checkpoints() {
     for l1 in [false, true] {
         let root = tempfile::tempdir().unwrap();
         let r = runtime(root.path(), l1, 0, 0);
         r.page_clock.set(10000);
         r.serve_range(&request(0, 32)).await.unwrap();
         let block = r.page_lifecycle.get(&id()).unwrap();
-        let before = {
-            let state = block.inner.lock().unwrap();
-            let access = state.pages.read().unwrap()[&0].handle.last_access();
-            (state.revision, state.dirty_since(), access)
-        };
+        let before = block.inner.lock().unwrap().revision;
+        assert_eq!(r.checkpoint_access_times().await.blocks, 1);
         r.page_clock.set(20000);
-        assert_eq!(r.page_access_time(), None);
+        assert_eq!(r.page_access_time(), Some(20000));
         assert_eq!(
             r.serve_range(&request(0, 16)).await.unwrap(),
             Bytes::from((0u8..16).collect::<Vec<_>>())
@@ -162,15 +159,16 @@ async fn disabled_tti_hits_leave_access_and_dirtiness_unchanged() {
             r.serve(&request(0, 32)).await.unwrap(),
             ServeOutcome::SendfileMany(_)
         ));
-        let state = block.inner.lock().unwrap();
-        assert_eq!(
-            (
-                state.revision,
-                state.dirty_since(),
-                state.pages.read().unwrap()[&0].handle.last_access()
-            ),
-            before
-        );
+        {
+            let state = block.inner.lock().unwrap();
+            assert_eq!(state.revision, before);
+            assert_eq!(
+                state.pages.read().unwrap()[&0].handle.last_access(),
+                Some(20000)
+            );
+        }
+        assert_eq!(r.checkpoint_access_times().await.blocks, 1);
+        assert_eq!(r.gc_once().await.reclaimed, 0);
     }
 }
 
@@ -319,7 +317,6 @@ async fn no_checkpoint_corrupt_checkpoint_and_disabled_tti() {
     let root = tempfile::tempdir().unwrap();
     let r = runtime(root.path(), false, 0, 0);
     r.serve_range(&request(0, 16)).await.unwrap();
-    assert_eq!(r.checkpoint_access_times().await.blocks, 0);
     assert_eq!(r.gc_once().await.reclaimed, 0);
     drop(r);
     let r = runtime(root.path(), false, 0, 100);
@@ -1597,4 +1594,75 @@ async fn page_access_journal_scale() {
     assert_eq!(clean.bytes, 0);
     assert_eq!(clean.blocks, 0);
     println!("pages=1000000 dirty_pages=10000 dirty_blocks=10 base_bytes={} delta_bytes={} base_ms={base_ms} delta_ms={delta_ms}", base.bytes, delta.bytes);
+}
+
+#[tokio::test]
+async fn dynamic_tti_enables_resizes_and_disables_collection_without_losing_access() {
+    let root = tempfile::tempdir().unwrap();
+    let r = Arc::new(runtime(root.path(), false, 0, 0));
+    let mut dynamic = crate::dynamic_config::DynamicConfig::default();
+    let snapshot = |hours| {
+        format!(
+            "page_tti_hours = {hours}
+rate_limits = {{ enabled = false }}
+"
+        )
+    };
+    r.page_clock.set(10_000);
+    r.serve_range(&request(0, 16)).await.unwrap();
+    r.page_clock.set(4_000_000);
+    assert_eq!(r.gc_once().await.reclaimed, 0);
+    r.serve_range(&request(0, 16)).await.unwrap();
+    assert!(dynamic.apply_runtime(&snapshot(1), &r));
+    assert_eq!(r.gc_once().await.reclaimed, 0);
+    assert_eq!(r.page_gc_metrics.tti_seconds.get(), 3600.0);
+    r.page_clock.set(7_600_001);
+    assert!(dynamic.apply_runtime(&snapshot(2), &r));
+    assert_eq!(r.gc_once().await.reclaimed, 0);
+    assert!(dynamic.apply_runtime(&snapshot(1), &r));
+    // An already selected deletion must check the current setting after waiting.
+    let mut cursor = ScanCursor::default();
+    let (candidates, _) =
+        r.page_lifecycle
+            .scan(&mut cursor, 4096, r.page_clock.now(), Some(3_600_000), 64);
+    let candidate = candidates.into_iter().next().expect("idle candidate");
+    let permit = r
+        .page_gc_io
+        .clone()
+        .acquire_many_owned(r.page_gc_config.io_concurrency as u32)
+        .await
+        .unwrap();
+    let w = r.clone();
+    let mut deletion = tokio::spawn(async move { w.evict_page_candidate(candidate, 0).await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), &mut deletion)
+            .await
+            .is_err()
+    );
+    assert!(dynamic.apply_runtime(&snapshot(0), &r));
+    drop(permit);
+    assert!(deletion.await.unwrap().is_none());
+    assert_eq!(r.gc_once().await.reclaimed, 0);
+    assert_eq!(r.checkpoint_access_times().await.blocks, 1);
+    assert!(dynamic.apply_runtime(&snapshot(1), &r));
+    assert_eq!(r.gc_once().await.reclaimed, 1);
+}
+
+#[tokio::test]
+async fn disabled_tti_restores_checkpointed_access_after_restart() {
+    let root = tempfile::tempdir().unwrap();
+    let r = runtime(root.path(), false, 0, 0);
+    r.page_clock.set(10_000);
+    r.serve_range(&request(0, 16)).await.unwrap();
+    assert_eq!(r.checkpoint_access_times().await.blocks, 1);
+    drop(r);
+    let r = runtime(root.path(), false, 0, 0);
+    let state = r.page_lifecycle.get(&id()).unwrap();
+    assert_eq!(
+        state.inner.lock().unwrap().pages.read().unwrap()[&0]
+            .handle
+            .last_access(),
+        Some(10_000)
+    );
+    assert_eq!(r.gc_once().await.reclaimed, 0);
 }

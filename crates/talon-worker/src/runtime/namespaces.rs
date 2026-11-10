@@ -32,6 +32,7 @@ impl std::borrow::Borrow<str> for CacheIdentity {
 }
 
 pub(super) struct NamespaceRuntimes {
+    dynamic_settings: Arc<arc_swap::ArcSwapOption<talon_core::dynamic_config::WorkerDynamicConfig>>,
     uring: bool,
     membership: Arc<Mutex<Option<Arc<MembershipSnapshot>>>>,
     membership_changed: tokio::sync::watch::Sender<()>,
@@ -56,6 +57,52 @@ pub(super) struct NamespaceRuntimes {
 }
 
 impl NamespaceRuntimes {
+    pub(super) fn namespace_config(&self, namespace: &NamespaceId) -> Result<WorkerConfig, String> {
+        self.config
+            .for_namespace(namespace)
+            .map_err(|error| error.to_string())
+    }
+    pub(super) fn validate_settings(
+        &self,
+        config: &talon_core::dynamic_config::WorkerDynamicConfig,
+    ) -> Result<(), String> {
+        let validate = |static_config: &WorkerConfig, hours: u64| {
+            if hours > 0 {
+                if static_config.l2_page_size_bytes == 0
+                    && static_config.small_object_threshold_bytes == 0
+                {
+                    return Err("TTI requires paged L2 or small-object storage".to_string());
+                }
+                if static_config.page_access_checkpoint_interval_minutes * 60_000
+                    > hours * 3_600_000
+                {
+                    return Err("checkpoint interval exceeds TTI".to_string());
+                }
+            }
+            Ok(())
+        };
+        if let Some(hours) = config.page_tti_hours {
+            validate(&self.config, hours)?;
+        }
+        for name in config
+            .namespaces
+            .keys()
+            .chain(self.config.namespaces.keys())
+        {
+            if let Some(hours) = config.settings_for(name).page_tti_hours {
+                let static_config = self
+                    .config
+                    .for_namespace(&NamespaceId::named(name))
+                    .map_err(|e| e.to_string())?;
+                validate(&static_config, hours)?;
+            }
+        }
+        Ok(())
+    }
+    pub(super) fn publish_settings(&self, config: talon_core::dynamic_config::WorkerDynamicConfig) {
+        self.background_budget.update(&config);
+        self.dynamic_settings.store(Some(Arc::new(config)));
+    }
     pub(super) fn snapshot(&self) -> Vec<Arc<WorkerRuntime>> {
         self.workers.read().unwrap().values().cloned().collect()
     }
@@ -183,11 +230,13 @@ impl NamespaceRuntimes {
             config.l1_page_size_bytes,
             self.metrics.clone(),
             config.stale_gc_enabled,
-            config.stale_gc_enabled || config.ownership_gc_enabled || config.page_tti_hours > 0,
+            true,
         )
         .with_backend_kind(config.backend.as_deref().unwrap_or("azure").parse()?)
         .with_rate_limiter(self.limiter.clone())
         .with_paged_miss_run_concurrency(config.paged_miss_run_concurrency);
+        worker.namespace = namespace.normalized();
+        worker.dynamic_settings = self.dynamic_settings.clone();
         worker.page_mutations = Arc::new(Mutations::new(self.uring));
         worker.background_heads = self.background_heads.clone();
         // The backend is deliberately absent for recovered credential scopes.
@@ -388,6 +437,7 @@ impl WorkerRuntime {
             background_heads: uring
                 .then(|| origin_head::OriginHeads::new(config.stale_gc_head_concurrency)),
             metrics,
+            dynamic_settings: Arc::new(arc_swap::ArcSwapOption::empty()),
             limiter: Arc::new(NamespaceRateLimiter::new(config.rate_limits.clone())),
             load_slots: Arc::new(tokio::sync::Semaphore::new(8)),
             load_bytes: Arc::new(tokio::sync::Semaphore::new(
@@ -1051,6 +1101,294 @@ mod tests {
             .unwrap(),
         )
     }
+    #[tokio::test]
+    async fn unified_config_applies_hot_fields_and_reports_restart_changes() {
+        use crate::dynamic_config::DynamicConfig;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config();
+        let root = open(dir.path(), &cfg, Arc::default());
+        let a = root.for_namespace(&NamespaceId::named("a")).await.unwrap();
+        // Keep fixture settings below the file layer; the file owns listen and TTI.
+        let env = talon_core::WorkerConfigPatch::default();
+        let cli = talon_core::WorkerConfigPatch::default();
+        let startup =
+            talon_core::WorkerConfig::resolve(Default::default(), env.clone(), cli.clone())
+                .unwrap();
+        let mut state = DynamicConfig::new(startup.clone(), env, cli);
+        assert!(state.apply_runtime(
+            r#""listen" = "127.0.0.1:9001"
+"paged_miss_run_concurrency" = 2
+"namespaces" = { "a" = { "page_tti_hours" = 1 } }
+"#,
+            &root
+        ));
+        let status = state.status();
+        assert_eq!(a.current_tti_ms(), 3_600_000);
+        assert_eq!(a.current_paged_miss_run_concurrency(), 2);
+        assert!(status.restart_required);
+        assert_eq!(
+            status.pending_restart_fields,
+            vec!["advertise_addr", "listen"]
+        );
+        assert_eq!(
+            status.effective_config.as_ref().unwrap()["listen"],
+            startup.listen
+        );
+        assert_eq!(
+            status.desired_config.as_ref().unwrap()["listen"],
+            "127.0.0.1:9001"
+        );
+        assert!(status.applied_hash.is_none());
+        assert!(status.observed_hash.is_some());
+        assert!(!state.apply_runtime(
+            r#""background_task_concurrency" = 0
+"#,
+            &root
+        ));
+        assert_eq!(state.status().desired_config, status.desired_config);
+        assert_eq!(a.current_paged_miss_run_concurrency(), 2);
+        for field in ["node_id", "advertise_addr"] {
+            let text = format!("{field} = \"shared-node\"\npaged_miss_run_concurrency = 9\n");
+            assert!(!state.apply_runtime(&text, &root));
+            assert!(state.status().last_error.as_ref().unwrap().contains(field));
+            assert_eq!(state.status().desired_config, status.desired_config);
+            assert_eq!(state.status().effective_config, status.effective_config);
+            assert_eq!(state.status().observed_hash, status.observed_hash);
+            assert_eq!(a.current_paged_miss_run_concurrency(), 2);
+        }
+        assert!(state.apply_runtime("", &root));
+        assert!(!state.status().restart_required);
+        assert!(state.status().applied_hash.is_some());
+        assert_eq!(a.current_tti_ms(), startup.page_tti_hours * 3_600_000);
+    }
+
+    #[tokio::test]
+    async fn configmap_symlink_reload_preserves_last_good_and_accepts_rollback() {
+        use crate::dynamic_config::{reload_once, DynamicConfig};
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        std::fs::create_dir(&cache).unwrap();
+        let root = open(&cache, &config(), Arc::default());
+        let a = root.for_namespace(&NamespaceId::named("a")).await.unwrap();
+        let b = root.for_namespace(&NamespaceId::named("b")).await.unwrap();
+        let status = Arc::new(
+            crate::WorkerObservability::new(
+                "cluster".into(),
+                talon_core::NodeInfo {
+                    id: talon_core::NodeId::new("worker"),
+                    role: talon_core::NodeRole::Worker,
+                    address: "localhost:7001".into(),
+                },
+                "localhost:8001".into(),
+                config().capacity_bytes,
+                root.index.clone(),
+                root.inflight.clone(),
+            )
+            .unwrap(),
+        );
+        status.attach_namespace_runtime(&root);
+        let projected = dir.path().join("projected");
+        std::fs::create_dir(&projected).unwrap();
+        for (name, text) in [
+            (
+                "first",
+                r#""paged_miss_run_concurrency" = 2
+"namespaces" = { "a" = { "page_tti_hours" = 1 } }
+"#,
+            ),
+            (
+                "second",
+                r#""paged_miss_run_concurrency" = 3
+"namespaces" = { "a" = { "page_tti_hours" = 2 } }
+"#,
+            ),
+            (
+                "invalid",
+                r#""unsupported" = "changed"
+"#,
+            ),
+            ("empty", ""),
+        ] {
+            std::fs::create_dir(projected.join(name)).unwrap();
+            std::fs::write(projected.join(name).join("worker.toml"), text).unwrap();
+        }
+        symlink("first", projected.join("..data")).unwrap();
+        symlink("..data/worker.toml", projected.join("worker.toml")).unwrap();
+        let replace = |name: &str| {
+            symlink(name, projected.join("..data_tmp")).unwrap();
+            std::fs::rename(projected.join("..data_tmp"), projected.join("..data")).unwrap();
+        };
+        let file = projected.join("worker.toml");
+        let mut dynamic = DynamicConfig::default();
+        reload_once(&file, &mut dynamic, &root, &status).await;
+        let first_hash = status.config_reload_status().applied_hash.unwrap();
+        assert_eq!(a.current_tti_ms(), 3_600_000);
+        assert_eq!(a.current_paged_miss_run_concurrency(), 2);
+        assert_eq!(b.current_tti_ms(), 0);
+        replace("second");
+        reload_once(&file, &mut dynamic, &root, &status).await;
+        let second_hash = status.config_reload_status().applied_hash.unwrap();
+        assert_ne!(first_hash, second_hash);
+        assert_eq!(a.current_tti_ms(), 7_200_000);
+        replace("invalid");
+        reload_once(&file, &mut dynamic, &root, &status).await;
+        assert!(status.config_reload_status().last_error.is_some());
+        assert_eq!(
+            status.config_reload_status().applied_hash.as_ref(),
+            Some(&second_hash)
+        );
+        assert_eq!(a.current_paged_miss_run_concurrency(), 3);
+        std::fs::remove_file(&file).unwrap();
+        reload_once(&file, &mut dynamic, &root, &status).await;
+        assert_eq!(
+            status.config_reload_status().applied_hash.as_ref(),
+            Some(&second_hash)
+        );
+        symlink("..data/worker.toml", &file).unwrap();
+        replace("first");
+        reload_once(&file, &mut dynamic, &root, &status).await;
+        assert_eq!(
+            status.config_reload_status().applied_hash.as_ref(),
+            Some(&first_hash)
+        );
+        assert!(status.config_reload_status().last_error.is_none());
+        assert_eq!(a.current_tti_ms(), 3_600_000);
+        assert_eq!(status.status().labels["config_hash"], first_hash);
+        assert!(!status.status().labels.contains_key("config_error"));
+        let settings = root
+            .effective_namespace_settings(
+                &NamespaceId::named("a"),
+                status.config_reload_status().config.as_ref(),
+            )
+            .unwrap();
+        assert_eq!(settings.page_tti_hours, Some(1));
+        replace("empty");
+        reload_once(&file, &mut dynamic, &root, &status).await;
+        assert_eq!(a.current_tti_ms(), 0);
+        assert_eq!(
+            a.current_paged_miss_run_concurrency(),
+            config().paged_miss_run_concurrency
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(crate::serve_admin(listener, status.clone()));
+        for path in ["/api/v1/config", "/api/v1/namespaces/a/config"] {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            stream
+                .write_all(
+                    format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                        .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await.unwrap();
+            assert!(response.starts_with("HTTP/1.1 200 OK"));
+            let json: serde_json::Value =
+                serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+            assert_eq!(
+                json["applied_hash"],
+                status.config_reload_status().applied_hash.unwrap()
+            );
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn namespace_dynamic_tuning_isolates_existing_scopes_and_future_runtimes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = config();
+        cfg.background_io_max_mb_per_sec = 0;
+        cfg.background_delete_max_per_sec = 0;
+        cfg.rate_limits = serde_json::from_value(
+            serde_json::json!({"enabled":true,"default":{"read_iops":{"rate":1}}}),
+        )
+        .unwrap();
+        let root = open(dir.path(), &cfg, Arc::default());
+        let a = root.for_namespace(&NamespaceId::named("a")).await.unwrap();
+        let b = root.for_namespace(&NamespaceId::named("b")).await.unwrap();
+        assert!(root
+            .rate_limiter()
+            .admit(&NamespaceId::named("b"), 1)
+            .is_ok());
+        assert!(root
+            .rate_limiter()
+            .admit(&NamespaceId::named("b"), 1)
+            .is_err());
+        let mut dynamic = crate::dynamic_config::DynamicConfig::default();
+        let text = r#"paged_miss_run_concurrency = 2
+background_scan_batch_size = 7
+background_delete_batch_size = 3
+background_io_max_mb_per_sec = 4
+background_delete_max_per_sec = 5
+[namespaces.a]
+page_tti_hours = 1
+rate_limits = { read_iops = { rate = 2 } }
+[namespaces.late]
+page_tti_hours = 2
+"#;
+        assert!(dynamic.apply_runtime(text, &root));
+        assert_eq!(a.current_tti_ms(), 3_600_000);
+        assert_eq!(a.current_paged_miss_run_concurrency(), 2);
+        assert_eq!(a.maintenance_batch_limits(), (7, 3));
+        assert_eq!(b.current_tti_ms(), 0);
+        assert_eq!(b.current_paged_miss_run_concurrency(), 2);
+        assert_eq!(b.maintenance_batch_limits(), (7, 3));
+        assert!(
+            root.rate_limiter()
+                .admit(&NamespaceId::named("b"), 1)
+                .is_err(),
+            "updating a must preserve b's consumed credits"
+        );
+        assert!(root
+            .rate_limiter()
+            .admit(&NamespaceId::named("a"), 1)
+            .is_ok());
+        assert!(root
+            .rate_limiter()
+            .admit(&NamespaceId::named("a"), 1)
+            .is_ok());
+        assert!(root
+            .rate_limiter()
+            .admit(&NamespaceId::named("a"), 1)
+            .is_err());
+        let late = root
+            .for_namespace(&NamespaceId::named("late"))
+            .await
+            .unwrap();
+        assert_eq!(late.current_tti_ms(), 7_200_000);
+        assert_eq!(late.current_paged_miss_run_concurrency(), 2);
+        let scoped = root
+            .registry()
+            .unwrap()
+            .resolve(
+                &NamespaceId::named("a"),
+                Some(scope('c')),
+                Arc::new(Origin::default()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(scoped.current_tti_ms(), 3_600_000);
+        assert!(Arc::ptr_eq(
+            a.background_budget.as_ref().unwrap(),
+            scoped.background_budget.as_ref().unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            a.background_budget.as_ref().unwrap(),
+            b.background_budget.as_ref().unwrap()
+        ));
+        a.page_clock.set(10000);
+        b.page_clock.set(10000);
+        read(&a).await;
+        read(&b).await;
+        a.page_clock.set(3_610_001);
+        b.page_clock.set(3_610_001);
+        assert!(a.gc_once().await.reclaimed > 0);
+        assert_eq!(b.gc_once().await.reclaimed, 0);
+    }
+
     fn request() -> RangeRequest {
         RangeRequest {
             object: ObjectId::new(Backend::S3, "bucket", "object"),
@@ -1707,6 +2045,7 @@ mod tests {
             assert_eq!(a.serve_cached(&cached).await.unwrap().to_vec(), [42; 4]);
             assert_eq!(a.namespace(), &namespace);
             assert_eq!(b.namespace(), &namespace);
+            assert!(Arc::ptr_eq(&a.dynamic_settings, &b.dynamic_settings));
             assert!(Arc::ptr_eq(&a.rate_limiter, &b.rate_limiter));
             assert!(Arc::ptr_eq(&a.load_slots, &b.load_slots));
             assert!(Arc::ptr_eq(&a.load_bytes, &b.load_bytes));

@@ -43,23 +43,31 @@ impl WorkerRuntime {
                 "page GC duration overflows clock"
             );
         }
-        if config.tti_ms > 0 {
+        let effective_tti = self
+            .dynamic_settings
+            .load()
+            .as_ref()
+            .and_then(|c| {
+                c.settings_for(self.namespace.effective_name())
+                    .page_tti_hours
+            })
+            .map(|hours| hours * 3_600_000)
+            .unwrap_or(config.tti_ms);
+        if effective_tti > 0 {
             anyhow::ensure!(
                 self.paged.is_some() || self.small.as_ref().is_some(),
                 "TTI requires paged L2 or small-object storage"
             );
             anyhow::ensure!(
-                config.checkpoint_interval_ms <= config.tti_ms,
+                config.checkpoint_interval_ms <= effective_tti,
                 "checkpoint interval exceeds TTI"
             );
         }
-        if config.tti_ms > 0 {
-            if let Some(small) = self.small.as_ref() {
-                small.enable_access_tracking()?;
-            }
+        self.page_lifecycle.enable_access_tracking();
+        if let Some(small) = self.small.as_ref() {
+            small.enable_access_tracking()?;
         }
-        if let Some(paged) = self.paged.as_ref().filter(|_| config.tti_ms > 0) {
-            self.page_lifecycle.enable_access_tracking();
+        if let Some(paged) = self.paged.as_ref() {
             self.index.restore_page_states(&self.page_lifecycle);
             let now = self.page_clock.now();
             // Load each shard once; keep only one shard's recovered metadata in memory.
@@ -124,7 +132,7 @@ impl WorkerRuntime {
         }
         self.page_gc_metrics
             .tti_seconds
-            .set(config.tti_ms as f64 / 1000.0);
+            .set(effective_tti as f64 / 1000.0);
         self.page_gc_metrics
             .checkpoint_interval
             .set(config.checkpoint_interval_ms as f64 / 1000.0);
@@ -233,7 +241,8 @@ impl WorkerRuntime {
     async fn gc_batch(&self, cursor: &mut ScanCursor) -> GcReport {
         let started = Instant::now();
         let lifecycle = self.page_lifecycle.clone();
-        let tti = (self.page_gc_config.tti_ms > 0).then_some(self.page_gc_config.tti_ms);
+        let age = self.current_tti_ms();
+        let tti = (age > 0).then_some(age);
         let now = self.page_clock.now();
         let mut scan = std::mem::take(cursor);
         let (scan, candidates, stats) = tokio::task::spawn_blocking(move || {
@@ -303,7 +312,9 @@ impl WorkerRuntime {
             let block = &candidate.block;
             let _gate = block.gate.lock().await;
             if reason == 1 && (runtime.capacity_bytes == 0 || runtime.resident_bytes() <= target) { return None; }
-            let tti = (reason == 0).then_some(runtime.page_gc_config.tti_ms);
+            let age = runtime.current_tti_ms();
+            if reason == 0 && age == 0 { return None; }
+            let tti = (reason == 0).then_some(age);
             if !block.claim(&candidate, runtime.page_clock.now(), tti) {return None;}
             let paged = runtime.paged.as_ref()?;
             let page = candidate.page;
@@ -378,7 +389,7 @@ impl WorkerRuntime {
         candidate: crate::eviction::StaleBlockCandidate,
         membership: Option<Arc<super::MembershipSnapshot>>,
     ) {
-        self.unlink_stale_block_inner(candidate, membership, false)
+        self.unlink_stale_block_inner(candidate, membership, false, None)
             .await;
     }
 
@@ -386,7 +397,17 @@ impl WorkerRuntime {
         &self,
         candidate: crate::eviction::StaleBlockCandidate,
     ) {
-        self.unlink_stale_block_inner(candidate, None, true).await;
+        self.unlink_stale_block_inner(candidate, None, true, None)
+            .await;
+    }
+
+    pub(super) async fn unlink_idle_block(
+        &self,
+        candidate: crate::eviction::StaleBlockCandidate,
+        now: u64,
+    ) {
+        self.unlink_stale_block_inner(candidate, None, false, Some(now))
+            .await;
     }
 
     async fn unlink_stale_block_inner(
@@ -394,6 +415,7 @@ impl WorkerRuntime {
         candidate: crate::eviction::StaleBlockCandidate,
         membership: Option<Arc<super::MembershipSnapshot>>,
         prepaid: bool,
+        idle_at: Option<u64>,
     ) {
         let runtime = self.clone();
         self.page_mutations.run(async move {
@@ -410,6 +432,7 @@ impl WorkerRuntime {
             let state = runtime.page_lifecycle.block(&candidate.block);
             {
                 let Some(_gate) = before_deadline(ownership_deadline, state.gate.lock()).await else { return; };
+                if idle_at.is_some_and(|now| !candidate.is_idle(now.max(crate::eviction::access_millis()), runtime.current_tti_ms())) { return; }
                 if !runtime.lru.stale_candidate_is_current(&candidate) { return; }
                 let Some(claim) = state.claim_all_pages() else { return; };
                 // A reader may have completed while the pages were being closed.
@@ -571,7 +594,7 @@ impl WorkerRuntime {
     }
 
     async fn checkpoint_shards(&self, all: bool) -> CheckpointReport {
-        if self.page_gc_config.tti_ms == 0 || self.paged.is_none() {
+        if self.paged.is_none() {
             return CheckpointReport::default();
         }
         let Ok(mut cursor) = self.page_checkpoint.clone().try_lock_owned() else {

@@ -92,3 +92,18 @@ the lookup and needs no Node RBAC. See the [Pod configuration](../../kubernetes/
 reads stay local and fail when no usable local owner exists. See the
 [zone-affinity runbook](../../../docs/operations/zone-affinity.md) before
 enabling zone discovery on existing persistent members.
+
+## Worker configuration
+
+`worker.dynamicConfig.config` supplies ordinary startup and hot settings. The chart
+adds coordinator/listener/cache defaults from the existing Helm values and renders
+the merged document into a mutable ConfigMap, mounted as
+`/etc/talon/config/worker.toml` by default. Update namespace overrides through
+Helm values or use `worker.dynamicConfig.existingConfigMap` for an external
+ConfigMap with a `worker.toml` key. Hot fields apply without restart; other changes appear in `pending_restart_fields`.
+File-only changes do not roll the Worker Pods.
+Set `worker.dynamicConfig.enabled=false` to disable the mount and reload task.
+Workers poll every five seconds after kubelet projects the update. Check each
+Worker's `GET /api/v1/config` for the applied SHA-256 and any error. See
+[Worker dynamic configuration](../../../docs/reference/worker-dynamic-config.md)
+for startup fields, the hot whitelist, namespace semantics and restart status.

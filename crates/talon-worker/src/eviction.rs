@@ -309,6 +309,12 @@ pub(crate) struct StaleBlockCandidate {
     last_access: u64,
 }
 
+impl StaleBlockCandidate {
+    pub(crate) fn is_idle(&self, now: u64, age: u64) -> bool {
+        age > 0 && now.saturating_sub(self.last_access) > age
+    }
+}
+
 pub(crate) struct BlockPolicy {
     pins: usize,
     position: u64,

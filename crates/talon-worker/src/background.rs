@@ -275,23 +275,31 @@ impl Drop for BackgroundHandle {
 /// A shared, paced reservation clock. Charges precede work; idle time does not
 /// accumulate burst credit. Cancellation may waste credit but cannot exceed the rate.
 pub(crate) struct Rate {
-    per_second: u64,
+    per_second: std::sync::atomic::AtomicU64,
     next: Mutex<std::time::Instant>,
 }
 impl Rate {
     pub(crate) fn new(per_second: u64) -> Self {
         Self {
-            per_second,
+            per_second: std::sync::atomic::AtomicU64::new(per_second),
             next: Mutex::new(std::time::Instant::now()),
         }
     }
+    fn per_second(&self) -> u64 {
+        self.per_second.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    fn set_rate(&self, rate: u64) {
+        self.per_second
+            .store(rate, std::sync::atomic::Ordering::Relaxed);
+    }
     fn reserve(&self, units: u64) -> Option<std::time::Instant> {
-        if self.per_second == 0 || units == 0 {
+        let per_second = self.per_second();
+        if per_second == 0 || units == 0 {
             return None;
         }
         let mut next = self.next.lock().unwrap();
         *next = (*next).max(std::time::Instant::now())
-            + Duration::from_secs_f64(units as f64 / self.per_second as f64);
+            + Duration::from_secs_f64(units as f64 / per_second as f64);
         Some(*next)
     }
     pub(crate) async fn charge(&self, units: u64) {
@@ -309,6 +317,8 @@ impl Rate {
 /// Keep the I/O permit inside owned mutations through disk and metadata completion.
 pub(crate) struct BackgroundBudget {
     io: Arc<Semaphore>,
+    startup_byte_rate: u64,
+    startup_delete_rate: u64,
     bytes: Rate,
     deletes: Rate,
     #[cfg(test)]
@@ -320,6 +330,8 @@ impl BackgroundBudget {
     pub fn new(config: &WorkerConfig) -> Arc<Self> {
         Arc::new(Self {
             io: Arc::new(Semaphore::new(config.background_io_concurrency)),
+            startup_byte_rate: config.background_io_max_mb_per_sec * 1_000_000,
+            startup_delete_rate: config.background_delete_max_per_sec,
             bytes: Rate::new(config.background_io_max_mb_per_sec * 1_000_000),
             deletes: Rate::new(config.background_delete_max_per_sec),
             #[cfg(test)]
@@ -327,6 +339,19 @@ impl BackgroundBudget {
             #[cfg(test)]
             charged_deletes: Default::default(),
         })
+    }
+    pub(crate) fn update(&self, config: &talon_core::dynamic_config::WorkerDynamicConfig) {
+        self.bytes.set_rate(
+            config
+                .background_io_max_mb_per_sec
+                .map(|rate| rate * 1_000_000)
+                .unwrap_or(self.startup_byte_rate),
+        );
+        self.deletes.set_rate(
+            config
+                .background_delete_max_per_sec
+                .unwrap_or(self.startup_delete_rate),
+        );
     }
     #[cfg(test)]
     pub fn available_io(&self) -> usize {
@@ -362,10 +387,10 @@ impl BackgroundBudget {
         // Never reserve an entire large block ahead of every other task. Bound
         // each reservation to about 10 ms (one item at very low rates), then
         // rejoin the shared clock so small deletions can make progress.
-        if self.deletes.per_second == 0 {
+        if self.deletes.per_second() == 0 {
             return;
         }
-        let quantum = (self.deletes.per_second / 100).max(1);
+        let quantum = (self.deletes.per_second() / 100).max(1);
         let mut remaining = units;
         while remaining > 0 {
             let batch = remaining.min(quantum);
@@ -377,10 +402,10 @@ impl BackgroundBudget {
     /// Callers retain paid credits across scheduler slices, never while holding
     /// a directory or block mutation lock.
     pub(crate) async fn delete_slice(&self, remaining: u64) -> u64 {
-        let units = if self.deletes.per_second == 0 {
+        let units = if self.deletes.per_second() == 0 {
             remaining
         } else {
-            remaining.min((self.deletes.per_second / 10).max(1))
+            remaining.min((self.deletes.per_second() / 10).max(1))
         };
         self.delete_units(units).await;
         units
@@ -614,6 +639,37 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn dynamic_budget_rates_keep_existing_disk_semaphore() {
+        let budget = BackgroundBudget::new(&WorkerConfig {
+            background_io_concurrency: 3,
+            background_io_max_mb_per_sec: 2,
+            background_delete_max_per_sec: 7,
+            ..Default::default()
+        });
+        let io = budget.io.clone();
+        let config = talon_core::dynamic_config::WorkerDynamicConfig::parse(
+            r#""rate_limits" = { "enabled" = false }
+"background_io_max_mb_per_sec" = 4
+"background_delete_max_per_sec" = 0
+"#,
+        )
+        .unwrap();
+        budget.update(&config);
+        assert_eq!(budget.bytes.per_second(), 4_000_000);
+        assert!(budget.deletes.reserve(1).is_none());
+        assert!(Arc::ptr_eq(&io, &budget.io));
+        assert_eq!(budget.available_io(), 3);
+        let initial = talon_core::dynamic_config::WorkerDynamicConfig::parse(
+            r#""rate_limits" = { "enabled" = false }
+"#,
+        )
+        .unwrap();
+        budget.update(&initial);
+        assert_eq!(budget.bytes.per_second(), 2_000_000);
+        assert_eq!(budget.deletes.per_second(), 7);
     }
 
     #[tokio::test]
