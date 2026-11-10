@@ -10,6 +10,8 @@ pub struct WorkerDynamicConfig {
     pub rate_limits: Option<RateLimitPolicy>,
     #[serde(default)]
     pub namespaces: std::collections::BTreeMap<String, NamespaceDynamicConfig>,
+    #[serde(default)]
+    pub namespace_rules: Vec<crate::namespace_rules::NamespaceRule>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub page_tti_hours: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -29,6 +31,14 @@ pub struct WorkerDynamicConfig {
 }
 impl WorkerDynamicConfig {
     pub fn validate(&self) -> Result<(), String> {
+        crate::namespace_rules::validate(&self.namespace_rules).map_err(|e| e.to_string())?;
+        for rule in &self.namespace_rules {
+            NamespaceDynamicConfig {
+                page_tti_hours: rule.config.page_tti_hours,
+                rate_limits: rule.config.rate_limits,
+            }
+            .validate()?;
+        }
         if let Some(hours) = self.page_tti_hours {
             let millis = hours
                 .checked_mul(3_600_000)
@@ -97,6 +107,7 @@ impl WorkerDynamicConfig {
     pub fn from_patch(patch: &crate::WorkerConfigPatch) -> Self {
         Self {
             rate_limits: patch.rate_limits.clone(),
+            namespace_rules: patch.namespace_rules.clone().unwrap_or_default(),
             namespaces: patch
                 .namespaces
                 .as_ref()
@@ -129,6 +140,7 @@ impl WorkerDynamicConfig {
     pub fn from_config(config: &crate::WorkerConfig) -> Self {
         Self {
             rate_limits: Some(config.rate_limits.clone()),
+            namespace_rules: config.namespace_rules.clone(),
             namespaces: Default::default(),
             page_tti_hours: Some(config.page_tti_hours),
             paged_miss_run_concurrency: Some(config.paged_miss_run_concurrency),
@@ -170,15 +182,26 @@ impl WorkerDynamicConfig {
         let own = self.namespaces.get(namespace).cloned().unwrap_or_default();
         NamespaceDynamicConfig {
             rate_limits: own.rate_limits,
-            page_tti_hours: own.page_tti_hours.or(self.page_tti_hours),
+            page_tti_hours: own
+                .page_tti_hours
+                .or_else(|| {
+                    crate::namespace_rules::resolve(&self.namespace_rules, None, namespace)
+                        .page_tti_hours
+                })
+                .or(self.page_tti_hours),
         }
     }
     pub fn effective_rate_limits(&self, startup: &RateLimitPolicy) -> RateLimitPolicy {
         let mut policy = self.rate_limits.as_ref().unwrap_or(startup).clone();
+        policy.namespace_rules = self.namespace_rules.clone();
         if self
-            .namespaces
-            .values()
-            .any(|config| config.rate_limits.is_some())
+            .namespace_rules
+            .iter()
+            .any(|r| r.config.rate_limits.is_some())
+            || self
+                .namespaces
+                .values()
+                .any(|config| config.rate_limits.is_some())
         {
             if !policy.enabled {
                 policy.default = Default::default();
@@ -241,12 +264,18 @@ impl WorkerConfigDocument {
             return Err("credentials must be supplied through Secrets".into());
         }
         if patch.namespaces.as_ref().is_some_and(|namespaces| {
-            namespaces
-                .values()
-                .any(|own| own.paged_miss_run_concurrency.is_some())
+            namespaces.values().any(|own| {
+                own.l2_page_size_bytes.is_some()
+                    || own.l1_page_size_bytes.is_some()
+                    || own.page_access_checkpoint_interval_minutes.is_some()
+                    || own.page_gc_interval_minutes.is_some()
+                    || own.paged_miss_run_concurrency.is_some()
+            })
         }) {
-            return Err("paged_miss_run_concurrency is Worker-global".into());
+            return Err("namespace settings only support page_tti_hours and rate_limits".into());
         }
+        crate::namespace_rules::validate(patch.namespace_rules.as_deref().unwrap_or_default())
+            .map_err(|e| e.to_string())?;
         let tuning = WorkerDynamicConfig::from_patch(&patch);
         tuning.validate()?;
         Ok(Self { patch, tuning })
@@ -307,6 +336,31 @@ rate_limits = { read_iops = { rate = 10 } }
         );
         assert!(WorkerConfigDocument::parse(r#"{"listen":"127.0.0.1:9001"}"#).is_err());
         assert!(WorkerConfigDocument::parse("").is_ok());
+    }
+
+    #[test]
+    fn namespaces_and_rules_reject_worker_global_fields() {
+        for field in [
+            "l2_page_size_bytes",
+            "l1_page_size_bytes",
+            "page_access_checkpoint_interval_minutes",
+            "page_gc_interval_minutes",
+            "paged_miss_run_concurrency",
+            "background_scan_batch_size",
+            "background_delete_batch_size",
+            "background_io_max_mb_per_sec",
+            "background_delete_max_per_sec",
+        ] {
+            let exact = format!("[namespaces.a]\n{field} = 4096");
+            let rule =
+                format!("[[namespace_rules]]\npattern = 'prod-*'\nconfig = {{ {field} = 4096 }}");
+            assert!(WorkerConfigDocument::parse(&exact).is_err(), "{field}");
+            assert!(WorkerConfigDocument::parse(&rule).is_err(), "{field}");
+            assert!(
+                WorkerConfigDocument::parse(&format!("{field} = 4096")).is_ok(),
+                "{field}"
+            );
+        }
     }
 
     #[test]

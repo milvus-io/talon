@@ -79,6 +79,7 @@ impl DynamicConfig {
                 for field in talon_core::dynamic_config::HOT_FIELDS {
                     effective[*field] = desired_view[*field].clone();
                 }
+                effective["namespace_rules"] = desired_view["namespace_rules"].clone();
                 // Keep the actual namespace storage layout until restart.
                 let mut namespace_names = std::collections::BTreeSet::new();
                 namespace_names.extend(startup.namespaces.keys().cloned());

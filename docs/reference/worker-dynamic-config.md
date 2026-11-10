@@ -67,8 +67,8 @@ are required; restoring a previous file is a valid rollback.
 | `rate_limits` | Namespace `read_iops`/`read_throughput`; `{}` means unlimited, omitted inherits |
 
 Only `page_tti_hours` and `rate_limits` may be hot-updated per namespace.
-Existing namespace storage geometry and checkpoint/GC intervals may also be
-specified in this document but require restart. Concurrency,
+Namespace entries reject storage geometry and checkpoint/GC interval overrides;
+configure those fields at the document root. Concurrency,
 background batch sizes and rate caps, and eviction watermarks are Worker-global
 settings supplied at the document root; namespace entries reject these fields.
 Root `rate_limits` uses the existing policy shape with `enabled`, `default` and
@@ -143,3 +143,39 @@ network policy and have no configuration mutation API.
 
 The namespace view reports effective TTI and read rate limits. Worker-global
 settings are visible in the applied document returned by `/api/v1/config`.
+
+## Namespace wildcard rules
+
+Use ordered rules to apply configuration to existing and future cache namespaces:
+
+```toml
+[[namespace_rules]]
+pattern = "prod-*"
+config = { page_tti_hours = 24, rate_limits = { read_iops = { rate = 2000 } } }
+
+[[namespace_rules]]
+pattern = "prod-batch-?"
+config = { page_tti_hours = 48 }
+
+[namespaces.prod-batch-a]
+page_tti_hours = 0
+```
+
+Matching is case-sensitive and covers the entire namespace name. `*` matches zero
+or more characters; `?` matches exactly one. Brackets, escapes, and regular
+expressions are unsupported. Patterns are limited to 255 bytes and 256 rules.
+Rules never create namespaces or grant access to source objects.
+
+Worker defaults apply first, matching rules apply in document order, and exact
+`namespaces.NAME` entries apply last. Later entries override only fields they
+specify. `rate_limits` replaces the entire pair of read limits; `{}` explicitly
+removes both limits. Root `rate_limits.overrides` also takes precedence over rule
+limits. Limits apply independently per namespace, rather than sharing one bucket
+across every name matching a pattern. Beyond the existing 4096 namespace cell
+limit, overflow traffic shares bounded buckets by matching rule limits.
+
+Rule `config` accepts only `page_tti_hours` and `rate_limits`, both updated live.
+Other fields, including storage geometry, checkpoint/GC intervals and concurrency,
+are rejected in rules and named namespace entries in the shared document.
+These remain Worker-global settings. Invalid snapshots retain the last good
+configuration. Removing a rule restores inherited values.

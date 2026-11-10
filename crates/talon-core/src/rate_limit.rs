@@ -151,6 +151,8 @@ pub struct RateLimitPolicy {
     pub default: MetricLimits,
     /// Per-namespace overrides, keyed by [`NamespaceId`] name.
     pub overrides: HashMap<String, MetricLimits>,
+    #[serde(skip)]
+    pub namespace_rules: Vec<crate::namespace_rules::NamespaceRule>,
 }
 
 impl RateLimitPolicy {
@@ -160,7 +162,15 @@ impl RateLimitPolicy {
         self.overrides
             .get(namespace.effective_name())
             .copied()
-            .unwrap_or(self.default)
+            .unwrap_or_else(|| {
+                crate::namespace_rules::resolve(
+                    &self.namespace_rules,
+                    None,
+                    namespace.effective_name(),
+                )
+                .rate_limits
+                .unwrap_or(self.default)
+            })
     }
 
     /// Validate every limit in the policy.
