@@ -246,6 +246,7 @@ impl Args {
             // The [rate_limits] table is file-only; the CLI leaves it unset.
             rate_limits: None,
             namespaces: None,
+            namespace_rules: None,
         }
     }
 }

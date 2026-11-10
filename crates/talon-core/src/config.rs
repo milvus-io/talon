@@ -457,6 +457,7 @@ pub struct WorkerConfig {
     pub rate_limits: RateLimitPolicy,
     /// Optional named cache policies; unknown namespaces inherit worker defaults.
     pub namespaces: std::collections::BTreeMap<String, NamespaceCacheConfig>,
+    pub namespace_rules: Vec<crate::namespace_rules::NamespaceRule>,
 }
 
 /// Per-namespace cache overrides. Omitted fields inherit the worker defaults.
@@ -546,7 +547,13 @@ impl WorkerConfig {
             .map_err(|e| Error::Other(e.to_string()))?;
         let mut result = self.clone();
         result.namespaces.clear();
-        if let Some(overrides) = self.namespaces.get(namespace.effective_name()) {
+        result.namespace_rules.clear();
+        let overrides = crate::namespace_rules::resolve(
+            &self.namespace_rules,
+            self.namespaces.get(namespace.effective_name()),
+            namespace.effective_name(),
+        );
+        {
             if let Some(value) = overrides.l2_page_size_bytes {
                 result.l2_page_size_bytes = value;
             }
@@ -686,6 +693,7 @@ impl Default for WorkerConfig {
             data_plane_connections_per_thread: 8192,
             rate_limits: RateLimitPolicy::default(),
             namespaces: Default::default(),
+            namespace_rules: Default::default(),
         }
     }
 }
@@ -844,6 +852,7 @@ pub struct WorkerConfigPatch {
     /// Optional `[rate_limits]` table: the per-namespace rate-limit policy.
     pub rate_limits: Option<RateLimitPolicy>,
     pub namespaces: Option<std::collections::BTreeMap<String, NamespaceCacheConfig>>,
+    pub namespace_rules: Option<Vec<crate::namespace_rules::NamespaceRule>>,
 }
 
 impl Patch for WorkerConfigPatch {
@@ -980,6 +989,7 @@ impl Patch for WorkerConfigPatch {
                 .or(base.data_plane_connections_per_thread),
             rate_limits: self.rate_limits.or(base.rate_limits),
             namespaces: self.namespaces.or(base.namespaces),
+            namespace_rules: self.namespace_rules.or(base.namespace_rules),
         }
     }
 }
@@ -1732,6 +1742,7 @@ impl WorkerConfigPatch {
             // The [rate_limits] table is file-only; env does not override it.
             rate_limits: None,
             namespaces: None,
+            namespace_rules: None,
         })
     }
 }
@@ -1908,8 +1919,15 @@ impl WorkerConfig {
                 .unwrap_or(d.data_plane_connections_per_thread),
             rate_limits: merged.rate_limits.unwrap_or(d.rate_limits),
             namespaces: merged.namespaces.unwrap_or(d.namespaces),
+            namespace_rules: merged.namespace_rules.unwrap_or(d.namespace_rules),
         };
-        if cfg.namespaces.values().any(|own| own.rate_limits.is_some()) {
+        cfg.rate_limits.namespace_rules = cfg.namespace_rules.clone();
+        if cfg.namespaces.values().any(|own| own.rate_limits.is_some())
+            || cfg
+                .namespace_rules
+                .iter()
+                .any(|r| r.config.rate_limits.is_some())
+        {
             if !cfg.rate_limits.enabled {
                 cfg.rate_limits.default = Default::default();
                 cfg.rate_limits.overrides.clear();
@@ -1966,6 +1984,26 @@ impl WorkerConfig {
         }
         if self.cluster_id.is_empty() {
             return Err(Error::Other("cluster_id must not be empty".into()));
+        }
+        crate::namespace_rules::validate(&self.namespace_rules)?;
+        for rule in &self.namespace_rules {
+            if let Some(limits) = rule.config.rate_limits {
+                limits
+                    .validate()
+                    .map_err(|e| Error::Other(format!("invalid namespace rule limits: {e}")))?;
+            }
+            let mut probe = self.clone();
+            probe.namespace_rules.clear();
+            probe.namespaces.clear();
+            probe.namespaces.insert(
+                "rule-validation".into(),
+                NamespaceCacheConfig {
+                    page_tti_hours: rule.config.page_tti_hours,
+                    rate_limits: rule.config.rate_limits,
+                    ..Default::default()
+                },
+            );
+            probe.for_namespace(&crate::NamespaceId::named("rule-validation"))?;
         }
         for name in self.namespaces.keys() {
             self.for_namespace(&crate::NamespaceId::named(name))?;

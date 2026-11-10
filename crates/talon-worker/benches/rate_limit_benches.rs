@@ -39,6 +39,7 @@ fn always_admits(iops: bool, throughput: bool) -> NamespaceRateLimiter {
             read_throughput: throughput.then_some(limit),
         },
         overrides: HashMap::new(),
+        namespace_rules: Vec::new(),
     })
 }
 

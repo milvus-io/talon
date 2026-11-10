@@ -84,10 +84,22 @@ impl NamespaceRuntimes {
         if let Some(hours) = config.page_tti_hours {
             validate(&self.config, hours)?;
         }
+        for rule in &config.namespace_rules {
+            if let Some(hours) = rule.config.page_tti_hours {
+                validate(&self.config, hours)?;
+            }
+        }
+        let mut known = std::collections::BTreeSet::new();
+        known.extend(
+            self.snapshot()
+                .iter()
+                .map(|worker| worker.namespace.effective_name().to_string()),
+        );
         for name in config
             .namespaces
             .keys()
             .chain(self.config.namespaces.keys())
+            .chain(known.iter())
         {
             if let Some(hours) = config.settings_for(name).page_tti_hours {
                 let static_config = self
@@ -1294,6 +1306,60 @@ mod tests {
             );
         }
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn namespace_rules_reload_existing_and_future_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config();
+        let root = open(dir.path(), &cfg, Arc::default());
+        let existing = root
+            .for_namespace(&NamespaceId::named("prod-a"))
+            .await
+            .unwrap();
+        let other = root
+            .for_namespace(&NamespaceId::named("dev-a"))
+            .await
+            .unwrap();
+        let mut state =
+            crate::dynamic_config::DynamicConfig::new(cfg, Default::default(), Default::default());
+        let text = r#"
+[[namespace_rules]]
+pattern = "prod-*"
+config = { page_tti_hours = 1, rate_limits = { read_iops = { rate = 1 } } }
+"#;
+        assert!(state.apply_runtime(text, &root));
+        assert!(!state
+            .status()
+            .pending_restart_fields
+            .contains(&"namespace_rules".to_string()));
+        assert_eq!(existing.current_tti_ms(), 3_600_000);
+        assert_eq!(other.current_tti_ms(), 0);
+        let future = root
+            .for_namespace(&NamespaceId::named("prod-future"))
+            .await
+            .unwrap();
+        assert_eq!(future.current_tti_ms(), 3_600_000);
+        let limiter = root.rate_limiter();
+        assert!(limiter.admit(&NamespaceId::named("prod-future"), 1).is_ok());
+        assert!(limiter
+            .admit(&NamespaceId::named("prod-future"), 1)
+            .is_err());
+        assert!(!state.apply_runtime(
+            "[[namespace_rules]]\npattern = 'bad/path'\nconfig = {}",
+            &root
+        ));
+        assert_eq!(existing.current_tti_ms(), 3_600_000);
+        let cold = text.replace(
+            "page_tti_hours = 1,",
+            "page_gc_interval_minutes = 7, page_tti_hours = 1,",
+        );
+        assert!(!state.apply_runtime(&cold, &root));
+        assert_eq!(existing.current_tti_ms(), 3_600_000);
+        assert!(state.apply_runtime("", &root));
+        assert_eq!(existing.current_tti_ms(), 0);
+        assert_eq!(future.current_tti_ms(), 0);
+        assert!(limiter.admit(&NamespaceId::named("prod-future"), 1).is_ok());
     }
 
     #[tokio::test]

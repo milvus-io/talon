@@ -12,6 +12,7 @@ pub mod key;
 pub mod metrics;
 pub mod namespace;
 pub mod namespace_policy;
+pub mod namespace_rules;
 pub mod node;
 pub mod placement;
 pub mod rate_limit;

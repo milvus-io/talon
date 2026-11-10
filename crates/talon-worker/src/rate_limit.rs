@@ -94,6 +94,7 @@ pub struct NamespaceRateLimiter {
     overflow: Option<std::sync::Arc<NamespaceCells>>,
     /// Ceiling on the number of distinct namespace cells (see [`MAX_NAMESPACE_CELLS`]).
     max_cells: usize,
+    rule_overflow: Vec<(MetricLimits, std::sync::Arc<NamespaceCells>)>,
 }
 
 impl NamespaceRateLimiter {
@@ -120,7 +121,20 @@ impl NamespaceRateLimiter {
         }
         let overflow = (!policy.default.is_empty())
             .then(|| std::sync::Arc::new(NamespaceCells::from_limits(&policy.default)));
+        let rule_overflow = policy
+            .namespace_rules
+            .iter()
+            .filter_map(|r| r.config.rate_limits)
+            .filter(|limits| !limits.is_empty())
+            .map(|limits| {
+                (
+                    limits,
+                    std::sync::Arc::new(NamespaceCells::from_limits(&limits)),
+                )
+            })
+            .collect();
         Self {
+            rule_overflow,
             replacement: arc_swap::ArcSwapOption::empty(),
             policy,
             origin: Instant::now(),
@@ -147,6 +161,12 @@ impl NamespaceRateLimiter {
                 }
             }
             drop(cells);
+            for (limits, state) in &mut next.rule_overflow {
+                if let Some((_, old)) = current.rule_overflow.iter().find(|(old, _)| old == limits)
+                {
+                    *state = old.clone();
+                }
+            }
             if current.policy.default == next.policy.default {
                 next.overflow = current.overflow.clone();
             }
@@ -229,6 +249,9 @@ impl NamespaceRateLimiter {
                 .charge(read_bytes, now_nanos);
         }
         drop(map);
+        if let Some((_, cells)) = self.rule_overflow.iter().find(|(own, _)| *own == limits) {
+            return cells.charge(read_bytes, now_nanos);
+        }
         match &self.overflow {
             Some(overflow) => overflow.charge(read_bytes, now_nanos),
             None => Ok(()),
@@ -261,7 +284,45 @@ mod tests {
                 read_throughput: None,
             },
             overrides: HashMap::new(),
+            namespace_rules: Vec::new(),
         }
+    }
+
+    #[test]
+    fn wildcard_limits_preserve_credits_and_bound_overflow() {
+        let mut policy = RateLimitPolicy {
+            enabled: true,
+            ..Default::default()
+        };
+        policy
+            .namespace_rules
+            .push(talon_core::namespace_rules::NamespaceRule {
+                pattern: "prod-*".into(),
+                config: talon_core::dynamic_config::NamespaceDynamicConfig {
+                    rate_limits: Some(MetricLimits {
+                        read_iops: Some(RateLimit::new(1, 1.0).unwrap()),
+                        read_throughput: None,
+                    }),
+                    ..Default::default()
+                },
+            });
+        let limiter = NamespaceRateLimiter::with_max_cells(policy.clone(), 1);
+        assert!(limiter
+            .admit_at(&NamespaceId::named("prod-a"), 1, 0)
+            .is_ok());
+        assert!(limiter
+            .admit_at(&NamespaceId::named("prod-b"), 1, 0)
+            .is_ok());
+        assert!(limiter
+            .admit_at(&NamespaceId::named("prod-c"), 1, 0)
+            .is_err());
+        assert_eq!(limiter.cell_count(), 1);
+        limiter.update(policy.clone()).unwrap();
+        assert!(limiter.admit(&NamespaceId::named("prod-a"), 1).is_err());
+        assert!(limiter.admit(&NamespaceId::named("prod-c"), 1).is_err());
+        policy.namespace_rules.clear();
+        limiter.update(policy).unwrap();
+        assert!(limiter.admit(&NamespaceId::named("prod-a"), 1).is_ok());
     }
 
     #[test]
@@ -336,6 +397,7 @@ mod tests {
                 read_throughput: Some(RateLimit::new(1_000_000, 1.0).unwrap()),
             },
             overrides: HashMap::new(),
+            namespace_rules: Vec::new(),
         };
         let limiter = NamespaceRateLimiter::new(policy);
         let namespace = NamespaceId::named("a");
@@ -512,6 +574,7 @@ mod tests {
             enabled: true,
             default: MetricLimits::default(),
             overrides: HashMap::new(),
+            namespace_rules: Vec::new(),
         });
         for i in 0..1000 {
             assert!(limiter
