@@ -1,0 +1,17 @@
+{{- if and .Values.worker.enabled .Values.worker.dynamicConfig.enabled (not .Values.worker.dynamicConfig.existingConfigMap) }}
+{{- if not (kindIs "map" .Values.worker.dynamicConfig.config) }}
+{{- fail "worker.dynamicConfig.config must be an object" }}
+{{- end }}
+{{- $defaults := dict "coordinator" (printf "%s-coordinator:7000" .Release.Name) "listen" "0.0.0.0:7001" "admin_listen" "0.0.0.0:8001" "cluster_id" .Values.coordinator.clusterId "cache_dirs" (list "/var/cache/talon") "block_size" .Values.worker.blockSizeBytes "capacity_bytes" .Values.worker.capacityBytes "l1_capacity_bytes" .Values.worker.l1CapacityBytes "l1_page_size_bytes" .Values.worker.l1PageSizeBytes }}
+{{- $config := mergeOverwrite $defaults (deepCopy .Values.worker.dynamicConfig.config) }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-worker-config
+  labels:
+    {{- include "talon.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+data:
+  worker.toml: |
+{{ regexReplaceAll "(?m)(= [-+]?[0-9]+)\\.0$" ($config | toToml) "${1}" | indent 4 }}
+{{- end }}

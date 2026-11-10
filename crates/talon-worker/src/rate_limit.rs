@@ -79,6 +79,7 @@ const MAX_NAMESPACE_CELLS: usize = 4096;
 /// Worker-global, `Arc`-shared per-namespace limiter.
 #[derive(Debug)]
 pub struct NamespaceRateLimiter {
+    replacement: arc_swap::ArcSwapOption<NamespaceRateLimiter>,
     policy: RateLimitPolicy,
     /// Monotonic clock origin; GCRA cells advance in nanoseconds from here.
     origin: Instant,
@@ -86,11 +87,11 @@ pub struct NamespaceRateLimiter {
     /// default-governed namespaces. A read lock covers the common warm lookup; the
     /// write lock is taken only the first time a default-governed namespace is
     /// seen. Bounded at `max_cells` entries (see [`MAX_NAMESPACE_CELLS`]).
-    cells: RwLock<HashMap<NamespaceId, NamespaceCells>>,
+    cells: RwLock<HashMap<NamespaceId, std::sync::Arc<NamespaceCells>>>,
     /// Shared fallback cell for namespaces first seen after the cap is reached,
     /// governed by the default limit. `None` when the default limits nothing
     /// (then default-governed namespaces are admitted without a cell at all).
-    overflow: Option<NamespaceCells>,
+    overflow: Option<std::sync::Arc<NamespaceCells>>,
     /// Ceiling on the number of distinct namespace cells (see [`MAX_NAMESPACE_CELLS`]).
     max_cells: usize,
 }
@@ -113,19 +114,49 @@ impl NamespaceRateLimiter {
             if !limits.is_empty() {
                 cells.insert(
                     NamespaceId::named(name.clone()),
-                    NamespaceCells::from_limits(limits),
+                    std::sync::Arc::new(NamespaceCells::from_limits(limits)),
                 );
             }
         }
-        let overflow =
-            (!policy.default.is_empty()).then(|| NamespaceCells::from_limits(&policy.default));
+        let overflow = (!policy.default.is_empty())
+            .then(|| std::sync::Arc::new(NamespaceCells::from_limits(&policy.default)));
         Self {
+            replacement: arc_swap::ArcSwapOption::empty(),
             policy,
             origin: Instant::now(),
             cells: RwLock::new(cells),
             overflow,
             max_cells,
         }
+    }
+
+    /// Atomically replace the policy for existing and future namespaces.
+    pub fn update(&self, policy: RateLimitPolicy) -> Result<(), talon_core::RateLimitError> {
+        policy.validate()?;
+        let held = self.replacement.load_full();
+        let current = held.as_deref().unwrap_or(self);
+        let mut next = Self::with_max_cells(policy, current.max_cells);
+        next.origin = current.origin;
+        if current.policy.enabled && next.policy.enabled {
+            let mut cells = next.cells.write().unwrap();
+            for (namespace, state) in current.cells.read().unwrap().iter() {
+                if current.policy.limits_for(namespace) == next.policy.limits_for(namespace)
+                    && (cells.contains_key(namespace) || cells.len() < next.max_cells)
+                {
+                    cells.insert(namespace.clone(), state.clone());
+                }
+            }
+            drop(cells);
+            if current.policy.default == next.policy.default {
+                next.overflow = current.overflow.clone();
+            }
+        }
+        self.replacement.store(Some(std::sync::Arc::new(next)));
+        Ok(())
+    }
+
+    pub(crate) fn startup_policy(&self) -> &RateLimitPolicy {
+        &self.policy
     }
 
     /// A limiter that admits every request (the feature disabled).
@@ -135,12 +166,18 @@ impl NamespaceRateLimiter {
 
     /// Whether the limiter enforces anything.
     pub fn is_enabled(&self) -> bool {
-        self.policy.enabled
+        self.replacement
+            .load()
+            .as_ref()
+            .map_or(self.policy.enabled, |value| value.is_enabled())
     }
 
     /// Charge one read request expected to return `read_bytes` bytes against
     /// `namespace`, returning [`Throttled`] if it would exceed a configured limit.
     pub fn admit(&self, namespace: &NamespaceId, read_bytes: u64) -> Result<(), Throttled> {
+        if let Some(current) = self.replacement.load_full() {
+            return current.admit(namespace, read_bytes);
+        }
         // Skip the clock read entirely when the feature is off.
         if !self.policy.enabled {
             return Ok(());
@@ -188,7 +225,7 @@ impl NamespaceRateLimiter {
         if map.len() < self.max_cells {
             return map
                 .entry(namespace.clone())
-                .or_insert_with(|| NamespaceCells::from_limits(&limits))
+                .or_insert_with(|| std::sync::Arc::new(NamespaceCells::from_limits(&limits)))
                 .charge(read_bytes, now_nanos);
         }
         drop(map);

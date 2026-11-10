@@ -916,58 +916,60 @@ async fn small_tti_hit_is_checkpointed_and_bad_snapshot_does_not_drop_data() {
 
 #[tokio::test]
 async fn small_tti_background_and_shutdown_checkpoint_without_paged_cache() {
-    let dir = tempfile::tempdir().unwrap();
-    let (_, mut w) = runtime(dir.path(), false, false);
-    w = w
-        .with_page_gc(crate::page_gc::PageGcConfig {
-            tti_ms: 3_600_000,
-            checkpoint_interval_ms: 1,
-            ..Default::default()
-        })
-        .unwrap();
-    w.write_object(&object(), data()).await.unwrap();
-    let block = id(&w);
-    w.small
-        .as_ref()
-        .unwrap()
-        .access(&block)
-        .unwrap()
-        .restore(crate::eviction::access_millis() - 60_000);
-    let w = Arc::new(w);
-    let service = WorkerBackground::start(
-        w.clone(),
-        &WorkerConfig {
-            page_tti_hours: 1,
-            stale_gc_enabled: false,
-            ownership_gc_enabled: false,
-            async_eviction_enabled: false,
-            background_io_max_mb_per_sec: 0,
-            ..Default::default()
-        },
-    );
-    tokio::time::timeout(Duration::from_secs(3), async {
-        while !dir.path().join("small/access.checkpoint").exists() {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .unwrap();
-    // A real access after the periodic checkpoint must be flushed on shutdown.
-    let access = w.small.as_ref().unwrap().access(&block).unwrap();
-    access.touch();
-    let touched = access.last_access();
-    service.shutdown().await;
-    drop(w);
-    let (_, w) = runtime(dir.path(), false, false);
-    assert_eq!(
+    for tti_ms in [0, 3_600_000] {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, mut w) = runtime(dir.path(), false, false);
+        w = w
+            .with_page_gc(crate::page_gc::PageGcConfig {
+                tti_ms,
+                checkpoint_interval_ms: 1,
+                ..Default::default()
+            })
+            .unwrap();
+        w.write_object(&object(), data()).await.unwrap();
+        let block = id(&w);
         w.small
             .as_ref()
             .unwrap()
             .access(&block)
             .unwrap()
-            .last_access(),
-        touched
-    );
+            .restore(crate::eviction::access_millis() - 60_000);
+        let w = Arc::new(w);
+        let service = WorkerBackground::start(
+            w.clone(),
+            &WorkerConfig {
+                page_tti_hours: tti_ms / 3_600_000,
+                stale_gc_enabled: false,
+                ownership_gc_enabled: false,
+                async_eviction_enabled: false,
+                background_io_max_mb_per_sec: 0,
+                ..Default::default()
+            },
+        );
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !dir.path().join("small/access.checkpoint").exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        // A real access after the periodic checkpoint must be flushed on shutdown.
+        let access = w.small.as_ref().unwrap().access(&block).unwrap();
+        access.touch();
+        let touched = access.last_access();
+        service.shutdown().await;
+        drop(w);
+        let (_, w) = runtime(dir.path(), false, false);
+        assert_eq!(
+            w.small
+                .as_ref()
+                .unwrap()
+                .access(&block)
+                .unwrap()
+                .last_access(),
+            touched
+        );
+    }
 }
 
 #[tokio::test]
@@ -2110,4 +2112,64 @@ async fn compact_policy_explicit_delete_preserves_other_units() {
         }
         assert_eq!(w.lru.total_bytes(), 0);
     }
+}
+
+#[tokio::test]
+async fn dynamic_small_tti_rechecks_disabled_setting_after_waiting() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, worker) = runtime(dir.path(), false, false);
+    let worker = Arc::new(
+        worker
+            .with_page_gc(PageGcConfig {
+                tti_ms: 0,
+                ..Default::default()
+            })
+            .unwrap(),
+    );
+    let mut dynamic = crate::dynamic_config::DynamicConfig::default();
+    let snapshot = |hours| {
+        format!(
+            "page_tti_hours = {hours}
+rate_limits = {{ enabled = false }}
+"
+        )
+    };
+    worker.write_object(&object(), data()).await.unwrap();
+    let block = id(&worker);
+    let now = crate::eviction::access_millis();
+    worker
+        .small
+        .as_ref()
+        .unwrap()
+        .access(&block)
+        .unwrap()
+        .restore(now - 3_600_001);
+    worker.gc_small_idle_at(now).await;
+    assert!(worker.small.as_ref().unwrap().contains(&block));
+    assert!(dynamic.apply_runtime(&snapshot(1), &worker));
+    let candidate = worker
+        .lru
+        .idle_candidates(&mut (0, 0), now, 3_600_000, 4096, 1)
+        .pop()
+        .unwrap();
+    let permit = worker
+        .page_gc_io
+        .clone()
+        .acquire_many_owned(worker.page_gc_config.io_concurrency as u32)
+        .await
+        .unwrap();
+    let w = worker.clone();
+    let mut deletion = tokio::spawn(async move { w.unlink_idle_block(candidate, now).await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), &mut deletion)
+            .await
+            .is_err()
+    );
+    assert!(dynamic.apply_runtime(&snapshot(0), &worker));
+    drop(permit);
+    deletion.await.unwrap();
+    assert!(worker.small.as_ref().unwrap().contains(&block));
+    assert!(dynamic.apply_runtime(&snapshot(1), &worker));
+    worker.gc_small_idle_at(now + 1).await;
+    assert!(!worker.small.as_ref().unwrap().contains(&block));
 }

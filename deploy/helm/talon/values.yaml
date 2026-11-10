@@ -71,6 +71,12 @@ worker:
   l1CapacityBytes: 0
   # -- Fixed L1 DRAM page size.
   l1PageSizeBytes: 262144
+  # -- Unified Worker configuration. Hot fields apply live; other changes require restart.
+  dynamicConfig:
+    enabled: true
+    # Use an operator-managed ConfigMap containing worker.toml, or let Helm create one.
+    existingConfigMap: ""
+    config: {}
   # -- Object-store credentials. Reference a Secret you create out-of-band (see
   # deploy/kubernetes/worker-secret.example.yaml).
   backend:

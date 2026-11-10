@@ -128,8 +128,9 @@ impl StaleGc {
         if self.pending.is_empty() {
             let lru = worker.lru.clone();
             let mut cursor = self.cursor;
-            let scan = worker.page_gc_config.scan_batch_size.min(4096);
-            let deletes = worker.page_gc_config.delete_batch_size.min(256);
+            let (scan, deletes) = worker.maintenance_batch_limits();
+            let scan = scan.min(4096);
+            let deletes = deletes.min(256);
             let (cursor, candidates) = tokio::task::spawn_blocking(move || {
                 let candidates = lru.stale_gc_candidates(&mut cursor, now, DAY_MS, scan, deletes);
                 (cursor, candidates)

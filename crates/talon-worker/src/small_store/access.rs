@@ -30,7 +30,7 @@ pub(super) struct DirtyQueue {
     enabled: AtomicBool,
 }
 
-/// Attached to packed read tokens when TTI is enabled. The
+/// Attached to packed read tokens when access tracking is enabled. The
 /// queue owns metadata, never a payload pin; the weak back-reference avoids a cycle.
 pub(crate) struct DirtyAccess {
     key: SmallKey,
@@ -232,6 +232,9 @@ impl SmallObjectStore {
 
     pub(crate) fn track_access(&self, id: &(impl SmallStoreKey + ?Sized)) -> io::Result<()> {
         format::validate_key(&id.view())?;
+        if !self.access_dirty.enabled.load(Ordering::Acquire) {
+            return Ok(());
+        }
         for stream in self.streams() {
             let mut entries = stream.entries.write().unwrap();
             let key = entries

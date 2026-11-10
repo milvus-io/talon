@@ -1,3 +1,23 @@
+# Dynamic tuning is projected without subPath so kubelet updates reach running Pods.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: talon-worker-config
+  namespace: talon
+  labels:
+    app.kubernetes.io/name: talon
+    app.kubernetes.io/component: worker
+data:
+  worker.toml: |
+    coordinator = "talon-coordinator:7000"
+    listen = "0.0.0.0:7001"
+    admin_listen = "0.0.0.0:8001"
+    cluster_id = "talon"
+    cache_dirs = ["/var/cache/talon"]
+    capacity_bytes = 8589934592
+    l1_capacity_bytes = 0
+    l1_page_size_bytes = 262144
+---
 # Persistent Worker slots. Each ordinal reopens its retained cache PVC and
 # worker_identity. See docs/how-to/rolling-upgrade.md before migrating a Deployment.
 # Provision matching PVs or change storageClassName to your persistent class.
@@ -71,25 +91,22 @@ spec:
             matchLabels:
               app.kubernetes.io/name: talon
               app.kubernetes.io/component: worker
+      volumes:
+        - name: dynamic-config
+          configMap:
+            name: talon-worker-config
       containers:
         - name: worker
           image: ghcr.io/milvus-io/talon-worker:latest
           imagePullPolicy: IfNotPresent
-          args:
-            - "--coordinator"
-            - "talon-coordinator:7000"
-            - "--listen"
-            - "0.0.0.0:7001"
-            - "--admin-listen"
-            - "0.0.0.0:8001"
           ports:
             - name: data
               containerPort: 7001
             - name: admin
               containerPort: 8001
           env:
-            - name: TALON_WORKER_CLUSTER_ID
-              value: "talon"
+            - name: TALON_WORKER_CONFIG
+              value: /etc/talon/config/worker.toml
             # Lets the worker look up its node's zone label for zone-aware
             # cache reads (ADR 0006); requires the talon-node-zone-reader
             # ClusterRole in node-zone-rbac.yaml. TALON_ZONE overrides the lookup.
@@ -102,18 +119,6 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: status.podIP
-            - name: TALON_WORKER_CACHE_DIRS
-              value: /var/cache/talon
-            # Cache capacity the worker is allowed to fill (8 GiB). Keep this
-            # below the emptyDir/PVC size and the container memory limit.
-            - name: TALON_WORKER_CAPACITY_BYTES
-              value: "8589934592"
-            # Optional L1 DRAM cache. Keep disabled unless the pod memory limit
-            # includes this capacity plus the worker's normal heap/runtime use.
-            - name: TALON_WORKER_L1_CAPACITY_BYTES
-              value: "0"
-            - name: TALON_WORKER_L1_PAGE_SIZE_BYTES
-              value: "262144"
             # Object-store backend credentials from the Secret — never logged.
             - name: TALON_WORKER_AZURE_ACCOUNT
               valueFrom:
@@ -126,6 +131,9 @@ spec:
                   name: talon-worker-backend
                   key: azure-sas
           volumeMounts:
+            - name: dynamic-config
+              mountPath: /etc/talon/config
+              readOnly: true
             - name: cache
               mountPath: /var/cache/talon
           startupProbe:

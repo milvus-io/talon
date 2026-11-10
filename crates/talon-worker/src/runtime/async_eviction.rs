@@ -16,6 +16,9 @@ pub(super) enum SmallCapacityPhase {
 }
 
 pub(super) struct EvictionCycle {
+    capacity: u64,
+    startup_high: u64,
+    startup_low: u64,
     high: u64,
     low: u64,
     active: bool,
@@ -25,6 +28,10 @@ pub(super) struct EvictionCycle {
 impl EvictionCycle {
     pub(super) fn new(capacity: u64, config: &WorkerConfig) -> Self {
         Self {
+            capacity,
+            startup_high: ((capacity as f64 * config.async_eviction_high_watermark).ceil() as u64)
+                .max(1),
+            startup_low: (capacity as f64 * config.async_eviction_low_watermark).floor() as u64,
             high: ((capacity as f64 * config.async_eviction_high_watermark).ceil() as u64).max(1),
             low: (capacity as f64 * config.async_eviction_low_watermark).floor() as u64,
             active: false,
@@ -46,6 +53,20 @@ impl EvictionCycle {
     }
 
     pub(super) async fn tick(&mut self, worker: &WorkerRuntime) {
+        let tuning = worker.dynamic_settings.load();
+        self.high = tuning
+            .as_ref()
+            .and_then(|c| c.async_eviction_high_watermark)
+            .map_or(self.startup_high, |high| {
+                ((self.capacity as f64 * high).ceil() as u64).max(1)
+            });
+        self.low = tuning
+            .as_ref()
+            .and_then(|c| c.async_eviction_low_watermark)
+            .map_or(self.startup_low, |low| {
+                (self.capacity as f64 * low).floor() as u64
+            });
+        drop(tuning);
         self.progressed = false;
         if let Some(registry) = worker.registry() {
             let workers = registry.snapshot();
@@ -139,8 +160,7 @@ impl WorkerRuntime {
             let policy_target = self.lru.total_bytes().saturating_sub(missing);
             let lru = self.lru.clone();
             let count = lru.len();
-            let scan = self.page_gc_config.scan_batch_size;
-            let deletes = self.page_gc_config.delete_batch_size;
+            let (scan, deletes) = self.maintenance_batch_limits();
             let units = tokio::task::spawn_blocking(move || {
                 lru.candidates_to_fit_bounded(policy_target, &Default::default(), scan, deletes)
             })
@@ -296,6 +316,33 @@ mod tests {
             namespaces.push(namespace);
         }
         (worker, config, namespaces)
+    }
+
+    #[tokio::test]
+    async fn dynamic_watermarks_reach_existing_cycle_and_future_namespaces() {
+        let root = tempfile::tempdir().unwrap();
+        let (worker, config, namespaces) = filled_namespaces(root.path(), false, 0.8).await;
+        let mut cycle = EvictionCycle::new(config.capacity_bytes, &config);
+        let mut dynamic = crate::dynamic_config::DynamicConfig::default();
+        assert!(dynamic.apply_runtime(
+            r#""rate_limits" = { "enabled" = false }
+"async_eviction_high_watermark" = 0.7
+"async_eviction_low_watermark" = 0.5
+"paged_miss_run_concurrency" = 2
+"#,
+            &worker
+        ));
+        cycle.tick(&worker).await;
+        assert_eq!(
+            namespaces.iter().map(|w| w.resident_bytes()).sum::<u64>(),
+            5 * disk_unit()
+        );
+        let future = worker
+            .for_namespace(&talon_core::NamespaceId::named("created-after-update"))
+            .await
+            .unwrap();
+        assert_eq!(future.current_paged_miss_run_concurrency(), 2);
+        assert_eq!(namespaces[0].current_paged_miss_run_concurrency(), 2);
     }
 
     #[tokio::test]

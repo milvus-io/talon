@@ -211,7 +211,7 @@ pub enum WorkloadIdentityError {
 ///
 /// This stores paths only. PEM certificate and private-key bytes are loaded by
 /// the future listener implementation and must use a redacting wrapper there.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ControlTlsConfig {
     /// CA bundle used to validate the peer certificate.
     pub ca_cert_path: PathBuf,

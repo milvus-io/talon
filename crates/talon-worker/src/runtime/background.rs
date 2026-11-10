@@ -111,11 +111,6 @@ impl WorkerBackground {
                 Some(schedule.delay(cleanup_period))
             }
         });
-        if worker
-            .namespace_runtimes()
-            .iter()
-            .any(|w| w.page_gc_config.tti_ms > 0)
-            || config.page_tti_hours > 0
         {
             let w = worker.clone();
             let period = Duration::from_millis(
@@ -137,24 +132,20 @@ impl WorkerBackground {
                 let last_small = last_small_checkpoint.clone();
                 async move {
                     for namespace in w.namespace_runtimes() {
-                        if namespace.page_gc_config.tti_ms > 0
-                            && due(
-                                &last,
-                                &namespace,
-                                (namespace.page_gc_config.checkpoint_interval_ms
-                                    / crate::page_lifecycle::SHARDS as u64)
-                                    .max(1),
-                            )
-                        {
+                        if due(
+                            &last,
+                            &namespace,
+                            (namespace.page_gc_config.checkpoint_interval_ms
+                                / crate::page_lifecycle::SHARDS as u64)
+                                .max(1),
+                        ) {
                             namespace.checkpoint_next_shard().await;
                         }
-                        if namespace.page_gc_config.tti_ms > 0
-                            && due(
-                                &last_small,
-                                &namespace,
-                                namespace.page_gc_config.checkpoint_interval_ms,
-                            )
-                        {
+                        if due(
+                            &last_small,
+                            &namespace,
+                            namespace.page_gc_config.checkpoint_interval_ms,
+                        ) {
                             namespace.checkpoint_small_access().await;
                         }
                     }
