@@ -15,15 +15,13 @@
 //! `set_nonblocking(true)`, `from_std`. The ring path needs none of that (see the
 //! module docs on `uring_conn`), which is a large part of why it is the default.
 //!
-//! Keeping the two side by side as sibling modules — rather than one in the
-//! library and one inline in `main.rs` — is deliberate: the protocol handling
-//! must stay behaviourally identical between them, and divergence is easier to
-//! spot when they are structurally parallel.
+//! Range-read semantics are shared with the ring path in `range_request`;
+//! each connection module owns its socket and payload transmission.
 
 use std::sync::Arc;
 use std::time::Instant;
 
-use talon_core::{NamespaceId, RequestId, Version};
+use talon_core::NamespaceId;
 use talon_transport::data;
 use talon_transport::frame::{MsgType, HEADER_LEN};
 use talon_transport::{codec, ControlMessage, DataErrorCode, FrameHeader};
@@ -32,64 +30,6 @@ use tokio::net::TcpStream;
 
 use crate::data_error::encode_runtime_error;
 use crate::{send_file_range, ServeOutcome, WorkerObservability, WorkerRuntime, DEFAULT_CHUNK};
-
-// Source version and its caller-supplied total length.
-type PinnedVersion = (Version, u64);
-
-/// Decode origin-backed coordinates, the optional exact version, and namespace.
-fn decode_range_with_namespace(
-    header: &FrameHeader,
-    payload: &[u8],
-) -> Result<
-    (
-        FrameHeader,
-        data::RangeRequest,
-        Option<PinnedVersion>,
-        NamespaceId,
-    ),
-    talon_transport::DataError,
-> {
-    let mut full = Vec::with_capacity(HEADER_LEN + payload.len());
-    full.extend_from_slice(&header.encode());
-    full.extend_from_slice(payload);
-    match header.msg_type {
-        MsgType::GetRange => {
-            let (frame, request) = data::decode_request(&full)?;
-            Ok((frame, request, None, NamespaceId::Unattributed))
-        }
-        MsgType::GetRangeNamespace => {
-            let (frame, scoped) = data::decode_namespace_request(&full)?;
-            Ok((frame, scoped.request, None, scoped.namespace))
-        }
-        MsgType::GetVersionedRange | MsgType::GetExactRange => {
-            let (frame, versioned) = if header.msg_type == MsgType::GetExactRange {
-                data::decode_exact_request(&full)?
-            } else {
-                data::decode_versioned_request(&full)?
-            };
-            Ok((
-                frame,
-                versioned.request,
-                Some((versioned.version, versioned.object_len)),
-                NamespaceId::Unattributed,
-            ))
-        }
-        MsgType::GetVersionedRangeNamespace | MsgType::GetExactRangeNamespace => {
-            let (frame, scoped) = if header.msg_type == MsgType::GetExactRangeNamespace {
-                data::decode_exact_namespace_request(&full)?
-            } else {
-                data::decode_versioned_namespace_request(&full)?
-            };
-            Ok((
-                frame,
-                scoped.request.request,
-                Some((scoped.request.version, scoped.request.object_len)),
-                scoped.namespace,
-            ))
-        }
-        other => Err(talon_transport::DataError::NotGetRange(other)),
-    }
-}
 
 /// Decode a `GetCachedRange` or `GetCachedRangeNamespace` frame into its cache-only
 /// request and the namespace it declared (`Unattributed` for a plain
@@ -268,172 +208,23 @@ async fn handle_request(
         return Ok(Some(stream));
     }
 
-    // Type check BEFORE any per-request work; a data listener only serves
-    // GetRange (plus the Put/Delete/Control handled above); other frames are
-    // capped tightly by read_frame.
-    if !matches!(
-        header.msg_type,
-        MsgType::GetRange
-            | MsgType::GetRangeNamespace
-            | MsgType::GetVersionedRange
-            | MsgType::GetVersionedRangeNamespace
-            | MsgType::GetExactRange
-            | MsgType::GetExactRangeNamespace
-    ) {
-        let mut err = data::encode_typed_error(
-            header.request_id,
-            DataErrorCode::InvalidRequest,
-            "worker only serves GetRange/Put/Delete/StatObject/ListObjects",
-        );
-        err[2] = response_version;
-        talon_telemetry::outcome("error");
-        stream.write_all(&err).await?;
-        stream.flush().await?;
-        observability
-            .metrics()
-            .record_request_error(request_started.elapsed());
-        return Ok(Some(stream));
-    }
-
-    let (h, req, expected_version, namespace) = match decode_range_with_namespace(header, payload) {
-        Ok(v) => v,
-        Err(e) => {
-            let mut err = data::encode_typed_error(
-                header.request_id,
-                DataErrorCode::InvalidRequest,
-                format!("bad request: {e}"),
-            );
-            err[2] = response_version;
-            talon_telemetry::outcome("error");
-            stream.write_all(&err).await?;
+    let outcome = match crate::range_request::serve(header, payload, worker, observability).await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            stream.write_all(&error.response(header)).await?;
             stream.flush().await?;
-            observability
-                .metrics()
-                .record_request_error(request_started.elapsed());
+            error.record(observability.metrics(), request_started.elapsed());
             return Ok(Some(stream));
         }
     };
-
-    // The declared namespace is attacker-controlled on the unauthenticated data
-    // plane; reject an empty or over-long name before it is used as a cell
-    // key or telemetry label. `Unattributed` always validates.
-    if let Err(e) = namespace.validate() {
-        let mut err = data::encode_typed_error(
-            h.request_id,
-            DataErrorCode::InvalidRequest,
-            format!("invalid namespace: {e}"),
-        );
-        err[2] = response_version;
-        talon_telemetry::outcome("error");
-        stream.write_all(&err).await?;
-        stream.flush().await?;
-        observability
-            .metrics()
-            .record_request_error(request_started.elapsed());
-        return Ok(Some(stream));
-    }
-
-    if !observability.is_ready() {
-        let mut err = data::encode_typed_error(
-            h.request_id,
-            DataErrorCode::Unavailable,
-            "worker is not ready",
-        );
-        err[2] = response_version;
-        talon_telemetry::outcome("error");
-        stream.write_all(&err).await?;
-        stream.flush().await?;
-        observability
-            .metrics()
-            .record_request_error(request_started.elapsed());
-        return Ok(Some(stream));
-    }
-
-    let end = req.offset.checked_add(req.len);
-    if end.is_none()
-        || (matches!(
-            h.msg_type,
-            MsgType::GetExactRange | MsgType::GetExactRangeNamespace
-        ) && req.len > talon_core::MAX_EXACT_READ_LEN)
-        || expected_version
-            .as_ref()
-            .map(|(_, size)| *size)
-            .is_some_and(|size| end.is_some_and(|end| end > size))
-    {
-        let mut err = data::encode_typed_error(
-            h.request_id,
-            DataErrorCode::InvalidRequest,
-            "range exceeds the object size, u64 bounds, or the 1 MiB exact-read limit",
-        );
-        err[2] = response_version;
-        talon_telemetry::outcome("error");
-        stream.write_all(&err).await?;
-        stream.flush().await?;
-        observability
-            .metrics()
-            .record_request_error(request_started.elapsed());
-        return Ok(Some(stream));
-    }
-
-    if expected_version
-        .as_ref()
-        .is_some_and(|(version, _)| version.0.trim().is_empty())
-    {
-        let mut err = data::encode_typed_error(
-            h.request_id,
-            DataErrorCode::InvalidRequest,
-            "version-pinned range request has an empty source version",
-        );
-        err[2] = response_version;
-        talon_telemetry::outcome("error");
-        stream.write_all(&err).await?;
-        stream.flush().await?;
-        observability
-            .metrics()
-            .record_request_error(request_started.elapsed());
-        return Ok(Some(stream));
-    }
-
-    if let Err(throttled) = worker.rate_limiter().admit(worker.namespace(), req.len) {
-        let mut err = data::encode_typed_error(
-            h.request_id,
-            DataErrorCode::RateLimited,
-            format!(
-                "namespace rate limit exceeded on {}; retry after {} ms",
-                throttled.metric.label(),
-                throttled.retry_after.as_millis()
-            ),
-        );
-        err[2] = response_version;
-        talon_telemetry::outcome("error");
-        stream.write_all(&err).await?;
-        stream.flush().await?;
-        observability
-            .metrics()
-            .record_rate_limited(throttled.metric);
-        return Ok(Some(stream));
-    }
-
-    let outcome = match expected_version.as_ref() {
-        Some((version, size))
-            if matches!(
-                h.msg_type,
-                MsgType::GetExactRange | MsgType::GetExactRangeNamespace
-            ) =>
-        {
-            worker.serve_exact(&req, version, *size).await
-        }
-        Some((version, size)) => worker.serve_versioned(&req, version, *size).await,
-        None => worker.serve(&req).await,
-    };
     match outcome {
-        Ok(ServeOutcome::Sendfile(handle)) => {
+        ServeOutcome::Sendfile(handle) => {
             // Zero-copy hit: write the frame header async, then stream the
             // block file's fd straight into the socket with sendfile(2) on
             // the blocking pool. The header's advertised length equals the
             // handle length, so a short read can never desync the client.
             let len = handle.len;
-            let mut hdr = data::response_header_ok(h.request_id, len as u32);
+            let mut hdr = data::response_header_ok(header.request_id, len as u32);
             hdr[2] = response_version;
             stream.write_all(&hdr).await?;
             stream.flush().await?;
@@ -455,13 +246,13 @@ async fn handle_request(
                 }
             }
         }
-        Ok(ServeOutcome::SendfileMany(handles)) => {
+        ServeOutcome::SendfileMany(handles) => {
             // Cross-page zero-copy: one `sendfile` per page file, all on
             // the blocking pool. The advertised length is the sum of the
             // segments, so a short send can never desync the client
             // silently — it surfaces as an error and drops the connection.
             let len: u64 = handles.iter().map(|h| h.len).sum();
-            let mut hdr = data::response_header_ok(h.request_id, len as u32);
+            let mut hdr = data::response_header_ok(header.request_id, len as u32);
             hdr[2] = response_version;
             stream.write_all(&hdr).await?;
             stream.flush().await?;
@@ -481,8 +272,8 @@ async fn handle_request(
                 }
             }
         }
-        Ok(ServeOutcome::Bytes(bytes)) => {
-            let mut hdr = data::response_header_ok(h.request_id, bytes.len() as u32);
+        ServeOutcome::Bytes(bytes) => {
+            let mut hdr = data::response_header_ok(header.request_id, bytes.len() as u32);
             hdr[2] = response_version;
             stream.write_all(&hdr).await?;
             stream.write_all(&bytes).await?;
@@ -491,24 +282,6 @@ async fn handle_request(
             observability
                 .metrics()
                 .record_request_success(bytes.len() as u64, request_started.elapsed());
-        }
-        Err(e) => {
-            tracing::error!(
-                req = %RequestId(h.request_id),
-                object = %req.object.to_path(),
-                offset = req.offset,
-                len = req.len,
-                error = %e,
-                "serving range failed"
-            );
-            let mut err = encode_runtime_error(h.request_id, &e);
-            err[2] = response_version;
-            talon_telemetry::outcome("error");
-            stream.write_all(&err).await?;
-            stream.flush().await?;
-            observability
-                .metrics()
-                .record_request_error(request_started.elapsed());
         }
     }
     Ok(Some(stream))
