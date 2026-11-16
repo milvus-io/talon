@@ -67,62 +67,20 @@ impl DynamicConfig {
         let result = (|| -> Result<(), String> {
             let (next, views) = if let Some(startup) = &self.startup {
                 let document = talon_core::dynamic_config::WorkerConfigDocument::parse(text)?;
-                let desired = talon_core::WorkerConfig::resolve(
-                    document.patch,
+                let plan = talon_core::dynamic_config::WorkerConfigPlan::resolve(
+                    startup,
+                    document,
                     self.env.clone(),
                     self.cli.clone(),
+                )?;
+                (
+                    plan.tuning,
+                    Some((
+                        plan.effective_config,
+                        plan.desired_config,
+                        plan.pending_restart_fields,
+                    )),
                 )
-                .map_err(|_| "worker configuration validation failed".to_string())?;
-                let mut desired_view = serde_json::to_value(&desired).map_err(|e| e.to_string())?;
-                let mut effective = serde_json::to_value(startup).map_err(|e| e.to_string())?;
-                let mut next = WorkerDynamicConfig::from_config(&desired);
-                for field in talon_core::dynamic_config::HOT_FIELDS {
-                    effective[*field] = desired_view[*field].clone();
-                }
-                effective["namespace_rules"] = desired_view["namespace_rules"].clone();
-                // Keep the actual namespace storage layout until restart.
-                let mut namespace_names = std::collections::BTreeSet::new();
-                namespace_names.extend(startup.namespaces.keys().cloned());
-                namespace_names.extend(desired.namespaces.keys().cloned());
-                namespace_names.extend(document.tuning.namespaces.keys().cloned());
-                for name in namespace_names {
-                    let namespace = talon_core::NamespaceId::named(&name);
-                    let desired_ns = desired
-                        .for_namespace(&namespace)
-                        .map_err(|e| e.to_string())?;
-                    let limits = desired.rate_limits.limits_for(&namespace);
-                    next.namespaces.insert(
-                        name.clone(),
-                        talon_core::dynamic_config::NamespaceDynamicConfig {
-                            page_tti_hours: Some(desired_ns.page_tti_hours),
-                            rate_limits: None,
-                        },
-                    );
-                    let mut own = serde_json::to_value(
-                        startup.namespaces.get(&name).cloned().unwrap_or_default(),
-                    )
-                    .map_err(|e| e.to_string())?;
-                    own["page_tti_hours"] = desired_ns.page_tti_hours.into();
-                    own["rate_limits"] = serde_json::to_value(limits).map_err(|e| e.to_string())?;
-                    effective["namespaces"][&name] = own;
-                    desired_view["namespaces"][&name] = serde_json::to_value(
-                        desired.namespaces.get(&name).cloned().unwrap_or_default(),
-                    )
-                    .map_err(|e| e.to_string())?;
-                    desired_view["namespaces"][&name]["page_tti_hours"] =
-                        desired_ns.page_tti_hours.into();
-                    desired_view["namespaces"][&name]["rate_limits"] =
-                        serde_json::to_value(limits).map_err(|e| e.to_string())?;
-                }
-                next.validate()?;
-                let pending: Vec<String> = desired_view
-                    .as_object()
-                    .unwrap()
-                    .iter()
-                    .filter(|(key, value)| effective.get(*key) != Some(*value))
-                    .map(|(key, _)| key.clone())
-                    .collect();
-                (next, Some((effective, desired_view, pending)))
             } else {
                 (WorkerDynamicConfig::parse(text)?, None)
             };

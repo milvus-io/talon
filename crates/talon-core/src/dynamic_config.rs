@@ -103,55 +103,6 @@ impl WorkerDynamicConfig {
     pub fn parse(text: &str) -> Result<Self, String> {
         Ok(WorkerConfigDocument::parse(text)?.tuning)
     }
-
-    pub fn from_patch(patch: &crate::WorkerConfigPatch) -> Self {
-        Self {
-            rate_limits: patch.rate_limits.clone(),
-            namespace_rules: patch.namespace_rules.clone().unwrap_or_default(),
-            namespaces: patch
-                .namespaces
-                .as_ref()
-                .map(|namespaces| {
-                    namespaces
-                        .iter()
-                        .map(|(name, own)| {
-                            (
-                                name.clone(),
-                                NamespaceDynamicConfig {
-                                    page_tti_hours: own.page_tti_hours,
-                                    rate_limits: own.rate_limits,
-                                },
-                            )
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
-            page_tti_hours: patch.page_tti_hours,
-            paged_miss_run_concurrency: patch.paged_miss_run_concurrency,
-            background_scan_batch_size: patch.background_scan_batch_size,
-            background_delete_batch_size: patch.background_delete_batch_size,
-            background_io_max_mb_per_sec: patch.background_io_max_mb_per_sec,
-            background_delete_max_per_sec: patch.background_delete_max_per_sec,
-            async_eviction_high_watermark: patch.async_eviction_high_watermark,
-            async_eviction_low_watermark: patch.async_eviction_low_watermark,
-        }
-    }
-
-    pub fn from_config(config: &crate::WorkerConfig) -> Self {
-        Self {
-            rate_limits: Some(config.rate_limits.clone()),
-            namespace_rules: config.namespace_rules.clone(),
-            namespaces: Default::default(),
-            page_tti_hours: Some(config.page_tti_hours),
-            paged_miss_run_concurrency: Some(config.paged_miss_run_concurrency),
-            background_scan_batch_size: Some(config.background_scan_batch_size),
-            background_delete_batch_size: Some(config.background_delete_batch_size),
-            background_io_max_mb_per_sec: Some(config.background_io_max_mb_per_sec),
-            background_delete_max_per_sec: Some(config.background_delete_max_per_sec),
-            async_eviction_high_watermark: Some(config.async_eviction_high_watermark),
-            async_eviction_low_watermark: Some(config.async_eviction_low_watermark),
-        }
-    }
 }
 
 /// A complete override for one namespace. Omitted fields inherit worker defaults.
@@ -164,6 +115,26 @@ pub struct NamespaceDynamicConfig {
     pub page_tti_hours: Option<u64>,
 }
 impl NamespaceDynamicConfig {
+    /// Check live TTI against the storage and checkpoint interval retained until restart.
+    pub fn validate_tti_storage(
+        &self,
+        supports_tti: bool,
+        checkpoint_interval_ms: u64,
+    ) -> Result<(), String> {
+        if let Some(hours) = self.page_tti_hours.filter(|hours| *hours > 0) {
+            if !supports_tti {
+                return Err("TTI requires paged L2 or small-object storage".into());
+            }
+            let tti_ms = hours
+                .checked_mul(3_600_000)
+                .ok_or("TTI duration overflows")?;
+            if checkpoint_interval_ms > tti_ms {
+                return Err("checkpoint interval exceeds TTI".into());
+            }
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         // Validate the same bounds as global tuning without recursively visiting namespaces.
         let config = WorkerDynamicConfig {
@@ -282,17 +253,56 @@ impl WorkerConfigDocument {
     }
 }
 
-pub const HOT_FIELDS: &[&str] = &[
-    "page_tti_hours",
-    "paged_miss_run_concurrency",
-    "background_scan_batch_size",
-    "background_delete_batch_size",
-    "background_io_max_mb_per_sec",
-    "background_delete_max_per_sec",
-    "async_eviction_high_watermark",
-    "async_eviction_low_watermark",
-    "rate_limits",
-];
+macro_rules! hot_fields {
+    ($($field:ident),* $(,)?) => {
+        pub const HOT_FIELDS: &[&str] = &[$(stringify!($field)),*];
+
+        impl WorkerDynamicConfig {
+            pub fn from_patch(patch: &crate::WorkerConfigPatch) -> Self {
+                Self {
+                    $($field: patch.$field.to_owned(),)*
+                    namespace_rules: patch.namespace_rules.clone().unwrap_or_default(),
+                    namespaces: patch.namespaces.as_ref().map(|namespaces| {
+                        namespaces.iter().map(|(name, own)| {
+                            (name.clone(), NamespaceDynamicConfig {
+                                page_tti_hours: own.page_tti_hours,
+                                rate_limits: own.rate_limits,
+                            })
+                        }).collect()
+                    }).unwrap_or_default(),
+                }
+            }
+
+            pub fn from_config(config: &crate::WorkerConfig) -> Self {
+                Self {
+                    $($field: Some(config.$field.to_owned()),)*
+                    namespace_rules: config.namespace_rules.clone(),
+                    namespaces: Default::default(),
+                }
+            }
+
+            fn apply_resolved(effective: &mut crate::WorkerConfig, desired: &crate::WorkerConfig) {
+                $(effective.$field = desired.$field.to_owned();)*
+                effective.namespace_rules = desired.namespace_rules.clone();
+            }
+        }
+    };
+}
+
+hot_fields! {
+    page_tti_hours,
+    paged_miss_run_concurrency,
+    background_scan_batch_size,
+    background_delete_batch_size,
+    background_io_max_mb_per_sec,
+    background_delete_max_per_sec,
+    async_eviction_high_watermark,
+    async_eviction_low_watermark,
+    rate_limits,
+}
+
+mod plan;
+pub use plan::WorkerConfigPlan;
 
 #[cfg(test)]
 mod tests {
