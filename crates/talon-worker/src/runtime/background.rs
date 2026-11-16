@@ -284,19 +284,17 @@ impl WorkerRuntime {
     }
 
     pub(super) async fn maintain_small_background(&self) {
-        // Do not relocate halfway through capacity victim selection. Hold the
-        // same gate through maintenance so a new selection plan cannot overlap.
-        let capacity = self.small_capacity_eviction.lock().await;
-        if *capacity != super::async_eviction::SmallCapacityPhase::Idle {
-            return;
-        }
-        let _io = self.background_io().await;
-        if let Err(error) = self
-            .maintain_small_budget(false, self.background_budget.clone())
-            .await
-        {
-            tracing::warn!(%error, "small object maintenance failed");
-        }
+        self.capacity_plan
+            .maintain_if_idle(async {
+                let _io = self.background_io().await;
+                if let Err(error) = self
+                    .maintain_small_budget(false, self.background_budget.clone())
+                    .await
+                {
+                    tracing::warn!(%error, "small object maintenance failed");
+                }
+            })
+            .await;
     }
 }
 

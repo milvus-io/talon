@@ -301,7 +301,7 @@ async fn small_background_reclaims_after_bounded_scans_of_hot_or_pinned_keys() {
             ..Default::default()
         };
         let target = (before as f64 * config.async_eviction_low_watermark) as u64;
-        let credit = w.small_reclaim_credit().await;
+        let credit = w.small.as_ref().unwrap().reclaimable_bytes().await;
         assert!(credit > 0 && credit < before - target);
         assert!(w.lru.len() > w.page_gc_config.scan_batch_size);
         let live = w.block_count();
@@ -2172,4 +2172,135 @@ rate_limits = {{ enabled = false }}
     assert!(dynamic.apply_runtime(&snapshot(1), &worker));
     worker.gc_small_idle_at(now + 1).await;
     assert!(!worker.small.as_ref().unwrap().contains(&block));
+}
+
+#[tokio::test]
+async fn capacity_plan_foreground_admission_finishes_a_background_selection() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, mut w) = runtime(dir.path(), false, false);
+    w.page_gc_config.delete_batch_size = 1;
+    for n in 0..10 {
+        let mut block = id(&w);
+        block.object.object_path = format!("interleaved-{n}");
+        w.commit_cached_block(&block, Bytes::from(vec![n; 16 << 10]))
+            .await
+            .unwrap();
+    }
+    w.maintain_small(true).await.unwrap();
+    let payload_files = || {
+        let mut files: Vec<_> = crate::small_store::tests::files(&dir.path().join("small"))
+            .into_iter()
+            .filter(|p| {
+                p.extension().is_some_and(|e| e == "data")
+                    && std::fs::metadata(p).unwrap().len() > 0
+            })
+            .collect();
+        files.sort();
+        files
+    };
+    let original = payload_files();
+    let before = w.resident_bytes();
+    let config = WorkerConfig {
+        async_eviction_low_watermark: 0.30,
+        ..Default::default()
+    };
+    let target = (before as f64 * config.async_eviction_low_watermark) as u64;
+    let mut cycle = async_eviction::EvictionCycle::new(before, &config);
+    cycle.tick(&w).await;
+    assert_eq!(w.block_count(), 9);
+    assert_eq!(payload_files(), original);
+    let mut maintenance_ran = false;
+    w.capacity_plan
+        .maintain_if_idle(async {
+            maintenance_ran = true;
+        })
+        .await;
+    assert!(
+        !maintenance_ran,
+        "routine relocation must wait for victim selection"
+    );
+    w.capacity_bytes = target;
+    let mut admitted = id(&w);
+    admitted.object.object_path = "admitted-during-selection".into();
+    w.commit_cached_block(&admitted, Bytes::from(vec![11; 1024]))
+        .await
+        .unwrap();
+    assert!(w.resident_bytes() <= target);
+    assert!(w
+        .cached_small_range(&admitted, 0, 1024)
+        .await
+        .unwrap()
+        .is_some());
+    let retained = w.block_count();
+    assert!(
+        retained > 1,
+        "pressure must preserve an unpinned survivor alongside the admission"
+    );
+    let reclaimed = payload_files();
+    assert!(original.iter().all(|path| !reclaimed.contains(path)));
+    for _ in 0..3 {
+        cycle.tick(&w).await;
+        w.maintain_small_background().await;
+        assert_eq!(
+            w.block_count(),
+            retained,
+            "completed foreground pressure must not leave duplicate victim work"
+        );
+        assert_eq!(
+            payload_files(),
+            reclaimed,
+            "completed relocation must not be repeated"
+        );
+    }
+}
+
+#[tokio::test]
+async fn capacity_plan_maintenance_keeps_reclaim_exclusive_until_completion() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, w) = runtime(dir.path(), false, false);
+    for n in 0..4 {
+        let mut block = id(&w);
+        block.object.object_path = format!("maintenance-gate-{n}");
+        w.commit_cached_block(&block, Bytes::from(vec![n; 48 << 10]))
+            .await
+            .unwrap();
+    }
+    w.maintain_small(true).await.unwrap();
+    let before = w.resident_bytes();
+    let target = before * 3 / 4;
+    let (started, waiting) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let plan = w.clone().capacity_plan;
+    let maintenance = tokio::spawn(async move {
+        plan.maintain_if_idle(async {
+            started.send(()).unwrap();
+            released.await.unwrap();
+        })
+        .await;
+    });
+    tokio::time::timeout(Duration::from_secs(2), waiting)
+        .await
+        .unwrap()
+        .unwrap();
+    let reclaim = w.evict_to_target(target);
+    tokio::pin!(reclaim);
+    assert!(futures::poll!(&mut reclaim).is_pending());
+    assert_eq!(w.block_count(), 4);
+    assert_eq!(w.resident_bytes(), before);
+    release.send(()).unwrap();
+    maintenance.await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), reclaim)
+        .await
+        .unwrap();
+    assert!(w.resident_bytes() <= target);
+    let mut maintenance_ran = false;
+    w.capacity_plan
+        .maintain_if_idle(async {
+            maintenance_ran = true;
+        })
+        .await;
+    assert!(
+        maintenance_ran,
+        "completed reclamation must release routine maintenance"
+    );
 }

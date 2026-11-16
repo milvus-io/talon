@@ -1,6 +1,6 @@
 //! Instrumented worker cache request runtime.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 mod async_eviction;
 mod background;
 mod cache_routing;
+mod capacity_plan;
 mod load;
 mod namespaces;
 mod origin_head;
@@ -156,7 +157,7 @@ pub struct WorkerRuntime {
     page_scan: Arc<tokio::sync::Mutex<ScanCursor>>,
     page_checkpoint: Arc<tokio::sync::Mutex<usize>>,
     small_idle_cursor: Arc<tokio::sync::Mutex<(u64, u64)>>,
-    small_capacity_eviction: Arc<tokio::sync::Mutex<async_eviction::SmallCapacityPhase>>,
+    capacity_plan: Arc<capacity_plan::CapacityPlan>,
     page_cleanup: Arc<tokio::sync::Mutex<crate::page_cleanup::CleanupCursor>>,
 }
 
@@ -272,6 +273,11 @@ impl WorkerRuntime {
         ));
         metrics.set_l1_capacity(l1_capacity_bytes);
         let page_lifecycle = Arc::new(PageLifecycle::with_index(index.clone(), false));
+        let capacity_plan = Arc::new(capacity_plan::CapacityPlan::new(
+            index.clone(),
+            lru.clone(),
+            small.clone(),
+        ));
         // Residency gauges may already include other namespaces sharing these metrics.
         Self {
             membership: Arc::new(Mutex::new(None)),
@@ -317,7 +323,7 @@ impl WorkerRuntime {
             page_scan: Arc::new(tokio::sync::Mutex::new(ScanCursor::default())),
             page_checkpoint: Arc::new(tokio::sync::Mutex::new(0)),
             small_idle_cursor: Arc::new(tokio::sync::Mutex::new((0, 0))),
-            small_capacity_eviction: Arc::new(tokio::sync::Mutex::new(Default::default())),
+            capacity_plan,
         }
     }
 
@@ -2692,18 +2698,16 @@ impl WorkerRuntime {
             // able to reclaim idle units belonging to other namespaces.
             workers.sort_by_key(|worker| worker.namespace != self.namespace);
             for worker in &workers {
-                let total: u64 = workers.iter().map(|worker| worker.resident_bytes()).sum();
-                if total <= capacity {
+                let Some(target) = worker
+                    .capacity_plan
+                    .target_for(
+                        workers.iter().map(|worker| worker.capacity_plan.as_ref()),
+                        capacity,
+                    )
+                    .await
+                else {
                     break;
-                }
-                let other_credit = Self::other_small_reclaim_credit(&workers, worker).await;
-                let total: u64 = workers.iter().map(|worker| worker.resident_bytes()).sum();
-                if total <= capacity {
-                    break;
-                }
-                let target = worker
-                    .resident_bytes()
-                    .saturating_sub((total - capacity).saturating_sub(other_credit));
+                };
                 worker.evict_to_target(target).await;
             }
         } else {
@@ -2711,84 +2715,12 @@ impl WorkerRuntime {
         }
     }
 
-    /// Capacity reclamation for foreground admissions, bounded by initial residency.
     async fn evict_to_target(&self, target: u64) {
-        let mut phase = if self.small.as_ref().is_some() {
-            Some(self.small_capacity_eviction.lock().await)
-        } else {
-            None
-        };
-        if let Some(phase) = phase.as_mut() {
-            **phase = async_eviction::SmallCapacityPhase::Selecting {
-                empty_scan_remaining: self.lru.len().saturating_mul(2),
-            };
-        }
-        let budget = self.lru.len();
-        let mut attempted = HashSet::new();
-        // Finish victim selection before relocation. Previously one compaction
-        // per bounded batch could repeatedly copy the same surviving payloads.
-        while attempted.len() < budget && self.resident_bytes() > target {
-            let credit = self.small_reclaim_credit().await;
-            let missing = self
-                .resident_bytes()
-                .saturating_sub(target)
-                .saturating_sub(credit);
-            if missing == 0 {
-                break;
-            }
-            let mut evicted = self
-                .lru
-                .candidates_to_fit(self.lru.total_bytes().saturating_sub(missing), &attempted);
-            evicted.truncate(budget - attempted.len());
-            if evicted.is_empty() {
-                break;
-            }
-            attempted.extend(evicted.iter().map(|c| c.unit.clone()));
-            self.unlink_units_to_target(evicted, 1, target).await;
-        }
-        if let Some(phase) = phase.as_mut() {
-            **phase = async_eviction::SmallCapacityPhase::Reclaiming;
-        }
-        let segments = self
-            .small
-            .as_ref()
-            .and_then(|s| s.stats().ok())
-            .map_or(0, |s| s.segments);
-        for _ in 0..segments.saturating_add(1) {
-            if self.resident_bytes() <= target || self.small_readers_cover_excess(target) {
-                break;
-            }
-            match self.reclaim_small_to_target(target, None).await {
-                Ok(true) => {}
-                Ok(false) => break,
-                Err(error) => {
-                    tracing::warn!(%error, "small object pressure reclamation failed");
-                    break;
-                }
-            }
-        }
-        if let Some(phase) = phase.as_mut() {
-            **phase = async_eviction::SmallCapacityPhase::Idle;
-        }
-    }
-
-    async fn other_small_reclaim_credit(workers: &[Arc<Self>], namespace: &Self) -> u64 {
-        let mut credit = 0;
-        for worker in workers {
-            if !std::ptr::eq(worker.as_ref(), namespace) {
-                credit += worker.small_reclaim_credit().await;
-            }
-        }
-        credit
-    }
-
-    async fn small_reclaim_credit(&self) -> u64 {
-        match self.small.as_ref() {
-            Some(small) => {
-                small.reclaimable_bytes().await + small.stats().map_or(0, |s| s.retired_bytes)
-            }
-            None => 0,
-        }
+        self.capacity_plan
+            .foreground(target, |units| {
+                self.unlink_units_to_target(units, 1, target)
+            })
+            .await;
     }
 
     async fn checkpoint_small_access(&self) {
@@ -2800,33 +2732,6 @@ impl WorkerRuntime {
                 tracing::warn!(%error, "small object access checkpoint failed");
             }
         }
-    }
-
-    async fn reclaim_small_to_target(
-        &self,
-        target: u64,
-        budget: Option<Arc<crate::background::BackgroundBudget>>,
-    ) -> std::io::Result<bool> {
-        let excess = self.resident_bytes().saturating_sub(target);
-        if excess == 0 {
-            return Ok(false);
-        }
-        match self.small.as_ref() {
-            Some(small) => small.reclaim_with_budget(excess, budget).await,
-            None => Ok(false),
-        }
-    }
-
-    // Already unlinked inodes cannot be freed by evicting more objects. Wait for
-    // their readers when they cover the remaining excess over the target.
-    fn small_readers_cover_excess(&self, target: u64) -> bool {
-        self.small
-            .as_ref()
-            .and_then(|s| s.stats().ok())
-            .is_some_and(|s| {
-                let excess = self.resident_bytes().saturating_sub(target);
-                excess > 0 && s.retired_bytes >= excess
-            })
     }
 
     async fn gc_small_idle_at(&self, now: u64) {
@@ -2871,11 +2776,7 @@ impl WorkerRuntime {
 
     /// Allocated disk bytes of indexed cache data files, excluding sidecars.
     pub fn resident_bytes(&self) -> u64 {
-        let indexed = self.index.resident_bytes();
-        match self.small.as_ref().and_then(|s| s.stats().ok()) {
-            Some(stats) => indexed.saturating_add(stats.allocated_bytes),
-            None => indexed,
-        }
+        self.capacity_plan.resident_bytes()
     }
 
     #[cfg(test)]
