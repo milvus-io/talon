@@ -66,28 +66,24 @@ impl NamespaceRuntimes {
         &self,
         config: &talon_core::dynamic_config::WorkerDynamicConfig,
     ) -> Result<(), String> {
-        let validate = |static_config: &WorkerConfig, hours: u64| {
-            if hours > 0 {
-                if static_config.l2_page_size_bytes == 0
-                    && static_config.small_object_threshold_bytes == 0
-                {
-                    return Err("TTI requires paged L2 or small-object storage".to_string());
-                }
-                if static_config.page_access_checkpoint_interval_minutes * 60_000
-                    > hours * 3_600_000
-                {
-                    return Err("checkpoint interval exceeds TTI".to_string());
-                }
-            }
-            Ok(())
-        };
-        if let Some(hours) = config.page_tti_hours {
-            validate(&self.config, hours)?;
-        }
+        let validate =
+            |static_config: &WorkerConfig,
+             settings: &talon_core::dynamic_config::NamespaceDynamicConfig| {
+                settings.validate_tti_storage(
+                    static_config.l2_page_size_bytes > 0
+                        || static_config.small_object_threshold_bytes > 0,
+                    static_config.page_access_checkpoint_interval_minutes * 60_000,
+                )
+            };
+        validate(
+            &self.config,
+            &talon_core::dynamic_config::NamespaceDynamicConfig {
+                page_tti_hours: config.page_tti_hours,
+                ..Default::default()
+            },
+        )?;
         for rule in &config.namespace_rules {
-            if let Some(hours) = rule.config.page_tti_hours {
-                validate(&self.config, hours)?;
-            }
+            validate(&self.config, &rule.config)?;
         }
         let mut known = std::collections::BTreeSet::new();
         known.extend(
@@ -106,7 +102,13 @@ impl NamespaceRuntimes {
                     .config
                     .for_namespace(&NamespaceId::named(name))
                     .map_err(|e| e.to_string())?;
-                validate(&static_config, hours)?;
+                validate(
+                    &static_config,
+                    &talon_core::dynamic_config::NamespaceDynamicConfig {
+                        page_tti_hours: Some(hours),
+                        ..Default::default()
+                    },
+                )?;
             }
         }
         Ok(())
