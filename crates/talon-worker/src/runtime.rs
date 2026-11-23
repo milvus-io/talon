@@ -530,19 +530,12 @@ impl WorkerRuntime {
             registry.validate_settings(config)?;
         }
         let validate = |runtime: &Self| {
-            if let Some(hours) = config
+            config
                 .settings_for(runtime.namespace.effective_name())
-                .page_tti_hours
-                .filter(|hours| *hours > 0)
-            {
-                if runtime.paged.is_none() && runtime.small.is_none() {
-                    return Err("TTI requires paged L2 or small-object storage".to_string());
-                }
-                if runtime.page_gc_config.checkpoint_interval_ms > hours * 3_600_000 {
-                    return Err("checkpoint interval exceeds TTI".to_string());
-                }
-            }
-            Ok(())
+                .validate_tti_storage(
+                    runtime.paged.is_some() || runtime.small.is_some(),
+                    runtime.page_gc_config.checkpoint_interval_ms,
+                )
         };
         validate(self)?;
         if let Some(registry) = self.registry() {
