@@ -7,11 +7,12 @@
 //! # Layout
 //!
 //! ```text
-//! <root>/<shard>/<digest>.pages/
+//! <root>/<shard>/<address>.pages/
 //!     <page_index>.page      # one file per resident page
 //! ```
 //!
-//! `digest`/`shard` mirror the whole-block store ([`WholeBlockStore`]).
+//! The Worker catalog assigns a disk ID to each resident block. Standalone
+//! stores use the existing block hash and sidecar layout.
 //!
 //! [`get_page`](PagedBlockStore::get_page) opens a page's fd;
 //! [`get_range`](PagedBlockStore::get_range) returns one [`BlockHandle`] per
@@ -19,8 +20,8 @@
 //! single handle. Any absent covered page yields [`Error::NotFound`] carrying
 //! the `(block, page)` context so the caller can trigger a page-level miss.
 //!
-//! [`WholeBlockStore`]: crate::WholeBlockStore
 
+use crate::catalog::DiskId;
 use crate::fd_cache::{CachedFd, FdCache};
 use bytes::Bytes;
 use std::collections::hash_map::DefaultHasher;
@@ -45,6 +46,23 @@ pub(crate) fn block_dir(root: &Path, id: &BlockId) -> PathBuf {
     id.hash(&mut hasher);
     let hex = format!("{:016x}", hasher.finish());
     root.join(&hex[..2]).join(format!("{hex}.pages"))
+}
+
+pub(crate) fn disk_dir(root: &Path, id: DiskId) -> PathBuf {
+    // The legacy directory scanner must leave journal-managed files to replay.
+    id.path(root, "pages")
+}
+
+pub(crate) fn remove_empty_disk_dir(dir: &Path) -> std::io::Result<()> {
+    match std::fs::remove_dir(dir) {
+        Err(error) if error.raw_os_error() == Some(libc::ENOTEMPTY) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        result => result?,
+    }
+    match std::fs::File::open(dir.parent().unwrap()) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        file => file?.sync_all(),
+    }
 }
 
 fn catalog_error(error: anyhow::Error) -> Error {
@@ -121,7 +139,7 @@ impl PagedBlockStore {
         page: PageIndex,
         len: u64,
         payload: talon_uring::Payload,
-    ) -> Result<u64> {
+    ) -> Result<(u64, Option<DiskId>)> {
         let (catalog, store) = self.catalog.as_ref().unwrap();
         let transaction = catalog
             .begin(
@@ -131,10 +149,11 @@ impl PagedBlockStore {
             )
             .await
             .map_err(catalog_error)?;
-        let path = self.page_path(id, page);
-        let staged = self
-            .dir_for(id)
-            .join(format!("{}.page.catalog.{}", page.0, transaction.id));
+        let disk_id = transaction.disk_id;
+        let dir = disk_dir(&self.root, disk_id);
+        let path = dir.join(format!("{}.page", page.0));
+        let invalidate = path.clone();
+        let staged = dir.join(format!("{}.page.catalog.{}", page.0, transaction.id));
         let result: Result<u64> = if self.uring {
             let alignment = self.direct_alignment.expect("native store alignment");
             talon_uring::spawn_local(async move {
@@ -167,14 +186,14 @@ impl PagedBlockStore {
             })
             .await
         };
-        self.fd_cache.invalidate(&self.page_path(id, page));
+        self.fd_cache.invalidate(&invalidate);
         match result {
             Ok(allocated) => {
                 catalog
                     .complete(transaction, allocated)
                     .await
                     .map_err(catalog_error)?;
-                Ok(allocated)
+                Ok((allocated, Some(disk_id)))
             }
             Err(error) => {
                 catalog.poison();
@@ -190,7 +209,12 @@ impl PagedBlockStore {
     ) -> Result<()> {
         let (catalog, store) = self.catalog.as_ref().unwrap();
         let pages = if matches!(operation, crate::catalog::Operation::DeleteBlock) {
-            catalog.pages(store, id).await.map_err(catalog_error)?
+            let pages = catalog.pages(store, id).await.map_err(catalog_error)?;
+            // The last page unlink already retired the block and its directory.
+            if pages.is_empty() {
+                return Ok(());
+            }
+            pages
         } else {
             Vec::new()
         };
@@ -198,7 +222,7 @@ impl PagedBlockStore {
             .begin(store, id, operation.clone())
             .await
             .map_err(catalog_error)?;
-        let dir = self.dir_for(id);
+        let dir = disk_dir(&self.root, transaction.disk_id);
         self.fd_cache.invalidate_prefix(&dir);
         let result = spawn_blocking_io(move || {
             let (result, parent) = match operation {
@@ -228,6 +252,9 @@ impl PagedBlockStore {
             match std::fs::File::open(parent) {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 file => file?.sync_all()?,
+            }
+            if matches!(operation, crate::catalog::Operation::DeletePage { .. }) {
+                remove_empty_disk_dir(&dir)?;
             }
             Ok(())
         })
@@ -287,7 +314,7 @@ impl PagedBlockStore {
         page: PageIndex,
         block_len: u64,
         value: talon_uring::Payload,
-    ) -> Result<u64> {
+    ) -> Result<(u64, Option<DiskId>)> {
         if self.catalog.is_some() {
             return self.commit_catalog_page(id, page, block_len, value).await;
         }
@@ -325,14 +352,17 @@ impl PagedBlockStore {
                 )
                 .await?;
                 disk.fd_cache.invalidate(&path);
-                Ok(allocated)
+                Ok((allocated, None))
             })
             .await
             .map_err(|e| std::io::Error::other(format!("ring commit task stopped: {e}")))?;
         }
         spawn_blocking_io(move || {
             disk.write_sidecar(&id, block_len)?;
-            disk.put_page_allocated(&id, page, value.into_bytes())
+            Ok((
+                disk.put_page_allocated(&id, page, value.into_bytes())?,
+                None,
+            ))
         })
         .await
     }
@@ -385,9 +415,28 @@ impl PagedBlockStore {
         &self.root
     }
 
-    /// Directory holding a block's page files: `<root>/<shard>/<digest>.pages`.
+    /// Directory for the standalone sidecar layout.
     pub(crate) fn dir_for(&self, id: &BlockId) -> PathBuf {
         block_dir(&self.root, id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn catalog_dir_for(&self, id: &BlockId) -> Result<PathBuf> {
+        assert!(self.journaled(), "expected a catalog-backed paged store");
+        self.read_dir(id, None)
+    }
+
+    fn read_dir(&self, id: &BlockId, disk_id: Option<DiskId>) -> Result<PathBuf> {
+        let Some((catalog, store)) = &self.catalog else {
+            return Ok(block_dir(&self.root, id));
+        };
+        let disk_id = match disk_id {
+            Some(disk_id) => disk_id,
+            None => catalog
+                .disk_id(store, id)?
+                .ok_or_else(|| Error::NotFound(id.to_string()))?,
+        };
+        Ok(disk_dir(&self.root, disk_id))
     }
 
     /// Path of a single page file within a block directory.
@@ -645,7 +694,8 @@ impl PagedBlockStore {
 
     /// Whether a specific page is resident.
     pub fn has_page(&self, id: &BlockId, page: PageIndex) -> bool {
-        self.page_path(id, page).exists()
+        self.read_dir(id, None)
+            .is_ok_and(|dir| dir.join(format!("{}.page", page.0)).exists())
     }
 
     /// Materialize (commit) one page's bytes via temp-file + rename.
@@ -742,7 +792,17 @@ impl PagedBlockStore {
     /// trigger a page-level miss.
     /// `len` is the logical page length, excluding any physical tail padding.
     pub async fn get_page_bytes(&self, id: &BlockId, page: PageIndex, len: u64) -> Result<Bytes> {
-        let path = self.page_path(id, page);
+        self.get_page_bytes_at(id, None, page, len).await
+    }
+
+    pub(crate) async fn get_page_bytes_at(
+        &self,
+        id: &BlockId,
+        disk_id: Option<DiskId>,
+        page: PageIndex,
+        len: u64,
+    ) -> Result<Bytes> {
+        let path = self.read_dir(id, disk_id)?.join(format!("{}.page", page.0));
         let label = format!("{id} page {}", page.0);
         if self.uring {
             talon_uring::require_ring()?;
@@ -820,13 +880,19 @@ impl PagedBlockStore {
     /// spanning N pages opens N files, so the syscall count scales with the
     /// span rather than being one per request.
     pub fn get_page(&self, id: &BlockId, page: PageIndex) -> Result<BlockHandle> {
-        let (fd, len) = self.open_page_ro(id, page)?;
+        let dir = self.read_dir(id, None)?;
+        let (fd, len) = self.open_page_ro(&dir, id, page)?;
         Ok(BlockHandle::from_shared(fd, 0, len))
     }
 
     /// Open a present page read-only, returning a shared fd and its length.
-    fn open_page_ro(&self, id: &BlockId, page: PageIndex) -> Result<(Arc<OwnedFd>, u64)> {
-        let path = self.page_path(id, page);
+    fn open_page_ro(
+        &self,
+        dir: &Path,
+        id: &BlockId,
+        page: PageIndex,
+    ) -> Result<(Arc<OwnedFd>, u64)> {
+        let path = dir.join(format!("{}.page", page.0));
         if let Some(hit) = self.fd_cache.get(&path) {
             return Ok((hit.fd, hit.len));
         }
@@ -858,9 +924,20 @@ impl PagedBlockStore {
     /// returning one handle per page but merging the intra-page ranges. Any
     /// absent covered page yields [`Error::NotFound`].
     pub fn get_range(&self, id: &BlockId, offset: u64, len: u64) -> Result<Vec<BlockHandle>> {
+        self.get_range_buffered(id, None, offset, len)
+    }
+
+    fn get_range_buffered(
+        &self,
+        id: &BlockId,
+        disk_id: Option<DiskId>,
+        offset: u64,
+        len: u64,
+    ) -> Result<Vec<BlockHandle>> {
         if len == 0 {
             return Ok(Vec::new());
         }
+        let dir = self.read_dir(id, disk_id)?;
         let ps = self.page_size as u64;
         let start_page = (offset / ps) as u32;
         let end_byte = offset + len - 1;
@@ -876,11 +953,10 @@ impl PagedBlockStore {
             let in_page_off = from - page_start;
             let in_page_len = to - from;
 
-            let handle = self.get_page(id, page)?; // NotFound propagates
-                                                   // Clamp to the actually-present bytes of the page file.
-            let avail = handle.len.saturating_sub(in_page_off);
+            let (fd, page_len) = self.open_page_ro(&dir, id, page)?;
+            let avail = page_len.saturating_sub(in_page_off);
             let serve = in_page_len.min(avail);
-            handles.push(BlockHandle::from_shared(handle.fd, in_page_off, serve));
+            handles.push(BlockHandle::from_shared(fd, in_page_off, serve));
         }
         Ok(handles)
     }
@@ -892,12 +968,23 @@ impl PagedBlockStore {
         offset: u64,
         len: u64,
     ) -> Result<Vec<BlockHandle>> {
+        self.get_range_at(id, None, offset, len).await
+    }
+
+    pub(crate) async fn get_range_at(
+        &self,
+        id: &BlockId,
+        disk_id: Option<DiskId>,
+        offset: u64,
+        len: u64,
+    ) -> Result<Vec<BlockHandle>> {
         if !self.uring {
-            return self.get_range(id, offset, len);
+            return self.get_range_buffered(id, disk_id, offset, len);
         };
         if len == 0 {
             return Ok(Vec::new());
         }
+        let dir = self.read_dir(id, disk_id)?;
         let end = offset
             .checked_add(len)
             .ok_or_else(|| Error::Other("range overflows u64".into()))?;
@@ -909,7 +996,7 @@ impl PagedBlockStore {
             );
             let hit = self
                 .fd_cache
-                .open_native(self.page_path(id, page))
+                .open_native(dir.join(format!("{}.page", page.0)))
                 .await
                 .map_err(|error| {
                     crate::block_store::cache_read_error(error, format!("{id} page {}", page.0))

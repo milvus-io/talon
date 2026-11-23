@@ -63,7 +63,7 @@ fn restart_replay_and_index() {
     state
         .apply(
             0,
-            Record::Store {
+            Record::PagedStore {
                 path: "paged".into(),
                 page_size: 131072,
             },
@@ -86,6 +86,7 @@ fn restart_replay_and_index() {
                 store: "paged".into(),
                 block: model::Block {
                     id: BlockKey::new(&id),
+                    disk_id: DiskId::new(n + 1, 0).ok(),
                     len: 4 * 1024 * 1024,
                     pages: (0..32).map(|p| (p, 131072)).collect(),
                 },

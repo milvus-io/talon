@@ -117,9 +117,11 @@ fn scenario(count: usize, pages: u32, tracked: bool, tti: bool) {
     });
     let catalog: HashMap<_, _> = measure("catalog_excluding_identity", count, || {
         keys.iter()
-            .map(|key| {
+            .enumerate()
+            .map(|(n, key)| {
                 let block = Block {
                     id: key.clone(),
+                    disk_id: DiskId::new(n as u64 + 1, 0).ok(),
                     len: u64::from(pages.max(1)) << 20,
                     pages: (0..pages.max(1)).map(|p| (p, 1 << 20)).collect(),
                 };
@@ -130,9 +132,11 @@ fn scenario(count: usize, pages: u32, tracked: bool, tti: bool) {
     measure("resident_index_excluding_identity", count, || {
         let blocks = keys
             .iter()
-            .map(|key| StoredBlock {
+            .enumerate()
+            .map(|(n, key)| StoredBlock {
                 meta: StoredMeta {
                     id: key.clone(),
+                    disk_id: DiskId::new(n as u64 + 1, 0).ok(),
                     form: if pages == 0 {
                         BlockForm::Whole
                     } else {

@@ -12,26 +12,30 @@ every page. Whole-block recovery uses the same snapshot and journal without
 enumerating block files or reading per-block sidecars. Access-time checkpoints
 remain separate.
 
-This is a new cache format. Existing paged directories without a registered
-catalog, and the former root-level `.paged-catalog`, are rejected; use a new
-empty cache root. There is no legacy migration or automatic deletion of the old
-cache. An older Worker cannot safely write a
-catalog-backed cache root. Standalone low-level store fixtures still support
-the paged sidecar layout; the Worker namespace startup path always uses the catalog.
+The catalog assigns each whole or paged block a disk ID containing its shard
+and the sequence of its first durable write intent. Sibling pages share that
+ID, and replay and checkpoints preserve it.
 
-Whole blocks live at `<scope>/whole/<shard>/<digest>.blk`. Their catalog store
+Hash-addressed file catalogs, paged directories without a registered catalog
+and former root-level catalogs are incompatible. The existing
+`reset_incompatible_cache` setting controls whether startup rejects the cache
+or resets the cache root while preserving Worker identity. The previous Worker
+format also rejects Disk ID catalogs on rollback. Standalone paged stores
+continue to use the sidecar layout.
+
+Whole blocks live at `<scope>/whole/<shard>/disk-<id>.blk`. Their catalog store
 has `page_size = 0`; each block records its logical length and one allocation
 count (`st_blocks * 512`, measured when written). `PutWhole` and `DeleteBlock`
 use durable Begin/Complete records. A pending write or delete discards the block
-on restart; cleanup also removes `<digest>.blk.catalog.<transaction>` by exact
+on restart; cleanup also removes `disk-<id>.blk.catalog.<transaction>` by exact
 path before recording Resolve. Refill can then safely reuse the identity.
 Writes and deletes keep ownership through completion when a requester cancels.
 
 Whole stores always require a catalog, including standalone stores. First
 registration rejects legacy hash-shard directories and unregistered `whole/`
 data. It neither imports nor deletes old data. Registered stores do not enumerate
-the scope or data directories during recovery. Existing paged/small journal
-roots with no whole data can register an empty whole store on first startup.
+the scope or data directories during recovery. A scope with a Disk ID catalog
+and no whole data can register an empty whole store on first startup.
 
 ## Layout and ownership
 
@@ -44,12 +48,12 @@ roots with no whole data can register an empty whole store on first startup.
     <log files selected by CURRENT>
   <namespace>/shared/whole/
     ab/
-      <digest>.blk
-      <digest>.blk.catalog.<transaction>   # only while a put is incomplete
+      disk-<id>.blk
+      disk-<id>.blk.catalog.<transaction>   # only while a put is incomplete
   <namespace>/shared/paged/
     ab/
       access.shard
-      <digest>.pages/
+      disk-<disk-id>.pages/
         0.page
         1.page
         <page>.page.catalog.<transaction>   # only while a put is incomplete
@@ -104,18 +108,17 @@ an error rather than recursive removal.
 Prepare/Commit names here correspond to the encoded `Begin`/`Complete` records.
 Store registration records page geometry. The first completed put creates the
 block record; removal of the last page retires that record. Snapshot block
-records contain identity, logical length and page-index-to-allocation mappings.
-Mappings are encoded in chunks of at most 1,024 pages, so even the largest legal
-block/page geometry stays below the journal frame limit. Continuation chunks
-must match the block identity and length and advance beyond the previous page;
-duplicates and out-of-order chunks fail recovery. Existing single-record block
-snapshots remain readable. Older readers cannot restore multi-chunk snapshots;
-downgrading to such a reader requires a fresh cache root.
+records contain block identity, Disk ID, logical length and page allocations.
+The Disk ID format encodes each block in one or more chunks of at most 1,024
+pages, so even the largest legal geometry stays below the journal frame limit.
+Continuation chunks must match the identity, Disk ID and length and advance
+beyond the previous page. Duplicates and out-of-order chunks fail recovery.
 
 If a data mutation or journal operation fails, further catalog mutations fail
 until restart. This conservative boundary prevents reuse of a path with an
-unresolved operation. Already cached reads can still proceed; writes that need
-cache admission return the error. The cache-root lease outlives accepted work.
+unresolved operation. Committed blocks unaffected by the failure remain readable.
+Writes that need cache admission return the error. The cache-root lease outlives
+accepted work.
 
 ## Recovery and checkpointing
 
@@ -176,9 +179,9 @@ concerns whole-block and paged block/page enumeration, not zero
 filesystem operations or zero startup work. Access timestamps remain sampled
 in `access.shard`; ordinary read hits do not write residency log records.
 
-Background file cleanup remains available for empty directories and unrelated
-old temporary files. External filesystem edits/corruption are outside the
-journal transaction protocol; on-read failures still require origin recovery.
+Catalog deletion and recovery clean up the `disk-*.pages` directories.
+Background file cleanup still handles legacy empty directories and old temporary
+files. External edits or corruption may require a fresh read from the origin.
 Data-file allocation is tracked, while catalog/filesystem overhead requires
 operational disk headroom. ENOSPC does not turn a failed mutation into success.
 

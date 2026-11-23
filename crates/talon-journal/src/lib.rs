@@ -112,12 +112,20 @@ impl Admission {
         })
     }
 }
+type Publish = Box<dyn FnOnce()>;
+type Prepare<M> = Box<dyn FnOnce(&M, Lsn) -> Publish + Send>;
+
+enum AppendReply<M: Machine> {
+    Sequence(oneshot::Sender<Lsn>),
+    Project(Prepare<M>),
+}
+
 enum Command<M: Machine> {
     Append {
         record: M::Record,
         bytes: Bytes,
         ack: Ack,
-        done: oneshot::Sender<io::Result<Lsn>>,
+        reply: AppendReply<M>,
     },
     Query(Query<M>),
     Checkpoint(oneshot::Sender<watch::Receiver<bool>>),
@@ -388,6 +396,41 @@ impl<M: Machine> Handle<M> {
             .map_err(|_| stopped())
     }
     pub async fn append(&self, record: M::Record, ack: Ack) -> io::Result<Lsn> {
+        let (done, wait) = oneshot::channel();
+        self.enqueue_append(record, ack, AppendReply::Sequence(done))
+            .await?;
+        wait.await.map_err(|_| stopped())
+    }
+
+    /// Prepare a reply from the state immediately after applying the record.
+    /// Publish the prepared result only after the append's own durable sync.
+    /// Publication runs even when the caller has dropped the reply receiver.
+    pub async fn append_with<R, P>(
+        &self,
+        record: M::Record,
+        prepare: impl FnOnce(&M, Lsn) -> P + Send + 'static,
+    ) -> io::Result<R>
+    where
+        R: Send + 'static,
+        P: FnOnce() -> R + 'static,
+    {
+        let (done, wait) = oneshot::channel();
+        let reply = AppendReply::Project(Box::new(move |state, lsn| {
+            let publish = prepare(state, lsn);
+            Box::new(move || {
+                let _ = done.send(publish());
+            })
+        }));
+        self.enqueue_append(record, Ack::Durable, reply).await?;
+        wait.await.map_err(|_| stopped())
+    }
+
+    async fn enqueue_append(
+        &self,
+        record: M::Record,
+        ack: Ack,
+        reply: AppendReply<M>,
+    ) -> io::Result<()> {
         let limit = M::encoded_len(&record)?;
         if limit > self.inner.max_record {
             return Err(invalid("journal record exceeds stream budget"));
@@ -402,18 +445,16 @@ impl<M: Machine> Handle<M> {
         if bytes.len() > limit {
             return Err(invalid("journal encoded_len underestimated record"));
         }
-        let (done, wait) = oneshot::channel();
         self.send(
             Command::Append {
                 record,
                 bytes,
                 ack,
-                done,
+                reply,
             },
             permits,
         )
-        .await?;
-        wait.await.map_err(|_| stopped())?
+        .await
     }
     pub async fn query<R: Send + 'static>(
         &self,

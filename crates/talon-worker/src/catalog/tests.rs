@@ -11,7 +11,7 @@ fn repeated_whole_put_preserves_canonical_identity() {
     state
         .apply(
             1,
-            Record::Store {
+            Record::WholeStore {
                 path: "whole".into(),
                 page_size: 0,
             },
@@ -27,6 +27,8 @@ fn repeated_whole_put_preserves_canonical_identity() {
                         store: "whole".into(),
                         block: block(0),
                         operation: Operation::PutWhole { len: 4 },
+                        shard: Some(0),
+                        disk_id: None,
                     },
                 },
             )
@@ -42,6 +44,7 @@ fn repeated_whole_put_preserves_canonical_identity() {
             .unwrap();
         let (key, value) = state.stores["whole"].blocks.iter().next().unwrap();
         assert!(key.ptr_eq(&value.id));
+        assert_eq!(value.disk_id, DiskId::new(2, 0).ok());
         if let Some(old) = previous {
             assert!(BlockKey::ptr_eq(&old, key));
         }
@@ -55,7 +58,7 @@ fn frozen_snapshot_preserves_pages_and_pending_transaction_ids() {
     state
         .apply(
             1,
-            Record::Store {
+            Record::PagedStore {
                 path: "paged".into(),
                 page_size: 4,
             },
@@ -66,6 +69,8 @@ fn frozen_snapshot_preserves_pages_and_pending_transaction_ids() {
             store: "paged".into(),
             block: block(0),
             operation: Operation::Put { page: 0, len: 16 },
+            shard: Some(0),
+            disk_id: None,
         },
     };
     state.apply(2, begin()).unwrap();
@@ -99,7 +104,8 @@ fn frozen_snapshot_preserves_pages_and_pending_transaction_ids() {
     }
     let entries = restored.entries("paged").unwrap().unwrap();
     assert_eq!(entries[0].allocated, vec![(Some(PageIndex(0)), 4096)]);
-    assert!(restored.pending.contains_key(&4));
+    assert_eq!(entries[0].meta.disk_id, DiskId::new(2, 0).ok());
+    assert_eq!(restored.pending[&4].disk_id, DiskId::new(2, 0).ok());
     restored
         .apply(6, Record::Resolve { transaction: 4 })
         .unwrap();
@@ -113,6 +119,49 @@ fn frozen_snapshot_preserves_pages_and_pending_transaction_ids() {
     assert_eq!(
         State::encoded_len(&record).unwrap(),
         State::encode(&record).unwrap().len()
+    );
+}
+
+#[tokio::test]
+async fn sibling_begins_share_the_same_disk_id_before_either_completes() {
+    let root = tempfile::tempdir().unwrap();
+    let catalog = open(root.path());
+    let paged = store(&catalog);
+    let key = block(0);
+    let first = catalog
+        .begin("paged", &key, Operation::Put { page: 0, len: 16 })
+        .await
+        .unwrap();
+    let sibling = catalog
+        .begin("paged", &key, Operation::Put { page: 1, len: 16 })
+        .await
+        .unwrap();
+    let other = catalog
+        .begin("paged", &block(1), Operation::Put { page: 0, len: 16 })
+        .await
+        .unwrap();
+    let disk_id = first.disk_id;
+    assert_eq!(sibling.disk_id, disk_id);
+    assert_ne!(other.disk_id, disk_id);
+    let dir = crate::paged_store::disk_dir(paged.root(), disk_id);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("0.page"), b"lost").unwrap();
+    std::fs::write(dir.join("1.page"), b"kept").unwrap();
+    catalog.complete(sibling, 4096).await.unwrap();
+    catalog.checkpoint().await.unwrap();
+    drop((first, other, paged, catalog));
+
+    let catalog = open(root.path());
+    assert!(catalog.disk_id("paged", &block(1)).unwrap().is_none());
+    assert_eq!(catalog.disk_id("paged", &key).unwrap(), Some(disk_id));
+    assert!(!dir.join("0.page").exists());
+    assert_eq!(
+        store(&catalog)
+            .get_page_bytes_at(&key, Some(disk_id), PageIndex(1), 4)
+            .await
+            .unwrap()
+            .as_ref(),
+        b"kept"
     );
 }
 
@@ -131,6 +180,7 @@ async fn large_block_checkpoint_reopens_without_an_oversized_frame() {
     let count = id.page_count(config.l2_page_size_bytes as u32);
     let block = model::Block {
         id: BlockKey::new(&id),
+        disk_id: DiskId::new(1, 0).ok(),
         len: u64::from(id.block_size),
         pages: (0..count).map(|page| (page, 4096)).collect(),
     };
@@ -160,6 +210,8 @@ async fn large_block_checkpoint_reopens_without_an_oversized_frame() {
                     store: path.into(),
                     block: id.clone(),
                     operation: Operation::DeletePage { page: 0 },
+                    shard: Some(0),
+                    disk_id: None,
                 },
             },
             Ack::Durable,
@@ -205,6 +257,7 @@ fn snapshot_page_chunks_validate_identity_order_and_legacy_records() {
         store: path.into(),
         block: model::Block {
             id: BlockKey::new(&block(0)),
+            disk_id: DiskId::new(1, 0).ok(),
             len,
             pages: [(page, 4096)].into(),
         },
@@ -212,7 +265,7 @@ fn snapshot_page_chunks_validate_identity_order_and_legacy_records() {
     };
     let mut state = State::default();
     state
-        .restore(SnapshotRecord::Store {
+        .restore(SnapshotRecord::PagedStore {
             path: path.into(),
             page_size: 4,
         })
@@ -247,8 +300,8 @@ async fn catalog_failure_does_not_poison_another_stream_on_the_root_service() {
     let other = scoped(&service, "a/scopes/test");
     let paged = store(&catalog);
     let other_paged = store(&other);
-    let dir = paged.dir_for(&block(0));
-    std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
+    let dir = paged.root().to_owned();
+    std::fs::remove_dir(&dir).unwrap();
     std::fs::write(&dir, b"obstruction").unwrap();
     assert!(paged
         .commit_page(&block(0), PageIndex(0), 4, Bytes::from_static(b"data"))
@@ -415,7 +468,9 @@ async fn replay_restores_exact_residency_and_allocation_without_listing_data() {
         .await
         .unwrap();
     paged.delete_block_async(&block(1)).await.unwrap();
-    assert!(!paged.dir_for(&block(0)).join("block.meta").exists());
+    let dir = paged.catalog_dir_for(&block(0)).unwrap();
+    assert!(dir.join("2.page").exists());
+    assert!(!dir.join("block.meta").exists());
     let before = catalog.recover("paged").unwrap().unwrap();
     assert_eq!(before.len(), 1);
     assert_eq!(before[0].allocated.len(), 1);
@@ -448,7 +503,8 @@ async fn pending_put_is_cleaned_by_exact_path_including_replaced_page() {
             .begin("paged", &block(0), Operation::Put { page: 0, len: 16 })
             .await
             .unwrap();
-        let dir = paged.dir_for(&block(0));
+        let dir = paged.catalog_dir_for(&block(0)).unwrap();
+        assert_eq!(dir, crate::paged_store::disk_dir(paged.root(), id.disk_id));
         let temp = dir.join(format!("0.page.catalog.{}", id.id));
         std::fs::write(&temp, b"partial").unwrap();
         if checkpoint {
@@ -465,11 +521,13 @@ async fn pending_put_is_cleaned_by_exact_path_including_replaced_page() {
             .commit_page(&block(0), PageIndex(0), 16, Bytes::from_static(b"new!"))
             .await
             .unwrap();
+        let refill = paged.catalog_dir_for(&block(0)).unwrap();
+        assert_ne!(refill, dir);
         drop(paged);
         drop(catalog);
         let catalog = open(root.path());
         assert_eq!(catalog.recover("paged").unwrap().unwrap().len(), 1);
-        assert_eq!(std::fs::read(dir.join("0.page")).unwrap(), b"new!");
+        assert_eq!(std::fs::read(refill.join("0.page")).unwrap(), b"new!");
     }
 }
 
@@ -488,7 +546,8 @@ async fn pending_deletes_survive_checkpoint_and_recreation() {
             .await
             .unwrap();
         catalog.checkpoint().await.unwrap();
-        let path = paged.dir_for(&block(0)).join("0.page");
+        let path = paged.catalog_dir_for(&block(0)).unwrap().join("0.page");
+        assert!(path.exists());
         drop(paged);
         drop(catalog);
         let catalog = open(root.path());
@@ -546,8 +605,8 @@ async fn failed_file_mutation_blocks_further_admissions_until_recovery() {
     let root = tempfile::tempdir().unwrap();
     let catalog = open(root.path());
     let paged = store(&catalog);
-    let dir = paged.dir_for(&block(0));
-    std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
+    let dir = paged.root().to_owned();
+    std::fs::remove_dir(&dir).unwrap();
     std::fs::write(&dir, b"obstruction").unwrap();
     assert!(paged
         .commit_page(&block(0), PageIndex(0), 4, Bytes::from_static(b"data"))
@@ -568,6 +627,7 @@ async fn failed_file_mutation_blocks_further_admissions_until_recovery() {
 fn whole_geometry_rejects_page_operations_and_malformed_snapshots() {
     let mut state = State::default();
     for (path, page_size) in [
+        ("paged", 4),
         ("whole", 4),
         ("paged", 0),
         ("../whole", 0),
@@ -577,17 +637,20 @@ fn whole_geometry_rejects_page_operations_and_malformed_snapshots() {
         assert!(state
             .apply(
                 1,
-                Record::Store {
+                Record::WholeStore {
                     path: path.into(),
                     page_size
                 }
             )
             .is_err());
     }
+    let legacy = br#"{"Store":{"path":"whole","page_size":0}}"#;
+    assert!(State::decode(legacy).is_err());
+    assert!(State::decode_snapshot(legacy).is_err());
     state
         .apply(
             1,
-            Record::Store {
+            Record::WholeStore {
                 path: "whole".into(),
                 page_size: 0,
             },
@@ -605,7 +668,9 @@ fn whole_geometry_rejects_page_operations_and_malformed_snapshots() {
                     intent: model::Intent {
                         store: "whole".into(),
                         block: block(0),
-                        operation
+                        operation,
+                        shard: Some(0),
+                        disk_id: None,
                     }
                 }
             )
@@ -621,6 +686,7 @@ fn whole_geometry_rejects_page_operations_and_malformed_snapshots() {
                 store: "whole".into(),
                 block: model::Block {
                     id: BlockKey::new(&block(0)),
+                    disk_id: DiskId::new(1, 0).ok(),
                     len: 4,
                     pages: pages.into_iter().collect()
                 },
@@ -633,6 +699,7 @@ fn whole_geometry_rejects_page_operations_and_malformed_snapshots() {
             store: "whole".into(),
             block: model::Block {
                 id: BlockKey::new(&block(0)),
+                disk_id: DiskId::new(1, 0).ok(),
                 len: 4,
                 pages: [(0, 4096)].into(),
             },

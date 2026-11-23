@@ -872,6 +872,57 @@ mod tests {
         .await
     }
 
+    async fn write_hash_addressed_catalog(root: &Path, scope: &Path) {
+        struct LegacyCatalog;
+        impl talon_journal::Machine for LegacyCatalog {
+            type Record = Bytes;
+            type SnapshotRecord = ();
+            type Snapshot = std::iter::Empty<std::io::Result<Bytes>>;
+
+            fn encoded_len(record: &Bytes) -> std::io::Result<usize> {
+                Ok(record.len())
+            }
+            fn encode(record: &Bytes) -> std::io::Result<Bytes> {
+                Ok(record.clone())
+            }
+            fn decode(bytes: &[u8]) -> std::io::Result<Bytes> {
+                Ok(Bytes::copy_from_slice(bytes))
+            }
+            fn apply(&mut self, _: u64, _: Bytes) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn snapshot(&self) -> std::io::Result<Self::Snapshot> {
+                Ok(std::iter::empty())
+            }
+            fn decode_snapshot(_: &[u8]) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn restore(&mut self, _: ()) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        // Write the historical registration in a valid journal frame.
+        let relative = scope
+            .strip_prefix(root)
+            .unwrap()
+            .join(crate::catalog::DIRECTORY);
+        let lock = Arc::new(CacheRootLock::acquire(root).unwrap());
+        let service = crate::catalog::service(lock).unwrap();
+        let writer = service
+            .open_stream(relative, LegacyCatalog, Default::default())
+            .unwrap();
+        writer
+            .append(
+                Bytes::from_static(br#"{"Store":{"path":"paged","page_size":4}}"#),
+                talon_journal::Ack::Durable,
+            )
+            .await
+            .unwrap();
+        drop((writer, service));
+        talon_journal::JournalService::wait_for_retiring(root).unwrap();
+    }
+
     #[tokio::test]
     async fn incompatible_cache_reset_covers_layout_geometry_and_journal_formats() {
         for case in [
@@ -882,6 +933,7 @@ mod tests {
             "whole-without-journal",
             "paged-without-journal",
             "journal-version",
+            "hash-addressed-catalog",
             "small-journal-version",
             "legacy-small",
         ] {
@@ -931,6 +983,12 @@ mod tests {
                 "journal-version" => {
                     std::fs::write(shared.join(".paged-catalog/CURRENT"), b"future version")
                         .unwrap()
+                }
+                "hash-addressed-catalog" => {
+                    std::fs::remove_dir_all(shared.join(crate::catalog::DIRECTORY)).unwrap();
+                    std::fs::remove_dir(shared.join("whole")).unwrap();
+                    std::fs::remove_dir(shared.join("paged")).unwrap();
+                    write_hash_addressed_catalog(dir.path(), &shared).await;
                 }
                 "small-journal-version" => {
                     std::fs::write(shared.join("small/metadata/CURRENT"), b"future version")
@@ -2402,7 +2460,8 @@ page_tti_hours = 2
                     .paged
                     .as_ref()
                     .unwrap()
-                    .dir_for(&id)
+                    .catalog_dir_for(&id)
+                    .unwrap()
                     .join(format!("{page}.page"));
                 expected_paged += std::fs::metadata(path).unwrap().blocks() * 512;
             }
@@ -2447,7 +2506,13 @@ page_tti_hours = 2
         assert_eq!(paged.resident_bytes(), expected_paged);
         assert_eq!(whole.lru.total_bytes(), expected_whole);
         assert_eq!(paged.lru.total_bytes(), expected_paged);
-        let tail = paged.paged.as_ref().unwrap().dir_for(&id).join("3.page");
+        let tail = paged
+            .paged
+            .as_ref()
+            .unwrap()
+            .catalog_dir_for(&id)
+            .unwrap()
+            .join("3.page");
         let tail_bytes = std::fs::metadata(tail).unwrap().blocks() * 512;
         whole.unlink_units(whole.lru.block_candidates(&id), 2).await;
         paged.unlink_units(paged.lru.block_candidates(&id), 2).await;
@@ -2488,7 +2553,12 @@ page_tti_hours = 2
 
         a.page_clock.set(10_000);
         read(&a).await;
-        let pages = a.paged.as_ref().unwrap().dir_for(&block(16));
+        let pages = a
+            .paged
+            .as_ref()
+            .unwrap()
+            .catalog_dir_for(&block(16))
+            .unwrap();
         // A directory at the publication path makes the checkpoint rename fail.
         let checkpoint = pages.parent().unwrap().join("access.shard");
         std::fs::create_dir(&checkpoint).unwrap();
@@ -2640,8 +2710,18 @@ page_tti_hours = 2
             assert_eq!(a.block_count(), 1);
             assert_eq!(b.block_count(), 1);
             if paged {
-                let ap = a.paged.as_ref().unwrap().dir_for(&block(16));
-                let bp = b.paged.as_ref().unwrap().dir_for(&block(16));
+                let ap = a
+                    .paged
+                    .as_ref()
+                    .unwrap()
+                    .catalog_dir_for(&block(16))
+                    .unwrap();
+                let bp = b
+                    .paged
+                    .as_ref()
+                    .unwrap()
+                    .catalog_dir_for(&block(16))
+                    .unwrap();
                 assert_eq!(ap.file_name(), bp.file_name());
                 assert_ne!(ap, bp);
                 assert!(ap.starts_with(dir.path().join("a/shared/paged")));

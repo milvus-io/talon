@@ -12,6 +12,7 @@
 //! locking the entry. Removal/replacement retires the old entry under its write
 //! lock, so writers racing with retirement retry their lookup.
 use crate::block_key::{BlockIdentity, BlockKey};
+use crate::catalog::DiskId;
 use crate::small_store::key::{SmallIdentity, SmallRef};
 
 mod directory;
@@ -97,6 +98,7 @@ pub(crate) struct StoredBlock {
 #[derive(Clone)]
 pub(crate) struct StoredMeta {
     pub id: BlockKey,
+    pub disk_id: Option<DiskId>,
     pub form: BlockForm,
     pub len: u64,
 }
@@ -105,6 +107,7 @@ impl From<BlockMeta> for StoredMeta {
     fn from(meta: BlockMeta) -> Self {
         Self {
             id: BlockKey::new(&meta.id),
+            disk_id: None,
             form: meta.form,
             len: meta.len,
         }
@@ -132,6 +135,7 @@ struct IndexedBlock {
 
 struct ResidentMeta {
     id: BlockKey,
+    disk_id: Option<DiskId>,
     len: u64,
     page_size: u32,
     page_count: u32,
@@ -221,6 +225,7 @@ impl From<StoredMeta> for IndexedBlock {
         Self {
             meta: ResidentMeta {
                 id: meta.id,
+                disk_id: meta.disk_id,
                 len: meta.len,
                 page_size,
                 page_count,
@@ -290,6 +295,7 @@ impl IndexedBlock {
         };
         StoredMeta {
             id: self.meta.id.clone(),
+            disk_id: self.meta.disk_id,
             len: self.meta.len,
             form,
         }
@@ -914,6 +920,16 @@ impl BlockIndex {
         start: PageIndex,
         end: PageIndex,
     ) -> Option<(PageReadGuard, Vec<PageReadGuard>)> {
+        self.page_reads_and_touch_at(id, start, end)
+            .map(|(_, first, tail)| (first, tail))
+    }
+
+    pub(crate) fn page_reads_and_touch_at(
+        &self,
+        id: &BlockId,
+        start: PageIndex,
+        end: PageIndex,
+    ) -> Option<(Option<DiskId>, PageReadGuard, Vec<PageReadGuard>)> {
         if start.0 >= end.0 {
             return None;
         }
@@ -933,7 +949,7 @@ impl BlockIndex {
             };
             let first = acquire(start.0)?;
             let tail: Option<Vec<_>> = (start.0 + 1..end.0).map(acquire).collect();
-            Some((first, tail?))
+            Some((entry.meta.disk_id, first, tail?))
         })?
     }
 
@@ -1075,30 +1091,35 @@ impl BlockIndex {
 
     /// Resolve metadata and mark a whole-block read in the same index lookup.
     pub(crate) fn get_and_touch(&self, id: &BlockId) -> Option<BlockMeta> {
+        self.get_and_touch_at(id).map(|(meta, _)| meta)
+    }
+
+    pub(crate) fn get_and_touch_at(&self, id: &BlockId) -> Option<(BlockMeta, Option<DiskId>)> {
         self.read_entry(id, |entry| {
             if let IndexedUnits::Whole(slot) = &entry.units {
                 if let Some(access) = &slot.read().unwrap().access {
                     access.touch();
                 }
             }
-            entry.metadata().into()
+            (entry.metadata().into(), entry.meta.disk_id)
         })
     }
 
     /// Probe the whole-block fast path without touching any paged entries.
     pub(crate) fn is_whole_and_touch(&self, id: &BlockId) -> bool {
+        self.whole_and_touch(id).is_some()
+    }
+
+    pub(crate) fn whole_and_touch(&self, id: &BlockId) -> Option<Option<DiskId>> {
         self.read_entry(id, |entry| {
-            if !matches!(entry.units, IndexedUnits::Whole(_)) {
-                return false;
+            let IndexedUnits::Whole(slot) = &entry.units else {
+                return None;
+            };
+            if let Some(access) = &slot.read().unwrap().access {
+                access.touch();
             }
-            if let IndexedUnits::Whole(slot) = &entry.units {
-                if let Some(access) = &slot.read().unwrap().access {
-                    access.touch();
-                }
-            }
-            true
-        })
-        .unwrap_or(false)
+            Some(entry.meta.disk_id)
+        })?
     }
 
     /// Attach the policy token after admission, retaining any page lifecycle
@@ -1186,7 +1207,18 @@ impl BlockIndex {
         meta: BlockMeta,
         allocated: impl IntoIterator<Item = (Option<PageIndex>, u64)>,
     ) {
-        self.commit_shared(meta.into(), allocated);
+        self.commit_allocated_at(meta, None, allocated);
+    }
+
+    pub(crate) fn commit_allocated_at(
+        &self,
+        meta: BlockMeta,
+        disk_id: Option<DiskId>,
+        allocated: impl IntoIterator<Item = (Option<PageIndex>, u64)>,
+    ) {
+        let mut meta = StoredMeta::from(meta);
+        meta.disk_id = disk_id;
+        self.commit_shared(meta, allocated);
     }
 
     pub(crate) fn commit_stored(&self, block: StoredBlock) {
@@ -1272,6 +1304,7 @@ impl BlockIndex {
         let mut entry = Entry::new(
             StoredMeta {
                 id: id.clone(),
+                disk_id: None,
                 form: BlockForm::Paged {
                     page_size,
                     present: PresentBitmap::new(page_count),
@@ -1309,10 +1342,27 @@ impl BlockIndex {
     /// absent to present; `false` otherwise (whole blocks, unknown blocks, and
     /// already-present pages), so byte accounting is never double-counted.
     pub fn mark_page_allocated(&self, id: &BlockId, page: PageIndex, allocated: u64) -> bool {
+        self.mark_page_allocated_at(id, page, allocated, None)
+    }
+
+    pub(crate) fn mark_page_allocated_at(
+        &self,
+        id: &BlockId,
+        page: PageIndex,
+        allocated: u64,
+        disk_id: Option<DiskId>,
+    ) -> bool {
         self.write_entry(id, |entry| {
             let IndexedUnits::Paged(pages) = &mut entry.units else {
                 return false;
             };
+            if let Some(disk_id) = disk_id {
+                debug_assert!(entry
+                    .meta
+                    .disk_id
+                    .map_or(true, |current| current == disk_id));
+                entry.meta.disk_id = Some(disk_id);
+            }
             if page.0 >= entry.meta.page_count {
                 return false;
             }
@@ -1358,6 +1408,9 @@ impl BlockIndex {
             let bytes = std::mem::take(&mut slot.unit.allocated);
             entry.charged_bytes = entry.charged_bytes.saturating_sub(bytes);
             entry.charged_pages -= 1;
+            if entry.charged_pages == 0 {
+                entry.meta.disk_id = None;
+            }
             if slot.unit.policy.is_none() {
                 slot.unit.access.clear();
             }
@@ -1715,6 +1768,7 @@ mod tests {
             vec![StoredBlock {
                 meta: StoredMeta {
                     id: id.clone(),
+                    disk_id: None,
                     len: 4096,
                     form: BlockForm::Whole,
                 },

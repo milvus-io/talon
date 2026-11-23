@@ -254,6 +254,53 @@ async fn queries_do_not_expose_state_after_failed_sync() {
     a.inner.control.fail_sync.store(true, Ordering::Relaxed);
     assert!(a.query(|m| Ok(m.0.clone())).await.is_err());
 }
+
+#[tokio::test]
+async fn append_projection_uses_the_append_sync() {
+    let dir = tempfile::tempdir().unwrap();
+    let service =
+        JournalService::open(dir.path().to_owned(), Arc::new(()), Options::default()).unwrap();
+    for (name, fail) in [("success", false), ("failure", true)] {
+        let handle = stream(&service, name);
+        let pause = Arc::new(Pause::default());
+        *handle.inner.control.sync_pause.lock().unwrap() = Some(pause.clone());
+        let published = Arc::new(AtomicBool::new(false));
+        let append = {
+            let handle = handle.clone();
+            let published = published.clone();
+            tokio::spawn(async move {
+                handle
+                    .append_with((7, 11), move |state, lsn| {
+                        let value = state.0[&7];
+                        move || {
+                            published.store(true, Ordering::Release);
+                            (lsn, value)
+                        }
+                    })
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(2), pause.entered.notified())
+            .await
+            .unwrap();
+        assert!(!append.is_finished());
+        assert!(!published.load(Ordering::Acquire));
+        handle
+            .inner
+            .control
+            .fail_sync
+            .store(fail, Ordering::Relaxed);
+        pause.resume.notify_one();
+        let result = append.await.unwrap();
+        if fail {
+            assert!(result.is_err());
+        } else {
+            assert_eq!(result.unwrap(), (1, 11));
+        }
+        assert_eq!(published.load(Ordering::Acquire), !fail);
+        assert_eq!(handle.inner.control.syncs.load(Ordering::Relaxed), 1);
+    }
+}
 #[test]
 fn frames_reject_corrupt_headers_and_order_parallel_decode() {
     let bytes = frame::encode(1, &State::encode(&(1, 2)).unwrap()).unwrap();

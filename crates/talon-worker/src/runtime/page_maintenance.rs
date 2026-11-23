@@ -915,16 +915,64 @@ mod tests {
             let allocated = worker.resident_bytes();
             assert!(allocated > 0);
             assert!(catalog.recover("paged").unwrap().unwrap().is_empty());
+            let disk_id = catalog.disk_id("whole", &block()).unwrap().unwrap();
+            let path = disk_id.path(&worker.store.root().join("whole"), "blk");
             catalog.poison();
 
             evict(&worker, &config, stale).await;
 
             assert!(worker.store.scan_allocated().is_err());
-            assert!(worker.store.contains(&block()).await.unwrap());
+            assert!(path.exists());
             assert!(worker.index.get(&block()).is_some());
+            assert_eq!(
+                worker
+                    .cached_block_range(&block(), 0, 16)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                Bytes::from_static(&[1; 16])
+            );
             assert!(!worker.lru.is_empty());
             assert_eq!(worker.resident_bytes(), allocated);
         }
+    }
+
+    #[tokio::test]
+    async fn delayed_whole_miss_keeps_a_refilled_block() {
+        let root = tempfile::tempdir().unwrap();
+        let (worker, _, config) = runtime(root.path());
+        let id = block();
+        let request = CachedBlockPutRequest {
+            block: id.clone(),
+            object_len: 16,
+            body_len: 16,
+        };
+        worker
+            .admit_cached_block(&request, Bytes::from_static(&[1; 16]))
+            .await
+            .unwrap();
+        let old = worker.index.whole_and_touch(&id).unwrap().unwrap();
+        evict(&worker, &config, true).await;
+        assert!(worker.index.get(&id).is_none());
+        worker
+            .admit_cached_block(&request, Bytes::from_static(&[2; 16]))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            worker.store.get_range_bytes_at(&id, Some(old), 0, 16).await,
+            Err(talon_core::Error::NotFound(_))
+        ));
+        worker.forget_missing_l2_parent(&id, Some(old)).await;
+        assert_eq!(
+            worker
+                .cached_block_range(&id, 0, 16)
+                .await
+                .unwrap()
+                .unwrap(),
+            Bytes::from_static(&[2; 16])
+        );
+        assert_eq!(worker.lru.block_candidates(&id).len(), 1);
     }
 
     #[tokio::test]
@@ -939,27 +987,33 @@ mod tests {
                     .unwrap();
                 let allocated = worker.resident_bytes();
                 assert!(allocated > 0);
+                let disk_id = catalog.disk_id("paged", &block()).unwrap().unwrap();
+                let path = disk_id
+                    .path(worker.paged.as_ref().unwrap().root(), "pages")
+                    .join("0.page");
                 if poisoned {
                     catalog.poison();
                 }
 
                 evict(&worker, &config, stale).await;
 
-                assert_eq!(
-                    worker
-                        .paged
-                        .as_ref()
-                        .unwrap()
-                        .has_page(&block(), PageIndex(0)),
-                    poisoned
-                );
+                assert_eq!(path.exists(), poisoned);
                 assert_eq!(worker.index.get(&block()).is_some(), poisoned);
                 assert_eq!(!worker.lru.is_empty(), poisoned);
                 assert_eq!(
                     worker.resident_bytes(),
                     if poisoned { allocated } else { 0 }
                 );
-                if !poisoned {
+                if poisoned {
+                    assert_eq!(
+                        worker
+                            .cached_page(&block(), PageIndex(0), 16)
+                            .await
+                            .unwrap()
+                            .unwrap(),
+                        Bytes::from_static(b"data")
+                    );
+                } else {
                     assert!(catalog.recover("paged").unwrap().unwrap().is_empty());
                 }
             }
