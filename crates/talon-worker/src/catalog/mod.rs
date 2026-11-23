@@ -8,18 +8,56 @@ mod reconcile;
 #[cfg(test)]
 mod tests;
 
-use crate::{index::StoredBlock, page_access_store::CacheRootLock};
+use crate::{
+    block_key::{BlockIdentity, BlockKey},
+    index::StoredBlock,
+    page_access_store::CacheRootLock,
+};
 pub(crate) use model::Operation;
 use model::{valid_store, Record, State};
 use std::{
+    collections::HashMap,
+    num::NonZeroU64,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, RwLock},
 };
 use talon_core::BlockId;
 use talon_journal::{Ack, Handle, JournalService, Options, StreamOptions};
 
 pub(crate) const DIRECTORY: &str = ".paged-catalog";
 const TRANSACTIONS: usize = 1024;
+
+pub(crate) type WholeLocations = Arc<RwLock<HashMap<BlockKey, DiskId>>>;
+
+/// A block's shard and first durable Begin sequence, local to one catalog.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub(crate) struct DiskId(NonZeroU64);
+
+impl DiskId {
+    const SEQUENCE_MASK: u64 = (1 << 56) - 1;
+
+    fn new(sequence: u64, shard: u8) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            (1..=Self::SEQUENCE_MASK).contains(&sequence),
+            "invalid disk ID sequence"
+        );
+        Ok(Self(
+            NonZeroU64::new((u64::from(shard) << 56) | sequence).unwrap(),
+        ))
+    }
+
+    fn sequence(self) -> u64 {
+        self.0.get() & Self::SEQUENCE_MASK
+    }
+
+    pub(crate) fn path(self, root: &Path, extension: &str) -> PathBuf {
+        let id = self.0.get();
+        let shard = id >> 56;
+        root.join(format!("{shard:02x}"))
+            .join(format!("disk-{id:016x}.{extension}"))
+    }
+}
 
 pub(crate) fn transaction_budget() -> Arc<tokio::sync::Semaphore> {
     Arc::new(tokio::sync::Semaphore::new(TRANSACTIONS))
@@ -29,6 +67,7 @@ pub(crate) fn transaction_budget() -> Arc<tokio::sync::Semaphore> {
 /// separately bounds encoded requests across all streams on this cache root.
 pub(crate) struct Transaction {
     pub(crate) id: u64,
+    pub(crate) disk_id: DiskId,
     _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
@@ -113,13 +152,20 @@ impl Catalog {
     }
 
     pub(crate) fn register(&self, path: &str, page_size: u32) -> anyhow::Result<()> {
-        futures::executor::block_on(tokio::task::unconstrained(self.journal.append(
-            Record::Store {
+        let record = if page_size == 0 {
+            Record::WholeStore {
                 path: path.into(),
                 page_size,
-            },
-            Ack::Durable,
-        )))?;
+            }
+        } else {
+            Record::PagedStore {
+                path: path.into(),
+                page_size,
+            }
+        };
+        futures::executor::block_on(tokio::task::unconstrained(
+            self.journal.append(record, Ack::Durable),
+        ))?;
         Ok(())
     }
 
@@ -130,23 +176,50 @@ impl Catalog {
         operation: Operation,
     ) -> anyhow::Result<Transaction> {
         let permit = self.admission.clone().acquire_owned().await?;
-        let id = self
+        let (id, disk_id) = self
             .journal
-            .append(
+            .append_with(
                 Record::Begin {
                     intent: model::Intent {
                         store: store.into(),
                         block: block.clone(),
                         operation,
+                        shard: Some(crate::page_lifecycle::disk_shard(block) as u8),
+                        disk_id: None,
                     },
                 },
-                Ack::Durable,
+                |state, id| {
+                    let disk_id = state.pending[&id]
+                        .disk_id
+                        .expect("applied Begin has a disk ID");
+                    move || (id, disk_id)
+                },
             )
             .await?;
         Ok(Transaction {
             id,
+            disk_id,
             _permit: permit,
         })
+    }
+
+    pub(crate) fn disk_id(&self, store: &str, block: &BlockId) -> std::io::Result<Option<DiskId>> {
+        let store = store.to_owned();
+        let block = block.clone();
+        self.journal
+            .query_blocking(move |state| Ok(state.disk_id(&store, &block)))
+    }
+
+    pub(crate) async fn lookup_disk_id(
+        &self,
+        store: &str,
+        block: &BlockId,
+    ) -> std::io::Result<Option<DiskId>> {
+        let store = store.to_owned();
+        let block = block.clone();
+        self.journal
+            .query(move |state| Ok(state.disk_id(&store, &block)))
+            .await
     }
 
     pub(crate) async fn complete(
@@ -161,6 +234,55 @@ impl Catalog {
                     allocated,
                 },
                 Ack::Durable,
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub(crate) fn recover_whole_locations(&self) -> std::io::Result<WholeLocations> {
+        let locations = self.journal.query_blocking(|state| {
+            Ok(state.stores["whole"]
+                .blocks
+                .values()
+                .map(|block| {
+                    (
+                        block.id.clone(),
+                        block.disk_id.expect("whole block has a disk ID"),
+                    )
+                })
+                .collect())
+        })?;
+        Ok(Arc::new(RwLock::new(locations)))
+    }
+
+    pub(crate) async fn complete_whole(
+        &self,
+        transaction: Transaction,
+        allocated: u64,
+        id: BlockId,
+        locations: WholeLocations,
+    ) -> anyhow::Result<()> {
+        self.journal
+            .append_with(
+                Record::Complete {
+                    transaction: transaction.id,
+                    allocated,
+                },
+                move |state, _| {
+                    let key = state.stores["whole"]
+                        .blocks
+                        .get(&id as &dyn BlockIdentity)
+                        .map(|block| block.id.clone());
+                    let disk_id = transaction.disk_id;
+                    move || {
+                        let mut locations = locations.write().unwrap();
+                        if let Some(key) = key {
+                            locations.insert(key, disk_id);
+                        } else {
+                            locations.remove(&id as &dyn BlockIdentity);
+                        }
+                    }
+                },
             )
             .await?;
         Ok(())

@@ -60,15 +60,16 @@ process-wide background I/O and deletion budgets.
 ```text
 cache_root/
   default/shared/.paged-catalog/...
-  default/shared/whole/<hash-prefix>/<hash>.blk
+  default/shared/whole/<shard>/disk-<id>.blk
   analytics/shared/.paged-catalog/...
-  analytics/shared/whole/<hash-prefix>/<hash>.blk
-  analytics/shared/paged/<hash-prefix>/<hash>.pages/...
+  analytics/shared/whole/<shard>/disk-<id>.blk
+  analytics/shared/paged/<shard>/disk-<id>.pages/...
   analytics/scopes/<scope>/.paged-catalog/...
 ```
 
 Namespace identity does not enter `BlockId` or its hash. Equal object/version/block
-geometry produces equal block IDs and placement across namespaces. Separate
+geometry produces equal logical block IDs across namespaces. Disk IDs are
+allocated separately in each scope's catalog. Separate
 runtimes own each namespace's disk files, L1 entries, index, in-flight fills,
 version cache, access checkpoints and garbage collection. Streamed PUT staging
 also uses the namespace's `shared` directory. PUT and DELETE affect the requesting

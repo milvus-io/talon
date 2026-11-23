@@ -7,11 +7,7 @@
 //!
 //! # Layout
 //!
-//! Each block maps to `<root>/whole/<shard>/<digest>.blk`, where `digest` is a stable
-//! hash of the block's identity ([`BlockId`]'s `Display`, which includes object
-//! path, version, offset, and block size) and `shard` is the first two hex
-//! digits of that digest. Sharding keeps any single directory from growing
-//! unbounded.
+//! Each block maps to `<root>/whole/<shard>/disk-<id>.blk` using its catalog ID.
 //!
 //! Paging is not handled here — [`get_page`](WholeBlockStore::get_page) returns
 //! [`Error::NotFound`]. Per-page caching lives in
@@ -21,7 +17,9 @@
 #[cfg(test)]
 mod journal_tests;
 
-use crate::fd_cache::{CachedFd, FdCache};
+use crate::block_key::BlockIdentity;
+use crate::catalog::{DiskId, Transaction, WholeLocations};
+use crate::fd_cache::FdCache;
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::collections::hash_map::DefaultHasher;
@@ -32,13 +30,6 @@ use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use talon_core::{BlockHandle, BlockId, BlockMeta, Error, ObjectStore, PageIndex, Result};
-
-pub(crate) fn block_path(root: &Path, id: &BlockId) -> PathBuf {
-    let mut hasher = DefaultHasher::new();
-    id.hash(&mut hasher);
-    let hex = format!("{:016x}", hasher.finish());
-    root.join(&hex[..2]).join(format!("{hex}.blk"))
-}
 
 fn catalog_error(error: anyhow::Error) -> Error {
     let message = format!("whole block catalog: {error:#}");
@@ -98,8 +89,9 @@ pub struct WholeBlockStore {
     fd_cache: Arc<FdCache>,
     catalog: Arc<crate::catalog::Catalog>,
     catalog_path: String,
+    standalone_locations: Option<WholeLocations>,
     mutations: Arc<crate::page_gc::Mutations>,
-    gates: Arc<[tokio::sync::Mutex<()>; 64]>,
+    gates: Arc<[tokio::sync::RwLock<()>; 64]>,
 }
 
 impl WholeBlockStore {
@@ -121,7 +113,7 @@ impl WholeBlockStore {
         &self,
         id: &BlockId,
         value: talon_uring::Payload,
-    ) -> Result<u64> {
+    ) -> Result<(u64, DiskId)> {
         if self.uring {
             talon_uring::require_ring()?;
         }
@@ -129,7 +121,7 @@ impl WholeBlockStore {
         let id = id.clone();
         self.mutations
             .run(async move {
-                let _gate = store.gate(&id).lock().await;
+                let _gate = store.gate(&id).write().await;
                 let transaction = store
                     .catalog
                     .begin(
@@ -141,9 +133,12 @@ impl WholeBlockStore {
                     )
                     .await
                     .map_err(catalog_error)?;
+                store.hide_pending(&id);
                 #[cfg(test)]
                 crate::page_access_store::crash_barrier("whole_begin")?;
-                let path = store.path_for(&id);
+                let disk_id = transaction.disk_id;
+                let path = store.path_for(disk_id);
+                let invalidate = path.clone();
                 let staged = path.with_extension(format!("blk.catalog.{}", transaction.id));
                 let result: Result<u64> = if store.uring {
                     let alignment = store.direct_alignment.expect("native store alignment");
@@ -179,19 +174,17 @@ impl WholeBlockStore {
                     })
                     .await
                 };
-                store.fd_cache.invalidate(&store.path_for(&id));
+                store.fd_cache.invalidate(&invalidate);
                 match result {
                     Ok(allocated) => {
                         #[cfg(test)]
-                        crate::page_access_store::crash_barrier("whole_published")?;
-                        store
-                            .catalog
-                            .complete(transaction, allocated)
-                            .await
-                            .map_err(catalog_error)?;
+                        if crate::page_access_store::checkpoint_fault("whole_published").is_err() {
+                            store.catalog.poison();
+                        }
+                        store.complete(transaction, allocated, id).await?;
                         #[cfg(test)]
                         crate::page_access_store::crash_barrier("whole_complete")?;
-                        Ok(allocated)
+                        Ok((allocated, disk_id))
                     }
                     Err(error) => {
                         store.catalog.poison();
@@ -202,10 +195,25 @@ impl WholeBlockStore {
             .await
     }
 
-    fn gate(&self, id: &BlockId) -> &tokio::sync::Mutex<()> {
+    fn gate(&self, id: &BlockId) -> &tokio::sync::RwLock<()> {
         let mut hasher = DefaultHasher::new();
         id.hash(&mut hasher);
         &self.gates[hasher.finish() as usize % self.gates.len()]
+    }
+
+    fn hide_pending(&self, id: &BlockId) {
+        if let Some(locations) = &self.standalone_locations {
+            locations.write().unwrap().remove(id as &dyn BlockIdentity);
+        }
+    }
+
+    // A rewrite reuses the path. Hold the shared gate from location lookup
+    // until the file is open or the path-based read finishes.
+    async fn read_gate(&self, id: &BlockId) -> Option<tokio::sync::RwLockReadGuard<'_, ()>> {
+        match &self.standalone_locations {
+            Some(_) => Some(self.gate(id).read().await),
+            None => None,
+        }
     }
 
     pub(crate) async fn drain(&self) {
@@ -237,13 +245,15 @@ impl WholeBlockStore {
             None,
         )
         .map_err(catalog_error)?;
-        Self::open_with_catalog(
+        let mut store = Self::open_with_catalog(
             root,
             Arc::new(FdCache::new(
                 talon_core::WorkerConfig::default().whole_fd_cache_capacity,
             )),
             catalog,
-        )
+        )?;
+        store.standalone_locations = Some(store.catalog.recover_whole_locations()?);
+        Ok(store)
     }
 
     pub(crate) fn open_with_catalog(
@@ -289,8 +299,9 @@ impl WholeBlockStore {
             fd_cache,
             catalog,
             catalog_path,
+            standalone_locations: None,
             mutations: Arc::new(crate::page_gc::Mutations::new(true)),
-            gates: Arc::new(std::array::from_fn(|_| tokio::sync::Mutex::new(()))),
+            gates: Arc::new(std::array::from_fn(|_| tokio::sync::RwLock::new(()))),
         })
     }
 
@@ -303,8 +314,36 @@ impl WholeBlockStore {
         self.catalog.checkpoint().await
     }
 
-    fn path_for(&self, id: &BlockId) -> PathBuf {
-        block_path(&self.root.join("whole"), id)
+    fn path_for(&self, disk_id: DiskId) -> PathBuf {
+        disk_id.path(&self.root.join("whole"), "blk")
+    }
+
+    async fn complete(&self, transaction: Transaction, allocated: u64, id: BlockId) -> Result<()> {
+        match &self.standalone_locations {
+            Some(locations) => {
+                self.catalog
+                    .complete_whole(transaction, allocated, id, locations.clone())
+                    .await
+            }
+            None => self.catalog.complete(transaction, allocated).await,
+        }
+        .map_err(catalog_error)
+    }
+
+    async fn read_path(&self, id: &BlockId, indexed: Option<DiskId>) -> Result<PathBuf> {
+        let disk_id = match (&self.standalone_locations, indexed) {
+            // Public callers can combine a standalone store with an index
+            // populated by another catalog. Its IDs are local to that catalog.
+            (Some(locations), _) => locations
+                .read()
+                .unwrap()
+                .get(id as &dyn BlockIdentity)
+                .copied(),
+            (None, Some(disk_id)) => Some(disk_id),
+            (None, None) => self.catalog.lookup_disk_id(&self.catalog_path, id).await?,
+        }
+        .ok_or_else(|| Error::NotFound(id.to_string()))?;
+        Ok(self.path_for(disk_id))
     }
 
     /// Return residency from the journal without enumerating or statting data files.
@@ -343,8 +382,9 @@ impl WholeBlockStore {
     /// per request. Under load that trio dominated the serving path — it does
     /// not scale with threads (all callers serialize on the same inode and
     /// dentry), and measured ~50x the cost of the data access it guards.
-    async fn open_ro(&self, id: &BlockId) -> Result<(Arc<OwnedFd>, u64)> {
-        let path = self.path_for(id);
+    async fn open_ro(&self, id: &BlockId, disk_id: Option<DiskId>) -> Result<(Arc<OwnedFd>, u64)> {
+        let _gate = self.read_gate(id).await;
+        let path = self.read_path(id, disk_id).await?;
         if self.uring {
             talon_uring::require_ring()?;
             return self
@@ -354,27 +394,10 @@ impl WholeBlockStore {
                 .map(|hit| (hit.fd, hit.len))
                 .map_err(|error| cache_read_error(error, id.to_string()));
         }
-        if let Some(hit) = self.fd_cache.get(&path) {
-            return Ok((hit.fd, hit.len));
-        }
-        match std::fs::File::open(&path) {
-            Ok(f) => {
-                let len = f.metadata()?.len();
-                let fd = Arc::new(OwnedFd::from(f));
-                self.fd_cache.insert(
-                    path,
-                    CachedFd {
-                        fd: Arc::clone(&fd),
-                        len,
-                    },
-                );
-                Ok((fd, len))
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                Err(Error::NotFound(id.to_string()))
-            }
-            Err(e) => Err(e.into()),
-        }
+        self.fd_cache
+            .open_buffered(path)
+            .map(|hit| (hit.fd, hit.len))
+            .map_err(|error| cache_read_error(error, id.to_string()))
     }
 
     /// Read exactly one block-relative byte window into userspace.
@@ -388,7 +411,18 @@ impl WholeBlockStore {
     /// it is not on the hot serving path that motivated the fd cache; routing it
     /// through the cache is a follow-up, not a correctness matter.
     pub async fn get_range_bytes(&self, id: &BlockId, offset: u64, len: u64) -> Result<Bytes> {
-        let path = self.path_for(id);
+        self.get_range_bytes_at(id, None, offset, len).await
+    }
+
+    pub(crate) async fn get_range_bytes_at(
+        &self,
+        id: &BlockId,
+        disk_id: Option<DiskId>,
+        offset: u64,
+        len: u64,
+    ) -> Result<Bytes> {
+        let _gate = self.read_gate(id).await;
+        let path = self.read_path(id, disk_id).await?;
         let id = id.clone();
         if self.uring {
             talon_uring::require_ring()?;
@@ -422,12 +456,28 @@ impl WholeBlockStore {
         })
         .await
     }
+
+    pub(crate) async fn get_range_at(
+        &self,
+        id: &BlockId,
+        disk_id: Option<DiskId>,
+        offset: u64,
+        len: u64,
+    ) -> Result<Vec<BlockHandle>> {
+        let (fd, file_len) = self.open_ro(id, disk_id).await?;
+        if offset.checked_add(len).map_or(true, |end| end > file_len) {
+            return Err(Error::Other(format!(
+                "range {offset}+{len} out of bounds for block of {file_len} bytes"
+            )));
+        }
+        Ok(vec![BlockHandle::from_shared(fd, offset, len)])
+    }
 }
 
 #[async_trait]
 impl ObjectStore for WholeBlockStore {
     async fn get_block(&self, id: &BlockId) -> Result<BlockHandle> {
-        let (fd, len) = self.open_ro(id).await?;
+        let (fd, len) = self.open_ro(id, None).await?;
         Ok(BlockHandle::from_shared(fd, 0, len))
     }
 
@@ -438,17 +488,12 @@ impl ObjectStore for WholeBlockStore {
     }
 
     async fn get_range(&self, id: &BlockId, offset: u64, len: u64) -> Result<Vec<BlockHandle>> {
-        let (fd, file_len) = self.open_ro(id).await?;
-        if offset.checked_add(len).map_or(true, |end| end > file_len) {
-            return Err(Error::Other(format!(
-                "range {offset}+{len} out of bounds for block of {file_len} bytes"
-            )));
-        }
-        Ok(vec![BlockHandle::from_shared(fd, offset, len)])
+        self.get_range_at(id, None, offset, len).await
     }
 
     async fn get_bytes(&self, id: &BlockId) -> Result<Bytes> {
-        let path = self.path_for(id);
+        let _gate = self.read_gate(id).await;
+        let path = self.read_path(id, None).await?;
         let id = id.clone();
         if self.uring {
             talon_uring::require_ring()?;
@@ -486,7 +531,7 @@ impl ObjectStore for WholeBlockStore {
         let id = id.clone();
         self.mutations
             .run(async move {
-                let _gate = store.gate(&id).lock().await;
+                let _gate = store.gate(&id).write().await;
                 let transaction = store
                     .catalog
                     .begin(
@@ -496,9 +541,11 @@ impl ObjectStore for WholeBlockStore {
                     )
                     .await
                     .map_err(catalog_error)?;
+                store.hide_pending(&id);
                 #[cfg(test)]
                 crate::page_access_store::crash_barrier("whole_delete_begin")?;
-                let path = store.path_for(&id);
+                let path = store.path_for(transaction.disk_id);
+                let invalidate = path.clone();
                 let result = spawn_blocking_io(move || {
                     match std::fs::remove_file(&path) {
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -511,16 +558,12 @@ impl ObjectStore for WholeBlockStore {
                     Ok(())
                 })
                 .await;
-                store.fd_cache.invalidate(&store.path_for(&id));
+                store.fd_cache.invalidate(&invalidate);
                 match result {
                     Ok(()) => {
                         #[cfg(test)]
                         crate::page_access_store::crash_barrier("whole_deleted")?;
-                        store
-                            .catalog
-                            .complete(transaction, 0)
-                            .await
-                            .map_err(catalog_error)
+                        store.complete(transaction, 0, id).await
                     }
                     Err(error) => {
                         store.catalog.poison();
@@ -531,7 +574,12 @@ impl ObjectStore for WholeBlockStore {
             .await
     }
     async fn contains(&self, id: &BlockId) -> Result<bool> {
-        let path = self.path_for(id);
+        let _gate = self.read_gate(id).await;
+        let path = match self.read_path(id, None).await {
+            Ok(path) => path,
+            Err(Error::NotFound(_)) => return Ok(false),
+            Err(error) => return Err(error),
+        };
         spawn_blocking_io(move || Ok(path.exists())).await
     }
 }
@@ -584,8 +632,9 @@ mod tests {
         let store = WholeBlockStore::open(root.path()).unwrap();
         let id = block(0);
         store.put(&id, Bytes::from(vec![0; 6000])).await.unwrap();
-        let allocated = std::fs::metadata(store.path_for(&id)).unwrap().blocks() * 512;
-        let shard = store.path_for(&id).parent().unwrap().to_owned();
+        let path = store.read_path(&id, None).await.unwrap();
+        let allocated = std::fs::metadata(&path).unwrap().blocks() * 512;
+        let shard = path.parent().unwrap().to_owned();
         store.catalog.checkpoint().await.unwrap();
         drop(store);
         // Recovery must neither enumerate the shard nor stat its data files.
@@ -650,7 +699,13 @@ mod tests {
         // The committed block is complete.
         assert_eq!(store.get_bytes(&id).await.unwrap(), data);
         // No staging temp files leaked.
-        let shard = store.path_for(&id).parent().unwrap().to_path_buf();
+        let shard = store
+            .read_path(&id, None)
+            .await
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
         let leaked: Vec<_> = std::fs::read_dir(&shard)
             .unwrap()
             .filter_map(|e| e.ok())
@@ -665,9 +720,15 @@ mod tests {
     async fn journal_rebuilds_metadata_for_committed_blocks() {
         let root = tmp_root();
         let store = WholeBlockStore::open(&root).unwrap();
+        let first = block(1);
+        let shard = crate::page_lifecycle::disk_shard(&first);
+        let sibling = (4..)
+            .map(block)
+            .find(|id| crate::page_lifecycle::disk_shard(id) == shard)
+            .unwrap();
         let committed = [
-            (block(1), Bytes::from_static(b"one")),
-            (block(2), Bytes::from(vec![0u8; 100])),
+            (first, Bytes::from_static(b"one")),
+            (sibling, Bytes::from(vec![0u8; 100])),
             (block(3), Bytes::from_static(b"three-block")),
         ];
         for (id, data) in &committed {
@@ -687,16 +748,29 @@ mod tests {
             assert_eq!(found.len, data.len() as u64);
         }
 
+        let mut paths = Vec::new();
         for (id, _) in &committed {
-            assert!(!store.path_for(id).with_extension("meta").exists());
+            let path = store.read_path(id, None).await.unwrap();
+            assert!(!path.with_extension("meta").exists());
+            assert!(!paths.contains(&path));
+            paths.push(path);
         }
         store.catalog.checkpoint().await.unwrap();
         drop(store);
         let reopened = WholeBlockStore::open(&root).unwrap();
         assert_eq!(reopened.scan().unwrap().len(), 3);
+        for ((id, bytes), path) in committed.iter().zip(paths) {
+            assert_eq!(reopened.read_path(id, None).await.unwrap(), path);
+            assert_eq!(reopened.get_bytes(id).await.unwrap(), *bytes);
+        }
         let index = crate::BlockIndex::new();
         reopened.restore_index(&index).unwrap();
         assert_eq!(index.snapshot_units().len(), 3);
+        reopened.delete(&committed[0].0).await.unwrap();
+        assert_eq!(
+            reopened.get_bytes(&committed[1].0).await.unwrap(),
+            committed[1].1
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -790,6 +864,11 @@ mod tests {
             Bytes::from_static(b"56789a")
         );
         assert!(store.get_range_bytes(&id, 15, 2).await.is_err());
+        let disk_id = store.catalog.disk_id("whole", &id).unwrap();
+        assert!(matches!(
+            store.get_range_bytes_at(&block(99), disk_id, 0, 4).await,
+            Err(Error::NotFound(_))
+        ));
         std::fs::remove_dir_all(root).ok();
     }
 

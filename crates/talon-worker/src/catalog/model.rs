@@ -1,4 +1,5 @@
 //! File-cache residency state and codec; the shared journal owns ordering and I/O.
+use super::DiskId;
 use crate::block_key::{BlockIdentity, BlockKey};
 use crate::{
     index::{StoredBlock, StoredMeta},
@@ -18,6 +19,8 @@ use talon_journal::Machine;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct Block {
     pub id: BlockKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_id: Option<DiskId>,
     pub len: u64,
     pub pages: PageMap<u64>,
 }
@@ -35,12 +38,19 @@ pub(super) struct Intent {
     pub store: String,
     pub block: BlockId,
     pub operation: Operation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shard: Option<u8>,
+    // A live Begin derives this from the catalog. A pending snapshot retains
+    // the address even if the Begin that first allocated it was compacted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_id: Option<DiskId>,
 }
 
 /// Domain records contain no physical journal framing or checkpoint generation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) enum Record {
-    Store { path: String, page_size: u32 },
+    WholeStore { path: String, page_size: u32 },
+    PagedStore { path: String, page_size: u32 },
     Begin { intent: Intent },
     Complete { transaction: u64, allocated: u64 },
     Resolve { transaction: u64 },
@@ -60,9 +70,22 @@ pub(super) struct State {
 }
 
 impl State {
+    pub(super) fn disk_id(&self, store: &str, block: &BlockId) -> Option<DiskId> {
+        self.stores
+            .get(store)?
+            .blocks
+            .get(block as &dyn BlockIdentity)?
+            .disk_id
+    }
+
     fn apply_record(&mut self, lsn: u64, record: Record) -> anyhow::Result<()> {
+        let paged_format = matches!(record, Record::PagedStore { .. });
         match record {
-            Record::Store { path, page_size } => {
+            Record::WholeStore { path, page_size } | Record::PagedStore { path, page_size } => {
+                anyhow::ensure!(
+                    paged_format == (page_size > 0),
+                    "invalid catalog store format"
+                );
                 anyhow::ensure!(
                     valid_store(&path)
                         && (Path::new(&path).file_name().unwrap() == "whole") == (page_size == 0),
@@ -74,7 +97,7 @@ impl State {
                 let store = self.stores.entry(path).or_default();
                 store.page_size = page_size;
             }
-            Record::Begin { intent } => {
+            Record::Begin { mut intent } => {
                 anyhow::ensure!(
                     lsn > 0 && !self.pending.contains_key(&lsn),
                     "invalid catalog transaction"
@@ -103,23 +126,43 @@ impl State {
                         "invalid delete page"
                     );
                 }
-                anyhow::ensure!(
-                    !self.pending.values().any(|other| {
-                        other.store == intent.store
-                            && other.block == intent.block
-                            && match (&other.operation, &intent.operation) {
-                                (Operation::DeleteBlock | Operation::PutWhole { .. }, _)
-                                | (_, Operation::DeleteBlock | Operation::PutWhole { .. }) => true,
-                                (
-                                    Operation::Put { page: a, .. }
-                                    | Operation::DeletePage { page: a },
-                                    Operation::Put { page: b, .. }
-                                    | Operation::DeletePage { page: b },
-                                ) => a == b,
-                            }
-                    }),
-                    "overlapping catalog mutation: caller must hold the page/block gate"
-                );
+                let mut disk_id = None;
+                for other in self
+                    .pending
+                    .values()
+                    .filter(|other| other.store == intent.store && other.block == intent.block)
+                {
+                    let overlaps = match (&other.operation, &intent.operation) {
+                        (Operation::DeleteBlock | Operation::PutWhole { .. }, _)
+                        | (_, Operation::DeleteBlock | Operation::PutWhole { .. }) => true,
+                        (
+                            Operation::Put { page: a, .. } | Operation::DeletePage { page: a },
+                            Operation::Put { page: b, .. } | Operation::DeletePage { page: b },
+                        ) => a == b,
+                    };
+                    anyhow::ensure!(
+                        !overlaps,
+                        "overlapping catalog mutation: caller must hold the page/block gate"
+                    );
+                    disk_id = disk_id.or(other.disk_id);
+                }
+                disk_id = self.disk_id(&intent.store, &intent.block).or(disk_id);
+                if let Some(restored) = intent.disk_id {
+                    anyhow::ensure!(
+                        (1..=lsn).contains(&restored.sequence())
+                            && disk_id.map_or(true, |id| id == restored),
+                        "inconsistent pending disk ID"
+                    );
+                }
+                intent.disk_id = Some(match disk_id.or(intent.disk_id) {
+                    Some(id) => id,
+                    None => DiskId::new(
+                        lsn,
+                        intent
+                            .shard
+                            .ok_or_else(|| anyhow::anyhow!("missing block shard"))?,
+                    )?,
+                });
                 self.pending.insert(lsn, intent);
             }
             Record::Resolve { transaction } => {
@@ -165,6 +208,7 @@ impl State {
                         let id = entry.key().clone();
                         let block = Arc::new(Block {
                             id,
+                            disk_id: intent.disk_id,
                             len,
                             pages: [(0, allocated)].into(),
                         });
@@ -188,6 +232,7 @@ impl State {
                                 let id = entry.key().clone();
                                 entry.insert(Arc::new(Block {
                                     id,
+                                    disk_id: intent.disk_id,
                                     len,
                                     pages: PageMap::default(),
                                 }))
@@ -242,6 +287,7 @@ impl State {
                 return StoredBlock {
                     meta: StoredMeta {
                         id: b.id.clone(),
+                        disk_id: b.disk_id,
                         len: b.len,
                         form: BlockForm::Whole,
                     },
@@ -255,6 +301,7 @@ impl State {
             StoredBlock {
                 meta: StoredMeta {
                     id: b.id.clone(),
+                    disk_id: b.disk_id,
                     len: b.len,
                     form: BlockForm::Paged {
                         page_size: store.page_size,
@@ -277,7 +324,11 @@ pub(super) fn valid_store(path: &str) -> bool {
 
 #[derive(Serialize, Deserialize)]
 pub(super) enum SnapshotRecord {
-    Store {
+    WholeStore {
+        path: String,
+        page_size: u32,
+    },
+    PagedStore {
         path: String,
         page_size: u32,
     },
@@ -331,6 +382,7 @@ impl Iterator for Snapshot {
                         store: store.to_string(),
                         block: Block {
                             id: block.id.clone(),
+                            disk_id: block.disk_id,
                             len: block.len,
                             pages,
                         },
@@ -340,7 +392,10 @@ impl Iterator for Snapshot {
                 self.block = None;
             }
             match self.records.next()? {
-                Frozen::Store(path, page_size) => break SnapshotRecord::Store { path, page_size },
+                Frozen::Store(path, 0) => break SnapshotRecord::WholeStore { path, page_size: 0 },
+                Frozen::Store(path, page_size) => {
+                    break SnapshotRecord::PagedStore { path, page_size }
+                }
                 Frozen::Block(store, block) => self.block = Some((store, block, None)),
                 Frozen::Pending(transaction, intent) => {
                     break SnapshotRecord::Pending {
@@ -428,11 +483,17 @@ impl Machine for State {
 
     fn restore(&mut self, record: SnapshotRecord) -> io::Result<()> {
         match record {
-            SnapshotRecord::Store { path, page_size } => {
+            SnapshotRecord::WholeStore { path, page_size } => {
                 if self.stores.contains_key(&path) {
                     return Err(invalid("duplicate snapshot store"));
                 }
-                self.apply(0, Record::Store { path, page_size })
+                self.apply(0, Record::WholeStore { path, page_size })
+            }
+            SnapshotRecord::PagedStore { path, page_size } => {
+                if self.stores.contains_key(&path) {
+                    return Err(invalid("duplicate snapshot store"));
+                }
+                self.apply(0, Record::PagedStore { path, page_size })
             }
             SnapshotRecord::Block {
                 store,
@@ -443,7 +504,8 @@ impl Machine for State {
                     .stores
                     .get_mut(&store)
                     .ok_or_else(|| invalid("unknown snapshot store"))?;
-                if block.len > u64::from(block.id.view().block_size)
+                if block.disk_id.is_none()
+                    || block.len > u64::from(block.id.view().block_size)
                     || block.pages.is_empty()
                     || if store.page_size == 0 {
                         continuation || block.pages.len() != 1 || !block.pages.contains_key(&0)
@@ -462,6 +524,7 @@ impl Machine for State {
                         .get_mut(&block.id)
                         .ok_or_else(|| invalid("snapshot continuation without block"))?;
                     if previous.len != block.len
+                        || previous.disk_id != block.disk_id
                         || previous.pages.last_key_value().unwrap().0
                             >= block.pages.first_key_value().unwrap().0
                     {
@@ -482,6 +545,9 @@ impl Machine for State {
             } => {
                 if transaction == 0 || self.pending.contains_key(&transaction) {
                     return Err(invalid("invalid/duplicate snapshot transaction"));
+                }
+                if intent.disk_id.is_none() {
+                    return Err(invalid("missing pending disk ID"));
                 }
                 self.apply(transaction, Record::Begin { intent })
             }

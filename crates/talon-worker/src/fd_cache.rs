@@ -52,6 +52,20 @@ struct Shard {
     capacity: usize,
 }
 
+impl Shard {
+    fn insert(&mut self, path: PathBuf, entry: CachedFd) {
+        if self.capacity == 0 {
+            return;
+        }
+        if self.entries.len() >= self.capacity && !self.entries.contains_key(&path) {
+            if let Some(victim) = self.entries.keys().next().cloned() {
+                self.entries.remove(&victim);
+            }
+        }
+        self.entries.insert(path, entry);
+    }
+}
+
 impl FdCache {
     /// Whole-block cache with a worker-wide descriptor limit.
     pub(crate) fn new(capacity: usize) -> Self {
@@ -95,38 +109,51 @@ impl FdCache {
     }
 
     pub(crate) fn get(&self, path: &Path) -> Option<CachedFd> {
+        self.get_or_generation(path).ok()
+    }
+
+    fn get_or_generation(&self, path: &Path) -> Result<CachedFd, u64> {
         let shard = self.shard_for(path);
         let guard = shard.read().unwrap_or_else(|e| e.into_inner());
-        guard.entries.get(path).cloned()
+        guard.entries.get(path).cloned().ok_or(guard.generation)
     }
 
     pub(crate) fn insert(&self, path: PathBuf, entry: CachedFd) {
         let shard = self.shard_for(&path);
         let mut guard = shard.write().unwrap_or_else(|e| e.into_inner());
-        if guard.capacity == 0 {
-            return;
+        guard.insert(path, entry);
+    }
+
+    fn finish_open(&self, path: PathBuf, entry: CachedFd, generation: u64) -> CachedFd {
+        let shard = self.shard_for(&path);
+        let mut guard = shard.write().unwrap_or_else(|e| e.into_inner());
+        if guard.generation == generation && guard.capacity > 0 {
+            guard.insert(path, entry.clone());
         }
-        if guard.entries.len() >= guard.capacity && !guard.entries.contains_key(&path) {
-            if let Some(victim) = guard.entries.keys().next().cloned() {
-                guard.entries.remove(&victim);
-            }
-        }
-        guard.entries.insert(path, entry);
+        entry
+    }
+
+    pub(crate) fn open_buffered(&self, path: PathBuf) -> std::io::Result<CachedFd> {
+        let generation = match self.get_or_generation(&path) {
+            Ok(hit) => return Ok(hit),
+            Err(generation) => generation,
+        };
+        let file = std::fs::File::open(&path)?;
+        let len = file.metadata()?.len();
+        let entry = CachedFd {
+            fd: Arc::new(file.into()),
+            len,
+        };
+        Ok(self.finish_open(path, entry, generation))
     }
 
     /// Open cold descriptors asynchronously. Invalidation during open/stat must
     /// not allow a superseded inode to be inserted after the writer's rename.
     pub(crate) async fn open_native(&self, path: PathBuf) -> std::io::Result<CachedFd> {
         talon_uring::require_ring()?;
-        let generation = {
-            let guard = self
-                .shard_for(&path)
-                .read()
-                .unwrap_or_else(|e| e.into_inner());
-            if let Some(hit) = guard.entries.get(&path) {
-                return Ok(hit.clone());
-            }
-            guard.generation
+        let generation = match self.get_or_generation(&path) {
+            Ok(hit) => return Ok(hit),
+            Err(generation) => generation,
         };
         let open_path = path.clone();
         let (fd, len) =
@@ -137,19 +164,7 @@ impl FdCache {
             fd: Arc::new(fd),
             len,
         };
-        let mut guard = self
-            .shard_for(&path)
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
-        if guard.generation == generation && guard.capacity > 0 {
-            if guard.entries.len() >= guard.capacity && !guard.entries.contains_key(&path) {
-                if let Some(victim) = guard.entries.keys().next().cloned() {
-                    guard.entries.remove(&victim);
-                }
-            }
-            guard.entries.insert(path, entry.clone());
-        }
-        Ok(entry)
+        Ok(self.finish_open(path, entry, generation))
     }
 
     /// Drop any cached descriptor for `path`.
@@ -190,6 +205,21 @@ mod tests {
             fd: Arc::new(OwnedFd::from(f)),
             len,
         }
+    }
+
+    #[test]
+    fn delayed_open_cannot_repin_an_invalidated_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.blk");
+        let cache = FdCache::new(1);
+        let generation = cache.get_or_generation(&path).err().unwrap();
+        let opened = write(&path, b"old");
+        std::fs::remove_file(&path).unwrap();
+        cache.invalidate(&path);
+
+        let reader = cache.finish_open(path.clone(), opened, generation);
+        assert!(cache.get(&path).is_none());
+        assert_eq!(Arc::strong_count(&reader.fd), 1);
     }
 
     /// A directory unique to the calling test.

@@ -26,7 +26,7 @@ async fn pending_whole_mutations_reconcile_snapshot_and_tail() {
                 .begin(&store.catalog_path, &block(0), operation.clone())
                 .await
                 .unwrap();
-            let path = store.path_for(&block(0));
+            let path = store.path_for(transaction.disk_id);
             let staged = path.with_extension(format!("blk.catalog.{}", transaction.id));
             if matches!(operation, Operation::PutWhole { .. }) {
                 std::fs::write(&staged, b"partial").unwrap();
@@ -43,6 +43,7 @@ async fn pending_whole_mutations_reconcile_snapshot_and_tail() {
                 .put(&block(0), Bytes::from_static(b"new!"))
                 .await
                 .unwrap();
+            assert_ne!(store.read_path(&block(0), None).await.unwrap(), path);
             drop(store);
             let store = WholeBlockStore::open(root.path()).unwrap();
             assert_eq!(store.scan().unwrap().len(), 1);
@@ -56,7 +57,7 @@ async fn cancelled_request_finishes_owned_whole_transaction() {
     let root = tempfile::tempdir().unwrap();
     let store = Arc::new(WholeBlockStore::open(root.path()).unwrap());
     let id = block(0);
-    let gate = store.gate(&id).lock().await;
+    let gate = store.gate(&id).write().await;
     let task = tokio::spawn({
         let store = store.clone();
         let id = id.clone();
@@ -80,8 +81,9 @@ async fn cancelled_request_finishes_owned_whole_transaction() {
 async fn failed_whole_write_stops_admission_until_reconciliation() {
     let root = tempfile::tempdir().unwrap();
     let store = WholeBlockStore::open(root.path()).unwrap();
-    let path = store.path_for(&block(0));
-    std::fs::write(path.parent().unwrap(), b"obstruction").unwrap();
+    let shard = crate::page_lifecycle::disk_shard(&block(0));
+    let dir = store.root.join("whole").join(format!("{shard:02x}"));
+    std::fs::write(&dir, b"obstruction").unwrap();
     assert!(store
         .put(&block(0), Bytes::from_static(b"data"))
         .await
@@ -91,13 +93,39 @@ async fn failed_whole_write_stops_admission_until_reconciliation() {
         .await
         .is_err());
     drop(store);
-    std::fs::remove_file(path.parent().unwrap()).unwrap();
+    std::fs::remove_file(dir).unwrap();
     let store = WholeBlockStore::open(root.path()).unwrap();
     assert!(store.scan().unwrap().is_empty());
     store
         .put(&block(0), Bytes::from_static(b"data"))
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn failed_whole_rewrite_hides_only_pending_block() {
+    let root = tempfile::tempdir().unwrap();
+    let store = WholeBlockStore::open(root.path()).unwrap();
+    let (a, b) = (block(0), block(1));
+    store.put(&a, Bytes::from_static(b"kept")).await.unwrap();
+    store.put(&b, Bytes::from_static(b"old!")).await.unwrap();
+    let path = store.read_path(&b, None).await.unwrap();
+    let pinned = store.get_block(&b).await.unwrap();
+
+    crate::page_access_store::FAIL_CHECKPOINT.with(|f| f.set(Some("whole_published")));
+    let rewrite = store.put(&b, Bytes::from_static(b"new!")).await;
+    crate::page_access_store::FAIL_CHECKPOINT.with(|f| f.set(None));
+
+    assert!(rewrite.is_err());
+    assert_eq!(std::fs::read(path).unwrap(), b"new!");
+    assert_eq!(store.get_bytes(&a).await.unwrap(), b"kept"[..]);
+    assert!(matches!(store.get_block(&b).await, Err(Error::NotFound(_))));
+    assert!(!store.contains(&b).await.unwrap());
+    let mut old = [0; 4];
+    std::fs::File::from(pinned.fd.try_clone().unwrap())
+        .read_exact_at(&mut old, 0)
+        .unwrap();
+    assert_eq!(&old, b"old!");
 }
 
 #[test]
@@ -234,15 +262,14 @@ fn kill_at_whole_transaction_boundaries_recovers_only_completed_writes() {
             if complete {
                 assert_eq!(store.get_bytes(&block(0)).await.unwrap(), b"new!"[..]);
             }
-            let data = store.path_for(&block(0));
-            if data.parent().unwrap().exists() {
-                assert!(std::fs::read_dir(data.parent().unwrap())
+            let shard = crate::page_lifecycle::disk_shard(&block(0));
+            let dir = store.root.join("whole").join(format!("{shard:02x}"));
+            if dir.exists() {
+                assert!(std::fs::read_dir(dir).unwrap().all(|entry| !entry
                     .unwrap()
-                    .all(|entry| !entry
-                        .unwrap()
-                        .file_name()
-                        .to_string_lossy()
-                        .contains("catalog")));
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("catalog")));
             }
             store
                 .put(&block(0), Bytes::from_static(b"retry"))

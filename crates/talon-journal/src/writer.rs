@@ -5,9 +5,22 @@ struct Pending<M: Machine> {
     lsn: u64,
 }
 struct Durable {
-    done: oneshot::Sender<io::Result<Lsn>>,
-    lsn: Lsn,
+    reply: AppliedReply,
     _permits: Permits,
+}
+enum AppliedReply {
+    Sequence(oneshot::Sender<Lsn>, Lsn),
+    Project(Publish),
+}
+impl AppliedReply {
+    fn send(self) {
+        match self {
+            Self::Sequence(done, lsn) => {
+                let _ = done.send(lsn);
+            }
+            Self::Project(publish) => publish(),
+        }
+    }
 }
 type SyncBatch = LocalBoxFuture<'static, (Vec<Durable>, io::Result<()>)>;
 type WriteBatch<M> = LocalBoxFuture<'static, (Vec<Pending<M>>, io::Result<()>)>;
@@ -62,7 +75,7 @@ pub(crate) async fn run<M: Machine>(
             tokio::select! {
                 result=async {sync.as_mut().unwrap().await}, if sync.is_some()=>{
                     sync=None;let (requests,result)=result;result?;
-                    for pending in requests {let _=pending.done.send(Ok(pending.lsn));}
+                    for pending in requests {pending.reply.send();}
                 }
                 result=async {checkpoint.as_mut().unwrap().await}, if checkpoint.is_some()=>{
                     checkpoint=None;disk.publish_snapshot(result?).await?;
@@ -73,13 +86,17 @@ pub(crate) async fn run<M: Machine>(
                     let (requests,result)=result;result?;
                     for pending in requests {
                         let Request{command,_permits}=pending.request;
-                        if let Command::Append{record,bytes,ack,done}=command {
+                        if let Command::Append{record,bytes,ack,reply}=command {
                             machine.apply(pending.lsn,record)?;disk.lsn=pending.lsn;
+                            let reply = match reply {
+                                AppendReply::Sequence(done) => AppliedReply::Sequence(done, pending.lsn),
+                                AppendReply::Project(prepare) => AppliedReply::Project(prepare(&machine, pending.lsn)),
+                            };
                             if ack==Ack::Durable {
                                 // The applied record is no longer needed. Keep its
                                 // admission and acknowledgement until the covering sync.
-                                durable.push(Durable{lsn:pending.lsn,done,_permits});
-                            } else {let _=done.send(Ok(pending.lsn));}
+                                durable.push(Durable{reply,_permits});
+                            } else {reply.send();}
                             drop(bytes);
                         }
                     }

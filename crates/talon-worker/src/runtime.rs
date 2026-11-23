@@ -33,7 +33,7 @@ use talon_transport::data::{CachedBlockPutRequest, CachedRangeRequest, RangeRequ
 use talon_transport::frame::{HEADER_LEN, MAX_PAYLOAD_LEN};
 use talon_transport::{codec, ControlMessage, ObjectEntry, MAX_CONTROL_PAYLOAD_LEN};
 
-use crate::data_error::CacheMiss;
+use crate::{catalog::DiskId, data_error::CacheMiss};
 use crate::{
     miss::touched_pages, BlockIndex, CacheUnit, InFlightLoads, LoadKey, Lru, MemoryInsert,
     MemoryStore, NamespaceRateLimiter, PagedBlockStore, WholeBlockStore, WorkerMetrics,
@@ -1022,12 +1022,12 @@ impl WorkerRuntime {
                 let state = (request.len > 0 && l1_ok)
                     .then(|| {
                         self.index
-                            .page_reads_and_touch(&block, first, PageIndex(last.0 + 1))
+                            .page_reads_and_touch_at(&block, first, PageIndex(last.0 + 1))
                     })
                     .flatten();
-                if let Some((first_guard, guards)) = state {
+                if let Some((disk_id, first_guard, guards)) = state {
                     match paged
-                        .get_range_async(&block, offset_in_block, request.len)
+                        .get_range_at(&block, disk_id, offset_in_block, request.len)
                         .await
                     {
                         Ok(handles) if !handles.is_empty() => {
@@ -1077,13 +1077,13 @@ impl WorkerRuntime {
                     .await?,
                 ));
             }
-            if self.index.is_whole_and_touch(&block) {
+            if let Some(disk_id) = self.index.whole_and_touch(&block) {
                 // Open an fd over exactly the requested window. This can fail if
                 // the block was evicted between the presence check and the open
                 // (a benign race); fall through to the byte path in that case.
                 match self
                     .store
-                    .get_range(&block, offset_in_block, request.len)
+                    .get_range_at(&block, disk_id, offset_in_block, request.len)
                     .await
                 {
                     // The whole-block store returns exactly one handle spanning
@@ -1686,9 +1686,9 @@ impl WorkerRuntime {
         page: PageIndex,
         block_len: u64,
     ) -> anyhow::Result<Option<bytes::Bytes>> {
-        let Some((access, _)) = self
-            .index
-            .page_reads_and_touch(block, page, PageIndex(page.0 + 1))
+        let Some((disk_id, access, _)) =
+            self.index
+                .page_reads_and_touch_at(block, page, PageIndex(page.0 + 1))
         else {
             return Ok(None);
         };
@@ -1704,7 +1704,7 @@ impl WorkerRuntime {
         }
         let paged = self.paged.as_ref().expect("paged store");
         let len = talon_core::page_len(block_len, paged.page_size(), page);
-        match paged.get_page_bytes(block, page, len).await {
+        match paged.get_page_bytes_at(block, disk_id, page, len).await {
             Ok(bytes) => {
                 self.metrics.record_l2_hit();
                 talon_telemetry::cache_tier("l2");
@@ -1945,7 +1945,7 @@ impl WorkerRuntime {
                         }
                         let paged = runtime.paged.as_ref().expect("paged store").clone();
                         let value = bytes.clone();
-                        let allocated = paged
+                        let (allocated, disk_id) = paged
                             .commit_page_payload(&id, page, block_len, value)
                             .await?;
                         runtime
@@ -1957,7 +1957,9 @@ impl WorkerRuntime {
                             runtime.page_clock.now(),
                             true,
                         );
-                        runtime.index.mark_page_allocated(&id, page, allocated);
+                        runtime
+                            .index
+                            .mark_page_allocated_at(&id, page, allocated, disk_id);
                         let unit = CacheUnit::Page(id.clone(), page);
                         let access = runtime.lru.insert(unit.clone(), allocated);
                         runtime.index.set_access(&unit, access);
@@ -2094,7 +2096,7 @@ impl WorkerRuntime {
         offset: u64,
         len: u64,
     ) -> anyhow::Result<Option<bytes::Bytes>> {
-        let Some(meta) = self.index.get_and_touch(block) else {
+        let Some((meta, disk_id)) = self.index.get_and_touch_at(block) else {
             if self.l1.is_enabled() {
                 self.metrics.record_l1_miss();
             }
@@ -2124,10 +2126,14 @@ impl WorkerRuntime {
         self.record_l2_hit();
         tracing::debug!(block = %block, offset, len, tier = "l2", "HIT");
         if !self.l1.is_enabled() {
-            let bytes = match self.store.get_range_bytes(block, offset, len).await {
+            let bytes = match self
+                .store
+                .get_range_bytes_at(block, disk_id, offset, len)
+                .await
+            {
                 Ok(bytes) => bytes,
                 Err(Error::NotFound(_)) => {
-                    self.forget_missing_l2_parent(block);
+                    self.forget_missing_l2_parent(block, disk_id).await;
                     return Ok(None);
                 }
                 Err(error) => {
@@ -2140,12 +2146,12 @@ impl WorkerRuntime {
         let (page_start, page_len) = self.page_window(offset, len, meta.len)?;
         let pages = match self
             .store
-            .get_range_bytes(block, page_start, page_len)
+            .get_range_bytes_at(block, disk_id, page_start, page_len)
             .await
         {
             Ok(bytes) => bytes,
             Err(Error::NotFound(_)) => {
-                self.forget_missing_l2_parent(block);
+                self.forget_missing_l2_parent(block, disk_id).await;
                 return Ok(None);
             }
             Err(error) => return Err(anyhow::anyhow!("read committed L2 pages: {error}")),
@@ -2221,11 +2227,18 @@ impl WorkerRuntime {
     }
 
     /// Drop stale metadata after an index-hit/file-miss eviction race.
-    fn forget_missing_l2_parent(&self, block: &BlockId) {
-        self.invalidate_l1(block);
-        self.index.remove(block);
-        self.lru.remove(&CacheUnit::Whole(block.clone()));
-        tracing::debug!(%block, "discarded stale L2 index entry after file miss");
+    async fn forget_missing_l2_parent(&self, block: &BlockId, disk_id: Option<DiskId>) {
+        let state = self.page_lifecycle.block(block);
+        let gate = state.gate.lock().await;
+        if self.index.whole_and_touch(block) == Some(disk_id) {
+            self.invalidate_l1(block);
+            self.index.remove(block);
+            self.lru.remove(&CacheUnit::Whole(block.clone()));
+            tracing::debug!(%block, "discarded stale L2 index entry after file miss");
+        }
+        drop(gate);
+        drop(state);
+        self.page_lifecycle.retire_empty(block);
     }
 
     /// Record an L2 hit. The preceding index lookup already marks recency.
@@ -2462,13 +2475,15 @@ impl WorkerRuntime {
                                 .await?;
                             runtime.small.as_ref().unwrap().track_access(&id)?;
                         } else {
-                            let allocated = runtime.store.put_payload(&id, bytes).await?;
-                            runtime.index.commit_allocated(
+                            let (allocated, disk_id) =
+                                runtime.store.put_payload(&id, bytes).await?;
+                            runtime.index.commit_allocated_at(
                                 BlockMeta {
                                     id: id.clone(),
                                     form: BlockForm::Whole,
                                     len,
                                 },
+                                Some(disk_id),
                                 [(None, allocated)],
                             );
                             let access = runtime.lru.insert(unit.clone(), allocated);

@@ -27,27 +27,24 @@ impl Catalog {
         }
         let result = (|| {
             for (transaction, intent) in pending {
+                let disk_id = intent.disk_id.expect("catalog transaction disk ID");
+                let root = self.root.join(&intent.store);
                 if Path::new(&intent.store)
                     .file_name()
                     .is_some_and(|name| name == "whole")
                 {
-                    let path = crate::block_store::block_path(
-                        &self.root.join(&intent.store),
-                        &intent.block,
-                    );
+                    let path = disk_id.path(&root, "blk");
                     remove(&path)?;
                     remove(&path.with_extension(format!("blk.catalog.{transaction}")))?;
                     sync_dir(path.parent().unwrap())?;
                 } else {
-                    let dir = crate::paged_store::block_dir(
-                        &self.root.join(&intent.store),
-                        &intent.block,
-                    );
+                    let dir = crate::paged_store::disk_dir(&root, disk_id);
                     match intent.operation {
                         Operation::Put { page, .. } | Operation::DeletePage { page } => {
                             remove(&dir.join(format!("{page}.page")))?;
                             remove(&dir.join(format!("{page}.page.catalog.{transaction}")))?;
                             sync_dir(&dir)?;
+                            crate::paged_store::remove_empty_disk_dir(&dir)?;
                         }
                         Operation::DeleteBlock => {
                             let pages = futures::executor::block_on(tokio::task::unconstrained(
