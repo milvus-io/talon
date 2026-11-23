@@ -5,16 +5,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use talon_core::WorkerConfig;
 
-#[derive(Default, PartialEq, Eq)]
-pub(super) enum SmallCapacityPhase {
-    #[default]
-    Idle,
-    Selecting {
-        empty_scan_remaining: usize,
-    },
-    Reclaiming,
-}
-
 pub(super) struct EvictionCycle {
     capacity: u64,
     startup_high: u64,
@@ -79,22 +69,16 @@ impl EvictionCycle {
             }
             if self.active {
                 for namespace in &workers {
-                    // Cache units are indivisible: one namespace can release more
-                    // than requested. Recompute the global excess before reclaiming
-                    // from the next namespace instead of giving each a fixed share.
-                    let total: u64 = workers.iter().map(|w| w.resident_bytes()).sum();
-                    if total <= self.low {
+                    let Some(target) = namespace
+                        .capacity_plan
+                        .target_for(
+                            workers.iter().map(|worker| worker.capacity_plan.as_ref()),
+                            self.low,
+                        )
+                        .await
+                    else {
                         break;
-                    }
-                    let other_credit =
-                        WorkerRuntime::other_small_reclaim_credit(&workers, namespace).await;
-                    let total: u64 = workers.iter().map(|w| w.resident_bytes()).sum();
-                    if total <= self.low {
-                        break;
-                    }
-                    let target = namespace
-                        .resident_bytes()
-                        .saturating_sub((total - self.low).saturating_sub(other_credit));
+                    };
                     namespace.evict_background_batch(target).await;
                 }
                 let remaining = workers.iter().map(|w| w.resident_bytes()).sum::<u64>();
@@ -104,7 +88,7 @@ impl EvictionCycle {
             }
             if !self.active {
                 for namespace in workers {
-                    *namespace.small_capacity_eviction.lock().await = SmallCapacityPhase::Idle;
+                    namespace.capacity_plan.finish_cycle().await;
                 }
             }
             return;
@@ -123,87 +107,21 @@ impl EvictionCycle {
             self.active = remaining > self.low;
         }
         if !self.active {
-            *worker.small_capacity_eviction.lock().await = SmallCapacityPhase::Idle;
+            worker.capacity_plan.finish_cycle().await;
         }
     }
 }
 
 impl WorkerRuntime {
     async fn evict_background_batch(&self, target: u64) {
-        let mut phase = if self.small.as_ref().is_some() {
-            Some(self.small_capacity_eviction.lock().await)
-        } else {
-            None
-        };
-        let mut local_phase = SmallCapacityPhase::Idle;
-        let phase = phase.as_deref_mut().unwrap_or(&mut local_phase);
-        if self.resident_bytes() <= target {
-            *phase = SmallCapacityPhase::Idle;
-            return;
-        }
-        if *phase == SmallCapacityPhase::Idle {
-            *phase = SmallCapacityPhase::Selecting {
-                empty_scan_remaining: self.lru.len().saturating_mul(2),
-            };
-        }
-        let missing = self
-            .resident_bytes()
-            .saturating_sub(target)
-            .saturating_sub(self.small_reclaim_credit().await);
-        if missing == 0 {
-            *phase = SmallCapacityPhase::Reclaiming;
-        }
-        if let SmallCapacityPhase::Selecting {
-            empty_scan_remaining,
-        } = phase
-        {
-            let policy_target = self.lru.total_bytes().saturating_sub(missing);
-            let lru = self.lru.clone();
-            let count = lru.len();
-            let (scan, deletes) = self.maintenance_batch_limits();
-            let units = tokio::task::spawn_blocking(move || {
-                lru.candidates_to_fit_bounded(policy_target, &Default::default(), scan, deletes)
-            })
-            .await
-            .expect("eviction scan panicked");
-            // Keep a bounded no-progress walk across ticks. Hot reference bits
-            // may be refreshed between every batch, so an individual scan need
-            // never reach its forced second pass. Partial reclaim must still run.
-            let logical_before = self.lru.total_bytes();
-            self.unlink_units_to_target(units, 1, target).await;
-            if self.lru.total_bytes() >= logical_before {
-                *empty_scan_remaining = empty_scan_remaining.saturating_sub(scan);
-            } else {
-                *empty_scan_remaining = count.saturating_mul(2);
-            }
-            let exhausted = *empty_scan_remaining == 0;
-            let excess = self.resident_bytes().saturating_sub(target);
-            if self.small_reclaim_credit().await >= excess || exhausted {
-                // Exhausted unpinned victims may yield only partial progress.
-                *phase = SmallCapacityPhase::Reclaiming;
-            } else {
-                // Keep tombstones as credit across bounded selection batches.
-                // Routine GC also defers relocation while this plan is active.
-                return;
-            }
-        }
-        if self.resident_bytes() <= target {
-            *phase = SmallCapacityPhase::Idle;
-            return;
-        }
-        if self.small_readers_cover_excess(target) {
-            return;
-        }
-        match self
-            .reclaim_small_to_target(target, self.background_budget.clone())
-            .await
-        {
-            Ok(true) => {} // Continue relocation next tick, without selecting more victims.
-            Ok(false) => *phase = SmallCapacityPhase::Idle,
-            Err(error) => {
-                tracing::warn!(%error, "small object background pressure reclamation failed")
-            }
-        }
+        self.capacity_plan
+            .background_batch(
+                target,
+                || self.maintenance_batch_limits(),
+                self.background_budget.clone(),
+                |units| self.unlink_units_to_target(units, 1, target),
+            )
+            .await;
     }
 }
 
