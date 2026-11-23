@@ -29,6 +29,7 @@ pub mod page_gc;
 mod page_lifecycle;
 mod page_table;
 pub mod paged_store;
+mod range_request;
 pub mod rate_limit;
 mod recovery;
 pub mod runtime;
