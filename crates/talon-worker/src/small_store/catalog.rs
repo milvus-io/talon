@@ -1,5 +1,5 @@
 use super::journal::{Event, Model, SegmentMeta};
-use super::lookup::{Lookup, VISIBLE};
+use super::lookup::{Lookup, POLICY, VISIBLE};
 use super::{Location, SegmentFile};
 use crate::eviction::{AccessHandle, PolicyEntry};
 use crate::small_store::key::{SmallIdentity, SmallKey};
@@ -30,6 +30,7 @@ pub(super) struct Catalog {
     pub policy: HashMap<Address, PolicyEntry>,
     pub access: HashMap<Address, AccessHandle>,
     pub(super) recency: Option<super::recency::Recency>,
+    pub(super) ownership: Option<super::gc::Ownership>,
     pub live: HashMap<usize, usize>,
     pub compact_streams: HashSet<usize>,
     pub compact_totals: HashMap<usize, (u64, usize)>,
@@ -190,6 +191,14 @@ impl Catalog {
         }
         let handle = self.handle(address.0, row);
         self.lookup.find(record.hash, |found, _| found == handle)
+    }
+
+    pub(super) fn visible_policy_slot(&self, segment: u64, row: usize) -> Option<usize> {
+        let record = self.segment(segment)?.records.metadata(row)?;
+        let handle = self.handle(segment, row);
+        self.lookup.find(record.hash, |found, flags| {
+            found == handle && flags & (VISIBLE | POLICY) == VISIBLE | POLICY
+        })
     }
 
     fn lookup_location(
@@ -372,6 +381,9 @@ impl Catalog {
         self.unindex_rows(segment, 0, usize::MAX);
         self.retired_segments.remove(&segment);
         self.files.remove(&segment);
+        if let Some(ownership) = &mut self.ownership {
+            ownership.remove_segment(segment);
+        }
         if let Some(recency) = &mut self.recency {
             recency.remove_segment(segment);
         }

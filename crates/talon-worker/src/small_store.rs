@@ -13,6 +13,8 @@ pub(crate) use access::DirtyAccess;
 pub(crate) mod directory;
 mod disk_io;
 mod flush;
+mod gc;
+pub(crate) use gc::{GcCheck, OwnershipCursor, OwnershipLimit, SmallGcCandidate};
 mod format;
 mod journal;
 mod key_codec;
@@ -190,6 +192,11 @@ impl SegmentFile {
 }
 
 impl Location {
+    #[cfg(test)]
+    pub(crate) fn segment(&self) -> u64 {
+        self.segment
+    }
+
     pub(crate) fn len(&self) -> u64 {
         self.len
     }
@@ -889,6 +896,9 @@ impl SegmentStore {
                 let mut directory = self.entries.write().unwrap();
                 for (key, loc) in moved {
                     directory.insert(key, loc);
+                }
+                if let Some(new) = replacement {
+                    directory.replace_ownership_segment(old, new);
                 }
             }
             if state.active == Some(old) {

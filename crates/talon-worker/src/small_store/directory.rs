@@ -263,12 +263,16 @@ impl Directory {
     pub fn insert(&mut self, key: SmallKey, location: Location) -> Option<Location> {
         let model = self.catalog.clone();
         let mut catalog = model.0.write().unwrap();
+        let address = (location.segment, location.offset);
         let old = self.stage_in(&mut catalog, key.clone(), location);
+        if let (Some(old), Some(ownership)) = (&old, &mut catalog.ownership) {
+            ownership.relocate((old.segment, old.offset), address);
+        }
         #[cfg(test)]
         if let Some(pause) = self.before_relocation_publish.take() {
             pause();
         }
-        self.publish_in(&mut catalog, &key);
+        self.publish_in(&mut catalog, &key, old.is_none());
         old
     }
     pub fn stage(&mut self, key: SmallKey, location: Location) -> Option<Location> {
@@ -339,15 +343,20 @@ impl Directory {
     pub fn publish(&mut self, id: &dyn SmallIdentity) {
         let model = self.catalog.clone();
         let mut catalog = model.0.write().unwrap();
-        self.publish_in(&mut catalog, id);
+        self.publish_in(&mut catalog, id, true);
     }
-    fn publish_in(&mut self, catalog: &mut Catalog, id: &dyn SmallIdentity) {
+    fn publish_in(&mut self, catalog: &mut Catalog, id: &dyn SmallIdentity, admit: bool) {
         let slot = self.pending(catalog, id).expect("staged small object");
         let flags = catalog.lookup.flags(slot);
         if flags & VISIBLE == 0 {
             *catalog.live.entry(self.slot).or_default() += 1;
         }
         catalog.lookup.set_flags(slot, flags | VISIBLE);
+        if admit {
+            if let Some(ownership) = &mut catalog.ownership {
+                ownership.admit(self.staged.expect("published small address"));
+            }
+        }
         self.staged = None;
     }
     pub fn attach_access(&mut self, id: &dyn SmallIdentity, access: AccessHandle) {
@@ -484,6 +493,11 @@ impl Directory {
             catalog.retired.remove(id);
         }
         Some(policy)
+    }
+    pub(super) fn replace_ownership_segment(&mut self, old: u64, new: u64) {
+        if let Some(ownership) = &mut self.catalog.0.write().unwrap().ownership {
+            ownership.replace_segment(old, new);
+        }
     }
     pub fn retire_segment(&mut self, segment: u64) {
         self.catalog.0.write().unwrap().retire_segment(segment);

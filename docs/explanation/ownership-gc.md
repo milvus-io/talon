@@ -21,9 +21,10 @@ stop both ownership maintenance and its control-plane membership refresh.
 object deletion checks, which retain their one-hour delay after each completed
 backend round. Each setting controls its own task.
 
-Ownership scans continuously through the event boundary, with no block-count
-batch setting or page-GC scan cap. It holds one candidate at a time. Every resident
-page still consumes deletion-rate credit. Both fields support uppercase
+Ownership scans continuously through the event boundary. An ordinary scan works
+one candidate at a time. A compact Small Store scan retains at most one bounded
+batch of new candidates. Every selected packed entry or resident page consumes
+deletion-rate credit. Both fields support uppercase
 `TALON_WORKER_` environment variables overriding TOML. Changes require restart;
 replica count must be positive.
 
@@ -50,8 +51,9 @@ consumes validity. Missing/invalid observations expire the previous snapshot,
 but retain its topology and event boundary. Same-topology recovery renews validity
 and wakes pending work without expanding its scope.
 
-On each logical membership change, publication captures the existing block
-admission sequence as `scan_limit` and assigns a new local generation. The first
+On each logical membership change, publication captures the ordinary block
+admission sequence and the compact Small Store admission epoch for each initialized
+cache namespace and credential scope. It assigns a new local generation. The first
 valid observation is an event too, covering cache present at publication, including
 recovered blocks. GC scans only that fixed prefix for ownership. It also excludes
 blocks whose admission revision is at or beyond the limit: a post-event replacement
@@ -59,11 +61,11 @@ or page fill conservatively excludes the entire block. Reads do not change the
 admission revision. New data never expands an event's scan, including data written
 between publication and delayed GC startup.
 
-A complete pass marks the generation converged only after all selected misplaced
-blocks are gone and the generation remains valid. Reader/pin protection, activity
-races and unlink failure leave the event pending. Retrying after one second visits
-only protected or failed blocks, using their ownership queue positions as retry
-keys. The cursor and selected candidate survive cancellation; already checked
+A complete pass marks the generation converged once all selected misplaced entries
+have been reclaimed or superseded by a later admission and the generation remains
+valid. Reader and pin protection, activity races and unlink failure leave the event
+pending. After one second, the sweep retries protected or failed ordinary entries by
+queue position and packed entries by their retained locator tickets. The cursor and selected candidate survive cancellation; already checked
 owned blocks are not rescanned. Once converged, new writes do not immediately wake
 ownership; the supplemental check handles them later.
 
@@ -105,6 +107,16 @@ and leaves it pending for a later pass. This preserves the fixed event boundary
 without moving the index for every page. Protected retries use queue positions,
 while deletion still validates the latest revision, activity and pins.
 
+Small Store groups admissions by segment and epoch. Each ordinary append
+inherits its segment's first epoch or stores an offset exception for a later epoch.
+Immutable re-admissions update the epoch even when their payload locator is
+unchanged. Publication advances the epoch after capturing the event boundary.
+Hourly supplements skip unchanged segments' rows and hash only entries admitted
+within the captured epoch range. A segment replacement keeps its logical place
+in the scan and transfers row epochs and tickets to the copied extents. If the
+current segment moves between slices, the scan resumes at the beginning of its
+replacement.
+
 Supplemental passes use the same yielding, deletion budgets and protection checks
 as event passes. Reader/pin protection and unlink failure retry the fixed bounds
 after one second. Cancellation or a same-topology discovery outage preserves those
@@ -119,8 +131,8 @@ proportional to notified blocks, so cleanup under write load is not constant tim
 
 `ownership_gc` and `stale_gc` have separate modules, scheduler registrations and
 scan cursors. Ownership never issues backend requests; stale GC never consumes
-membership. They share only the resident block index, deletion budgets and guarded
-whole-block mutation.
+membership. Both tasks use the ordinary block index and the compact Small Store
+catalog. They share deletion budgets and the same guarded mutations.
 
 Ownership retains the active pass cursor, retry keys and current candidate across
 scheduler slices and cancellation, along with its configuration, cached placement
@@ -130,10 +142,9 @@ and checked against those tables. Reads do not update ownership notifications.
 Membership canonicalization costs O(N log N); scans use the resident index without
 cloning the full index or walking cache directories.
 
-Ownership streams blocks without candidate vectors or per-batch blocking-task
-dispatch. Each slice visits at most 64 entries and yields after about 10 ms of
-elapsed work, resuming unfinished scans without an interval sleep. Each block
-rechecks membership. Actual deletions consume
+A slice checks at most 64 ordinary entries or spends a 64-step budget traversing
+packed segments and rows. It yields between batches or after about 10 ms in
+the deletion loop. Each deletion rechecks membership. Actual deletions consume
 shared page/disk credits; pending
 protected blocks retry after one second. The event scheduler coalesces changes
 received during active work. Once converged, ownership waits for a membership
@@ -147,11 +158,16 @@ membership failure changes this schedule or policy.
 
 ## Reclamation and protection
 
-Both reasons retire a whole block. Under the mutation gate, the reclaimer rechecks
-admission revision, activity and pins, then claims all resident pages. Any active
-reader defers the entire block. Successful deletion removes files, L1, lifecycle,
-index and accounting entries. Failures retain conservative accounting and release
-page claims. TTI does not replay failed ownership deletions.
+For ordinary blocks, both reasons retire the whole file or all resident pages.
+Under the mutation gate the reclaimer rechecks admission revision, activity and
+pins, then claims all resident pages. An active page reader defers the block.
+Successful deletion clears L1, lifecycle, index and accounting entries. Failures
+retain conservative accounting and release page claims.
+
+For a packed entry, the reclaimer checks its locator ticket, pins, read activity
+and membership at tombstone publication. It retires just that whole object or
+exact range. An exact-range retirement leaves any ordinary whole block, paged
+block or L1 data for the same block identity available.
 
 Ownership charges all deletion credits before reading the latest valid snapshot
 of the expected generation. This permits renewal while a large block waits for

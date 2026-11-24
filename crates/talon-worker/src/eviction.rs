@@ -1187,8 +1187,26 @@ impl Lru {
             })
     }
 
-    /// Called under the block mutation gate after its complete on-disk deletion.
+    pub(crate) fn contains_tracked_block(&self, block: &BlockId) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .index
+            .policy_block_get(block)
+            .is_some()
+    }
+
+    pub(crate) fn remove_tracked_block(&self, block: &BlockId) {
+        self.remove_block_policy(block, false);
+    }
+
+    #[cfg(test)]
     pub(crate) fn remove_block(&self, block: &BlockId) {
+        self.remove_block_policy(block, true);
+    }
+
+    /// Called under the block mutation gate after its complete on-disk deletion.
+    fn remove_block_policy(&self, block: &BlockId, include_compact: bool) {
         let mut g = self.inner.lock().unwrap();
         for (kind, _) in g.index.policy_units(block) {
             let unit = match kind {
@@ -1196,7 +1214,13 @@ impl Lru {
                 UnitKind::Whole => CacheUnit::Whole(block.clone()),
                 UnitKind::ExactRange => CacheUnit::ExactRange(block.clone()),
             };
-            g.remove(&unit);
+            if include_compact
+                || g.index
+                    .policy_get(&unit)
+                    .is_some_and(|entry| entry.access.small().is_none())
+            {
+                g.remove(&unit);
+            }
         }
     }
 
@@ -1206,7 +1230,9 @@ impl Lru {
             .unwrap()
             .object_checks
             .get(object as &dyn ObjectIdentity)
-            .is_some_and(|(_, at)| at.map_or(true, |at| now.saturating_sub(at) >= age))
+            .map_or(true, |(_, at)| {
+                at.map_or(true, |at| now.saturating_sub(at) >= age)
+            })
     }
 
     pub(crate) fn stale_verified(&self, object: &ObjectId, now: u64) {

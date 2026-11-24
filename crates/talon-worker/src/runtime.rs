@@ -21,7 +21,7 @@ mod page_tti_tests;
 mod small_tests;
 use crate::page_gc::{Mutations, PageGcConfig, PageGcMetrics};
 use crate::page_lifecycle::{AccessClock, PageLifecycle, ScanCursor};
-use crate::small_store::{IdleRecencyCursor, SmallObjectStore};
+use crate::small_store::{IdleRecencyCursor, OwnershipLimit, SmallObjectStore};
 
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
@@ -173,7 +173,13 @@ struct MembershipSnapshot {
     valid_until: Instant,
     generation: u64,
     // Each namespace has an independent admission revision sequence.
-    scan_limits: Arc<HashMap<namespaces::CacheIdentity, u64>>,
+    scan_limits: Arc<HashMap<namespaces::CacheIdentity, OwnershipLimits>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct OwnershipLimits {
+    block: u64,
+    small: Option<OwnershipLimit>,
 }
 
 impl WorkerRuntime {
@@ -395,14 +401,14 @@ impl WorkerRuntime {
                                 .map(|worker| {
                                     (
                                         worker.cache_identity.clone(),
-                                        worker.lru.block_scan_ceiling(),
+                                        worker.capture_ownership_limits(),
                                     )
                                 })
                                 .collect()
                         } else {
                             HashMap::from([(
                                 self.cache_identity.clone(),
-                                self.lru.block_scan_ceiling(),
+                                self.capture_ownership_limits(),
                             )])
                         }),
                     )
@@ -428,6 +434,16 @@ impl WorkerRuntime {
                 }
                 result.map(|_| ())
             }
+        }
+    }
+
+    fn capture_ownership_limits(&self) -> OwnershipLimits {
+        OwnershipLimits {
+            block: self.lru.block_scan_ceiling(),
+            small: self
+                .small
+                .as_ref()
+                .and_then(|small| small.ownership_limit(true)),
         }
     }
 
@@ -2180,6 +2196,7 @@ impl WorkerRuntime {
 
     /// Management scans include each store's own residency directory. This is
     /// never a substitute for the locator lookup used by the read path.
+    #[cfg(test)]
     fn contains_block(&self, block: &BlockId) -> bool {
         self.small
             .as_ref()

@@ -170,18 +170,17 @@ is enabled by default. Set `ownership_gc_enabled = false` to disable it. Logical
 membership changes trigger scans of pre-event blocks; hourly supplemental checks
 handle later admissions, skipping the resident scan when no admissions occurred.
 Ownership uses the snapshot published by the Worker control plane and never issues
-backend HEADs. The tasks share the resident block index, deletion
-budgets and whole-block reclaimer, while keeping scans and schedules independent.
+backend HEADs. The tasks share deletion budgets and guarded deletion paths for
+ordinary blocks and packed entries. Their scans and schedules are independent.
 
-For backend-deletion checks, only blocks idle for **more than 24 hours** are eligible. Reads and admissions
-refresh a process-local, monotonic block timestamp, shared by all of its pages.
-The task walks resident metadata, without scanning cache directories or listing
-the backend. Each round traverses one fixed queue generation in batches. Each
-batch scans at most 4096 blocks (or the smaller configured scan budget) and retains
-at most the configured deletion batch size in block candidates. A paged block
-counts as one candidate regardless of how many pages it contains.
-A cursor resumes the admission-ordered block index, independently of the
-capacity-eviction queue. Blocks admitted during a round wait for the next round.
+Entries idle for **more than 24 hours** are eligible. Ordinary whole and paged
+blocks use a process-local block timestamp shared by the pages of each block.
+Packed whole objects and exact ranges use their own Small Store recency rows,
+including when TTI is disabled. Each round walks a fixed admission-ordered prefix
+of the ordinary block index and a bounded extent of the compact catalog, using
+independent cursors. A batch scans at most 4096 entries and retains at most 256
+candidates, subject to the configured scan and deletion limits. A paged block
+counts as one candidate regardless of its page count.
 
 Each scheduler slice issues at most one concurrent wave of HEAD requests,
 bounded by the configured concurrency, 32 distinct objects, and one second of
@@ -193,7 +192,10 @@ HEAD traffic. A whole-block removal charges deletion work for all resident pages
 even though they are removed together as a directory.
 
 A successful HEAD suppresses further GC verification for 24 hours across every
-cached offset and version of the same `(backend, bucket, key)`. A changed version
+cached offset and version of the same `(backend, bucket, key)`. Small Store
+allocates check metadata only for objects with a positive result, and expires
+those entries after the cooldown. Positive HEADs leave recency unchanged.
+A changed version
 still counts as an existing object. Only an explicit backend `NotFound` permits
 local reclamation; permission errors, transport failures, and timeouts retain the
 cache. Negative results and errors are shared only within the current batch.
@@ -205,7 +207,10 @@ page before deleting anything: if any page has an active reader, the entire bloc
 is deferred and all partial claims are released. Reads or page fills invalidate
 old block candidates. Successful reclamation removes the whole block file or the
 entire pages directory, then removes all of the block's L1 entries, page lifecycle
-state, index entries, and resident-byte accounting together.
+state, index entries, and resident-byte accounting together. For a packed entry
+the worker revalidates the locator ticket, read activity and pins before appending
+a tombstone. It charges one deletion unit. A packed exact range and its ordinary
+whole or paged siblings can be collected independently.
 
 An unlink failure retains accounting and reopens page handles; stale GC requires
 a fresh HEAD on retry. Directory removal can fail after partially removing files;
@@ -214,11 +219,10 @@ TTI GC does not independently replay the stale NotFound. Paged reclamation still
 counts the number of reclaimed pages under reason `backend_deleted` in the
 existing GC metrics; scheduler metrics expose task `stale_gc` for both forms.
 
-Idle timestamps and successful checks are in memory and retire with resident
-entries. Restart conservatively starts a fresh 24-hour idle window, including for
-recovered cache files. This is eventual space reclamation: hot blocks remain
-cached, and deletion discovery is delayed by idle age, positive-check cooldown,
-and scan progress. It does not change read-path version semantics.
+Restart clears successful HEAD checks and starts a fresh idle window for
+ordinary blocks. Small Store restores available access checkpoints and starts a
+fresh idle window for entries without a valid saved age. Hot entries stay cached.
+Deletion discovery depends on idle age, positive-check cooldown and scan progress.
 
 ## Stale-object checks
 

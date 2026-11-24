@@ -363,6 +363,40 @@ impl SmallObjectStore {
             .await
     }
 
+    pub(crate) async fn delete_gc(
+        self: &Arc<Self>,
+        candidate: super::SmallGcCandidate,
+        revision: u64,
+        authorized: impl FnOnce() -> bool + Send + 'static,
+    ) -> io::Result<bool> {
+        let store = self.clone();
+        self.tasks
+            .run(async move {
+                let id = candidate.unit;
+                let _guard = store.mutation(&id).await;
+                let Some(stream) = store.owner(&id) else {
+                    return Ok(false);
+                };
+                let removed = stream
+                    .delete_inner_if(&id, |loc| {
+                        loc.access
+                            .as_ref()
+                            .and_then(AccessHandle::small)
+                            .is_some_and(|current| {
+                                Arc::ptr_eq(current, &candidate.ticket)
+                                    && current.gc_is_current(revision)
+                                    && authorized()
+                            })
+                    })
+                    .await?;
+                if removed {
+                    store.policy().expect("compact small policy").remove(&id);
+                }
+                Ok(removed)
+            })
+            .await
+    }
+
     pub fn stats(&self) -> io::Result<SmallStoreStats> {
         let mut total = SmallStoreStats::default();
         for stream in self.streams() {
@@ -387,6 +421,13 @@ impl SmallObjectStore {
         track_clock: bool,
     ) {
         self.bind_index(index);
+        let streams = self.streams();
+        if !track_clock {
+            for stream in streams {
+                stream.entries.write().unwrap().enable_compact();
+            }
+            return;
+        }
         let shared_access = units
             .iter()
             .filter(|unit| {
@@ -395,11 +436,7 @@ impl SmallObjectStore {
             })
             .map(|unit| (unit.unit.block.materialize(), unit.access.clone()))
             .collect();
-        for stream in self.streams() {
-            if !track_clock {
-                stream.entries.write().unwrap().enable_compact();
-                continue;
-            }
+        for stream in streams {
             stream
                 .restore_policy_units(units, &shared_access, track_clock)
                 .expect("validated small object identity");

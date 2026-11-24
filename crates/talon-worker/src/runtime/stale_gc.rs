@@ -1,6 +1,7 @@
 //! Reclaim cold local cache entries only after an authoritative backend NotFound.
 use super::WorkerRuntime;
-use crate::eviction::access_millis;
+use crate::eviction::{access_millis, StaleBlockCandidate};
+use crate::small_store::{IdleRecencyCursor, SmallGcCandidate};
 use futures::StreamExt;
 use std::{
     collections::{HashMap, VecDeque},
@@ -12,11 +13,78 @@ use talon_core::{Error, ObjectId, WorkerConfig};
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 const MAX_HEADS: usize = 32;
 
+enum Candidate {
+    Block(StaleBlockCandidate),
+    Small(SmallGcCandidate, u64),
+}
+
+impl Candidate {
+    fn object(&self) -> &ObjectId {
+        match self {
+            Self::Block(candidate) => &candidate.block.object,
+            Self::Small(candidate, _) => &candidate.unit.block().object,
+        }
+    }
+
+    fn units(&self) -> u64 {
+        match self {
+            Self::Block(candidate) => candidate.units as u64,
+            Self::Small(_, _) => 1,
+        }
+    }
+
+    fn is_current(&self, worker: &WorkerRuntime) -> bool {
+        match self {
+            Self::Block(candidate) => worker.lru.stale_candidate_is_current(candidate),
+            Self::Small(candidate, revision) => candidate.ticket.gc_is_current(*revision),
+        }
+    }
+}
+
+#[derive(Default)]
+struct PositiveHeads {
+    checked: HashMap<Arc<ObjectId>, u64>,
+    expiry: VecDeque<(u64, Arc<ObjectId>)>,
+}
+
+impl PositiveHeads {
+    fn due(&self, object: &ObjectId, now: u64) -> bool {
+        self.checked
+            .get(object)
+            .map_or(true, |at| now.saturating_sub(*at) >= DAY_MS)
+    }
+
+    fn record(&mut self, object: ObjectId, now: u64) {
+        let object = Arc::new(object);
+        self.checked.insert(object.clone(), now);
+        self.expiry.push_back((now, object));
+    }
+
+    fn prune(&mut self, now: u64) {
+        for _ in 0..256 {
+            let Some((at, _)) = self.expiry.front() else {
+                break;
+            };
+            if now.saturating_sub(*at) < DAY_MS {
+                break;
+            }
+            let (at, object) = self.expiry.pop_front().unwrap();
+            if self.checked.get(&object) == Some(&at) {
+                self.checked.remove(&object);
+            }
+        }
+    }
+}
+
 pub(super) struct StaleGc {
     cursor: (u64, u64),
-    pending: VecDeque<crate::eviction::StaleBlockCandidate>,
+    blocks_done: bool,
+    small_cursor: IdleRecencyCursor,
+    small_done: bool,
+    pending: VecDeque<Candidate>,
     round_now: Option<u64>,
-    missing: VecDeque<(crate::eviction::StaleBlockCandidate, u64)>,
+    missing: VecDeque<(Candidate, u64)>,
+    small_checks: PositiveHeads,
     heads: Arc<crate::background::Rate>,
     concurrency: usize,
     head_batch: usize,
@@ -42,6 +110,10 @@ impl StaleGc {
     ) -> Self {
         Self {
             cursor: (0, 0),
+            blocks_done: false,
+            small_cursor: IdleRecencyCursor::default(),
+            small_done: false,
+            small_checks: PositiveHeads::default(),
             pending: VecDeque::new(),
             round_now: None,
             missing: VecDeque::new(),
@@ -68,11 +140,7 @@ impl StaleGc {
             self.check_batch(worker, now).await;
         }
         self.delete_slice(worker).await;
-        let done =
-            self.cursor.0 >= self.cursor.1 && self.pending.is_empty() && self.missing.is_empty();
-        if done {
-            self.round_now = None;
-        }
+        let done = self.finish_round_if_done();
         Some(if done {
             Duration::from_secs(3600)
         } else {
@@ -80,41 +148,57 @@ impl StaleGc {
         })
     }
 
+    fn finish_round_if_done(&mut self) -> bool {
+        let done = self.blocks_done
+            && self.small_done
+            && self.pending.is_empty()
+            && self.missing.is_empty();
+        if done {
+            self.round_now = None;
+            self.blocks_done = false;
+            self.small_done = false;
+            self.small_cursor = IdleRecencyCursor::default();
+        }
+        done
+    }
+
     #[cfg(test)]
     async fn run_round_at(&mut self, worker: &WorkerRuntime, now: u64) {
-        loop {
-            self.tick_at(worker, now).await;
-            if self.cursor.0 >= self.cursor.1 && self.pending.is_empty() {
-                break;
-            }
+        while !self.tick_at(worker, now).await {
             tokio::task::yield_now().await;
         }
     }
 
     #[cfg(test)]
-    async fn tick_at(&mut self, worker: &WorkerRuntime, now: u64) {
+    async fn tick_at(&mut self, worker: &WorkerRuntime, now: u64) -> bool {
         self.check_batch(worker, now).await;
         while !self.missing.is_empty() {
             self.delete_slice(worker).await;
         }
+        self.finish_round_if_done()
     }
 
     async fn delete_slice(&mut self, worker: &WorkerRuntime) {
         let Some((candidate, paid)) = self.missing.front_mut() else {
             return;
         };
-        if !worker.lru.stale_candidate_is_current(candidate) {
+        if !candidate.is_current(worker) {
             self.missing.pop_front();
             return;
         }
         if let Some(budget) = &worker.background_budget {
-            *paid += budget.delete_slice(candidate.units as u64 - *paid).await;
+            *paid += budget.delete_slice(candidate.units() - *paid).await;
         } else {
-            *paid = candidate.units as u64;
+            *paid = candidate.units();
         }
-        if *paid == candidate.units as u64 {
+        if *paid == candidate.units() {
             let (candidate, _) = self.missing.pop_front().unwrap();
-            worker.unlink_stale_block_prepaid(candidate).await;
+            match candidate {
+                Candidate::Block(candidate) => worker.unlink_stale_block_prepaid(candidate).await,
+                Candidate::Small(candidate, revision) => {
+                    worker.unlink_small_gc(candidate, revision, None).await
+                }
+            }
         }
     }
 
@@ -125,35 +209,60 @@ impl StaleGc {
         if !backend.ready_for_background() {
             return;
         }
+        self.small_checks.prune(now);
+        let compact = worker.small.as_ref().filter(|small| small.has_recency());
+        if compact.is_none() {
+            self.small_done = true;
+        }
         if self.pending.is_empty() {
-            let lru = worker.lru.clone();
-            let mut cursor = self.cursor;
             let (scan, deletes) = worker.maintenance_batch_limits();
             let scan = scan.min(4096);
             let deletes = deletes.min(256);
-            let (cursor, candidates) = tokio::task::spawn_blocking(move || {
-                let candidates = lru.stale_gc_candidates(&mut cursor, now, DAY_MS, scan, deletes);
-                (cursor, candidates)
-            })
-            .await
-            .expect("stale GC scan panicked");
-            self.cursor = cursor;
-            self.pending = candidates.into();
+            if !self.blocks_done {
+                let lru = worker.lru.clone();
+                let mut cursor = self.cursor;
+                let (cursor, candidates) = tokio::task::spawn_blocking(move || {
+                    let candidates =
+                        lru.stale_gc_candidates(&mut cursor, now, DAY_MS, scan, deletes);
+                    (cursor, candidates)
+                })
+                .await
+                .expect("stale block GC scan panicked");
+                self.cursor = cursor;
+                self.blocks_done = cursor.0 >= cursor.1;
+                self.pending
+                    .extend(candidates.into_iter().map(Candidate::Block));
+            } else if !self.small_done {
+                let small = compact.expect("compact small store").clone();
+                let mut cursor = self.small_cursor;
+                let (cursor, done, candidates) = tokio::task::spawn_blocking(move || {
+                    let (done, candidates) =
+                        small.stale_candidates(&mut cursor, now, DAY_MS, scan, deletes);
+                    (cursor, done, candidates)
+                })
+                .await
+                .expect("stale small GC scan panicked");
+                self.small_cursor = cursor;
+                self.small_done = done;
+                self.pending.extend(
+                    candidates
+                        .into_iter()
+                        .map(|(candidate, revision)| Candidate::Small(candidate, revision)),
+                );
+            }
         }
-        let mut groups: HashMap<ObjectId, Vec<crate::eviction::StaleBlockCandidate>> =
-            HashMap::new();
+        let mut groups: HashMap<ObjectId, Vec<Candidate>> = HashMap::new();
         while let Some(candidate) = self.pending.front() {
-            if !groups.contains_key(&candidate.block.object) && groups.len() == self.head_batch {
+            if !groups.contains_key(candidate.object()) && groups.len() == self.head_batch {
                 break;
             }
             let candidate = self.pending.pop_front().unwrap();
-            if worker.lru.stale_candidate_is_current(&candidate)
-                && worker
-                    .lru
-                    .stale_check_due(&candidate.block.object, now, DAY_MS)
+            if candidate.is_current(worker)
+                && self.small_checks.due(candidate.object(), now)
+                && worker.lru.stale_check_due(candidate.object(), now, DAY_MS)
             {
                 groups
-                    .entry(candidate.block.object.clone())
+                    .entry(candidate.object().clone())
                     .or_default()
                     .push(candidate);
             }
@@ -163,33 +272,33 @@ impl StaleGc {
             futures::stream::iter(groups.into_iter().map(|(object, candidates)| async move {
                 // Origin QPS is independent of local disk pacing and scan slicing.
                 heads.charge(1).await;
-                let missing = match tokio::time::timeout(
-                    Duration::from_secs(5),
-                    worker.background_head(&object),
-                )
-                .await
-                {
-                    Ok(Ok(_)) => {
-                        worker.lru.stale_verified(&object, now.max(access_millis()));
-                        false
-                    }
-                    Ok(Err(Error::NotFound(_))) => true,
-                    Ok(Err(error)) => {
-                        tracing::debug!(%error, "stale GC HEAD failed; retaining cache");
-                        false
-                    }
-                    Err(_) => false,
-                };
-                if missing {
-                    candidates
-                } else {
-                    Vec::new()
-                }
+                let result =
+                    tokio::time::timeout(Duration::from_secs(5), worker.background_head(&object))
+                        .await;
+                (object, candidates, result)
             }));
         let mut work = work.buffer_unordered(self.concurrency);
-        while let Some(candidates) = work.next().await {
-            self.missing
-                .extend(candidates.into_iter().map(|candidate| (candidate, 0)));
+        while let Some((object, candidates, result)) = work.next().await {
+            match result {
+                Ok(Ok(_)) => {
+                    let checked = now.max(access_millis());
+                    worker.lru.stale_verified(&object, checked);
+                    if candidates
+                        .iter()
+                        .any(|candidate| matches!(candidate, Candidate::Small(..)))
+                    {
+                        self.small_checks.record(object, checked);
+                    }
+                }
+                Ok(Err(Error::NotFound(_))) => {
+                    self.missing
+                        .extend(candidates.into_iter().map(|candidate| (candidate, 0)));
+                }
+                Ok(Err(error)) => {
+                    tracing::debug!(%error, "stale GC HEAD failed; retaining cache");
+                }
+                Err(_) => {}
+            }
         }
     }
 }
@@ -285,6 +394,159 @@ mod tests {
     }
     fn cold_now() -> u64 {
         access_millis() + DAY_MS + 1
+    }
+
+    fn compact_runtime(root: &std::path::Path, paged: bool, origin: Arc<Origin>) -> WorkerRuntime {
+        let config = WorkerConfig {
+            backend: Some("s3".into()),
+            block_size: 32,
+            l1_page_size_bytes: 16,
+            l2_page_size_bytes: if paged { 16 } else { 0 },
+            page_tti_hours: 2,
+            ..Default::default()
+        };
+        assert!(config.stale_gc_enabled && config.ownership_gc_enabled);
+        let lock = Arc::new(crate::page_access_store::CacheRootLock::acquire(root).unwrap());
+        WorkerRuntime::open_namespaces(&config, lock, origin, WorkerMetrics::new(0)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn compact_stale_gc_preserves_the_pinned_exact_range_of_an_ordinary_block() {
+        for paged in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let origin = Arc::new(Origin::default());
+            let worker = compact_runtime(root.path(), paged, origin.clone());
+            let small = worker.small.as_ref().unwrap();
+            let ordinary = block(0);
+            let exact = CacheUnit::ExactRange(ordinary.clone());
+            let mut whole = ordinary.clone();
+            // Exercise the same backend object and offset across versions.
+            whole.version = Version::new("v2");
+            worker
+                .commit_cached_block(&whole, Bytes::from_static(b"packed"))
+                .await
+                .unwrap();
+            fill(&worker, &ordinary, paged).await;
+            small
+                .put(&exact, Bytes::from_static(&[2; 32]))
+                .await
+                .unwrap();
+            assert_eq!(
+                worker.index.policy_block_get(&ordinary).unwrap().units,
+                if paged { 2 } else { 1 }
+            );
+            assert!(worker.index.policy_block_get(&whole).is_none());
+            let pin = worker.lru.pin_guard(exact.clone()).unwrap();
+            let mut gc = StaleGc::default();
+
+            gc.run_round_at(&worker, access_millis()).await;
+            assert_eq!(origin.calls.load(Ordering::Relaxed), 0);
+            gc.run_round_at(&worker, cold_now()).await;
+            assert!(worker.index.get(&ordinary).is_none());
+            assert!(!small.contains(&whole));
+            assert!(small.contains(&exact));
+            assert_eq!(
+                small.read(&exact).await.unwrap(),
+                Some(Bytes::from_static(&[2; 32]))
+            );
+            drop(pin);
+            gc.run_round_at(&worker, cold_now()).await;
+            assert!(!small.contains(&exact));
+            assert_eq!(worker.logical_resident_bytes(), 0);
+            assert_eq!(worker.lru.total_bytes(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn compact_stale_positive_head_spans_versions_ranges_and_does_not_refresh_tti() {
+        let root = tempfile::tempdir().unwrap();
+        let origin = Arc::new(Origin::default());
+        origin.mode.store(1, Ordering::Relaxed);
+        let mut worker = compact_runtime(root.path(), false, origin.clone());
+        worker.page_gc_config.scan_batch_size = 1;
+        worker.page_gc_config.delete_batch_size = 1;
+        let small = worker.small.as_ref().unwrap();
+        let whole = block(0);
+        let mut other_version = block(1);
+        other_version.version = Version::new("v2");
+        let exact = CacheUnit::ExactRange(other_version);
+        worker
+            .commit_cached_block(&whole, Bytes::from_static(b"packed"))
+            .await
+            .unwrap();
+        small
+            .put(&exact, Bytes::from_static(&[2; 32]))
+            .await
+            .unwrap();
+        let mut gc = StaleGc::default();
+        let now = cold_now();
+        assert!(gc.small_checks.checked.is_empty());
+        gc.run_round_at(&worker, now).await;
+        assert_eq!(origin.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(gc.small_checks.checked.len(), 1);
+        origin.mode.store(0, Ordering::Relaxed);
+        gc.run_round_at(&worker, now + DAY_MS - 1).await;
+        assert_eq!(origin.calls.load(Ordering::Relaxed), 1);
+        assert!(small.contains(&exact));
+
+        // TTI is shorter and reads its own unaltered Small Store timestamp.
+        worker.gc_small_idle_at(now).await;
+        assert!(!small.contains(&whole));
+        gc.run_round_at(&worker, now + DAY_MS).await;
+        assert_eq!(origin.calls.load(Ordering::Relaxed), 2);
+        assert!(!small.contains(&exact));
+        assert!(gc.small_checks.checked.is_empty());
+    }
+
+    #[tokio::test]
+    async fn compact_stale_revalidates_direct_reads_during_head_and_survives_relocation() {
+        for read_after_head in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let origin = Arc::new(Origin::default());
+            let worker = compact_runtime(root.path(), false, origin.clone());
+            let small = worker.small.as_ref().unwrap();
+            let live = block(0);
+            worker
+                .commit_cached_block(&live, Bytes::from_static(b"packed"))
+                .await
+                .unwrap();
+            for n in 0..8 {
+                let mut garbage = block(0);
+                garbage.object.object_path = format!("garbage-{n}");
+                worker
+                    .commit_cached_block(&garbage, Bytes::from_static(b"packed"))
+                    .await
+                    .unwrap();
+                small.delete(&garbage).await.unwrap();
+                worker.lru.remove(&CacheUnit::Whole(garbage));
+            }
+            let before = small.lookup_entry(&live).unwrap().unwrap().segment();
+            let mut gc = StaleGc::default();
+            origin.hold.store(true, Ordering::Relaxed);
+            let collect = gc.run_round_at(&worker, cold_now());
+            let relocate = async {
+                origin.entered.notified().await;
+                assert!(small.maintain(true).await.unwrap());
+                assert_ne!(
+                    small.lookup_entry(&live).unwrap().unwrap().segment(),
+                    before
+                );
+                if read_after_head {
+                    assert_eq!(
+                        small.read(&live).await.unwrap(),
+                        Some(Bytes::from_static(b"packed"))
+                    );
+                }
+                origin.release.notify_one();
+            };
+            tokio::time::timeout(Duration::from_secs(3), async {
+                tokio::join!(collect, relocate);
+            })
+            .await
+            .unwrap();
+            assert_eq!(small.contains(&live), read_after_head);
+            assert_eq!(origin.calls.load(Ordering::Relaxed), 1);
+        }
     }
 
     #[cfg(target_os = "linux")]

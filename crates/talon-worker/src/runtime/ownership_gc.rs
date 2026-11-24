@@ -1,8 +1,9 @@
 //! Event-driven reclamation of cache blocks outside current placement.
 use super::{MembershipSnapshot, WorkerRuntime};
 use crate::eviction::StaleBlockCandidate;
+use crate::small_store::{GcCheck, OwnershipCursor, OwnershipLimit, SmallGcCandidate};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, VecDeque},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -17,6 +18,7 @@ pub(super) struct OwnershipGc {
     placement: Vec<CachePlacementTable>,
     completed_generation: u64,
     completed_limit: u64,
+    completed_small_epoch: u64,
     // Retain fixed supplemental bounds across cancellation and protected retries.
     supplement: Option<std::ops::Range<u64>>,
     next_supplement: tokio::time::Instant,
@@ -34,6 +36,32 @@ struct OwnershipPass {
     // Publish before awaiting so cancellation cannot lose a selected block.
     // Queue position, observed block, and deletion credits already paid.
     attempt: Option<(u64, StaleBlockCandidate, u64)>,
+    block_round_done: bool,
+    small: Option<SmallPass>,
+}
+
+struct SmallPass {
+    first_epoch: u64,
+    limit: OwnershipLimit,
+    cursor: OwnershipCursor,
+    scan_done: bool,
+    pending: VecDeque<SmallGcCandidate>,
+    retries: VecDeque<SmallGcCandidate>,
+    attempt: Option<(SmallGcCandidate, u64, bool)>,
+}
+
+impl SmallPass {
+    fn new(first_epoch: u64, limit: OwnershipLimit) -> Self {
+        Self {
+            first_epoch,
+            limit,
+            cursor: OwnershipCursor::default(),
+            scan_done: false,
+            pending: VecDeque::new(),
+            retries: VecDeque::new(),
+            attempt: None,
+        }
+    }
 }
 
 impl OwnershipGc {
@@ -50,6 +78,7 @@ impl OwnershipGc {
             placement: Vec::new(),
             completed_generation: 0,
             completed_limit: 0,
+            completed_small_epoch: 0,
             supplement: None,
             next_supplement: tokio::time::Instant::now() + SUPPLEMENT_INTERVAL,
             pass: None,
@@ -106,22 +135,34 @@ impl OwnershipGc {
             self.supplement = None;
         }
         if self.pass.is_none() {
-            let range = if view.generation != self.completed_generation {
+            let (range, small) = if view.generation != self.completed_generation {
                 self.supplement = None;
-                // Each namespace retains its own publication boundary.
-                0..view
+                // Each namespace retains its own publication boundaries.
+                let limits = view
                     .scan_limits
                     .get(&worker.cache_identity)
                     .copied()
-                    .unwrap_or(0)
+                    .unwrap_or_default();
+                (
+                    0..limits.block,
+                    limits.small.map(|limit| SmallPass::new(0, limit)),
+                )
             } else {
                 let limit = worker.lru.ownership_admission_ceiling();
-                if limit <= self.completed_limit {
+                let small = worker
+                    .small
+                    .as_ref()
+                    .and_then(|small| small.ownership_limit(false));
+                if limit <= self.completed_limit && small.is_none() {
                     self.next_supplement = tokio::time::Instant::now() + SUPPLEMENT_INTERVAL;
                     return;
                 }
-                self.supplement = Some(self.completed_limit..limit);
-                self.supplement.clone().unwrap()
+                let range = self.completed_limit..limit.max(self.completed_limit);
+                self.supplement = Some(range.clone());
+                (
+                    range,
+                    small.map(|limit| SmallPass::new(self.completed_small_epoch, limit)),
+                )
             };
             self.pass = Some(OwnershipPass {
                 generation: view.generation,
@@ -131,13 +172,23 @@ impl OwnershipGc {
                 scanning: true,
                 retries: BTreeSet::new(),
                 attempt: None,
+                block_round_done: false,
+                small,
             });
         }
         if self.round_ended {
             let pass = self.pass.as_mut().unwrap();
             pass.retry_cursor = pass.range.start;
+            pass.block_round_done = false;
+            if let Some(small) = &mut pass.small {
+                small.pending = std::mem::take(&mut small.retries);
+            }
         }
         self.round_ended = false;
+        if self.pass.as_ref().unwrap().block_round_done {
+            self.run_small_slice(worker, &view).await;
+            return;
+        }
         let started = Instant::now();
         for _ in 0..64 {
             if !worker.membership_is_current(&view) {
@@ -152,7 +203,7 @@ impl OwnershipGc {
                 } else {
                     let Some(position) = pass.retries.range(pass.retry_cursor..).next().copied()
                     else {
-                        self.finish_round(&view);
+                        self.finish_block_round(&view);
                         return;
                     };
                     pass.retry_cursor = position + 1;
@@ -168,7 +219,7 @@ impl OwnershipGc {
                 };
                 let Some((position, candidate)) = next else {
                     pass.scanning = false;
-                    self.finish_round(&view);
+                    self.finish_block_round(&view);
                     return;
                 };
                 if candidate.revision >= pass.range.end {
@@ -187,7 +238,8 @@ impl OwnershipGc {
                 .as_ref()
                 .unwrap()
                 .clone();
-            let success = if self.owns(&candidate.block) || !worker.contains_block(&candidate.block)
+            let success = if self.owns(&candidate.block)
+                || !worker.lru.contains_tracked_block(&candidate.block)
             {
                 true
             } else if !worker.lru.stale_candidate_is_current(&candidate) {
@@ -215,12 +267,111 @@ impl OwnershipGc {
         }
     }
 
+    fn finish_block_round(&mut self, view: &MembershipSnapshot) {
+        let pass = self.pass.as_mut().unwrap();
+        pass.block_round_done = true;
+        if pass.small.is_none() {
+            self.finish_round(view);
+        }
+    }
+
+    async fn run_small_slice(&mut self, worker: &WorkerRuntime, view: &Arc<MembershipSnapshot>) {
+        let small = worker.small.as_ref().unwrap();
+        let pass = self.pass.as_mut().unwrap().small.as_mut().unwrap();
+        let started = Instant::now();
+        let epochs = pass.first_epoch..pass.limit.epoch;
+        if pass.attempt.is_none() && pass.pending.is_empty() && !pass.scan_done {
+            let mut cursor = pass.cursor;
+            // Move the cursor only after selection completes; cancellation of
+            // the publication-lock wait must leave the prior cursor intact.
+            let first_epoch = pass.first_epoch;
+            let limit = pass.limit;
+            let scan = small.ownership_candidates(&mut cursor, first_epoch, limit, 64, |block| {
+                worker.page_gc_metrics.ownership_checked.inc();
+                self.owns(block)
+            });
+            let Ok((done, candidates)) =
+                tokio::time::timeout_at(view.valid_until.into(), scan).await
+            else {
+                return;
+            };
+            let pass = self.pass.as_mut().unwrap().small.as_mut().unwrap();
+            pass.cursor = cursor;
+            pass.scan_done = done;
+            pass.pending = candidates.into();
+        }
+        let pass = self.pass.as_mut().unwrap().small.as_mut().unwrap();
+        for _ in 0..64 {
+            if !worker.membership_is_current(view) {
+                return;
+            }
+            if pass.attempt.is_none() {
+                let Some(candidate) = pass.pending.pop_front() else {
+                    if pass.scan_done {
+                        self.finish_round(view);
+                    }
+                    return;
+                };
+                match candidate.ticket.observe_gc(GcCheck::Ownership(&epochs)) {
+                    Some(revision) => pass.attempt = Some((candidate, revision, false)),
+                    None => {
+                        if candidate.ticket.admitted_in(&candidate.unit, &epochs) {
+                            pass.retries.push_back(candidate);
+                        }
+                        continue;
+                    }
+                }
+            }
+            let (candidate, revision, paid) = pass.attempt.as_mut().unwrap();
+            if !*paid {
+                if !candidate.ticket.gc_is_current(*revision) {
+                    let (candidate, _, _) = pass.attempt.take().unwrap();
+                    if candidate.ticket.admitted_in(&candidate.unit, &epochs) {
+                        pass.retries.push_back(candidate);
+                    }
+                    continue;
+                }
+                if let Some(budget) = &worker.background_budget {
+                    budget.delete().await;
+                }
+                *paid = true;
+            }
+            let Some(renewed) = worker
+                .membership_snapshot()
+                .filter(|snapshot| snapshot.generation == view.generation)
+            else {
+                return;
+            };
+            worker.page_gc_metrics.ownership_attempted.inc();
+            worker
+                .unlink_small_gc(candidate.clone(), *revision, Some(renewed))
+                .await;
+            let (candidate, _, _) = pass.attempt.take().unwrap();
+            if candidate.ticket.admitted_in(&candidate.unit, &epochs) {
+                pass.retries.push_back(candidate);
+            }
+            if started.elapsed() >= Duration::from_millis(10) {
+                return;
+            }
+        }
+    }
+
     fn finish_round(&mut self, view: &MembershipSnapshot) {
         let pass = self.pass.as_ref().unwrap();
         self.round_ended = true;
-        if pass.retries.is_empty() {
+        if pass.retries.is_empty()
+            && pass
+                .small
+                .as_ref()
+                .map_or(true, |small| small.retries.is_empty())
+        {
             self.completed_generation = view.generation;
             self.completed_limit = pass.range.end;
+            if let Some(small) = &pass.small {
+                self.completed_small_epoch = small.limit.epoch;
+            } else if self.supplement.is_none() {
+                self.completed_small_epoch = 0;
+            }
             self.pass = None;
             self.supplement = None;
             self.next_supplement = tokio::time::Instant::now() + SUPPLEMENT_INTERVAL;
@@ -302,7 +453,7 @@ impl OwnershipGc {
             .await;
         // Protection, activity races and errors retain the block. A concurrent
         // replacement is conservatively retried, then excluded by its revision.
-        !worker.contains_block(&id)
+        !worker.lru.contains_tracked_block(&id)
     }
 }
 
@@ -423,6 +574,27 @@ mod tests {
             .unwrap()
     }
 
+    fn packed_placed(owner: &str, nth: usize) -> BlockId {
+        let nodes = ["a", "b"].map(|name| NodeInfo {
+            id: NodeId::new(name),
+            address: String::new(),
+            role: NodeRole::Worker,
+        });
+        let table = CachePlacementTable::new(&nodes);
+        (0..10_000)
+            .map(|n| {
+                BlockId::new(
+                    ObjectId::new(Backend::S3, "bucket", format!("packed-{n}")),
+                    0,
+                    32,
+                    Version::new("v1"),
+                )
+            })
+            .filter(|id| table.primary(id).unwrap().id.0 == owner)
+            .nth(nth)
+            .unwrap()
+    }
+
     fn namespace_runtime(
         root: &std::path::Path,
         paged: bool,
@@ -452,27 +624,8 @@ mod tests {
     async fn small_ownership_gc_uses_store_residency_and_respects_policy_pins() {
         let root = tempfile::tempdir().unwrap();
         let (worker, fixture) = namespace_runtime(root.path(), false);
-        let nodes = ["a", "b"].map(|name| NodeInfo {
-            id: NodeId::new(name),
-            address: String::new(),
-            role: NodeRole::Worker,
-        });
-        let table = CachePlacementTable::new(&nodes);
-        let find = |owner: &str| {
-            (0..10_000)
-                .map(|n| {
-                    BlockId::new(
-                        ObjectId::new(Backend::S3, "bucket", format!("packed-{n}")),
-                        0,
-                        32,
-                        Version::new("v1"),
-                    )
-                })
-                .find(|id| table.primary(id).unwrap().id.0 == owner)
-                .unwrap()
-        };
-        let owned = find("a");
-        let unowned = find("b");
+        let owned = packed_placed("a", 0);
+        let unowned = packed_placed("b", 0);
         for id in [&owned, &unowned] {
             worker
                 .commit_cached_block(id, Bytes::from_static(b"packed"))
@@ -503,6 +656,129 @@ mod tests {
                 .unwrap(),
             b"packed"[..]
         );
+    }
+
+    #[tokio::test]
+    async fn compact_ownership_retries_a_relocated_pin_and_defers_late_admissions() {
+        let root = tempfile::tempdir().unwrap();
+        let (worker, fixture) = namespace_runtime(root.path(), true);
+        let original = packed_placed("b", 0);
+        let renewed = packed_placed("b", 1);
+        let small = worker.small.as_ref().unwrap();
+        let garbage: Vec<_> = (2..20).map(|n| packed_placed("b", n)).collect();
+        for id in [&original, &renewed].into_iter().chain(&garbage) {
+            worker
+                .commit_cached_block(id, Bytes::from_static(b"packed"))
+                .await
+                .unwrap();
+            assert!(worker.index.policy_block_get(id).is_none());
+        }
+
+        let paged = placed("b", 0);
+        fill(&worker, &paged, true).await;
+        let exact = CacheUnit::ExactRange(paged.clone());
+        let pin = worker
+            .lru
+            .pin_guard(CacheUnit::Whole(original.clone()))
+            .unwrap();
+        let mut gc = fixture.gc(&worker);
+        // A duplicate immutable admission gets the new epoch even though its
+        // locator is unchanged. An exact range must not join the paged block.
+        worker
+            .commit_cached_block(&renewed, Bytes::from_static(b"packed"))
+            .await
+            .unwrap();
+        small
+            .put(&exact, Bytes::from_static(&[1; 32]))
+            .await
+            .unwrap();
+        assert_eq!(worker.index.policy_block_get(&paged).unwrap().units, 2);
+
+        gc.run_round(&worker).await;
+        assert!(gc.pass.is_some());
+        assert!(worker.index.get(&paged).is_none());
+        assert!(small.contains(&exact));
+        assert!(small.contains(&original));
+        assert!(small.contains(&renewed));
+        assert!(garbage.iter().all(|id| !small.contains(id)));
+        let source = small.lookup_entry(&original).unwrap().unwrap().segment();
+        assert!(small.maintain(true).await.unwrap());
+        assert_ne!(
+            small.lookup_entry(&original).unwrap().unwrap().segment(),
+            source
+        );
+        drop(pin);
+
+        gc.run_round(&worker).await;
+        assert!(!small.contains(&original));
+        assert!(small.contains(&renewed));
+        assert!(small.contains(&exact));
+        assert!(gc.pass.is_none());
+        gc.next_supplement = tokio::time::Instant::now();
+        gc.run_round(&worker).await;
+        assert!(!small.contains(&renewed));
+        assert!(!small.contains(&exact));
+        assert_eq!(worker.lru.total_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn compact_ownership_cancels_a_selected_unlink_when_membership_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let (worker, fixture) = namespace_runtime(root.path(), false);
+        let foreign = packed_placed("b", 0);
+        worker
+            .commit_cached_block(&foreign, Bytes::from_static(b"packed"))
+            .await
+            .unwrap();
+        let permit = worker
+            .page_gc_io
+            .clone()
+            .acquire_many_owned(worker.page_gc_config.io_concurrency as u32)
+            .await
+            .unwrap();
+        let mut gc = fixture.gc(&worker);
+        let run = gc.run_round(&worker);
+        let change = async {
+            while worker.page_mutations.active_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+            *fixture.members.lock().unwrap() = Some(vec!["a"]);
+            fixture.publish(&worker);
+            drop(permit);
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(run, change);
+        })
+        .await
+        .unwrap();
+        gc.run_round(&worker).await;
+        assert!(worker.small.as_ref().unwrap().contains(&foreign));
+        assert!(gc.pass.is_none());
+    }
+
+    #[tokio::test]
+    async fn compact_ownership_captures_recovered_rows_at_the_first_membership() {
+        let root = tempfile::tempdir().unwrap();
+        let id = packed_placed("b", 0);
+        {
+            let (worker, _) = namespace_runtime(root.path(), false);
+            worker
+                .commit_cached_block(&id, Bytes::from_static(b"packed"))
+                .await
+                .unwrap();
+            worker.small.as_ref().unwrap().maintain(true).await.unwrap();
+        }
+        let (worker, fixture) = namespace_runtime(root.path(), false);
+        let small = worker.small.as_ref().unwrap();
+        assert!(small.contains(&id));
+        assert!(worker.index.policy_block_get(&id).is_none());
+        assert_eq!(
+            small.read(&id).await.unwrap(),
+            Some(Bytes::from_static(b"packed"))
+        );
+        let mut gc = fixture.gc(&worker);
+        gc.run_round(&worker).await;
+        assert!(!small.contains(&id));
     }
 
     #[tokio::test]

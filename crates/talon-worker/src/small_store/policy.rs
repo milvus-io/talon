@@ -5,12 +5,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
 pub(crate) struct SmallAccess {
-    catalog: Weak<RwLock<Catalog>>,
+    pub(super) catalog: Weak<RwLock<Catalog>>,
     tickets: Weak<super::tickets::Tickets>,
     pub(super) address: Mutex<Address>,
     position: AtomicUsize,
     epoch: AtomicU64,
     pub(crate) state: Mutex<PolicyState>,
+    pub(super) gc_revision: AtomicU64,
     retired: AtomicBool,
 }
 
@@ -35,7 +36,7 @@ impl SmallAccess {
         self.retired.store(true, Ordering::Release);
     }
 
-    fn slot(&self, catalog: &Catalog) -> Option<usize> {
+    pub(super) fn slot(&self, catalog: &Catalog) -> Option<usize> {
         if self.retired.load(Ordering::Acquire) {
             return None;
         }
@@ -170,6 +171,7 @@ impl Catalog {
                 revision: self.next_revision(),
                 pins: 0,
             }),
+            gc_revision: AtomicU64::new(0),
             retired: AtomicBool::new(false),
         });
         self.access
@@ -228,6 +230,11 @@ impl Catalog {
             self.charges.insert(address, bytes);
         }
         self.lookup.set_flags(slot, flags | POLICY);
+        if flags & VISIBLE != 0 {
+            if let Some(ownership) = &mut self.ownership {
+                ownership.admit(address);
+            }
+        }
         let mut entry = self.compact_entry(slot);
         let revision = self.next_revision();
         let ticket = entry.access.small().unwrap();
@@ -281,6 +288,9 @@ impl Catalog {
         total.0 -= entry.bytes;
         total.1 -= 1;
         entry.access.retire();
+        if let Some(ownership) = &mut self.ownership {
+            ownership.remove(address);
+        }
         self.tickets.remove(&address);
         self.pins.remove(&address);
         self.charges.remove(&address);
