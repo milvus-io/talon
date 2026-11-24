@@ -343,17 +343,21 @@ impl BlockIndex {
         });
     }
 
-    pub(crate) fn policy_block_get(&self, id: &dyn BlockIdentity) -> Option<BlockActivity> {
-        let small = [UnitKind::Whole, UnitKind::ExactRange]
-            .iter()
-            .filter(|&&kind| {
+    fn tracked_small_units(&self, id: &dyn BlockIdentity) -> usize {
+        [UnitKind::Whole, UnitKind::ExactRange]
+            .into_iter()
+            .filter(|&kind| {
                 self.small_policy(&SmallRef {
                     block: id.view(),
                     kind,
                 })
-                .is_some()
+                .is_some_and(|entry| entry.access.small().is_none())
             })
-            .count();
+            .count()
+    }
+
+    pub(crate) fn policy_block_get(&self, id: &dyn BlockIdentity) -> Option<BlockActivity> {
+        let small = self.tracked_small_units(id);
         let entries = self.entries.read().unwrap();
         let entry = entries.get(id)?;
         Some(
@@ -369,16 +373,7 @@ impl BlockIndex {
         id: &dyn BlockIdentity,
         admission_limit: u64,
     ) -> Option<BlockActivity> {
-        let small = [UnitKind::Whole, UnitKind::ExactRange]
-            .iter()
-            .filter(|&&kind| {
-                self.small_policy(&SmallRef {
-                    block: id.view(),
-                    kind,
-                })
-                .is_some()
-            })
-            .count();
+        let small = self.tracked_small_units(id);
         let entries = self.entries.read().unwrap();
         let entry = entries.get(id)?;
         let activity = entry.activity.as_deref()?;
@@ -580,32 +575,35 @@ impl BlockIndex {
         access
     }
 
+    /// Return the update result and whether the unit participates in block tracking.
     pub(crate) fn policy_update<T>(
         &self,
         unit: &impl crate::eviction::UnitKey,
         update: impl FnOnce(&mut PolicyState) -> T,
-    ) -> Option<T> {
+    ) -> Option<(T, bool)> {
         if !matches!(unit.kind(), UnitKind::Page(_)) {
-            if let Some(directory) = self.small_directory(&SmallRef::from_unit(unit)) {
+            let id = SmallRef::from_unit(unit);
+            if let Some(directory) = self.small_directory(&id) {
                 let mut directory = directory.write().unwrap();
-                if directory.policy_get(&SmallRef::from_unit(unit)).is_some() {
-                    return directory.policy_update(&SmallRef::from_unit(unit), update);
+                if let Some(entry) = directory.policy_get(&id) {
+                    let tracked = entry.access.small().is_none();
+                    return directory
+                        .policy_update(&id, update)
+                        .map(|result| (result, tracked));
                 }
             }
         }
         if unit.kind() == UnitKind::ExactRange {
             let mut entries = self.entries.write().unwrap();
             let policy = &mut entries.get_mut(unit.block())?.policy;
-            return Some(update(&mut policy.exact.as_deref_mut()?.state));
+            return Some((update(&mut policy.exact.as_deref_mut()?.state), true));
         }
         let entries = self.entries.read().unwrap();
         let policy = &entries.get(unit.block())?.policy;
-        match unit.kind() {
+        let result = match unit.kind() {
             UnitKind::ExactRange => unreachable!(),
-            UnitKind::Whole => Some(update(
-                policy.whole.as_ref()?.write().unwrap().policy.as_mut()?,
-            )),
-            UnitKind::Page(page) => Some(update(
+            UnitKind::Whole => update(policy.whole.as_ref()?.write().unwrap().policy.as_mut()?),
+            UnitKind::Page(page) => update(
                 policy
                     .pages
                     .as_ref()?
@@ -615,8 +613,9 @@ impl BlockIndex {
                     .unit
                     .policy
                     .as_mut()?,
-            )),
-        }
+            ),
+        };
+        Some((result, true))
     }
 
     pub(crate) fn policy_remove(
@@ -719,12 +718,15 @@ impl BlockIndex {
         unit: &impl crate::eviction::UnitKey,
         bytes: u64,
         clock: bool,
+        allow_uninitialized: bool,
     ) -> Option<AccessHandle> {
         let key = SmallRef::from_unit(unit);
-        self.small_directory(&key)?
-            .write()
-            .unwrap()
-            .compact_admit(&key, bytes, clock)
+        let directory = self.small_directory(&key)?;
+        let mut directory = directory.write().unwrap();
+        if !allow_uninitialized && !directory.has_recency() {
+            return None;
+        }
+        directory.compact_admit(&key, bytes, clock)
     }
 
     pub(crate) fn compact_small_directories(

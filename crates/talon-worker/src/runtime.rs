@@ -21,7 +21,7 @@ mod page_tti_tests;
 mod small_tests;
 use crate::page_gc::{Mutations, PageGcConfig, PageGcMetrics};
 use crate::page_lifecycle::{AccessClock, PageLifecycle, ScanCursor};
-use crate::small_store::SmallObjectStore;
+use crate::small_store::{IdleRecencyCursor, SmallObjectStore};
 
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
@@ -155,9 +155,15 @@ pub struct WorkerRuntime {
     background_budget: Option<Arc<crate::background::BackgroundBudget>>,
     page_scan: Arc<tokio::sync::Mutex<ScanCursor>>,
     page_checkpoint: Arc<tokio::sync::Mutex<usize>>,
-    small_idle_cursor: Arc<tokio::sync::Mutex<(u64, u64)>>,
+    small_idle_cursor: Arc<tokio::sync::Mutex<SmallIdleCursor>>,
     small_capacity_eviction: Arc<tokio::sync::Mutex<async_eviction::SmallCapacityPhase>>,
     page_cleanup: Arc<tokio::sync::Mutex<crate::page_cleanup::CleanupCursor>>,
+}
+
+#[derive(Default)]
+struct SmallIdleCursor {
+    block: (u64, u64),
+    recency: IdleRecencyCursor,
 }
 
 /// Placement data published by the control plane; GC never performs discovery.
@@ -226,6 +232,7 @@ impl WorkerRuntime {
             metrics,
             true,
             true,
+            false,
         )
     }
 
@@ -243,13 +250,17 @@ impl WorkerRuntime {
         metrics: WorkerMetrics,
         track_checks: bool,
         track_blocks: bool,
+        compact_small_recency: bool,
     ) -> Self {
         let lru_started = Instant::now();
         index.prepare_runtime_recovery();
         let mut units = index.restore_policy_units(track_blocks);
         let blocks = index.len() + small.as_ref().map_or(0, |small| small.len());
         if let Some(small) = &small {
-            small.restore_policy_units(&index, &mut units, track_blocks);
+            small.restore_policy_units(&index, &mut units, track_blocks && !compact_small_recency);
+            if compact_small_recency {
+                small.init_recency();
+            }
         }
         let lru = Arc::new(Lru::from_recovered(
             index.clone(),
@@ -316,7 +327,7 @@ impl WorkerRuntime {
             background_budget: None,
             page_scan: Arc::new(tokio::sync::Mutex::new(ScanCursor::default())),
             page_checkpoint: Arc::new(tokio::sync::Mutex::new(0)),
-            small_idle_cursor: Arc::new(tokio::sync::Mutex::new((0, 0))),
+            small_idle_cursor: Arc::new(tokio::sync::Mutex::new(SmallIdleCursor::default())),
             small_capacity_eviction: Arc::new(tokio::sync::Mutex::new(Default::default())),
         }
     }
@@ -808,8 +819,7 @@ impl WorkerRuntime {
             version.clone(),
         );
         let unit = CacheUnit::ExactRange(block.clone());
-        if let Some(loc) = small.lookup(&unit).await? {
-            let handle = loc.range(0, request.len)?;
+        if let Some(handle) = small.get_range(&unit, 0, request.len).await? {
             self.record_l2_hit();
             return Ok(ServeOutcome::Sendfile(handle));
         }
@@ -819,16 +829,14 @@ impl WorkerRuntime {
             .run(async move {
                 let key = LoadKey::ExactRange(block.clone());
                 loop {
-                    if let Some(loc) = small.lookup(&unit).await? {
-                        let handle = loc.range(0, request.len)?;
+                    if let Some(handle) = small.get_range(&unit, 0, request.len).await? {
                         runtime.record_l2_hit();
                         return Ok(ServeOutcome::Sendfile(handle));
                     }
                     let (admission, flight) = runtime.inflight.admit_traced(key.clone());
                     if let Some(_guard) = admission {
                         // The preceding leader may have published between lookup and admission.
-                        if let Some(loc) = small.lookup(&unit).await? {
-                            let handle = loc.range(0, request.len)?;
+                        if let Some(handle) = small.get_range(&unit, 0, request.len).await? {
                             runtime.record_l2_hit();
                             return Ok(ServeOutcome::Sendfile(handle));
                         }
@@ -976,9 +984,13 @@ impl WorkerRuntime {
             let offset_in_block = request.offset - block.offset;
             let known_len = object_len.or_else(|| self.cached_object_len(&request.object, version));
             if let Some(size) = known_len.filter(|size| self.accepts_small(&block, *size)) {
-                if !self.l1.is_enabled() {
-                    if let Some(loc) = self.small_location(&block).await? {
-                        let len = available_range_len(loc.len(), offset_in_block, request.len)?;
+                if let Some(small) = self.small.as_ref().filter(|_| !self.l1.is_enabled()) {
+                    if let Some((loc, len)) = small
+                        .read_location(&block, |len| {
+                            available_range_len(len, offset_in_block, request.len)
+                        })
+                        .await?
+                    {
                         let handle = loc.range(offset_in_block, len)?;
                         self.record_l2_hit();
                         return Ok(ServeOutcome::Sendfile(handle));
@@ -2166,16 +2178,6 @@ impl WorkerRuntime {
             .is_some_and(|small| small.accepts(id, len))
     }
 
-    async fn small_location(
-        &self,
-        block: &BlockId,
-    ) -> std::io::Result<Option<crate::small_store::ReadLocation>> {
-        match self.small.as_ref() {
-            Some(small) => small.lookup(block).await,
-            None => Ok(None),
-        }
-    }
-
     /// Management scans include each store's own residency directory. This is
     /// never a substitute for the locator lookup used by the read path.
     fn contains_block(&self, block: &BlockId) -> bool {
@@ -2195,11 +2197,12 @@ impl WorkerRuntime {
             return Ok(None);
         };
         if self.l1.is_enabled() {
-            let Some(loc) = small.lookup_entry(block)? else {
+            let Some(len) = small.touch_entry(block, |payload_len| {
+                available_range_len(payload_len, offset, len)
+            })?
+            else {
                 return Ok(None);
             };
-            let len = available_range_len(loc.len(), offset, len)?;
-            loc.touch();
             if let Some(bytes) = self.l1.get_range(block, offset, len) {
                 self.metrics.record_l1_hit();
                 talon_telemetry::cache_tier("l1");
@@ -2208,11 +2211,14 @@ impl WorkerRuntime {
             }
             self.metrics.record_l1_miss();
         }
-        let Some(loc) = small.lookup(block).await? else {
+        let Some((loc, len)) = small
+            .read_location(block, |payload_len| {
+                available_range_len(payload_len, offset, len)
+            })
+            .await?
+        else {
             return Ok(None);
         };
-        let len = available_range_len(loc.len(), offset, len)?;
-        loc.touch();
         self.record_l2_hit();
         let bytes = loc.read().await?;
         self.range_from_fetched(block, bytes, offset, len).map(Some)
@@ -2860,11 +2866,28 @@ impl WorkerRuntime {
             return;
         }
         let mut cursor = self.small_idle_cursor.lock().await;
-        let mut position = *cursor;
-        let lru = self.lru.clone();
         let (scan, deletes) = self.maintenance_batch_limits();
         let scan = scan.min(4096);
         let deletes = deletes.min(256);
+        if small.has_recency() {
+            let mut position = cursor.recency;
+            let store = small.clone();
+            let (next, candidates) = tokio::task::spawn_blocking(move || {
+                let candidates =
+                    store.idle_recency_candidates(&mut position, now, age, scan, deletes);
+                (position, candidates)
+            })
+            .await
+            .expect("small object idle scan panicked");
+            cursor.recency = next;
+            for (unit, ticket) in candidates {
+                self.unlink_idle_small(small.clone(), unit, ticket, now)
+                    .await;
+            }
+            return;
+        }
+        let mut position = cursor.block;
+        let lru = self.lru.clone();
         let (next, candidates) = tokio::task::spawn_blocking(move || {
             let candidates = lru.idle_candidates(&mut position, now, age, scan, deletes);
             (
@@ -2880,7 +2903,7 @@ impl WorkerRuntime {
         })
         .await
         .expect("small object idle scan panicked");
-        *cursor = next;
+        cursor.block = next;
         for candidate in candidates {
             self.unlink_idle_block(candidate, now).await;
         }

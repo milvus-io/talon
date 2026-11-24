@@ -410,6 +410,56 @@ impl WorkerRuntime {
             .await;
     }
 
+    pub(super) async fn unlink_idle_small(
+        &self,
+        small: Arc<SmallObjectStore>,
+        unit: CacheUnit,
+        ticket: Arc<crate::small_store::policy::SmallAccess>,
+        now: u64,
+    ) {
+        let runtime = self.clone();
+        self.page_mutations
+            .run(async move {
+                runtime.background_delete().await;
+                let _permit = runtime
+                    .page_gc_io
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("page GC semaphore closed");
+                let _background_io = runtime.background_io().await;
+                let block = unit.block().clone();
+                let whole = matches!(&unit, CacheUnit::Whole(_));
+                let state = runtime.page_lifecycle.block(&block);
+                {
+                    let _gate = state.gate.lock().await;
+                    let settings = runtime.clone();
+                    match small
+                        .delete_idle(unit, ticket, move || {
+                            (
+                                now.max(crate::eviction::access_millis()),
+                                settings.current_tti_ms(),
+                            )
+                        })
+                        .await
+                    {
+                        Ok(true) => {
+                            if whole {
+                                runtime.invalidate_l1(&block);
+                            }
+                            runtime.metrics.record_eviction();
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            tracing::warn!(%block, %error, "small object idle unlink failed")
+                        }
+                    }
+                }
+                runtime.page_lifecycle.retire_empty(&block);
+            })
+            .await;
+    }
+
     async fn unlink_stale_block_inner(
         &self,
         candidate: crate::eviction::StaleBlockCandidate,

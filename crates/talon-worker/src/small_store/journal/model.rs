@@ -1,6 +1,6 @@
 //! The writer's checkpointable metadata state. Segment maps use copy-on-write
 //! so a snapshot can be encoded off the I/O thread while mutations continue.
-use super::super::records::Records;
+use super::super::{checksum_len, records::Records};
 use super::*;
 use crate::small_store::key::SmallKey;
 
@@ -8,8 +8,22 @@ use crate::small_store::key::SmallKey;
 pub(crate) struct Record {
     pub key: SmallKey,
     pub len: u64,
-    pub checksum: u64,
+    /// Legacy records carry the checksum here. New records have an on-disk trailer.
+    pub checksum: Option<u64>,
 }
+
+impl Record {
+    pub(in crate::small_store) fn stored_len(&self) -> u64 {
+        self.len + checksum_len(self.checksum)
+    }
+
+    fn metadata_bytes(&self) -> u64 {
+        format::record_metadata_bytes(&self.key) - checksum_len(self.checksum)
+    }
+}
+
+const INSERT_LEGACY: u8 = 0;
+const INSERT_WITH_TRAILER: u8 = 9;
 
 #[derive(Clone)]
 pub(crate) struct SegmentMeta {
@@ -29,7 +43,7 @@ impl SegmentMeta {
             8 + self
                 .records
                 .before(self.durable_end)
-                .map(|(_, r)| 37 + format::key_len(&r.key) as u64)
+                .map(|(_, r)| r.metadata_bytes())
                 .sum::<u64>()
         }
     }
@@ -85,9 +99,16 @@ impl Event {
                 offset,
                 record,
             } => {
-                b.push(0);
-                for n in [*slot as u64, *segment, *offset, record.len, record.checksum] {
+                b.push(if record.checksum.is_some() {
+                    INSERT_LEGACY
+                } else {
+                    INSERT_WITH_TRAILER
+                });
+                for n in [*slot as u64, *segment, *offset, record.len] {
                     b.extend_from_slice(&n.to_le_bytes());
+                }
+                if let Some(checksum) = record.checksum {
+                    b.extend_from_slice(&checksum.to_le_bytes());
                 }
                 format::encode_key(&mut b, &record.key)?;
             }
@@ -127,13 +148,17 @@ impl Event {
             5 => Self::SetNext {
                 next: format::u64(&mut b)?,
             },
-            0 => {
+            INSERT_LEGACY | INSERT_WITH_TRAILER => {
                 let slot = usize::try_from(format::u64(&mut b)?)
                     .map_err(|_| invalid("stream slot overflow"))?;
                 let segment = format::u64(&mut b)?;
                 let offset = format::u64(&mut b)?;
                 let len = format::u64(&mut b)?;
-                let checksum = format::u64(&mut b)?;
+                let checksum = if kind == INSERT_LEGACY {
+                    Some(format::u64(&mut b)?)
+                } else {
+                    None
+                };
                 let id = format::view(b)?;
                 if len > 128 << 20 || !id.valid_extent(len) {
                     return Err(invalid("journal extent"));
@@ -214,15 +239,17 @@ impl Model {
                 if s.slot != slot || s.sealed || offset < s.durable_end {
                     return Err(invalid("insert into sealed/wrong stream"));
                 }
+                let stored_len = record.stored_len();
                 let end = offset
-                    .checked_add(record.len)
+                    .checked_add(stored_len)
                     .ok_or_else(|| invalid("extent overflow"))?;
-                if s.records.overlaps(offset, record.len) {
+                if s.records.overlaps(offset, stored_len) {
                     return Err(invalid("overlapping journal extent"));
                 }
-                s.bytes = s.bytes.max(end);
-                s.metadata += 37 + format::key_len(&record.key) as u64;
+                let metadata_bytes = record.metadata_bytes();
                 s.records.insert(offset, record)?;
+                s.bytes = s.bytes.max(end);
+                s.metadata += metadata_bytes;
             }
             Event::Delete { segment, offset } => {
                 let s = Arc::make_mut(
@@ -316,7 +343,7 @@ pub(crate) struct Snapshot {
 }
 pub(crate) enum SnapshotRecord {
     Next(u64),
-    Segment(u64, SegmentMeta),
+    Segment(u64, Arc<SegmentMeta>),
     Insert(Event),
 }
 impl Iterator for Snapshot {
@@ -364,7 +391,9 @@ impl talon_journal::Machine for Model {
     type Snapshot = Snapshot;
     fn encoded_len(event: &Event) -> io::Result<usize> {
         Ok(match event {
-            Event::Insert { record, .. } => 41 + format::key_len(&record.key),
+            Event::Insert { record, .. } => {
+                41 + format::key_len(&record.key) - checksum_len(record.checksum) as usize
+            }
             Event::Delete { .. } | Event::Replace { .. } | Event::Flush { .. } => 17,
             Event::Seal { .. } | Event::SetNext { .. } | Event::Recover { .. } => 9,
         })
@@ -419,17 +448,19 @@ impl talon_journal::Machine for Model {
                 }
                 Ok(SnapshotRecord::Segment(
                     id,
-                    SegmentMeta {
+                    Arc::new(SegmentMeta {
                         slot,
                         bytes,
                         durable_end,
                         metadata,
                         sealed,
                         records: Records::default(),
-                    },
+                    }),
                 ))
             }
-            0 => Ok(SnapshotRecord::Insert(Event::decode(bytes)?)),
+            INSERT_LEGACY | INSERT_WITH_TRAILER => {
+                Ok(SnapshotRecord::Insert(Event::decode(bytes)?))
+            }
             _ => Err(invalid("snapshot operation")),
         }
     }
@@ -448,7 +479,7 @@ impl talon_journal::Machine for Model {
                         Arc::make_mut(previous.get_mut()).records.seal();
                     }
                 }
-                if id == 0 || id >= self.next || self.segments.insert(id, Arc::new(s)).is_some() {
+                if id == 0 || id >= self.next || self.segments.insert(id, s).is_some() {
                     return Err(invalid("snapshot segment"));
                 }
             }
@@ -463,12 +494,14 @@ impl talon_journal::Machine for Model {
                         .get_mut(&segment)
                         .ok_or_else(|| invalid("snapshot missing segment"))?,
                 );
+                let stored_len = record.stored_len();
+                let end = offset
+                    .checked_add(stored_len)
+                    .ok_or_else(|| invalid("snapshot extent overflow"))?;
                 if s.slot != slot
-                    || offset
-                        .checked_add(record.len)
-                        .map_or(true, |end| end > s.bytes)
-                    || (offset < s.durable_end && offset + record.len > s.durable_end)
-                    || s.records.overlaps(offset, record.len)
+                    || end > s.bytes
+                    || (offset < s.durable_end && end > s.durable_end)
+                    || s.records.overlaps(offset, stored_len)
                 {
                     return Err(invalid("snapshot extent"));
                 }

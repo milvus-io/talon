@@ -8,6 +8,7 @@ mod catalog;
 pub(crate) mod key;
 mod lookup;
 pub(crate) mod policy;
+mod recency;
 pub(crate) use access::DirtyAccess;
 pub(crate) mod directory;
 mod disk_io;
@@ -19,6 +20,7 @@ mod keys;
 mod records;
 mod rings;
 mod tickets;
+pub(crate) use recency::IdleRecencyCursor;
 pub use rings::SmallObjectStore;
 #[cfg(test)]
 pub(crate) mod tests;
@@ -37,6 +39,16 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 use talon_core::{BlockHandle, BlockId};
+
+const CHECKSUM_BYTES: u64 = size_of::<u64>() as u64;
+
+fn checksum_len(legacy_checksum: Option<u64>) -> u64 {
+    if legacy_checksum.is_none() {
+        CHECKSUM_BYTES
+    } else {
+        0
+    }
+}
 
 /// Borrowed identity accepted by packed storage. Ordinary callers keep using BlockId.
 pub trait SmallStoreKey: Sync {
@@ -84,7 +96,8 @@ pub(crate) struct Location {
     segment: u64,
     offset: u64,
     len: u64,
-    checksum: u64,
+    // Legacy records keep their checksum in metadata.
+    checksum: Option<u64>,
     // Shared with the eviction policy; relocation preserves this exact token.
     access: Option<AccessHandle>,
 }
@@ -93,20 +106,28 @@ pub(crate) struct ReadLocation {
     location: Location,
     fd: Arc<OwnedFd>,
 }
+
+fn validate_range(payload_len: u64, offset: u64, len: u64) -> io::Result<()> {
+    if offset
+        .checked_add(len)
+        .map_or(true, |end| end > payload_len)
+    {
+        return Err(invalid("small object range out of bounds"));
+    }
+    Ok(())
+}
+
 impl ReadLocation {
     pub(crate) fn len(&self) -> u64 {
         self.location.len
     }
 
-    pub(crate) fn touch(&self) {
+    fn touch(&self) {
         self.location.touch();
     }
 
     pub(crate) fn range(&self, offset: u64, len: u64) -> io::Result<BlockHandle> {
-        if offset.checked_add(len).map_or(true, |end| end > self.len()) {
-            return Err(invalid("small object range out of bounds"));
-        }
-        self.touch();
+        validate_range(self.len(), offset, len)?;
         Ok(BlockHandle::from_shared(
             self.fd.clone(),
             self.location.offset + offset,
@@ -116,12 +137,37 @@ impl ReadLocation {
 
     // Deliberately does not touch: relocation also reads through this snapshot.
     pub(crate) async fn read(&self) -> io::Result<Bytes> {
-        let bytes =
-            disk_io::read(self.fd.clone(), self.location.offset, self.len() as usize).await?;
-        if xxhash_rust::xxh3::xxh3_64(&bytes) != self.location.checksum {
+        let mut bytes = self.read_stored().await?;
+        bytes.truncate(self.len() as usize);
+        Ok(bytes)
+    }
+
+    async fn read_stored(&self) -> io::Result<Bytes> {
+        let bytes = disk_io::read(
+            self.fd.clone(),
+            self.location.offset,
+            self.location.stored_len() as usize,
+        )
+        .await?;
+        let len = self.len() as usize;
+        let checksum = self
+            .location
+            .checksum
+            .unwrap_or_else(|| u64::from_le_bytes(bytes[len..].try_into().unwrap()));
+        if xxhash_rust::xxh3::xxh3_64(&bytes[..len]) != checksum {
             return Err(invalid("small object payload checksum"));
         }
         Ok(bytes)
+    }
+
+    async fn read_checksum_trailer(&self) -> io::Result<u64> {
+        let bytes = disk_io::read(
+            self.fd.clone(),
+            self.location.offset + self.location.len,
+            CHECKSUM_BYTES as usize,
+        )
+        .await?;
+        Ok(u64::from_le_bytes(bytes[..].try_into().unwrap()))
     }
 }
 
@@ -148,6 +194,10 @@ impl Location {
         self.len
     }
 
+    fn stored_len(&self) -> u64 {
+        self.len + checksum_len(self.checksum)
+    }
+
     pub(crate) fn touch(&self) {
         if let Some(access) = &self.access {
             access.touch();
@@ -172,7 +222,7 @@ struct Segment {
     metadata: u64,
     in_flight: BTreeSet<u64>,
     live: u64,
-    live_payload: u64,
+    live_data_bytes: u64,
     allocated: u64,
     records: usize,
     sealed: bool,
@@ -365,7 +415,10 @@ impl SegmentStore {
     pub async fn get(&self, id: &(impl SmallStoreKey + ?Sized)) -> io::Result<Option<BlockHandle>> {
         self.lookup(id)
             .await?
-            .map(|loc| loc.range(0, loc.len()))
+            .map(|loc| {
+                loc.touch();
+                loc.range(0, loc.len())
+            })
             .transpose()
     }
 
@@ -414,6 +467,7 @@ impl SegmentStore {
         };
         let key = SmallKey(unit.clone());
         let len = value.len() as u64;
+        let stored_len = len + CHECKSUM_BYTES;
         let charge = charge(&key, len);
         if charge > self.segment_size {
             return Err(invalid("small object record exceeds segment"));
@@ -434,13 +488,23 @@ impl SegmentStore {
             self.healthy(&state)?;
             let existing = self.entries.read().unwrap().get(&key);
             if let Some(old) = existing {
-                if old.len != len || old.checksum != checksum {
-                    return Err(invalid(
-                        "different bytes for immutable small object identity",
-                    ));
+                let conflict = || invalid("different bytes for immutable small object identity");
+                if old.len != len {
+                    return Err(conflict());
+                }
+                let weight = old.stored_len();
+                let previous = if let Some(previous) = old.checksum {
+                    previous
+                } else {
+                    let read = old.retain().await?;
+                    drop(state);
+                    read.read_checksum_trailer().await?
+                };
+                if previous != checksum {
+                    return Err(conflict());
                 }
                 if let Some(policy) = &policy {
-                    policy.insert_with_policy(unit.clone(), charge, true);
+                    policy.insert_with_policy(unit.clone(), weight, true);
                 }
                 return Ok(charge);
             }
@@ -485,12 +549,12 @@ impl SegmentStore {
                 segment,
                 offset: s.bytes,
                 len,
-                checksum,
+                checksum: None,
                 access: None,
             };
             let data = s.data().await?;
-            s.bytes += len;
-            s.metadata += 37 + format::key_len(&key) as u64;
+            s.bytes += stored_len;
+            s.metadata += charge - stored_len;
             s.in_flight.insert(loc.offset);
             state.written += charge;
             break (loc, data);
@@ -503,7 +567,7 @@ impl SegmentStore {
             self.pause_append().await;
             let (payload, record) = tokio::join!(
                 async {
-                    disk_io::write(data.clone(), value, loc.offset).await?;
+                    disk_io::write_record(data.clone(), value, checksum, loc.offset).await?;
                     #[cfg(test)]
                     tests::crash("append_payload");
                     Ok::<_, io::Error>(())
@@ -518,7 +582,7 @@ impl SegmentStore {
                                 record: journal::Record {
                                     key: key.clone(),
                                     len,
-                                    checksum,
+                                    checksum: None,
                                 },
                             },
                             false,
@@ -559,14 +623,14 @@ impl SegmentStore {
         let added = allocated.saturating_sub(segment.allocated);
         segment.allocated = segment.allocated.max(allocated);
         segment.live += charge;
-        segment.live_payload += loc.len;
+        segment.live_data_bytes += stored_len;
         segment.records += 1;
         state.allocated += added;
         state.live += charge;
         // Publish policy and locator together. The runtime's block gate keeps
         // eviction from retiring this admission before its mutation completes.
         if let Some(policy) = policy {
-            policy.publish_small(unit, charge, &self.entries, loc);
+            policy.publish_small(unit, stored_len, &self.entries, loc);
         } else {
             self.entries.write().unwrap().insert(key, loc);
         }
@@ -593,6 +657,14 @@ impl SegmentStore {
     }
 
     async fn delete_inner(&self, id: &(impl SmallStoreKey + ?Sized)) -> io::Result<()> {
+        self.delete_inner_if(id, |_| true).await.map(|_| ())
+    }
+
+    async fn delete_inner_if(
+        &self,
+        id: &(impl SmallStoreKey + ?Sized),
+        eligible: impl FnOnce(&Location) -> bool,
+    ) -> io::Result<bool> {
         format::validate_key(&id.view())?;
         // A tombstone must be either included in the sealing fsync or synced
         // after publication. Serialize logical publication with seal/relocation.
@@ -600,8 +672,11 @@ impl SegmentStore {
         let mut state = self.state.lock().await;
         self.healthy(&state)?;
         let Some(loc) = self.entries.read().unwrap().get(&id.view()) else {
-            return Ok(());
+            return Ok(false);
         };
+        if !eligible(&loc) {
+            return Ok(false);
+        }
         let result = async {
             let segment = state.segments.get_mut(&loc.segment).unwrap();
             self.journal
@@ -618,7 +693,7 @@ impl SegmentStore {
             tests::crash("delete_sync");
             let removed = charge(&id.view(), loc.len);
             segment.live -= removed;
-            segment.live_payload -= loc.len;
+            segment.live_data_bytes -= loc.stored_len();
             segment.records -= 1;
             let allocated = segment.allocated().await?;
             let added = allocated.saturating_sub(segment.allocated);
@@ -628,7 +703,7 @@ impl SegmentStore {
             state.written += 21;
             self.refresh_stats(&state);
             self.entries.write().unwrap().remove(&id.view());
-            Ok(())
+            Ok(true)
         }
         .await;
         if result.is_err() {
@@ -662,7 +737,7 @@ impl SegmentStore {
                 .unwrap_or_else(|| AccessHandle::new(track_clock));
             units.push(crate::eviction::RecoveredUnit {
                 unit: key.0.clone(),
-                bytes: charge(&key, loc.len),
+                bytes: loc.stored_len(),
                 independent: true,
                 access: access.clone(),
             });
@@ -694,6 +769,17 @@ impl SegmentStore {
         pressure: bool,
         budget: Option<Arc<crate::background::BackgroundBudget>>,
     ) -> io::Result<bool> {
+        let tracks_access = self.journal.model.0.read().unwrap().recency.is_some();
+        // Always take the relocation gate before competing with the snapshot for disk I/O.
+        let access_relocation = if tracks_access {
+            Some(self.journal.access_relocation.read().await)
+        } else {
+            None
+        };
+        let _io = match &budget {
+            Some(budget) => Some(budget.io().await),
+            None => None,
+        };
         let pressure_seal = if pressure {
             let state = self.state.lock().await;
             state
@@ -719,8 +805,8 @@ impl SegmentStore {
                     let s = &state.segments[&id];
                     (
                         id,
-                        s.live_payload.saturating_mul(2)
-                            + (s.live - s.live_payload)
+                        s.live_data_bytes.saturating_mul(2)
+                            + (s.live - s.live_data_bytes)
                             + 36 * s.records as u64
                             + 49,
                     )
@@ -758,8 +844,12 @@ impl SegmentStore {
                 // it before retired-reader accounting at unlink.
                 let _source = state.segments[&old].data().await?;
                 for (key, loc) in &entries {
-                    let bytes = loc.clone().retain().await?.read().await?;
-                    let mut replacement = self.append(&mut state, new, key, bytes, false).await?;
+                    let bytes = loc.clone().retain().await?.read_stored().await?;
+                    // Keep the storage weight and checksum format of an existing
+                    // admission when relocating it.
+                    let mut replacement = self
+                        .append(&mut state, new, key, bytes, loc.checksum)
+                        .await?;
                     replacement.access = loc.access.clone();
                     moved.push((key.clone(), replacement));
                 }
@@ -806,6 +896,7 @@ impl SegmentStore {
             }
             self.entries.write().unwrap().retire_segment(old);
             drop(readers);
+            drop(access_relocation);
             let segment = state.segments.remove(&old).unwrap();
             let allocated = segment.allocated().await?;
             disk_io::remove(self.path(old, "data")).await?;
@@ -873,7 +964,7 @@ impl SegmentStore {
             metadata: 8,
             in_flight: BTreeSet::new(),
             live: 0,
-            live_payload: 0,
+            live_data_bytes: 0,
             allocated,
             records: 0,
             sealed: false,
@@ -885,12 +976,13 @@ impl SegmentStore {
         id: u64,
         key: &SmallKey,
         value: Bytes,
-        publish: bool,
+        legacy_checksum: Option<u64>,
     ) -> io::Result<Location> {
         let segment = state.segments.get_mut(&id).unwrap();
         let offset = segment.bytes;
-        let checksum = xxhash_rust::xxh3::xxh3_64(&value);
-        let len = value.len() as u64;
+        let stored_len = value.len() as u64;
+        let len = stored_len - checksum_len(legacy_checksum);
+        let charge = charge(key, len);
         disk_io::write(segment.data().await?, value, offset).await?;
         #[cfg(test)]
         tests::crash("append_payload");
@@ -903,33 +995,30 @@ impl SegmentStore {
                     record: journal::Record {
                         key: key.clone(),
                         len,
-                        checksum,
+                        checksum: legacy_checksum,
                     },
                 },
                 false,
             )
             .await?;
-        let frame_len = 37 + format::key_len(key) as u64;
+        let frame_len = charge - stored_len;
         #[cfg(test)]
         tests::crash("append_index");
-        segment.bytes += len;
+        segment.bytes += stored_len;
         segment.metadata += frame_len;
-        segment.live += charge(key, len);
-        segment.live_payload += len;
+        segment.live += charge;
+        segment.live_data_bytes += stored_len;
         segment.records += 1;
         let allocated = segment.allocated().await?;
         state.allocated += allocated.saturating_sub(segment.allocated);
         segment.allocated = allocated;
-        if publish {
-            state.live += charge(key, len);
-        }
-        state.written += charge(key, len);
+        state.written += charge;
         let loc = Location {
             file: segment.file.clone(),
             segment: id,
             offset,
             len,
-            checksum,
+            checksum: legacy_checksum,
             access: None,
         };
         self.refresh_stats(state);
@@ -1090,11 +1179,11 @@ impl SegmentStore {
         let allocated = metadata.blocks() * 512;
         let mut records = 0;
         let mut live = 0;
-        let mut live_payload = 0;
+        let mut live_data_bytes = 0;
         for (offset, record) in meta.records.before(meta.durable_end) {
             records += 1;
             live += charge(&record.key, record.len);
-            live_payload += record.len;
+            live_data_bytes += record.stored_len();
             self.entries.write().unwrap().restore(
                 &record.key,
                 Location {
@@ -1122,7 +1211,7 @@ impl SegmentStore {
                 metadata: recovered_metadata,
                 in_flight: BTreeSet::new(),
                 live,
-                live_payload,
+                live_data_bytes,
                 allocated,
                 records,
                 sealed: true,
@@ -1196,7 +1285,7 @@ fn reclaimable(state: &State, id: u64) -> bool {
 }
 
 fn charge(key: &dyn SmallIdentity, len: u64) -> u64 {
-    len + format::key_len(key) as u64 + 37
+    len + format::record_metadata_bytes(key)
 }
 fn validate_geometry(threshold: u64, segment_size: u64, capacity: u64) -> io::Result<()> {
     if segment_size < threshold.saturating_add(format::MAX_KEY as u64 + 64)

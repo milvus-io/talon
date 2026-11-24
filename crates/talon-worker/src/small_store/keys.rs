@@ -1,5 +1,44 @@
 use std::io;
 
+#[derive(Clone)]
+enum Indices {
+    Narrow(Vec<u16>),
+    Wide(Vec<u32>),
+}
+
+impl Default for Indices {
+    fn default() -> Self {
+        Self::Wide(Vec::new())
+    }
+}
+
+impl Indices {
+    fn get(&self, index: usize) -> Option<u32> {
+        match self {
+            Self::Narrow(values) => values.get(index).copied().map(u32::from),
+            Self::Wide(values) => values.get(index).copied(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Narrow(values) => values.len(),
+            Self::Wide(values) => values.len(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn shrink_to_fit(&mut self) {
+        match self {
+            Self::Narrow(values) => values.shrink_to_fit(),
+            Self::Wide(values) => values.shrink_to_fit(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 struct Span {
     offset: u32,
@@ -30,9 +69,9 @@ impl Span {
 #[derive(Clone, Default)]
 pub(super) struct Keys {
     rows: Vec<Span>,
-    offsets: Vec<u32>,
+    offsets: Indices,
     suffixes: Vec<u8>,
-    prefix_ids: Vec<u32>,
+    prefix_ids: Indices,
     prefixes: Vec<Span>,
     prefix_bytes: Vec<u8>,
     garbage: usize,
@@ -43,8 +82,8 @@ impl Keys {
         let span = if self.offsets.is_empty() {
             *self.rows.get(row)?
         } else {
-            let &end = self.offsets.get(row.checked_add(1)?)?;
-            let offset = self.offsets[row];
+            let end = self.offsets.get(row.checked_add(1)?)?;
+            let offset = self.offsets.get(row)?;
             Span {
                 offset,
                 len: end - offset,
@@ -54,21 +93,23 @@ impl Keys {
         let prefix = self
             .prefix_ids
             .get(row)
-            .and_then(|&id| self.prefixes.get(id as usize));
+            .and_then(|id| self.prefixes.get(id as usize));
         Some((prefix.map_or(&[], |p| p.get(&self.prefix_bytes)), suffix))
     }
 
     pub fn insert(&mut self, row: usize, key: &[u8], replace: bool) -> io::Result<()> {
         if !self.offsets.is_empty() {
-            self.rows = self
-                .offsets
-                .windows(2)
-                .map(|p| Span {
-                    offset: p[0],
-                    len: p[1] - p[0],
+            self.rows = (0..self.offsets.len() - 1)
+                .map(|row| {
+                    let offset = self.offsets.get(row).unwrap();
+                    let end = self.offsets.get(row + 1).unwrap();
+                    Span {
+                        offset,
+                        len: end - offset,
+                    }
                 })
                 .collect();
-            self.offsets = Vec::new();
+            self.offsets = Indices::default();
         }
         if self.garbage > self.suffixes.len() / 2
             || self.suffixes.len().saturating_add(key.len()) > u32::MAX as usize
@@ -79,13 +120,17 @@ impl Keys {
         if replace {
             self.garbage += self.rows[row].len as usize;
             self.rows[row] = span;
-            if !self.prefix_ids.is_empty() {
-                self.prefix_ids[row] = u32::MAX;
+            match &mut self.prefix_ids {
+                Indices::Narrow(ids) => ids[row] = u16::MAX,
+                Indices::Wide(ids) if !ids.is_empty() => ids[row] = u32::MAX,
+                Indices::Wide(_) => {}
             }
         } else {
             self.rows.insert(row, span);
-            if !self.prefix_ids.is_empty() {
-                self.prefix_ids.insert(row, u32::MAX);
+            match &mut self.prefix_ids {
+                Indices::Narrow(ids) => ids.insert(row, u16::MAX),
+                Indices::Wide(ids) if !ids.is_empty() => ids.insert(row, u32::MAX),
+                Indices::Wide(_) => {}
             }
         }
         Ok(())
@@ -97,8 +142,10 @@ impl Keys {
         }
         self.garbage += self.rows[row].len as usize;
         self.rows[row] = Span::default();
-        if !self.prefix_ids.is_empty() {
-            self.prefix_ids[row] = u32::MAX;
+        match &mut self.prefix_ids {
+            Indices::Narrow(ids) => ids[row] = u16::MAX,
+            Indices::Wide(ids) if !ids.is_empty() => ids[row] = u32::MAX,
+            Indices::Wide(_) => {}
         }
     }
 
@@ -112,28 +159,29 @@ impl Keys {
         let compressed = !self.prefix_ids.is_empty();
         let mut next = Self::default();
         let mut prefix_ids = vec![u32::MAX; self.prefixes.len()];
+        let mut next_ids = Vec::new();
         for row in 0..len {
             if keep(row) {
                 let (prefix, suffix) = self.get(row).unwrap();
                 next.rows
                     .push(Span::append(&mut next.suffixes, suffix).unwrap());
                 if compressed {
-                    let old = self.prefix_ids[row];
-                    let id = if old == u32::MAX {
-                        u32::MAX
-                    } else {
-                        let id = &mut prefix_ids[old as usize];
+                    let old = self.prefix_ids.get(row).unwrap() as usize;
+                    let id = if let Some(id) = prefix_ids.get_mut(old) {
                         if *id == u32::MAX {
                             *id = next.prefixes.len() as u32;
                             next.prefixes
                                 .push(Span::append(&mut next.prefix_bytes, prefix).unwrap());
                         }
                         *id
+                    } else {
+                        u32::MAX
                     };
-                    next.prefix_ids.push(id);
+                    next_ids.push(id);
                 }
             }
         }
+        next.set_prefix_ids(next_ids);
         if sealed {
             next.freeze();
         }
@@ -157,7 +205,11 @@ impl Keys {
             suffixes.extend_from_slice(row.get(&self.suffixes));
         }
         offsets.push(suffixes.len() as u32);
-        self.offsets = offsets;
+        self.offsets = if suffixes.len() <= usize::from(u16::MAX) {
+            Indices::Narrow(offsets.into_iter().map(|offset| offset as u16).collect())
+        } else {
+            Indices::Wide(offsets)
+        };
         self.rows = Vec::new();
         self.suffixes = suffixes;
         self.garbage = 0;
@@ -188,20 +240,26 @@ impl Keys {
                     .sum::<usize>()
             })
             .sum();
-        if prefix_len + prefix_count * size_of::<Span>() + suffix_len + self.rows.len() * 4
+        let id_width = if prefix_count <= usize::from(u16::MAX) {
+            2
+        } else {
+            4
+        };
+        if prefix_len + prefix_count * size_of::<Span>() + suffix_len + self.rows.len() * id_width
             >= self.suffixes.len()
         {
             return;
         }
         let mut next = Self {
             rows: vec![Span::default(); self.rows.len()],
-            offsets: Vec::new(),
+            offsets: Indices::default(),
             suffixes: Vec::with_capacity(suffix_len),
-            prefix_ids: vec![u32::MAX; self.rows.len()],
+            prefix_ids: Indices::default(),
             prefixes: Vec::with_capacity(prefix_count),
             prefix_bytes: Vec::with_capacity(prefix_len),
             garbage: 0,
         };
+        let mut prefix_ids = vec![u32::MAX; self.rows.len()];
         for group in groups {
             let prefix_id = if group.prefix == 0 {
                 u32::MAX
@@ -215,10 +273,20 @@ impl Keys {
             for &row in &order[group.start..group.end] {
                 let key = self.rows[row].get(&self.suffixes);
                 next.rows[row] = Span::append(&mut next.suffixes, &key[group.prefix..]).unwrap();
-                next.prefix_ids[row] = prefix_id;
+                prefix_ids[row] = prefix_id;
             }
         }
+        next.set_prefix_ids(prefix_ids);
         *self = next;
+    }
+
+    fn set_prefix_ids(&mut self, ids: Vec<u32>) {
+        self.prefix_ids = if !ids.is_empty() && self.prefixes.len() <= usize::from(u16::MAX) {
+            // All actual IDs are below u16::MAX, which replaces the wide sentinel.
+            Indices::Narrow(ids.into_iter().map(|id| id as u16).collect())
+        } else {
+            Indices::Wide(ids)
+        };
     }
 
     fn groups(&self, order: &[usize]) -> Vec<Group> {
@@ -317,6 +385,24 @@ mod tests {
             assert_eq!([prefix, suffix].concat(), *key);
         }
         assert!(keys.get(expected.len()).is_none());
+    }
+
+    #[test]
+    fn sealed_key_tables_choose_their_widths_independently() {
+        for (total, narrow) in [(65_535, true), (65_536, false)] {
+            let mut keys = Keys::default();
+            let mut a = vec![b'p'; 64];
+            let mut b = a.clone();
+            a.resize(64 + 32_768, b'a');
+            b.resize(64 + total - 32_768, b'b');
+            keys.insert(0, &a, false).unwrap();
+            keys.insert(1, &b, false).unwrap();
+            keys.seal();
+            assert!(matches!(keys.prefix_ids, Indices::Narrow(_)));
+            assert_eq!(matches!(keys.offsets, Indices::Narrow(_)), narrow);
+            assert_eq!(keys.offsets.get(2), Some(total as u32));
+            check(&keys, &[a, b]);
+        }
     }
 
     #[test]

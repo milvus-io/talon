@@ -111,6 +111,454 @@ fn log(root: &Path) -> HashMap<CacheUnit, u64> {
     ages
 }
 
+fn open_compact(root: &Path) -> (Arc<SmallObjectStore>, Arc<Lru>) {
+    let store = Arc::new(
+        SmallObjectStore::open(root.to_owned(), 128 << 10, 256 << 10, 16 << 20, None).unwrap(),
+    );
+    let index = Arc::new(crate::BlockIndex::new());
+    let mut units = Vec::new();
+    store.restore_policy_units(&index, &mut units, false);
+    assert!(units.is_empty());
+    store.init_recency();
+    let policy = Arc::new(Lru::from_recovered(index, units, store.len(), false, true));
+    store.bind_policy(policy.clone());
+    store.enable_access_tracking().unwrap();
+    (store, policy)
+}
+
+fn compact_age(store: &SmallObjectStore, key: &BlockId) -> u64 {
+    let catalog = store.journal.model.0.read().unwrap();
+    let slot = catalog
+        .find(&key.view(), super::super::lookup::VISIBLE)
+        .unwrap();
+    let (recency, time) = catalog.recency_at(slot).unwrap();
+    recency.time(time.load(Ordering::Relaxed))
+}
+
+#[tokio::test]
+async fn compact_read_updates_the_matched_row_without_a_policy_ticket() {
+    use super::super::lookup::{REFERENCED, VISIBLE};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (store, policy) = open_compact(dir.path());
+    let key = id(1);
+    store
+        .put(&key, Bytes::from_static(b"payload"))
+        .await
+        .unwrap();
+    let cold = access_millis() - 30_000;
+    let revision = {
+        let catalog = store.journal.model.0.read().unwrap();
+        let slot = catalog.find(&key.view(), VISIBLE).unwrap();
+        let (_, time) = catalog.recency_at(slot).unwrap();
+        time.store(cold, Ordering::Relaxed);
+        catalog.lookup.take_reference(slot);
+        catalog.revision.load(Ordering::Relaxed)
+    };
+
+    assert!(store.get_range(&key, 5, 3).await.is_err());
+    assert!(store.get_range(&id(2), 0, 3).await.unwrap().is_none());
+    assert_eq!(compact_age(&store, &key), cold);
+    {
+        let catalog = store.journal.model.0.read().unwrap();
+        let slot = catalog.find(&key.view(), VISIBLE).unwrap();
+        assert_eq!(catalog.lookup.flags(slot) & REFERENCED, 0);
+    }
+
+    let handle = store.get_range(&key, 2, 3).await.unwrap().unwrap();
+    let data = super::super::disk_io::read(handle.fd, handle.offset, handle.len as usize)
+        .await
+        .unwrap();
+    assert_eq!(&data[..], b"ylo");
+    assert!(compact_age(&store, &key) > cold);
+    {
+        let catalog = store.journal.model.0.read().unwrap();
+        let slot = catalog.find(&key.view(), VISIBLE).unwrap();
+        assert_ne!(catalog.lookup.flags(slot) & REFERENCED, 0);
+        assert_eq!(catalog.revision.load(Ordering::Relaxed), revision);
+        assert_eq!(catalog.tickets.len(), 0);
+    }
+
+    let entry = policy
+        .index()
+        .policy_get(&CacheUnit::Whole(key.clone()))
+        .unwrap();
+    let ticket = entry.access.small().unwrap();
+    let revision = ticket.snapshot();
+    assert!(ticket.is_current(revision));
+    assert!(store.get(&key).await.unwrap().is_some());
+    assert!(!ticket.is_current(revision));
+}
+
+#[tokio::test]
+async fn compact_access_replays_legacy_ages_and_rechecks_idle_candidates() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = id(1);
+    let cold = access_millis() - 30_000;
+    {
+        let store = open(dir.path());
+        put(&store, &key).await;
+        store.maintain(true).await.unwrap();
+        let mut checkpoint = LEGACY.to_vec();
+        encode(&mut checkpoint, &key, cold).unwrap();
+        std::fs::write(dir.path().join(FILE), checkpoint).unwrap();
+    }
+
+    let (store, _) = open_compact(dir.path());
+    assert_eq!(compact_age(&store, &key), cold);
+    flush(&store).await;
+    let now = access_millis();
+    let mut candidates =
+        store.idle_recency_candidates(&mut IdleRecencyCursor::default(), now, 10_000, 10, 10);
+    assert_eq!(candidates.len(), 1);
+    let (unit, ticket) = candidates.pop().unwrap();
+    store.read(&key).await.unwrap().unwrap();
+    assert!(!store
+        .delete_idle(unit, ticket, move || (now, 10_000))
+        .await
+        .unwrap());
+    let touched = compact_age(&store, &key);
+    assert!(touched >= now);
+    flush(&store).await;
+    assert_eq!(
+        log(dir.path()),
+        HashMap::from([(CacheUnit::Whole(key.clone()), touched)])
+    );
+    drop(store);
+
+    let (store, policy) = open_compact(dir.path());
+    assert_eq!(compact_age(&store, &key), touched);
+    let now = touched + 30_000;
+    let (unit, ticket) = store
+        .idle_recency_candidates(&mut IdleRecencyCursor::default(), now, 10_000, 10, 10)
+        .pop()
+        .unwrap();
+    assert!(store
+        .delete_idle(unit, ticket, move || (now, 10_000))
+        .await
+        .unwrap());
+    assert!(!store.contains(&key));
+    assert_eq!(policy.len(), 0);
+}
+
+#[tokio::test]
+async fn compact_access_keeps_ages_through_row_compaction_and_relocation() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, policy) = open_compact(dir.path());
+    for n in 0..6 {
+        store
+            .put(&id(n), Bytes::from(vec![n as u8; 48 << 10]))
+            .await
+            .unwrap();
+    }
+    let key = id(3);
+    let before = store.lookup_entry(&key).unwrap().unwrap();
+    let retained = store.get_range(&key, 4, 8).await.unwrap().unwrap();
+    let age = compact_age(&store, &key);
+    for n in 0..3 {
+        store.delete(&id(n)).await.unwrap();
+        policy.remove(&CacheUnit::Whole(id(n)));
+    }
+    store.maintain(true).await.unwrap();
+    let after = store.lookup_entry(&key).unwrap().unwrap();
+    assert_ne!(before.segment, after.segment);
+    assert_eq!(compact_age(&store, &key), age);
+    let data = super::super::disk_io::read(retained.fd, retained.offset, retained.len as usize)
+        .await
+        .unwrap();
+    assert_eq!(&data[..], &[3; 8]);
+    flush(&store).await;
+    store.access_disk.lock().unwrap().log_bytes = MIN_COMPACT_BYTES;
+    flush(&store).await;
+    assert!(log(dir.path()).is_empty());
+    drop(store);
+    let (store, _) = open_compact(dir.path());
+    assert_eq!(compact_age(&store, &key), age);
+}
+
+#[tokio::test]
+async fn full_access_checkpoint_and_relocation_share_the_publication_boundary() {
+    use std::time::Duration;
+
+    for checkpoint_first in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, policy) = open_compact(dir.path());
+        for n in 0..6 {
+            store
+                .put(&id(n), Bytes::from(vec![n as u8; 48 << 10]))
+                .await
+                .unwrap();
+        }
+        store.maintain(true).await.unwrap();
+        let key = id(3);
+        let source = store.lookup_entry(&key).unwrap().unwrap().segment;
+        let cold = access_millis() - 30_000;
+        {
+            let catalog = store.journal.model.0.read().unwrap();
+            let slot = catalog
+                .find(&key.view(), super::super::lookup::VISIBLE)
+                .unwrap();
+            let (_, time) = catalog.recency_at(slot).unwrap();
+            time.store(cold, Ordering::Relaxed);
+        }
+        flush(&store).await;
+        for n in 0..3 {
+            store.delete(&id(n)).await.unwrap();
+            policy.remove(&CacheUnit::Whole(id(n)));
+        }
+        store.access_disk.lock().unwrap().full = true;
+
+        let budget = crate::background::BackgroundBudget::new(&talon_core::WorkerConfig {
+            background_io_concurrency: 1,
+            background_io_max_mb_per_sec: 1,
+            background_delete_max_per_sec: 0,
+            ..Default::default()
+        });
+        let relocating = || {
+            let store = store.clone();
+            let budget = budget.clone();
+            tokio::spawn(async move {
+                store
+                    .maintain_with_budget(false, Some(budget))
+                    .await
+                    .unwrap()
+            })
+        };
+        let checkpointing = || {
+            let store = store.clone();
+            let budget = budget.clone();
+            tokio::spawn(async move { store.checkpoint_access(Some(budget)).await.unwrap() })
+        };
+        let source_is_journaled = || {
+            store
+                .journal
+                .model
+                .0
+                .read()
+                .unwrap()
+                .model
+                .segments
+                .contains_key(&source)
+        };
+        if checkpoint_first {
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            *store.access_pause.lock().unwrap() = Some((entered.clone(), release.clone()));
+            let checkpoint = checkpointing();
+            tokio::time::timeout(Duration::from_secs(5), entered.notified())
+                .await
+                .unwrap();
+            let mut relocate = relocating();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), &mut relocate)
+                    .await
+                    .is_err()
+            );
+            assert!(source_is_journaled());
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                store.put(&id(6), Bytes::from_static(b"append")),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            // The snapshot has written its header and relocation is waiting for it.
+            // Another disk user can acquire the sole permit and keep it while
+            // the snapshot charges its next chunk against the byte rate.
+            let io = tokio::time::timeout(Duration::from_secs(5), budget.io())
+                .await
+                .unwrap();
+            let charged = budget.charged_bytes();
+            release.notify_one();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while budget.charged_bytes() == charged {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let fd = disk_io::open(dir.path().join(FILE), disk_io::Open::Read)
+                .await
+                .unwrap();
+            disk_io::sync(fd).await.unwrap();
+            drop(io);
+            tokio::time::timeout(Duration::from_secs(5), checkpoint)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(tokio::time::timeout(Duration::from_secs(5), relocate)
+                .await
+                .unwrap()
+                .unwrap());
+        } else {
+            let reader = store.journal.readers.read().await;
+            let relocate = relocating();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while source_is_journaled() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let mut checkpoint = checkpointing();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), &mut checkpoint)
+                    .await
+                    .is_err()
+            );
+            drop(reader);
+            assert!(relocate.await.unwrap());
+            checkpoint.await.unwrap();
+        }
+        assert_ne!(store.lookup_entry(&key).unwrap().unwrap().segment, source);
+        drop(store);
+
+        let (store, _) = open_compact(dir.path());
+        assert_eq!(compact_age(&store, &key), cold);
+    }
+}
+
+#[tokio::test]
+async fn compact_delta_visits_only_dirty_rows_after_row_compaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, policy) = open_compact(dir.path());
+    for n in 0..192 {
+        store
+            .put(&id(n), Bytes::from_static(b"data"))
+            .await
+            .unwrap();
+    }
+    flush(&store).await;
+
+    let pending = || {
+        let catalog = store.journal.model.0.read().unwrap();
+        let mut offsets = Vec::new();
+        let done = catalog.visit_dirty_recency(&mut (0, 0), (u64::MAX, u64::MAX), 16, |id, row| {
+            offsets.push((id, row));
+            true
+        });
+        assert!(done);
+        offsets
+    };
+    assert!(pending().is_empty());
+
+    // The second delete crosses the 1% compaction threshold, moving dirty
+    // rows that previously straddled two bitmap-word boundaries.
+    for n in [64, 129] {
+        assert!(store.get(&id(n)).await.unwrap().is_some());
+    }
+    let two_rows = pending();
+    assert_eq!(two_rows.len(), 2);
+    for n in [0, 1] {
+        store.delete(&id(n)).await.unwrap();
+        policy.remove(&CacheUnit::Whole(id(n)));
+    }
+    assert_eq!(
+        pending(),
+        two_rows
+            .into_iter()
+            .map(|(segment, row)| (segment, row - 2))
+            .collect::<Vec<_>>()
+    );
+
+    flush(&store).await;
+    assert!(pending().is_empty());
+    let expected = [64, 129]
+        .into_iter()
+        .map(|n| (CacheUnit::Whole(id(n)), compact_age(&store, &id(n))))
+        .collect();
+    assert_eq!(log(dir.path()), expected);
+}
+
+#[tokio::test]
+async fn compact_full_checkpoint_retries_after_sampling_with_one_io_permit() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _) = open_compact(dir.path());
+    let budget = crate::background::BackgroundBudget::new(&talon_core::WorkerConfig {
+        background_io_concurrency: 1,
+        background_io_max_mb_per_sec: 0,
+        ..Default::default()
+    });
+    let flush_with_budget = || async {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            store.checkpoint_access(Some(budget.clone())),
+        )
+        .await
+        .expect("a full checkpoint must make progress with a single I/O permit")
+    };
+    let key = id(1);
+    store
+        .put(&key, Bytes::from_static(b"payload"))
+        .await
+        .unwrap();
+    store.maintain(true).await.unwrap();
+    {
+        let catalog = store.journal.model.0.read().unwrap();
+        let slot = catalog
+            .find(&key.view(), super::super::lookup::VISIBLE)
+            .unwrap();
+        let (_, time) = catalog.recency_at(slot).unwrap();
+        time.store(access_millis() - 30_000, Ordering::Relaxed);
+    }
+    flush_with_budget().await.unwrap();
+    assert!(store.get(&key).await.unwrap().is_some());
+    let touched = compact_age(&store, &key);
+
+    store.access_disk.lock().unwrap().full = true;
+    // Fail after the full snapshot sampled the dirty rows and replaced FILE.
+    let log_temp = dir.path().join("access.log.tmp");
+    std::fs::create_dir(&log_temp).unwrap();
+    assert!(flush_with_budget().await.is_err());
+    assert!(store.access_disk.lock().unwrap().full);
+    std::fs::remove_dir(log_temp).unwrap();
+    flush_with_budget().await.unwrap();
+    drop(store);
+
+    let (store, _) = open_compact(dir.path());
+    assert_eq!(compact_age(&store, &key), touched);
+}
+
+#[tokio::test]
+async fn compact_idle_sweep_revisits_old_rows_during_active_appends() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _) = open_compact(dir.path());
+    let mut cursor = IdleRecencyCursor::default();
+    let age = 10_000;
+    for key in [id(0), id(1)] {
+        store
+            .put(&key, Bytes::from_static(b"payload"))
+            .await
+            .unwrap();
+    }
+    let now = access_millis();
+    assert!(store
+        .idle_recency_candidates(&mut cursor, now, age, 1, 10)
+        .is_empty());
+
+    let expired_at = now + age + 1;
+    store
+        .put(&id(2), Bytes::from_static(b"payload"))
+        .await
+        .unwrap();
+    let _ = store.idle_recency_candidates(&mut cursor, expired_at, age, 1, 10);
+    store
+        .put(&id(3), Bytes::from_static(b"payload"))
+        .await
+        .unwrap();
+    let (unit, ticket) = store
+        .idle_recency_candidates(&mut cursor, expired_at, age, 1, 10)
+        .pop()
+        .expect("the next sweep revisits the oldest row");
+    let oldest = id(0);
+    assert_eq!(unit, CacheUnit::Whole(oldest.clone()));
+    assert!(store
+        .delete_idle(unit, ticket, move || (expired_at, age))
+        .await
+        .unwrap());
+    assert!(!store.contains(&oldest));
+}
+
 #[test]
 fn access_records_preserve_whole_and_exact_range_identities() {
     let whole = CacheUnit::Whole(id(0));
@@ -440,7 +888,7 @@ async fn million_item_sparse_access_probe() {
                 segment: 1,
                 offset: n as u64,
                 len: 1,
-                checksum: 0,
+                checksum: Some(0),
                 access: Some(store.attach_access(key, AccessHandle::default(), false)),
             },
         );

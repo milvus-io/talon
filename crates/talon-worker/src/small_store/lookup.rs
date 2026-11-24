@@ -42,7 +42,7 @@ impl Lookup {
         (self.len + self.deleted + additional) * 5 > self.capacity() * 4
     }
 
-    pub fn rebuild(&mut self, additional: usize, hash: impl Fn(u32) -> u64) {
+    pub fn rebuild(&mut self, additional: usize, hash: impl Fn(u32) -> u32) {
         let target = (self.len + additional).max(16);
         let capacity = (target * 5).div_ceil(4).div_ceil(64) * 64;
         let mut next = Self {
@@ -61,12 +61,19 @@ impl Lookup {
         *self = next;
     }
 
-    pub fn find(&self, hash: u64, mut equal: impl FnMut(u32, u8) -> bool) -> Option<usize> {
+    fn start_slot(&self, hash: u32) -> usize {
+        // Spread the 32-bit hash over the entire slot range, even for tables
+        // whose spare capacity takes them beyond 2^32 slots.
+        let spread = u64::from(hash).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        (spread % self.capacity() as u64) as usize
+    }
+
+    pub fn find(&self, hash: u32, mut equal: impl FnMut(u32, u8) -> bool) -> Option<usize> {
         if self.capacity() == 0 {
             return None;
         }
-        let fingerprint = (hash >> 59) as u8;
-        let mut slot = (hash % self.capacity() as u64) as usize;
+        let fingerprint = (hash >> 27) as u8;
+        let mut slot = self.start_slot(hash);
         for _ in 0..self.capacity() {
             let handle = self.handles[slot];
             if handle == EMPTY {
@@ -86,9 +93,9 @@ impl Lookup {
         None
     }
 
-    pub fn insert(&mut self, hash: u64, handle: u32, flags: u8) -> usize {
+    pub fn insert(&mut self, hash: u32, handle: u32, flags: u8) -> usize {
         assert!(handle != EMPTY && handle != DELETED);
-        let mut slot = (hash % self.capacity() as u64) as usize;
+        let mut slot = self.start_slot(hash);
         let mut tombstone = None;
         for _ in 0..self.capacity() {
             match self.handles[slot] {
@@ -96,7 +103,7 @@ impl Lookup {
                     let slot = tombstone.unwrap_or(slot);
                     self.deleted -= usize::from(tombstone.is_some());
                     self.handles[slot] = handle;
-                    *self.control[slot].get_mut() = (hash >> 59) as u8 | (flags & !FINGERPRINT);
+                    *self.control[slot].get_mut() = (hash >> 27) as u8 | (flags & !FINGERPRINT);
                     self.len += 1;
                     self.changed();
                     return slot;

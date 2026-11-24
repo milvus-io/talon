@@ -57,6 +57,10 @@ impl Directory {
         Some(catalog.compact_admit(slot, bytes, clock))
     }
 
+    pub(crate) fn has_recency(&self) -> bool {
+        self.catalog.0.read().unwrap().recency.is_some()
+    }
+
     pub(crate) fn compact_candidates(
         &mut self,
         bytes: &mut u64,
@@ -309,6 +313,7 @@ impl Directory {
                 .lookup
                 .set_flags(old_slot, flags & !(VISIBLE | POLICY | REFERENCED));
             *catalog.live.entry(self.slot).or_default() -= 1;
+            catalog.relocate_recency(old_address, slot);
             catalog.relocate_policy(old_address, address, slot);
             if let Some(policy) = catalog.policy.remove(&old_address) {
                 catalog.policy.insert(address, policy);
@@ -516,7 +521,7 @@ mod tests {
                     segment: 1,
                     offset: n,
                     len: 1,
-                    checksum: 0,
+                    checksum: Some(0),
                     access: None,
                 },
             );
@@ -735,7 +740,7 @@ mod tests {
                     segment: 1,
                     offset: n,
                     len: 1,
-                    checksum: 0,
+                    checksum: Some(0),
                     access: None,
                 },
             );
@@ -801,7 +806,7 @@ mod tests {
                 record: super::super::journal::Record {
                     key: SmallKey::new(&id),
                     len: 1,
-                    checksum: 0,
+                    checksum: Some(0),
                 },
             })
             .unwrap();
@@ -906,7 +911,7 @@ mod tests {
                     segment: 1,
                     offset: n,
                     len: 1,
-                    checksum: 0,
+                    checksum: Some(0),
                     access: None,
                 },
             );
@@ -972,7 +977,7 @@ mod tests {
                         segment: 1,
                         offset: 0,
                         len: 1,
-                        checksum: 0,
+                        checksum: Some(0),
                         access: None,
                     },
                 )

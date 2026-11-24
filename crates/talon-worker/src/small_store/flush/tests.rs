@@ -45,7 +45,7 @@ async fn idle_maintenance_flushes_without_sealing_and_recovery_discards_only_tai
             let state = store.state.lock().await;
             assert_eq!(state.active, Some(segment));
             assert!(!state.segments[&segment].sealed);
-            assert_eq!(state.segments[&segment].durable_end, 5);
+            assert_eq!(state.segments[&segment].durable_end, 5 + CHECKSUM_BYTES);
         }
         put(&store, "tail", b"uncommitted").await;
         assert_eq!(store.state.lock().await.active, Some(segment));
@@ -65,7 +65,7 @@ async fn idle_maintenance_flushes_without_sealing_and_recovery_discards_only_tai
                 std::fs::metadata(store.path(segment, "data"))
                     .unwrap()
                     .len(),
-                5
+                5 + CHECKSUM_BYTES
             );
             let state = store.state.lock().await;
             assert_eq!(
@@ -111,7 +111,7 @@ async fn byte_threshold_flushes_before_interval_without_rotating() {
     let state = store.state.lock().await;
     assert_eq!(state.active, Some(segment));
     let s = &state.segments[&segment];
-    assert_eq!(s.durable_end, 84 * (100 << 10));
+    assert_eq!(s.durable_end, 84 * ((100 << 10) + CHECKSUM_BYTES));
     assert!(!s.sealed);
 }
 
@@ -150,7 +150,7 @@ async fn flush_waits_for_earlier_appends_but_not_later_reservations() {
     {
         let state = store.state.lock().await;
         let s = &state.segments[&state.active.unwrap()];
-        assert_eq!(s.durable_end, 11);
+        assert_eq!(s.durable_end, 11 + 2 * CHECKSUM_BYTES);
         assert_eq!(s.in_flight.len(), 1);
     }
     later_pause.resume.notify_one();
@@ -278,16 +278,18 @@ async fn truncated_durable_prefix_is_rejected_without_repair() {
     let path = store.path(segment, "data");
     store.tasks.drain().await;
     drop(store);
+    // Keep the entire payload, but truncate one byte of its durable checksum.
+    let truncated = 5 + CHECKSUM_BYTES - 1;
     std::fs::OpenOptions::new()
         .write(true)
         .open(&path)
         .unwrap()
-        .set_len(4)
+        .set_len(truncated)
         .unwrap();
     assert!(
         SegmentStore::open(dir.path().to_owned(), 128 << 10, 256 << 10, 4 << 20, None).is_err()
     );
-    assert_eq!(std::fs::metadata(path).unwrap().len(), 4);
+    assert_eq!(std::fs::metadata(path).unwrap().len(), truncated);
 }
 
 #[tokio::test]

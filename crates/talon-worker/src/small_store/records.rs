@@ -1,15 +1,152 @@
-use super::{format, journal::Record, key_codec, keys::Keys};
+use super::{checksum_len, format, journal::Record, key_codec, keys::Keys};
 use crate::small_store::key::SmallIdentity;
 use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
 use std::io;
 use std::sync::OnceLock;
 
-const WIDTH: usize = 26;
+const OFFSET_BITS: u32 = 26;
+const OFFSET_LIMIT: u32 = 1 << OFFSET_BITS;
+const LENGTH_LIMIT: u32 = 1 << 22;
+
+#[derive(Clone, Copy)]
+struct CompactRow {
+    extent: [u8; 6],
+    hash: [u8; 4],
+}
+
+#[derive(Clone, Copy)]
+struct WideRow {
+    offset: u32,
+    len: u32,
+    hash: u32,
+}
+
+const _: () = assert!(size_of::<CompactRow>() == 10 && size_of::<WideRow>() == 12);
+
+impl CompactRow {
+    fn offset(&self) -> u32 {
+        u32::from_le_bytes(self.extent[..4].try_into().unwrap()) & (OFFSET_LIMIT - 1)
+    }
+
+    fn len(&self) -> u32 {
+        u32::from_le_bytes(self.extent[2..].try_into().unwrap()) >> (OFFSET_BITS - 16)
+    }
+
+    fn set_len_zero(&mut self) {
+        // The first 26 bits are the offset, including two bits of extent[3].
+        self.extent[3] &= 3;
+        self.extent[4..].fill(0);
+    }
+}
+
+impl From<CompactRow> for WideRow {
+    fn from(row: CompactRow) -> Self {
+        Self {
+            offset: row.offset(),
+            len: row.len(),
+            hash: u32::from_le_bytes(row.hash),
+        }
+    }
+}
+
+#[derive(Clone)]
+enum Rows {
+    Compact(Vec<CompactRow>),
+    Wide(Vec<WideRow>),
+}
+
+impl Default for Rows {
+    fn default() -> Self {
+        Self::Compact(Vec::new())
+    }
+}
+
+impl Rows {
+    fn len(&self) -> usize {
+        match self {
+            Self::Compact(rows) => rows.len(),
+            Self::Wide(rows) => rows.len(),
+        }
+    }
+
+    fn get(&self, index: usize) -> Option<WideRow> {
+        match self {
+            Self::Compact(rows) => rows.get(index).copied().map(WideRow::from),
+            Self::Wide(rows) => rows.get(index).copied(),
+        }
+    }
+
+    fn partition(&self, before: impl Fn(u32) -> bool) -> usize {
+        match self {
+            Self::Compact(rows) => rows.partition_point(|row| before(row.offset())),
+            Self::Wide(rows) => rows.partition_point(|row| before(row.offset)),
+        }
+    }
+
+    fn store(&mut self, index: usize, row: WideRow, replace: bool) {
+        if row.offset >= OFFSET_LIMIT || row.len >= LENGTH_LIMIT {
+            if let Self::Compact(rows) = self {
+                *self = Self::Wide(rows.iter().copied().map(WideRow::from).collect());
+            }
+        }
+        fn store<T>(rows: &mut Vec<T>, index: usize, row: T, replace: bool) {
+            if replace {
+                rows[index] = row;
+            } else {
+                if rows.len() == rows.capacity() {
+                    rows.reserve_exact(64);
+                }
+                rows.insert(index, row);
+            }
+        }
+        match self {
+            Self::Compact(rows) => {
+                let extent = u64::from(row.offset) | (u64::from(row.len) << OFFSET_BITS);
+                let row = CompactRow {
+                    extent: extent.to_le_bytes()[..6].try_into().unwrap(),
+                    hash: row.hash.to_le_bytes(),
+                };
+                store(rows, index, row, replace);
+            }
+            Self::Wide(rows) => store(rows, index, row, replace),
+        }
+    }
+
+    fn remove(&mut self, index: usize) {
+        match self {
+            Self::Compact(rows) => rows[index].set_len_zero(),
+            Self::Wide(rows) => rows[index].len = 0,
+        }
+    }
+
+    fn retain_live(&mut self) {
+        match self {
+            Self::Compact(rows) => rows.retain(|row| row.len() != 0),
+            Self::Wide(rows) => rows.retain(|row| row.len != 0),
+        }
+    }
+
+    fn shrink_to_fit(&mut self) {
+        match self {
+            Self::Compact(rows) => rows.shrink_to_fit(),
+            Self::Wide(rows) => rows.shrink_to_fit(),
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+enum Checksums {
+    #[default]
+    Unset,
+    Legacy(Vec<u64>),
+    Trailer,
+}
 
 #[derive(Clone, Default)]
 pub(super) struct Records {
-    rows: Vec<[u8; WIDTH]>,
+    rows: Rows,
+    checksums: Checksums,
     keys: Keys,
     live: usize,
 }
@@ -18,18 +155,19 @@ pub(super) struct Records {
 pub(super) struct Metadata {
     pub offset: u64,
     pub len: u64,
-    pub checksum: u64,
-    pub hash: u64,
-    pub charge: u64,
+    pub checksum: Option<u64>,
+    pub hash: u32,
 }
 
-pub(super) fn key_hash(key: &dyn SmallIdentity) -> u64 {
+impl Metadata {
+    pub fn stored_len(&self) -> u64 {
+        self.len + checksum_len(self.checksum)
+    }
+}
+
+pub(super) fn key_hash(key: &dyn SmallIdentity) -> u32 {
     static HASH: OnceLock<RandomState> = OnceLock::new();
-    HASH.get_or_init(RandomState::new).hash_one(key.view())
-}
-
-fn n32(bytes: &[u8]) -> u32 {
-    u32::from_le_bytes(bytes.try_into().unwrap())
+    HASH.get_or_init(RandomState::new).hash_one(key.view()) as u32
 }
 
 impl Records {
@@ -42,20 +180,22 @@ impl Records {
         self.live == 0
     }
 
-    pub fn metadata(&self, row: usize) -> Option<Metadata> {
-        let row = self.rows.get(row)?;
-        let len = u64::from(n32(&row[4..8]));
-        (len != 0).then(|| Metadata {
-            offset: u64::from(n32(&row[..4])),
-            len,
-            checksum: u64::from_le_bytes(row[8..16].try_into().unwrap()),
-            hash: u64::from_le_bytes(row[16..24].try_into().unwrap()),
-            charge: len + u64::from(u16::from_le_bytes(row[24..26].try_into().unwrap())) + 25 + 37,
+    pub fn metadata(&self, index: usize) -> Option<Metadata> {
+        let row = self.rows.get(index).filter(|row| row.len != 0)?;
+        let checksum = match &self.checksums {
+            Checksums::Legacy(checksums) => Some(checksums[index]),
+            _ => None,
+        };
+        Some(Metadata {
+            offset: u64::from(row.offset),
+            len: u64::from(row.len),
+            checksum,
+            hash: row.hash,
         })
     }
 
     pub fn matches(&self, row: usize, key: &[u8]) -> bool {
-        if self.metadata(row).is_none() {
+        if !matches!(self.rows.get(row), Some(meta) if meta.len != 0) {
             return false;
         }
         let Some((prefix, suffix)) = self.keys.get(row) else {
@@ -68,13 +208,11 @@ impl Records {
 
     pub fn get(&self, row: usize) -> Option<(u64, Record)> {
         let meta = self.metadata(row)?;
+        let (prefix, suffix) = self.keys.get(row).expect("small-object key");
         Some((
             meta.offset,
             Record {
-                key: {
-                    let (prefix, suffix) = self.keys.get(row).expect("small-object key");
-                    key_codec::decode(&[prefix, suffix].concat())
-                },
+                key: key_codec::decode(&[prefix, suffix].concat()),
                 len: meta.len,
                 checksum: meta.checksum,
             },
@@ -82,7 +220,7 @@ impl Records {
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (u64, Record)> + '_ {
-        (0..self.rows.len()).filter_map(|row| self.get(row))
+        (0..self.slots()).filter_map(|row| self.get(row))
     }
 
     #[cfg(test)]
@@ -95,93 +233,100 @@ impl Records {
     }
 
     pub fn overlaps(&self, offset: u64, len: u64) -> bool {
-        let next = self
-            .rows
-            .partition_point(|row| u64::from(n32(&row[..4])) < offset);
-        let live = |row: &&[u8; WIDTH]| n32(&row[4..8]) != 0;
-        self.rows[..next]
-            .iter()
-            .rev()
-            .find(live)
-            .is_some_and(|row| u64::from(n32(&row[..4])) + u64::from(n32(&row[4..8])) > offset)
-            || self.rows[next..]
-                .iter()
-                .find(live)
-                .is_some_and(|row| u64::from(n32(&row[..4])) < offset + len)
+        let next = self.position(offset);
+        self.crosses_before(next, offset)
+            || (next..self.slots())
+                .find_map(|row| self.metadata(row))
+                .is_some_and(|row| row.offset < offset + len)
     }
 
     pub fn crosses(&self, end: u64) -> bool {
-        let next = self
-            .rows
-            .partition_point(|row| u64::from(n32(&row[..4])) < end);
-        self.rows[..next]
-            .iter()
+        self.crosses_before(self.position(end), end)
+    }
+
+    fn crosses_before(&self, next: usize, end: u64) -> bool {
+        (0..next)
             .rev()
-            .find(|row| n32(&row[4..8]) != 0)
-            .is_some_and(|row| u64::from(n32(&row[..4])) + u64::from(n32(&row[4..8])) > end)
+            .find_map(|row| self.metadata(row))
+            .is_some_and(|row| row.offset + row.stored_len() > end)
     }
 
     pub fn insert(&mut self, offset: u64, record: Record) -> io::Result<usize> {
         format::validate_key(&record.key)?;
-        let key = record.key.view();
-        if !key.valid_extent(record.len)
+        if !record.key.view().valid_extent(record.len)
             || offset >= 1 << 30
             || record.len == 0
             || record.len > 128 << 20
-            || offset + record.len > 1 << 30
+            || offset + record.stored_len() > 1 << 30
         {
             return Err(format::invalid("invalid small-object record extent"));
         }
-        let mut row = [0; WIDTH];
-        row[..4].copy_from_slice(&(offset as u32).to_le_bytes());
-        row[4..8].copy_from_slice(&(record.len as u32).to_le_bytes());
-        row[8..16].copy_from_slice(&record.checksum.to_le_bytes());
-        row[16..24].copy_from_slice(&key_hash(&record.key).to_le_bytes());
-        row[24..26].copy_from_slice(&((format::key_len(&record.key) - 25) as u16).to_le_bytes());
+        if matches!(
+            (&self.checksums, record.checksum),
+            (Checksums::Trailer, Some(_)) | (Checksums::Legacy(_), None)
+        ) {
+            return Err(format::invalid(
+                "mixed small-object checksum formats in segment",
+            ));
+        }
+        let row = WideRow {
+            offset: offset as u32,
+            len: record.len as u32,
+            hash: key_hash(&record.key),
+        };
         let key = key_codec::encode(&record.key);
         let vacant = self.position(offset);
-        if self
+        let replace = self
             .rows
             .get(vacant)
-            .is_some_and(|row| u64::from(n32(&row[..4])) == offset && n32(&row[4..8]) == 0)
+            .is_some_and(|row| u64::from(row.offset) == offset && row.len == 0);
+        let index = if replace {
+            vacant
+        } else {
+            self.rows.partition(|o| u64::from(o) <= offset)
+        };
+        self.keys.insert(index, &key, replace)?;
+        if matches!(self.checksums, Checksums::Unset) {
+            self.checksums = if record.checksum.is_some() {
+                Checksums::Legacy(Vec::new())
+            } else {
+                Checksums::Trailer
+            };
+        }
+        if let (Checksums::Legacy(checksums), Some(checksum)) =
+            (&mut self.checksums, record.checksum)
         {
-            self.keys.insert(vacant, &key, true)?;
-            self.rows[vacant] = row;
-            self.live += 1;
-            return Ok(vacant);
+            if replace {
+                checksums[index] = checksum;
+            } else {
+                if checksums.len() == checksums.capacity() {
+                    checksums.reserve_exact(64);
+                }
+                checksums.insert(index, checksum);
+            }
         }
-        let index = self
-            .rows
-            .partition_point(|row| u64::from(n32(&row[..4])) <= offset);
-        if self.rows.len() == self.rows.capacity() {
-            self.rows.reserve_exact(64);
-        }
-        self.keys.insert(index, &key, false)?;
-        self.rows.insert(index, row);
+        self.rows.store(index, row, replace);
         self.live += 1;
         Ok(index)
     }
 
     pub fn remove(&mut self, offset: &u64) -> Option<()> {
-        let index = self
-            .rows
-            .partition_point(|row| u64::from(n32(&row[..4])) < *offset);
-        let index = (index..self.rows.len())
-            .take_while(|&i| u64::from(n32(&self.rows[i][..4])) == *offset)
-            .find(|&i| n32(&self.rows[i][4..8]) != 0)?;
+        let index = (self.position(*offset)..self.slots())
+            .take_while(|&i| u64::from(self.rows.get(i).unwrap().offset) == *offset)
+            .find(|&i| self.rows.get(i).unwrap().len != 0)?;
         self.keys.remove(index);
-        self.rows[index][4..8].fill(0);
+        self.rows.remove(index);
         self.live -= 1;
-        if (self.rows.len() - self.live) * 100 >= self.rows.len() {
+        if (self.slots() - self.live) * 100 >= self.slots() {
             self.compact();
         }
         Some(())
     }
 
     pub fn retain_before(&mut self, end: u64) {
-        for row in &mut self.rows {
-            if u64::from(n32(&row[..4])) >= end && n32(&row[4..8]) != 0 {
-                row[4..8].fill(0);
+        for index in self.position(end)..self.slots() {
+            if self.rows.get(index).unwrap().len != 0 {
+                self.rows.remove(index);
                 self.live -= 1;
             }
         }
@@ -193,16 +338,22 @@ impl Records {
     }
 
     pub fn position(&self, offset: u64) -> usize {
-        self.rows
-            .partition_point(|row| u64::from(n32(&row[..4])) < offset)
+        self.rows.partition(|o| u64::from(o) < offset)
+    }
+
+    pub(super) fn offset_at(&self, row: usize) -> u64 {
+        u64::from(self.rows.get(row).unwrap().offset)
     }
 
     pub fn compacts_after_remove(&self) -> bool {
-        (self.rows.len() - self.live + 1) * 100 >= self.rows.len()
+        (self.slots() - self.live + 1) * 100 >= self.slots()
     }
 
     pub fn shrink_to_fit(&mut self) {
         self.rows.shrink_to_fit();
+        if let Checksums::Legacy(checksums) = &mut self.checksums {
+            checksums.shrink_to_fit();
+        }
         self.keys.shrink_to_fit();
     }
 
@@ -212,8 +363,17 @@ impl Records {
     }
 
     fn compact(&mut self) {
-        self.keys.retain(|row| n32(&self.rows[row][4..8]) != 0);
-        self.rows.retain(|row| n32(&row[4..8]) != 0);
+        let live = |row| self.rows.get(row).unwrap().len != 0;
+        self.keys.retain(live);
+        if let Checksums::Legacy(checksums) = &mut self.checksums {
+            let mut index = 0;
+            checksums.retain(|_| {
+                let keep = live(index);
+                index += 1;
+                keep
+            });
+        }
+        self.rows.retain_live();
         self.shrink_to_fit();
     }
 }
@@ -233,7 +393,43 @@ mod tests {
                 Version::new("版本"),
             )),
             len: 10,
-            checksum: u64::MAX,
+            checksum: Some(u64::MAX),
+        }
+    }
+
+    #[test]
+    fn compact_rows_keep_full_extents_and_widen_at_either_limit() {
+        let mut records = Records::default();
+        let mut last_compact = record("compact");
+        last_compact.checksum = None;
+        last_compact.len = u64::from(LENGTH_LIMIT - 1);
+        let offset = u64::from(OFFSET_LIMIT - 1);
+        let end = offset + last_compact.stored_len();
+        let row = records.insert(offset, last_compact).unwrap();
+        let meta = records.metadata(row).unwrap();
+        assert_eq!(
+            (meta.offset, meta.len),
+            (offset, u64::from(LENGTH_LIMIT - 1))
+        );
+        assert!(matches!(records.rows, Rows::Compact(_)));
+        assert!(records.overlaps(end - 1, 1));
+        assert!(records.crosses(end - 1));
+        assert!(!records.crosses(end));
+        assert!(!records.overlaps(end, 1));
+
+        for (offset, len) in [(end, 1), (0, u64::from(LENGTH_LIMIT))] {
+            let mut copy = records.clone();
+            let mut wide = record("wide");
+            wide.checksum = None;
+            wide.len = len;
+            let inserted = copy.insert(offset, wide).unwrap();
+            assert!(matches!(copy.rows, Rows::Wide(_)));
+            let meta = copy.metadata(inserted).unwrap();
+            assert_eq!((meta.offset, meta.len), (offset, len));
+            copy.remove(&offset).unwrap();
+            let meta = copy.metadata(0).unwrap();
+            assert_eq!(meta.offset, u64::from(OFFSET_LIMIT - 1));
+            assert_eq!(meta.len, u64::from(LENGTH_LIMIT - 1));
         }
     }
 
@@ -244,7 +440,7 @@ mod tests {
         records.insert(20, expected.clone()).unwrap();
         records.insert(0, record("first")).unwrap();
         assert_eq!(records.get(1).unwrap().1.to_owned().key, expected.key);
-        assert_eq!(records.get(1).unwrap().1.checksum, u64::MAX);
+        assert_eq!(records.get(1).unwrap().1.checksum, Some(u64::MAX));
         assert!(records.overlaps(15, 6));
         assert!(!records.overlaps(10, 10));
         assert!(records.crosses(25));
@@ -275,7 +471,7 @@ mod tests {
                     Record {
                         key: SmallKey::new(&exact),
                         len: 16,
-                        checksum: 7,
+                        checksum: Some(7),
                     },
                 )
                 .unwrap();
@@ -342,8 +538,8 @@ mod tests {
             assert!(records.matches(row, &key_codec::encode(&want.key)));
             assert_eq!(records.metadata(row).unwrap().hash, key_hash(&want.key));
             assert_eq!(
-                records.metadata(row).unwrap().charge,
-                super::super::charge(&want.key, want.len)
+                records.metadata(row).unwrap().stored_len(),
+                want.stored_len()
             );
         }
         assert_eq!(records.len(), expected.len());
@@ -390,7 +586,7 @@ mod tests {
             let value = Record {
                 key: SmallKey::new(&key),
                 len: i + 1,
-                checksum: i,
+                checksum: Some(i),
             };
             records.insert(i * 100, value.clone()).unwrap();
             expected.push(value);

@@ -13,7 +13,7 @@ fn snapshot_keeps_rows_when_live_deletion_compacts_and_append_moves_them() {
         record: Record {
             key: crate::small_store::key::SmallKey::new(&id(key)),
             len: 5,
-            checksum: offset,
+            checksum: Some(offset),
         },
     };
     let mut model = Model::default();
@@ -76,7 +76,7 @@ fn dense_segment_snapshot_restores_one_hundred_thousand_extents() {
                 record: Record {
                     key: crate::small_store::key::SmallKey::new(&id(&offset.to_string())),
                     len: 1,
-                    checksum: offset,
+                    checksum: Some(offset),
                 },
             })
             .unwrap();
@@ -90,7 +90,7 @@ fn dense_segment_snapshot_restores_one_hundred_thousand_extents() {
     }
     assert_eq!(restored.segments[&1].records.len(), 100_000);
     for (offset, record) in restored.segments[&1].records.iter() {
-        assert_eq!(record.checksum, offset);
+        assert_eq!(record.checksum, Some(offset));
         assert_eq!(
             crate::small_store::key::SmallIdentity::view(&record.key),
             crate::small_store::key::SmallIdentity::view(&id(&offset.to_string()))
@@ -115,7 +115,7 @@ fn sealed_snapshot_preserves_deleted_rows_and_frozen_prefix_dictionaries() {
                             "path/".repeat(40)
                         ))),
                         len: 1,
-                        checksum: offset,
+                        checksum: Some(offset),
                     },
                 })
                 .unwrap();
@@ -147,7 +147,7 @@ fn sealed_snapshot_preserves_deleted_rows_and_frozen_prefix_dictionaries() {
         assert_eq!(records.len(), 299);
         for (offset, record) in records.iter() {
             assert_ne!(offset, 7);
-            assert_eq!(record.checksum, offset);
+            assert_eq!(record.checksum, Some(offset));
             assert_eq!(
                 record.key,
                 crate::small_store::key::SmallKey::new(&id(&format!(
@@ -253,7 +253,7 @@ fn flush_boundaries_reject_record_splits_and_regression() {
                 record: Record {
                     key: crate::small_store::key::SmallKey::new(&id(key)),
                     len: 5,
-                    checksum: 0,
+                    checksum: Some(0),
                 },
             })
             .unwrap();
@@ -476,7 +476,7 @@ async fn recovered_small_store_tail_uses_initial_snapshot_budget() {
                     record: Record {
                         key: key.clone(),
                         len: 1,
-                        checksum: 0,
+                        checksum: Some(0),
                     },
                 },
                 Ack::Written,

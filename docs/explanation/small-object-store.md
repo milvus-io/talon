@@ -45,26 +45,30 @@ The runtime coordinates store selection, capacity accounting, GC, and shutdown
 checkpoints.
 
 `SmallObjectStore` owns its residency directory. READ and LOAD choose the store
-from the complete object size; a packed hit resolves its segment extent and
-access token without consulting `BlockIndex`. Ordinary whole and paged entries
-remain in `BlockIndex`. Small objects register directly with the shared LRU as
-whole-object eviction units, retaining capacity, idle, and ownership policies
-without a second residency entry. The locator carries the shared access token;
-relocation preserves that token and recovery reconstructs policy from locators.
+from the complete object size. A packed hit resolves its segment extent from
+this directory. Ordinary whole and paged entries remain in `BlockIndex`. Small
+objects register directly with the shared LRU as whole-object eviction units,
+retaining capacity, idle, and ownership policies without a second residency
+entry. Relocation preserves any existing access token.
 `GetCachedRange` remains an ordinary whole/paged-store operation: an object
 resident only in small storage returns `CacheMiss`, without origin access.
 Packed keys do not participate in cross-version supersession. Page TTI applies
 to the whole small object using its shared access timestamp, including when
-paged L2 is disabled. With TTI enabled, reads update memory and coalesce dirty
-notifications per resident token. Tokens share the store's encoded key and do
-not pin payloads. The existing access-checkpoint interval flushes only dirty
-keys to `small/access.log`; graceful shutdown performs the same flush. A clean
-cycle does not traverse the resident index or write either access file.
+paged L2 is disabled. When stale-version and ownership GC are disabled, Small
+Store maintains an 8-byte access timestamp alongside each index row and uses its
+compact capacity policy. A read validates the key and range, then updates the
+row's timestamp and second-chance bit under the existing lookup read lock.
+A bit in the timestamp marks changes for checkpointing. Idle scans visit segment
+rows in bounded batches. The legacy per-object policy
+also supports the block-level scans used by stale-version and ownership GC.
+The access-checkpoint interval flushes only dirty keys to `small/access.log`;
+graceful shutdown performs the same flush.
 
 `small/access.checkpoint` is a full base snapshot. The first flush, migration
 from `TLSA0001`, or a log reaching `max(1 MiB, base snapshot size / 2)` rebuilds it
-from current residents. This remains O(N) CPU, memory and sequential writes,
-but is removed from the normal periodic flush. Recovery also requests a base
+from current residents. The compact policy reads and writes the existing formats
+in bounded batches, deriving each encoded key from the index when it is saved.
+Recovery also requests a base
 checkpoint when a resident key has no saved age, or an age needed clock repair,
 so repeated restarts do not keep granting that key a fresh idle window.
 Deleted identities disappear
@@ -181,12 +185,17 @@ retain independent active/spare segments but do not own separate directories or
 index files. Payload files are created exclusively and never overwritten.
 
 The metadata writer owns checksummed, versioned log records: insert (stream,
-segment, offset, length, checksum, full identity), delete (segment, offset), flush
+segment, offset, payload length, full identity), delete (segment, offset), flush
 (segment, durable end), seal, recovery truncation, and atomic replacement of an
 old segment with a new one. Metadata is kept separate
 from payloads; it is not a redo log containing origin data. Identity includes
 backend, bucket, path, version, block offset and block size, compared in full.
 Sendfile/splice still use retained payload descriptors and explicit byte ranges.
+Each new record stores its 64-bit payload checksum immediately after the payload.
+Journal and snapshot insert records identify this layout, so checkpoints can
+write the locator without reading the payload. Older segments keep the checksum
+in the insert record and remain readable, including after relocation. Binaries
+that predate the checksum trailer require a new cache root after downgrade.
 
 `metadata/CURRENT` selects a checksummed snapshot and an explicit ordered set of
 log generations to replay. It also records exact pending cleanup paths.
@@ -287,7 +296,8 @@ LOAD residency checks and L1 hits use only the in-memory directory.
 A read takes an asynchronous directory lease until its fd is retained. Compaction
 excludes new leases while replacing locators and unlinking files, so a pending
 open cannot race unlink. Returned handles retain the old inode independently.
-Packed byte reads still verify the complete object's checksum; promoted L1 pages
+Packed byte reads verify the complete object and fetch its checksum trailer in
+the same read. Sendfile ranges end at the payload boundary. Promoted L1 pages
 each own only their charged bytes, even after sibling pages are evicted.
 
 Each data stream still permits up to 32 concurrent appends. Append reserves its
@@ -395,6 +405,8 @@ transiently exceed it. Crossing that target does not reject an admission;
 actual filesystem I/O errors still propagate. Filesystem free space must
 accommodate those temporary allocations, normal large-object writes, and
 filesystem overhead; this cache budget is not a filesystem-wide reservation.
+The eviction policy weights a small item by its payload bytes plus the checksum
+trailer when present. Segment rollovers still account for record metadata.
 Under pressure, small objects, ordinary blocks, and pages share each namespace's
 second-chance eviction queue. Segment placement does not determine which objects
 are cold. Capacity reclamation has two phases:
@@ -402,7 +414,7 @@ are cold. Capacity reclamation has two phases:
 1. Select victims in bounded batches. Whole blocks/pages release their files;
    small objects append tombstones. Carry the small-store reclaim estimate across
    batches instead of repeatedly charging the same physical excess. The estimate
-   uses live payload lengths rounded to filesystem allocation units, plus retired
+   uses live record extents rounded to filesystem allocation units, plus retired
    payload files awaiting their last reader. Global metadata remains charged and
    is reclaimed independently by checkpointing. Only segments
    exceeding the shared 50% garbage threshold (by logical payload plus metadata

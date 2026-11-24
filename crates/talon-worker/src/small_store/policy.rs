@@ -58,6 +58,7 @@ impl SmallAccess {
         let catalog = catalog.read().unwrap();
         if let Some(slot) = self.slot(&catalog) {
             catalog.lookup.reference(slot);
+            catalog.touch_recency(slot);
         }
     }
 
@@ -106,6 +107,22 @@ impl SmallAccess {
             && state.revision == revision
             && catalog.lookup.flags(slot) & REFERENCED == 0
     }
+
+    pub(crate) fn is_idle_at(&self, now: u64, age: u64) -> bool {
+        let Some(catalog) = self.catalog.upgrade() else {
+            return false;
+        };
+        let catalog = catalog.read().unwrap();
+        let Some(slot) = self.slot(&catalog) else {
+            return false;
+        };
+        age != 0
+            && catalog.lookup.flags(slot) & VISIBLE != 0
+            && self.state.lock().unwrap().pins == 0
+            && catalog.recency_at(slot).is_some_and(|(recency, value)| {
+                now.saturating_sub(recency.time(value.load(Ordering::Relaxed))) > age
+            })
+    }
 }
 
 impl Catalog {
@@ -122,8 +139,8 @@ impl Catalog {
         let (address, record) = self
             .metadata(self.lookup.handle(slot))
             .expect("small policy record");
-        let charge = record.charge;
-        let access = self.compact_access(slot, address, charge);
+        let stored_len = record.stored_len();
+        let access = self.compact_access(slot, address, stored_len);
         let state = *access
             .small()
             .expect("compact access token")
@@ -137,9 +154,9 @@ impl Catalog {
         &self,
         slot: usize,
         address: Address,
-        charge: u64,
+        stored_len: u64,
     ) -> AccessHandle {
-        let bytes = self.charges.get(&address).copied().unwrap_or(charge);
+        let bytes = self.charges.get(&address).copied().unwrap_or(stored_len);
         let ticket = self.tickets.get_or_insert(address, || SmallAccess {
             catalog: self.owner.clone(),
             tickets: Arc::downgrade(&self.tickets),
@@ -185,7 +202,7 @@ impl Catalog {
                 !self.policy.contains_key(&address),
                 "generic policy already installed"
             );
-            total.0 += record.charge;
+            total.0 += record.stored_len();
             total.1 += 1;
             self.lookup.set_flags(slot, flags | POLICY);
         }
@@ -195,17 +212,17 @@ impl Catalog {
     pub(super) fn compact_admit(&mut self, slot: usize, bytes: u64, clock: bool) -> AccessHandle {
         let (address, record) = self.metadata(self.lookup.handle(slot)).unwrap();
         let stream = self.segment(address.0).unwrap().slot;
-        let charge = record.charge;
+        let stored_len = record.stored_len();
         let flags = self.lookup.flags(slot);
         let old = if flags & POLICY != 0 {
-            self.charges.get(&address).copied().unwrap_or(charge)
+            self.charges.get(&address).copied().unwrap_or(stored_len)
         } else {
             0
         };
         let total = self.compact_totals.entry(stream).or_default();
         total.0 = total.0 - old + bytes;
         total.1 += usize::from(flags & POLICY == 0);
-        if bytes == charge {
+        if bytes == stored_len {
             self.charges.remove(&address);
         } else {
             self.charges.insert(address, bytes);
@@ -219,7 +236,9 @@ impl Catalog {
             state.bytes = bytes;
             state.revision = revision;
         }
-        if clock {
+        if self.recency.is_some() {
+            self.touch_recency(slot);
+        } else if clock {
             entry.access = entry.access.enable_clock();
             self.access.insert(address, entry.access.clone());
         }
