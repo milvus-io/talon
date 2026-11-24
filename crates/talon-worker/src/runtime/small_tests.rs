@@ -110,6 +110,7 @@ fn runtime_with_tracking(
         WorkerMetrics::new(capacity),
         tracking,
         tracking,
+        false,
     );
     if paged {
         worker = worker.with_paged_store(PagedBlockStore::open(root.join("paged"), 1024).unwrap());

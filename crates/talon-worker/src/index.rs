@@ -719,12 +719,15 @@ impl BlockIndex {
         unit: &impl crate::eviction::UnitKey,
         bytes: u64,
         clock: bool,
+        allow_uninitialized: bool,
     ) -> Option<AccessHandle> {
         let key = SmallRef::from_unit(unit);
-        self.small_directory(&key)?
-            .write()
-            .unwrap()
-            .compact_admit(&key, bytes, clock)
+        let directory = self.small_directory(&key)?;
+        let mut directory = directory.write().unwrap();
+        if !allow_uninitialized && !directory.has_recency() {
+            return None;
+        }
+        directory.compact_admit(&key, bytes, clock)
     }
 
     pub(crate) fn compact_small_directories(

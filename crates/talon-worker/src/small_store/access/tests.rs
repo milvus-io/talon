@@ -111,6 +111,170 @@ fn log(root: &Path) -> HashMap<CacheUnit, u64> {
     ages
 }
 
+fn open_compact(root: &Path) -> (Arc<SmallObjectStore>, Arc<Lru>) {
+    let store = Arc::new(
+        SmallObjectStore::open(root.to_owned(), 128 << 10, 256 << 10, 16 << 20, None).unwrap(),
+    );
+    let index = Arc::new(crate::BlockIndex::new());
+    let mut units = Vec::new();
+    store.restore_policy_units(&index, &mut units, false);
+    assert!(units.is_empty());
+    store.init_recency();
+    let policy = Arc::new(Lru::from_recovered(index, units, store.len(), false, true));
+    store.bind_policy(policy.clone());
+    store.enable_access_tracking().unwrap();
+    (store, policy)
+}
+
+fn compact_age(store: &SmallObjectStore, key: &BlockId) -> u64 {
+    let catalog = store.journal.model.0.read().unwrap();
+    let slot = catalog
+        .find(&key.view(), super::super::lookup::VISIBLE)
+        .unwrap();
+    let (recency, time) = catalog.recency_at(slot).unwrap();
+    recency.time(time.load(Ordering::Relaxed))
+}
+
+#[tokio::test]
+async fn compact_read_updates_the_matched_row_without_a_policy_ticket() {
+    use super::super::lookup::{REFERENCED, VISIBLE};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (store, policy) = open_compact(dir.path());
+    let key = id(1);
+    store
+        .put(&key, Bytes::from_static(b"payload"))
+        .await
+        .unwrap();
+    let cold = access_millis() - 30_000;
+    let revision = {
+        let catalog = store.journal.model.0.read().unwrap();
+        let slot = catalog.find(&key.view(), VISIBLE).unwrap();
+        let (_, time) = catalog.recency_at(slot).unwrap();
+        time.store(cold, Ordering::Relaxed);
+        catalog.lookup.take_reference(slot);
+        catalog.revision.load(Ordering::Relaxed)
+    };
+
+    assert!(store.get_range(&key, 5, 3).await.is_err());
+    assert!(store.get_range(&id(2), 0, 3).await.unwrap().is_none());
+    assert_eq!(compact_age(&store, &key), cold);
+    {
+        let catalog = store.journal.model.0.read().unwrap();
+        let slot = catalog.find(&key.view(), VISIBLE).unwrap();
+        assert_eq!(catalog.lookup.flags(slot) & REFERENCED, 0);
+    }
+
+    let handle = store.get_range(&key, 2, 3).await.unwrap().unwrap();
+    let data = super::super::disk_io::read(handle.fd, handle.offset, handle.len as usize)
+        .await
+        .unwrap();
+    assert_eq!(&data[..], b"ylo");
+    assert!(compact_age(&store, &key) > cold);
+    {
+        let catalog = store.journal.model.0.read().unwrap();
+        let slot = catalog.find(&key.view(), VISIBLE).unwrap();
+        assert_ne!(catalog.lookup.flags(slot) & REFERENCED, 0);
+        assert_eq!(catalog.revision.load(Ordering::Relaxed), revision);
+        assert_eq!(catalog.tickets.len(), 0);
+    }
+
+    let entry = policy
+        .index()
+        .policy_get(&CacheUnit::Whole(key.clone()))
+        .unwrap();
+    let ticket = entry.access.small().unwrap();
+    let revision = ticket.snapshot();
+    assert!(ticket.is_current(revision));
+    assert!(store.get(&key).await.unwrap().is_some());
+    assert!(!ticket.is_current(revision));
+}
+
+#[tokio::test]
+async fn compact_access_replays_legacy_ages_and_rechecks_idle_candidates() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = id(1);
+    let cold = access_millis() - 30_000;
+    {
+        let store = open(dir.path());
+        put(&store, &key).await;
+        store.maintain(true).await.unwrap();
+        let mut checkpoint = LEGACY.to_vec();
+        encode(&mut checkpoint, &key, cold).unwrap();
+        std::fs::write(dir.path().join(FILE), checkpoint).unwrap();
+    }
+
+    let (store, _) = open_compact(dir.path());
+    assert_eq!(compact_age(&store, &key), cold);
+    flush(&store).await;
+    let now = access_millis();
+    let mut candidates = store.idle_recency_candidates(&mut (0, 0), now, 10_000, 10, 10);
+    assert_eq!(candidates.len(), 1);
+    let (unit, ticket) = candidates.pop().unwrap();
+    store.read(&key).await.unwrap().unwrap();
+    assert!(!store
+        .delete_idle(unit, ticket, move || (now, 10_000))
+        .await
+        .unwrap());
+    let touched = compact_age(&store, &key);
+    assert!(touched >= now);
+    flush(&store).await;
+    assert_eq!(
+        log(dir.path()),
+        HashMap::from([(CacheUnit::Whole(key.clone()), touched)])
+    );
+    drop(store);
+
+    let (store, policy) = open_compact(dir.path());
+    assert_eq!(compact_age(&store, &key), touched);
+    let now = touched + 30_000;
+    let (unit, ticket) = store
+        .idle_recency_candidates(&mut (0, 0), now, 10_000, 10, 10)
+        .pop()
+        .unwrap();
+    assert!(store
+        .delete_idle(unit, ticket, move || (now, 10_000))
+        .await
+        .unwrap());
+    assert!(!store.contains(&key));
+    assert_eq!(policy.len(), 0);
+}
+
+#[tokio::test]
+async fn compact_access_keeps_ages_through_row_compaction_and_relocation() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, policy) = open_compact(dir.path());
+    for n in 0..6 {
+        store
+            .put(&id(n), Bytes::from(vec![n as u8; 48 << 10]))
+            .await
+            .unwrap();
+    }
+    let key = id(3);
+    let before = store.lookup_entry(&key).unwrap().unwrap();
+    let retained = store.get_range(&key, 4, 8).await.unwrap().unwrap();
+    let age = compact_age(&store, &key);
+    for n in 0..3 {
+        store.delete(&id(n)).await.unwrap();
+        policy.remove(&CacheUnit::Whole(id(n)));
+    }
+    store.maintain(true).await.unwrap();
+    let after = store.lookup_entry(&key).unwrap().unwrap();
+    assert_ne!(before.segment, after.segment);
+    assert_eq!(compact_age(&store, &key), age);
+    let data = super::super::disk_io::read(retained.fd, retained.offset, retained.len as usize)
+        .await
+        .unwrap();
+    assert_eq!(&data[..], &[3; 8]);
+    flush(&store).await;
+    store.access_disk.lock().unwrap().log_bytes = MIN_COMPACT_BYTES;
+    flush(&store).await;
+    assert!(log(dir.path()).is_empty());
+    drop(store);
+    let (store, _) = open_compact(dir.path());
+    assert_eq!(compact_age(&store, &key), age);
+}
+
 #[test]
 fn access_records_preserve_whole_and_exact_range_identities() {
     let whole = CacheUnit::Whole(id(0));
@@ -440,7 +604,7 @@ async fn million_item_sparse_access_probe() {
                 segment: 1,
                 offset: n as u64,
                 len: 1,
-                checksum: 0,
+                checksum: Some(0),
                 access: Some(store.attach_access(key, AccessHandle::default(), false)),
             },
         );

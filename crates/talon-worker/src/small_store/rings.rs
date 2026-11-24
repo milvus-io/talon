@@ -11,7 +11,7 @@ type Stream = Arc<OnceCell<Arc<SegmentStore>>>;
 pub struct SmallObjectStore {
     pub(super) root: PathBuf,
     fallback: Arc<SegmentStore>,
-    journal: Arc<journal::Journal>,
+    pub(super) journal: Arc<journal::Journal>,
     allocation_unit: u64,
     pub(super) access_checkpoint: tokio::sync::Mutex<()>,
     #[cfg(test)]
@@ -213,34 +213,80 @@ impl SmallObjectStore {
 
     /// Resolve all ring-owned records through the namespace's shared index.
     pub(crate) fn lookup_entry(&self, id: &dyn SmallIdentity) -> io::Result<Option<Location>> {
-        if id.view().kind != crate::eviction::UnitKind::ExactRange && id.view().offset != 0 {
+        let id = id.view();
+        if !Self::validate_lookup_key(&id)? {
             return Ok(None);
         }
-        format::validate_key(&id.view())?;
-        Ok(self.journal.model.lookup(&id.view()))
+        Ok(self.journal.model.lookup(&id))
     }
 
-    pub(crate) async fn lookup(
+    fn validate_lookup_key(id: &super::key::SmallRef<'_>) -> io::Result<bool> {
+        if id.kind != crate::eviction::UnitKind::ExactRange && id.offset != 0 {
+            return Ok(false);
+        }
+        format::validate_key(id)?;
+        Ok(true)
+    }
+
+    fn lookup_read<T, E: From<io::Error>>(
+        &self,
+        id: &dyn SmallIdentity,
+        validate: impl FnOnce(u64) -> Result<T, E>,
+    ) -> Result<Option<(Location, T)>, E> {
+        let id = id.view();
+        if !Self::validate_lookup_key(&id)? {
+            return Ok(None);
+        }
+        self.journal.model.lookup_read(&id, validate)
+    }
+
+    pub(crate) fn touch_entry<T, E: From<io::Error>>(
+        &self,
+        id: &dyn SmallIdentity,
+        validate: impl FnOnce(u64) -> Result<T, E>,
+    ) -> Result<Option<T>, E> {
+        Ok(self.lookup_read(id, validate)?.map(|(loc, range)| {
+            loc.touch();
+            range
+        }))
+    }
+
+    pub(crate) async fn read_location<T, E: From<io::Error>>(
         &self,
         id: &(impl SmallStoreKey + ?Sized),
-    ) -> io::Result<Option<ReadLocation>> {
-        let _readers = self.journal.readers.read().await;
-        match self.lookup_entry(&id.view())? {
-            Some(location) => Ok(Some(location.retain().await?)),
-            None => Ok(None),
-        }
+        validate: impl FnOnce(u64) -> Result<T, E>,
+    ) -> Result<Option<(ReadLocation, T)>, E> {
+        let readers = self.journal.readers.read().await;
+        let Some((location, range)) = self.lookup_read(&id.view(), validate)? else {
+            return Ok(None);
+        };
+        let loc = location.retain().await?;
+        drop(readers);
+        loc.touch();
+        Ok(Some((loc, range)))
+    }
+
+    pub(crate) async fn get_range(
+        &self,
+        id: &(impl SmallStoreKey + ?Sized),
+        offset: u64,
+        len: u64,
+    ) -> io::Result<Option<BlockHandle>> {
+        self.read_location(id, |payload_len| validate_range(payload_len, offset, len))
+            .await?
+            .map(|(loc, ())| loc.range(offset, len))
+            .transpose()
     }
 
     pub async fn get(&self, id: &(impl SmallStoreKey + ?Sized)) -> io::Result<Option<BlockHandle>> {
-        self.lookup(id)
+        self.read_location(id, Ok::<_, io::Error>)
             .await?
-            .map(|loc| loc.range(0, loc.len()))
+            .map(|(loc, len)| loc.range(0, len))
             .transpose()
     }
 
     pub async fn read(&self, id: &(impl SmallStoreKey + ?Sized)) -> io::Result<Option<Bytes>> {
-        if let Some(loc) = self.lookup(id).await? {
-            loc.touch();
+        if let Some((loc, _)) = self.read_location(id, Ok::<_, io::Error>).await? {
             return Ok(Some(loc.read().await?));
         }
         Ok(None)
@@ -281,6 +327,38 @@ impl SmallObjectStore {
                     stream.delete_inner(&id).await?;
                 }
                 Ok(())
+            })
+            .await
+    }
+
+    pub(crate) async fn delete_idle(
+        self: &Arc<Self>,
+        id: CacheUnit,
+        ticket: Arc<super::policy::SmallAccess>,
+        expiry: impl FnOnce() -> (u64, u64) + Send + 'static,
+    ) -> io::Result<bool> {
+        let store = self.clone();
+        self.tasks
+            .run(async move {
+                let _guard = store.mutation(&id).await;
+                let Some(stream) = store.owner(&id) else {
+                    return Ok(false);
+                };
+                let removed = stream
+                    .delete_inner_if(&id, |loc| {
+                        let (now, age) = expiry();
+                        loc.access
+                            .as_ref()
+                            .and_then(AccessHandle::small)
+                            .is_some_and(|current| {
+                                Arc::ptr_eq(current, &ticket) && current.is_idle_at(now, age)
+                            })
+                    })
+                    .await?;
+                if removed {
+                    store.policy().expect("compact small policy").remove(&id);
+                }
+                Ok(removed)
             })
             .await
     }
@@ -350,7 +428,7 @@ impl SmallObjectStore {
             self.policy.set(policy).is_ok(),
             "small store already bound to a runtime"
         );
-        if track_clock {
+        if track_clock && !self.has_recency() {
             self.restore_access();
         }
     }
@@ -394,7 +472,7 @@ impl SmallObjectStore {
 
     /// Only threshold-eligible segments provide planning credit. Garbage in a
     /// mostly-live segment cannot cover pressure until more items are evicted.
-    /// Planning credit, never physical accounting. Round live payload lengths
+    /// Planning credit, never physical accounting. Round live record extents
     /// to destination file allocation units. Computed only on the
     /// pressure path, not by walking all segments on each append.
     pub(crate) async fn reclaimable_bytes(&self) -> u64 {
@@ -411,7 +489,7 @@ impl SmallObjectStore {
                 let destination = if s.live == 0 {
                     0
                 } else {
-                    s.live_payload.div_ceil(self.allocation_unit) * self.allocation_unit
+                    s.live_data_bytes.div_ceil(self.allocation_unit) * self.allocation_unit
                 };
                 bytes += s.allocated.saturating_sub(destination);
             }
@@ -554,7 +632,11 @@ mod tests {
                     .maintain_with_budget(false, Some(budget.clone()))
                     .await
                     .unwrap());
-                let payload_io = if survivor { 2 * 2048 } else { 0 };
+                let payload_io = if survivor {
+                    2 * (2048 + CHECKSUM_BYTES)
+                } else {
+                    0
+                };
                 assert_eq!(budget.charged_bytes(), payload_io + log_bytes() - before);
             }
         });
@@ -847,7 +929,10 @@ mod recovery_tests {
         let location = store.lookup_entry(&id(0)).unwrap().unwrap();
         let held = location.file.fd.lock().await;
         let reader_store = store.clone();
-        let task = tokio::spawn(async move { reader_store.lookup(&id(0)).await });
+        let task =
+            tokio::spawn(
+                async move { reader_store.read_location(&id(0), Ok::<_, io::Error>).await },
+            );
         tokio::time::timeout(Duration::from_secs(5), async {
             while stream.readers.try_write().is_ok() {
                 tokio::task::yield_now().await;
@@ -861,7 +946,11 @@ mod recovery_tests {
         assert!(matches!(task.await, Err(error) if error.is_cancelled()));
         assert!(stream.readers.try_write().is_ok());
         drop(held);
-        let retained = store.lookup(&id(0)).await.unwrap().unwrap();
+        let (retained, _) = store
+            .read_location(&id(0), Ok::<_, io::Error>)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(stream.readers.try_write().is_ok());
         store.delete(&id(0)).await.unwrap();
         store.maintain(true).await.unwrap();
@@ -1006,16 +1095,16 @@ mod recovery_tests {
         let policy = Arc::new(crate::Lru::from_recovered(index, units, 0, false, false));
         store.bind_policy(policy.clone());
         assert_eq!(policy.len(), 1);
-        assert_eq!(policy.total_bytes(), charge(&id(0), 4));
+        assert_eq!(policy.total_bytes(), 4 + CHECKSUM_BYTES);
 
         store.put(&id(1), Bytes::from_static(b"new")).await.unwrap();
         assert_eq!(policy.len(), 2);
-        assert_eq!(policy.total_bytes(), charge(&id(0), 4) + charge(&id(1), 3));
+        assert_eq!(policy.total_bytes(), 7 + 2 * CHECKSUM_BYTES);
         assert_eq!(store.read(&id(1)).await.unwrap().unwrap(), &b"new"[..]);
         store.delete(&id(0)).await.unwrap();
         policy.remove(&crate::eviction::CacheUnit::Whole(id(0)));
         assert_eq!(policy.len(), 1);
-        assert_eq!(policy.total_bytes(), charge(&id(1), 3));
+        assert_eq!(policy.total_bytes(), 3 + CHECKSUM_BYTES);
         store.delete(&id(1)).await.unwrap();
         policy.remove(&crate::eviction::CacheUnit::Whole(id(1)));
         assert!(policy.is_empty());

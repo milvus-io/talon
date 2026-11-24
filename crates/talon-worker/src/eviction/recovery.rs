@@ -119,7 +119,7 @@ impl Lru {
                 return (BTreeMap::new(), BTreeMap::new());
             }
             let started = std::time::Instant::now();
-            let mut queue = Vec::with_capacity(blocks);
+            let mut queue = Vec::with_capacity(units.len().min(blocks));
             for (position, u) in units.iter().enumerate() {
                 let position = position as u64;
                 if index

@@ -714,11 +714,13 @@ impl Lru {
         independent: bool,
     ) -> AccessHandle {
         let independent = independent || unit.kind() == UnitKind::ExactRange;
-        if independent && !g.track_blocks && !g.track_checks {
-            if let Some(access) = g
-                .index
-                .compact_small_admit(&unit, bytes, g.track_small_clock)
-            {
+        if independent {
+            if let Some(access) = g.index.compact_small_admit(
+                &unit,
+                bytes,
+                g.track_small_clock,
+                !g.track_blocks && !g.track_checks,
+            ) {
                 return access;
             }
         }

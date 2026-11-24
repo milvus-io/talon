@@ -243,6 +243,7 @@ impl NamespaceRuntimes {
             self.metrics.clone(),
             config.stale_gc_enabled,
             true,
+            !config.stale_gc_enabled && !config.ownership_gc_enabled,
         )
         .with_backend_kind(config.backend.as_deref().unwrap_or("azure").parse()?)
         .with_rate_limiter(self.limiter.clone())

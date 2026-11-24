@@ -1,5 +1,6 @@
 //! Advisory recency: coalesced dirty keys, a bounded delta log, and infrequent
 //! full checkpoints. Neither file establishes residency or stores payloads.
+mod compact;
 #[cfg(test)]
 mod tests;
 
@@ -211,6 +212,10 @@ impl SmallObjectStore {
         if self.access_dirty.enabled.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
+        if self.has_recency() {
+            self.restore_compact_access();
+            return Ok(());
+        }
         let restore = self
             .policy()
             .map_or(true, |policy| policy.enable_small_clock());
@@ -233,6 +238,12 @@ impl SmallObjectStore {
     pub(crate) fn track_access(&self, id: &(impl SmallStoreKey + ?Sized)) -> io::Result<()> {
         format::validate_key(&id.view())?;
         if !self.access_dirty.enabled.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if self.has_recency() {
+            if let Some(loc) = self.lookup_entry(&id.view())? {
+                loc.touch();
+            }
             return Ok(());
         }
         for stream in self.streams() {
@@ -273,6 +284,10 @@ impl SmallObjectStore {
         self.tasks
             .run(async move {
                 let _gate = store.access_checkpoint.lock().await;
+                if store.has_recency() {
+                    store.enable_access_tracking()?;
+                    return store.checkpoint_compact_access(budget.as_deref()).await;
+                }
                 let prepare = store.clone();
                 let (mut state, full, bytes) =
                     tokio::task::spawn_blocking(move || -> io::Result<_> {
@@ -379,6 +394,17 @@ impl SmallObjectStore {
         offset: u64,
         budget: Option<&crate::background::BackgroundBudget>,
     ) -> io::Result<()> {
+        self.write_access_chunks(&fd, bytes, offset, budget).await?;
+        self.sync_access(fd, budget).await
+    }
+
+    async fn write_access_chunks(
+        &self,
+        fd: &Arc<OwnedFd>,
+        bytes: Bytes,
+        offset: u64,
+        budget: Option<&crate::background::BackgroundBudget>,
+    ) -> io::Result<()> {
         for start in (0..bytes.len()).step_by(64 << 10) {
             let end = (start + (64 << 10)).min(bytes.len());
             if let Some(budget) = budget {
@@ -390,6 +416,14 @@ impl SmallObjectStore {
             };
             disk_io::write(fd.clone(), bytes.slice(start..end), offset + start as u64).await?;
         }
+        Ok(())
+    }
+
+    async fn sync_access(
+        &self,
+        fd: Arc<OwnedFd>,
+        budget: Option<&crate::background::BackgroundBudget>,
+    ) -> io::Result<()> {
         let _io = match budget {
             Some(b) => Some(b.io().await),
             None => None,
@@ -406,6 +440,15 @@ impl SmallObjectStore {
         let tmp = self.root.join(format!("{name}.tmp"));
         let fd = disk_io::open(tmp.clone(), disk_io::Open::Replace).await?;
         self.write_access(fd, bytes, 0, budget).await?;
+        self.rename_access(tmp, name, budget).await
+    }
+
+    async fn rename_access(
+        &self,
+        tmp: PathBuf,
+        name: &str,
+        budget: Option<&crate::background::BackgroundBudget>,
+    ) -> io::Result<()> {
         let _io = match budget {
             Some(b) => Some(b.io().await),
             None => None,

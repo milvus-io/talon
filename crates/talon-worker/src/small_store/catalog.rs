@@ -29,6 +29,7 @@ pub(super) struct Catalog {
     pub files: BTreeMap<u64, Arc<SegmentFile>>,
     pub policy: HashMap<Address, PolicyEntry>,
     pub access: HashMap<Address, AccessHandle>,
+    pub(super) recency: Option<super::recency::Recency>,
     pub live: HashMap<usize, usize>,
     pub compact_streams: HashSet<usize>,
     pub compact_totals: HashMap<usize, (u64, usize)>,
@@ -61,18 +62,49 @@ impl LiveModel {
         let encoded = super::key_codec::encode(id);
         self.0.read().unwrap().lookup_location(id, hash, &encoded)
     }
+
+    pub fn lookup_read<T, E>(
+        &self,
+        id: &dyn SmallIdentity,
+        validate: impl FnOnce(u64) -> Result<T, E>,
+    ) -> Result<Option<(Location, T)>, E> {
+        let hash = super::records::key_hash(id);
+        let encoded = super::key_codec::encode(id);
+        let catalog = self.0.read().unwrap();
+        let Some((slot, record)) = catalog.find_record(hash, &encoded, VISIBLE) else {
+            return catalog
+                .retired_location(id)
+                .map(|loc| validate(loc.len).map(|range| (loc, range)))
+                .transpose();
+        };
+        let range = validate(record.len)?;
+        let loc = if catalog.recency.is_some() && catalog.compact_policy(slot, record.stream) {
+            let Some(loc) = catalog.payload_location(record, None) else {
+                return Ok(None);
+            };
+            // This guard keeps the row and slot stable through both atomic updates.
+            catalog.lookup.reference(slot);
+            catalog.touch_recency(slot);
+            loc
+        } else {
+            let Some(loc) = catalog.resolve_location(slot, record) else {
+                return Ok(None);
+            };
+            loc
+        };
+        Ok(Some((loc, range)))
+    }
 }
 
 struct ResolvedRecord {
     address: Address,
     len: u64,
-    checksum: u64,
-    charge: u64,
+    checksum: Option<u64>,
     stream: usize,
 }
 
 impl Catalog {
-    pub fn hash(&self, key: &dyn SmallIdentity) -> u64 {
+    pub fn hash(&self, key: &dyn SmallIdentity) -> u32 {
         super::records::key_hash(key)
     }
 
@@ -90,7 +122,7 @@ impl Catalog {
         Some(((segment, offset), record))
     }
 
-    fn row(&self, handle: u32) -> Option<(u64, usize)> {
+    pub(super) fn row(&self, handle: u32) -> Option<(u64, usize)> {
         let handle = handle.checked_sub(1)?;
         let (segment, base) = *self.chunks.get((handle >> 10) as usize)?;
         Some((segment, base + (handle & 1023) as usize))
@@ -110,7 +142,7 @@ impl Catalog {
             .is_some_and(|meta| meta.records.matches(row, key))
     }
 
-    fn handle(&self, segment: u64, row: usize) -> u32 {
+    pub(super) fn handle(&self, segment: u64, row: usize) -> u32 {
         (self.segment_chunks[&segment][row / 1024] << 10 | (row % 1024) as u32) + 1
     }
 
@@ -120,7 +152,7 @@ impl Catalog {
             .map(|(slot, _)| slot)
     }
 
-    fn find_record(&self, hash: u64, encoded: &[u8], flags: u8) -> Option<(usize, ResolvedRecord)> {
+    fn find_record(&self, hash: u32, encoded: &[u8], flags: u8) -> Option<(usize, ResolvedRecord)> {
         let mut resolved = None;
         let slot = self.lookup.find(hash, |handle, state| {
             if state & flags != flags {
@@ -142,7 +174,6 @@ impl Catalog {
                 address: (segment, record.offset),
                 len: record.len,
                 checksum: record.checksum,
-                charge: record.charge,
                 stream: meta.slot,
             });
             true
@@ -164,12 +195,16 @@ impl Catalog {
     fn lookup_location(
         &self,
         id: &dyn SmallIdentity,
-        hash: u64,
+        hash: u32,
         encoded: &[u8],
     ) -> Option<Location> {
         if let Some((slot, record)) = self.find_record(hash, encoded, VISIBLE) {
             return self.resolve_location(slot, record);
         }
+        self.retired_location(id)
+    }
+
+    fn retired_location(&self, id: &dyn SmallIdentity) -> Option<Location> {
         self.retired
             .get(id)
             .filter(|entry| entry.live)
@@ -182,23 +217,37 @@ impl Catalog {
             address,
             len: record.len,
             checksum: record.checksum,
-            charge: record.charge,
             stream: self.segment(address.0)?.slot,
         };
         self.resolve_location(slot, resolved)
     }
 
-    fn resolve_location(&self, slot: usize, record: ResolvedRecord) -> Option<Location> {
-        let access = if self.compact_streams.contains(&record.stream)
+    fn compact_policy(&self, slot: usize, stream: usize) -> bool {
+        self.compact_streams.contains(&stream)
             && self.lookup.flags(slot) & super::lookup::POLICY != 0
-        {
-            Some(self.compact_access(slot, record.address, record.charge))
+    }
+
+    fn resolve_location(&self, slot: usize, record: ResolvedRecord) -> Option<Location> {
+        let access = if self.compact_policy(slot, record.stream) {
+            Some(self.compact_access(
+                slot,
+                record.address,
+                record.len + super::checksum_len(record.checksum),
+            ))
         } else {
             self.policy
                 .get(&record.address)
                 .map(|entry| entry.access.clone())
                 .or_else(|| self.access.get(&record.address).cloned())
         };
+        self.payload_location(record, access)
+    }
+
+    fn payload_location(
+        &self,
+        record: ResolvedRecord,
+        access: Option<AccessHandle>,
+    ) -> Option<Location> {
         Some(Location {
             file: self.files.get(&record.address.0)?.clone(),
             segment: record.address.0,
@@ -323,6 +372,9 @@ impl Catalog {
         self.unindex_rows(segment, 0, usize::MAX);
         self.retired_segments.remove(&segment);
         self.files.remove(&segment);
+        if let Some(recency) = &mut self.recency {
+            recency.rows.remove(&segment);
+        }
         if let Some(chunks) = self.segment_chunks.remove(&segment) {
             self.free_chunks.extend(chunks);
         }
@@ -404,7 +456,45 @@ impl Catalog {
         let flags = changed.map_or_else(Vec::new, |(segment, row, limit)| {
             self.unindex_rows(segment, row, limit)
         });
+        let recency_change = self.recency.as_ref().and_then(|_| match &event {
+            Event::Insert {
+                segment, offset, ..
+            } => {
+                let records = self.segment(*segment).map(|meta| &meta.records);
+                Some(super::recency::Change::Insert {
+                    segment: *segment,
+                    row: records.map_or(0, |records| records.position(*offset)),
+                    old_slots: records.map_or(0, |records| records.slots()),
+                })
+            }
+            Event::Delete { segment, offset } => {
+                self.model
+                    .segments
+                    .get(segment)
+                    .map(|meta| super::recency::Change::Delete {
+                        segment: *segment,
+                        row: meta.records.position(*offset),
+                        old: meta.records.compacts_after_remove().then(|| meta.clone()),
+                    })
+            }
+            Event::Recover { segment } => {
+                self.model
+                    .segments
+                    .get(segment)
+                    .map(|meta| super::recency::Change::Recover {
+                        segment: *segment,
+                        old: meta.clone(),
+                        end: meta.durable_end,
+                    })
+            }
+            _ => None,
+        });
         let result = self.model.apply(event);
+        if result.is_ok() {
+            if let Some(change) = recency_change {
+                change.apply(&self.model, self.recency.as_mut().unwrap());
+            }
+        }
         if let Some((segment, row, limit)) = changed {
             self.index_rows(segment, row, limit, &flags)?;
             if removing {
@@ -484,7 +574,7 @@ mod tests {
                             Version::new("v"),
                         )),
                         len: 1,
-                        checksum: 0,
+                        checksum: Some(0),
                     },
                 })
                 .unwrap();
@@ -516,7 +606,7 @@ mod tests {
                             Version::new("v"),
                         )),
                         len: 1,
-                        checksum: 0,
+                        checksum: Some(0),
                     },
                 })
                 .unwrap();

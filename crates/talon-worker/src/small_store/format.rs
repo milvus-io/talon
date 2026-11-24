@@ -12,6 +12,12 @@ pub(super) fn key_len(id: &dyn SmallIdentity) -> usize {
     25 + id.object.bucket.len() + id.object.object_path.len() + id.version.len()
 }
 
+pub(super) fn record_metadata_bytes(id: &dyn SmallIdentity) -> u64 {
+    // Existing segment estimate, including the eight checksum bytes.
+    // Records with a trailer account for those bytes in the data file instead.
+    37 + key_len(id) as u64
+}
+
 pub(super) fn validate_key(id: &dyn SmallIdentity) -> io::Result<()> {
     if matches!(id.view().kind, UnitKind::Page(_)) {
         return Err(invalid("page is not a small-store key"));

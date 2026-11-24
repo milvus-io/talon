@@ -92,6 +92,81 @@ fn read_handle(handle: &BlockHandle) -> Vec<u8> {
 }
 
 #[tokio::test]
+async fn legacy_and_trailer_records_survive_the_same_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let legacy = id("legacy");
+    let current = id("current");
+    let (journal, _) = journal::Journal::open(dir.path().to_owned(), None, None).unwrap();
+    let segment = journal.allocate().unwrap();
+    let path = journal.data_path(segment);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, b"legacy bytes").unwrap();
+    journal
+        .append(
+            journal::Event::Insert {
+                slot: 0,
+                segment,
+                offset: 0,
+                record: journal::Record {
+                    key: SmallKey::new(&legacy),
+                    len: b"legacy bytes".len() as u64,
+                    checksum: Some(xxhash_rust::xxh3::xxh3_64(b"legacy bytes")),
+                },
+            },
+            false,
+        )
+        .await
+        .unwrap();
+    journal
+        .append(journal::Event::Seal { segment }, true)
+        .await
+        .unwrap();
+    drop(journal);
+
+    let store = open(dir.path());
+    put(&store, &current, b"current bytes").await.unwrap();
+    put(&store, &id("garbage"), &[1; 4096]).await.unwrap();
+    store.maintain(true).await.unwrap();
+    store.tasks.drain().await;
+    drop(store);
+
+    let store = open(dir.path());
+    assert_eq!(
+        store.read(&legacy).await.unwrap().unwrap(),
+        b"legacy bytes"[..]
+    );
+    assert_eq!(
+        store.read(&current).await.unwrap().unwrap(),
+        b"current bytes"[..]
+    );
+    assert_eq!(
+        std::fs::metadata(path).unwrap().len(),
+        b"legacy bytes".len() as u64
+    );
+    put(&store, &current, b"current bytes").await.unwrap();
+    assert!(put(&store, &current, b"changed bytes").await.is_err());
+    let handle = store.get(&current).await.unwrap().unwrap();
+    assert_eq!(read_handle(&handle), b"current bytes");
+    let current = store.entries.read().unwrap().get(&current);
+    let location = current.unwrap();
+    assert!(location.checksum.is_none());
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&location.file.path)
+        .unwrap();
+    file.write_all_at(
+        &(!xxhash_rust::xxh3::xxh3_64(b"current bytes")).to_le_bytes(),
+        location.offset + location.len,
+    )
+    .unwrap();
+    let error = location.retain().await.unwrap().read().await.unwrap_err();
+    assert!(error.to_string().contains("checksum"));
+    store.delete(&id("garbage")).await.unwrap();
+    let error = store.maintain(false).await.unwrap_err();
+    assert!(error.to_string().contains("checksum"));
+}
+
+#[tokio::test]
 async fn sparse_segments_do_not_exhaust_file_descriptors() {
     let dir = tempfile::tempdir().unwrap();
     let child = tokio::process::Command::new(std::env::current_exe().unwrap())
@@ -673,7 +748,7 @@ fn native_small_io_uses_current_ring_without_blocking_fallback() {
         {
             let state = store.state.lock().await;
             let segment = &state.segments[&state.active.unwrap()];
-            assert_eq!(segment.durable_end, 10 * 3072);
+            assert_eq!(segment.durable_end, 10 * (3072 + CHECKSUM_BYTES));
             assert!(!segment.sealed);
         }
         store.maintain(true).await.unwrap();
