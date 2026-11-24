@@ -60,19 +60,26 @@ impl PositiveHeads {
         self.expiry.push_back((now, object));
     }
 
-    fn prune(&mut self, now: u64) {
-        for _ in 0..256 {
-            let Some((at, _)) = self.expiry.front() else {
-                break;
-            };
+    /// Returns true when the next slice has more expired records to release.
+    fn prune(&mut self, now: u64) -> bool {
+        let mut budget = 256;
+        while let Some((at, _)) = self.expiry.front() {
             if now.saturating_sub(*at) < DAY_MS {
-                break;
+                return false;
             }
+            if budget == 0 {
+                return true;
+            }
+            budget -= 1;
             let (at, object) = self.expiry.pop_front().unwrap();
             if self.checked.get(&object) == Some(&at) {
                 self.checked.remove(&object);
             }
         }
+        if self.expiry.capacity() != 0 {
+            *self = Self::default();
+        }
+        false
     }
 }
 
@@ -138,6 +145,9 @@ impl StaleGc {
         worker: &WorkerRuntime,
         clock: impl Fn() -> u64,
     ) -> Option<Duration> {
+        if self.positive_heads.prune(clock()) {
+            return Some(Duration::ZERO);
+        }
         // Recovery has no Broker configuration. Only a request may bind the
         // backend; local maintenance remains active while origin GC waits.
         if !worker.backend.get()?.ready_for_background() {
@@ -179,6 +189,9 @@ impl StaleGc {
 
     #[cfg(test)]
     async fn tick_at(&mut self, worker: &WorkerRuntime, now: u64) -> bool {
+        if self.positive_heads.prune(now) {
+            return false;
+        }
         self.check_batch(worker, now, || now).await;
         while !self.missing.is_empty() {
             self.delete_slice(worker).await;
@@ -266,7 +279,6 @@ impl StaleGc {
         // The idle cutoff belongs to the round. Successful HEADs expire in
         // real time, even while a long round is still scanning its prefix.
         let now = clock();
-        self.positive_heads.prune(now);
         let mut groups: HashMap<ObjectId, Vec<Candidate>> = HashMap::new();
         while let Some(candidate) = self.pending.front() {
             if !groups.contains_key(candidate.object()) && groups.len() == self.head_batch {
@@ -574,6 +586,44 @@ mod tests {
         gc.run_round_at(&worker, now + DAY_MS).await;
         assert_eq!(origin.calls.load(Ordering::Relaxed), 2);
         assert!(!small.contains(&exact));
+    }
+
+    #[tokio::test]
+    async fn empty_cache_drains_expired_heads_in_continuous_bounded_slices() {
+        for backend_ready in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let origin = Arc::new(Origin::default());
+            let mut worker = compact_runtime(root.path(), false, origin.clone());
+            if !backend_ready {
+                worker.backend = Arc::default();
+            }
+            let mut gc = StaleGc::default();
+            for row in 0..1025 {
+                gc.positive_heads
+                    .record(ObjectId::new(Backend::S3, "bucket", row.to_string()), 1);
+            }
+            for left in [769, 513, 257, 1] {
+                assert_eq!(
+                    gc.run_slice_with_clock(&worker, || DAY_MS + 1).await,
+                    Some(Duration::ZERO)
+                );
+                assert_eq!(gc.positive_heads.checked.len(), left);
+                assert!(gc.round_now.is_none());
+            }
+            let delay = gc.run_slice_with_clock(&worker, || DAY_MS + 1).await;
+            assert_eq!(gc.positive_heads.checked.capacity(), 0);
+            assert_eq!(gc.positive_heads.expiry.capacity(), 0);
+            if backend_ready {
+                assert_eq!(delay, Some(Duration::ZERO));
+                assert_eq!(
+                    gc.run_slice_with_clock(&worker, || DAY_MS + 1).await,
+                    Some(Duration::from_secs(3600))
+                );
+            } else {
+                assert!(delay.is_none());
+            }
+            assert_eq!(origin.calls.load(Ordering::Relaxed), 0);
+        }
     }
 
     #[tokio::test]
