@@ -373,7 +373,7 @@ impl Catalog {
         self.retired_segments.remove(&segment);
         self.files.remove(&segment);
         if let Some(recency) = &mut self.recency {
-            recency.rows.remove(&segment);
+            recency.remove_segment(segment);
         }
         if let Some(chunks) = self.segment_chunks.remove(&segment) {
             self.free_chunks.extend(chunks);
@@ -467,24 +467,31 @@ impl Catalog {
                     old_slots: records.map_or(0, |records| records.slots()),
                 })
             }
-            Event::Delete { segment, offset } => {
-                self.model
-                    .segments
-                    .get(segment)
-                    .map(|meta| super::recency::Change::Delete {
+            Event::Delete { segment, offset } => self.model.segments.get(segment).map(|meta| {
+                let row = meta.records.position(*offset);
+                if meta.records.compacts_after_remove() {
+                    super::recency::Change::Retain {
                         segment: *segment,
-                        row: meta.records.position(*offset),
-                        old: meta.records.compacts_after_remove().then(|| meta.clone()),
-                    })
-            }
+                        live: (0..meta.records.slots())
+                            .map(|r| r != row && meta.records.metadata(r).is_some())
+                            .collect(),
+                    }
+                } else {
+                    super::recency::Change::Delete {
+                        segment: *segment,
+                        row,
+                    }
+                }
+            }),
             Event::Recover { segment } => {
                 self.model
                     .segments
                     .get(segment)
-                    .map(|meta| super::recency::Change::Recover {
+                    .map(|meta| super::recency::Change::Retain {
                         segment: *segment,
-                        old: meta.clone(),
-                        end: meta.durable_end,
+                        live: (0..meta.records.position(meta.durable_end))
+                            .map(|row| meta.records.metadata(row).is_some())
+                            .collect(),
                     })
             }
             _ => None,

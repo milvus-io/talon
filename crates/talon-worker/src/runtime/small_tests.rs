@@ -1938,6 +1938,68 @@ async fn exact_cache_identity_does_not_alias_an_ordinary_block_with_same_coordin
 }
 
 #[tokio::test]
+async fn compact_exact_idle_eviction_preserves_coexisting_l1_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = WorkerConfig {
+        backend: Some("s3".into()),
+        block_size: 1 << 20,
+        capacity_bytes: 16 << 20,
+        l1_capacity_bytes: 1 << 20,
+        l1_page_size_bytes: 1024,
+        l2_page_size_bytes: 1024,
+        small_object_threshold_bytes: 128 << 10,
+        small_object_segment_bytes: 2 << 20,
+        stale_gc_enabled: false,
+        ownership_gc_enabled: false,
+        page_tti_hours: 1,
+        ..Default::default()
+    };
+    let lock = Arc::new(crate::page_access_store::CacheRootLock::acquire(dir.path()).unwrap());
+    let root = WorkerRuntime::open_namespaces(
+        &config,
+        lock,
+        Arc::new(ExactLargeOrigin(Mutex::new(Vec::new()))),
+        WorkerMetrics::new(config.capacity_bytes),
+    )
+    .unwrap();
+    let root = Arc::new(root);
+    let worker = root
+        .for_namespace(&talon_core::NamespaceId::named("exact-idle"))
+        .await
+        .unwrap();
+    let small = worker.small.as_ref().unwrap();
+    assert!(small.has_recency());
+
+    let exact_request = RangeRequest {
+        object: object(),
+        offset: 0,
+        len: 1 << 20,
+    };
+    let version = Version::new("v1");
+    let exact = exact_unit(&exact_request);
+    worker
+        .serve_exact(&exact_request, &version, 3 << 20)
+        .await
+        .unwrap();
+    let ordinary_request = RangeRequest {
+        len: 10,
+        ..exact_request
+    };
+    worker
+        .serve_versioned(&ordinary_request, &version, 3 << 20)
+        .await
+        .unwrap();
+    let page = PageIndex(0);
+    let l1_bytes = worker.l1.get_page(exact.block(), page).unwrap();
+
+    worker
+        .gc_small_idle_at(crate::eviction::access_millis() + worker.current_tti_ms() + 1)
+        .await;
+    assert!(!small.contains(&exact));
+    assert_eq!(worker.l1.get_page(exact.block(), page), Some(l1_bytes));
+}
+
+#[tokio::test]
 async fn exact_reads_over_tcp_cover_miss_sendfile_hit_and_oversize_rejection() {
     use talon_core::{NodeId, NodeInfo, NodeRole};
     use talon_transport::{data, envelope, Flags, FrameHeader, HEADER_LEN};

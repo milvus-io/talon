@@ -429,6 +429,7 @@ impl WorkerRuntime {
                     .expect("page GC semaphore closed");
                 let _background_io = runtime.background_io().await;
                 let block = unit.block().clone();
+                let whole = matches!(&unit, CacheUnit::Whole(_));
                 let state = runtime.page_lifecycle.block(&block);
                 {
                     let _gate = state.gate.lock().await;
@@ -443,7 +444,9 @@ impl WorkerRuntime {
                         .await
                     {
                         Ok(true) => {
-                            runtime.invalidate_l1(&block);
+                            if whole {
+                                runtime.invalidate_l1(&block);
+                            }
                             runtime.metrics.record_eviction();
                         }
                         Ok(false) => {}

@@ -28,6 +28,8 @@ pub(super) struct Journal {
     handle: Handle<LiveModel>,
     pub(super) model: LiveModel,
     pub(super) readers: Arc<tokio::sync::RwLock<()>>,
+    // Full access snapshots sample a stable set of locations across batches.
+    pub(super) access_relocation: tokio::sync::RwLock<()>,
     pub(super) next: Arc<AtomicU64>,
     #[cfg(test)]
     pub(super) control: Arc<TestControl>,
@@ -97,6 +99,7 @@ impl Journal {
                 handle,
                 model: shared,
                 readers: Arc::default(),
+                access_relocation: Default::default(),
                 next,
                 #[cfg(test)]
                 control: Default::default(),

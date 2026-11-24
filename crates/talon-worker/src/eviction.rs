@@ -865,14 +865,14 @@ impl Lru {
     /// Returns `true` if the unit exists.
     pub fn pin(&self, unit: &CacheUnit) -> bool {
         let g = self.inner.lock().unwrap();
-        match g.index.policy_update(unit, |e| e.pins += 1) {
-            Some(()) => {
-                g.index
-                    .policy_block_update(unit.block(), |activity| activity.pins += 1);
-                true
-            }
-            None => false,
+        let Some(((), tracked)) = g.index.policy_update(unit, |e| e.pins += 1) else {
+            return false;
+        };
+        if tracked {
+            g.index
+                .policy_block_update(unit.block(), |activity| activity.pins += 1);
         }
+        true
     }
 
     pub fn pin_guard(self: &Arc<Self>, unit: CacheUnit) -> Option<LruPin> {
@@ -885,14 +885,14 @@ impl Lru {
     /// Release one pin previously taken with [`pin`](Self::pin).
     pub fn unpin(&self, unit: &CacheUnit) {
         let g = self.inner.lock().unwrap();
-        if g.index.policy_update(unit, |e| {
+        let release = g.index.policy_update(unit, |e| {
             if e.pins == 0 {
                 return false;
             }
             e.pins -= 1;
             true
-        }) == Some(true)
-        {
+        });
+        if release.is_some_and(|(released, tracked)| released && tracked) {
             g.index
                 .policy_block_update(unit.block(), |activity| activity.pins -= 1);
         }
@@ -1427,6 +1427,68 @@ mod tests {
                     .policy_block_get(&block)
                     .is_none());
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn compact_exact_range_pins_and_membership_are_independent_of_ordinary_block() {
+        use crate::small_store::SmallObjectStore;
+        use bytes::Bytes;
+
+        for retire_exact_before_unpin in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let store = Arc::new(
+                SmallObjectStore::open(root.path().to_owned(), 128 << 10, 256 << 10, 4 << 20, None)
+                    .unwrap(),
+            );
+            let index = Arc::new(crate::BlockIndex::new());
+            let mut units = Vec::new();
+            store.restore_policy_units(&index, &mut units, false);
+            store.init_recency();
+            let lru = Arc::new(Lru::from_recovered(index.clone(), units, 0, false, true));
+            store.bind_policy(lru.clone());
+
+            let payload = Bytes::from_static(b"payload");
+            let id = BlockId {
+                block_size: payload.len() as u32,
+                ..blk(1)
+            };
+            let exact = CacheUnit::ExactRange(id.clone());
+            let ordinary = CacheUnit::Whole(id.clone());
+            store.put(&exact, payload).await.unwrap();
+            assert!(index.policy_get(&exact).unwrap().access.small().is_some());
+            assert!(index.policy_block_get(&id).is_none());
+            assert!(lru.pin(&exact));
+
+            lru.insert(ordinary.clone(), 4096);
+            if retire_exact_before_unpin {
+                store.delete(&exact).await.unwrap();
+            }
+            lru.unpin(&exact);
+            assert_eq!(index.policy_get(&exact).unwrap().pins, 0);
+            let activity = index.policy_block_get(&id).unwrap();
+            assert_eq!((activity.pins, activity.units), (0, 1));
+            assert!(lru.pin(&ordinary));
+            assert!(lru.pin(&exact));
+            assert_eq!(index.policy_block_get(&id).unwrap().pins, 1);
+            lru.unpin(&ordinary);
+            assert_eq!(index.policy_block_get(&id).unwrap().pins, 0);
+            lru.unpin(&exact);
+
+            assert_eq!(lru.remove(&ordinary), Some(4096));
+            assert!(index.policy_get(&exact).is_some());
+            {
+                let g = lru.inner.lock().unwrap();
+                assert!(index.policy_block_get(&id).is_none());
+                assert!(g.block_queue.is_empty());
+                assert!(g.ownership_queue.is_empty());
+            }
+            if !retire_exact_before_unpin {
+                store.delete(&exact).await.unwrap();
+            }
+            lru.remove(&exact).unwrap();
+            assert!(lru.is_empty());
+            assert_eq!(lru.total_bytes(), 0);
         }
     }
 

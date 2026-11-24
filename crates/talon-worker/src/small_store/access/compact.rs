@@ -17,15 +17,24 @@ impl SmallObjectStore {
 
     pub(crate) fn idle_recency_candidates(
         &self,
-        cursor: &mut Address,
+        cursor: &mut IdleRecencyCursor,
         now: u64,
         age: u64,
         scan: usize,
         deletes: usize,
     ) -> Vec<(CacheUnit, Arc<crate::small_store::policy::SmallAccess>)> {
         let catalog = self.journal.model.0.read().unwrap();
+        let Some(end) = cursor.end.or_else(|| {
+            let (&id, segment) = catalog.model.segments.last_key_value()?;
+            Some((id, segment.bytes))
+        }) else {
+            return Vec::new();
+        };
+        // Freeze the active segment's extent as well as its ID. Otherwise a
+        // busy stream can keep the sweep from returning to older rows.
+        cursor.end = Some(end);
         let mut candidates = Vec::new();
-        let done = catalog.visit_recency(cursor, u64::MAX, scan, |slot, id, row| {
+        let done = catalog.visit_recency(&mut cursor.next, end, scan, |slot, id, row| {
             let (recency, value) = catalog.recency_at(slot).unwrap();
             if now.saturating_sub(recency.time(value.load(Ordering::Relaxed))) > age {
                 let records = &catalog.segment(id).unwrap().records;
@@ -43,7 +52,7 @@ impl SmallObjectStore {
             candidates.len() < deletes
         });
         if done {
-            *cursor = (0, 0);
+            *cursor = IdleRecencyCursor::default();
         }
         candidates
     }
@@ -115,15 +124,17 @@ impl SmallObjectStore {
         };
         let full = state.full
             || state.log_bytes >= MIN_COMPACT_BYTES.max(state.snapshot_bytes.div_ceil(2));
-        #[cfg(test)]
-        {
-            let pause = self.access_pause.lock().unwrap().take();
-            if let Some((entered, release)) = pause {
-                entered.notify_one();
-                release.notified().await;
-            }
-        }
-        let tmp = self.root.join("access.checkpoint.tmp");
+        // Maintenance can already own a disk permit when it needs this gate.
+        // Take the permit first and reuse it for all writes until sampling ends.
+        let reserved_io = match (full, budget) {
+            (true, Some(budget)) => Some(budget.io().await),
+            _ => None,
+        };
+        let access_relocation = if full {
+            Some(self.journal.access_relocation.write().await)
+        } else {
+            None
+        };
         let mut cursor: Address = (0, 0);
         let ceiling = self
             .journal
@@ -134,7 +145,16 @@ impl SmallObjectStore {
             .model
             .segments
             .last_key_value()
-            .map_or(0, |(&id, _)| id);
+            .map_or((0, 0), |(&id, segment)| (id, segment.bytes));
+        #[cfg(test)]
+        {
+            let pause = self.access_pause.lock().unwrap().take();
+            if let Some((entered, release)) = pause {
+                entered.notify_one();
+                release.notified().await;
+            }
+        }
+        let tmp = self.root.join("access.checkpoint.tmp");
         let mut fd = None;
         let mut offset = state.log_bytes;
         if full {
@@ -143,8 +163,14 @@ impl SmallObjectStore {
                 .checked_add(1)
                 .ok_or_else(|| invalid("access generation exhausted"))?;
             let file = disk_io::open(tmp.clone(), disk_io::Open::Replace).await?;
-            self.write_access_chunks(&file, header(MAGIC, state.generation).into(), 0, budget)
-                .await?;
+            self.write_access_chunks(
+                &file,
+                header(MAGIC, state.generation).into(),
+                0,
+                budget,
+                reserved_io.as_ref(),
+            )
+            .await?;
             offset = HEADER;
             fd = Some(file);
         }
@@ -153,14 +179,21 @@ impl SmallObjectStore {
             let mut result = Ok(());
             let done = {
                 let catalog = self.journal.model.0.read().unwrap();
-                catalog.visit_recency(&mut cursor, ceiling, ROWS_PER_BATCH, |slot, id, row| {
-                    let (recency, value) = catalog.recency_at(slot).unwrap();
-                    if let Some(time) = recency.sample(value, full) {
+                let recency = catalog.recency.as_ref().unwrap();
+                let mut sample = |id, row| {
+                    if let Some(time) = recency.sample(id, row, full) {
                         let (_, record) = catalog.segment(id).unwrap().records.get(row).unwrap();
                         result = encode(&mut bytes, &record.key, time);
                     }
                     result.is_ok() && bytes.len() < BATCH_BYTES
-                })
+                };
+                if full {
+                    catalog.visit_recency(&mut cursor, ceiling, ROWS_PER_BATCH, |_, id, row| {
+                        sample(id, row)
+                    })
+                } else {
+                    catalog.visit_dirty_recency(&mut cursor, ceiling, ROWS_PER_BATCH, sample)
+                }
             };
             result?;
             if !bytes.is_empty() {
@@ -168,8 +201,14 @@ impl SmallObjectStore {
                     fd = Some(disk_io::open(self.root.join(LOG), disk_io::Open::Update).await?);
                 }
                 let len = bytes.len() as u64;
-                self.write_access_chunks(fd.as_ref().unwrap(), bytes.into(), offset, budget)
-                    .await?;
+                self.write_access_chunks(
+                    fd.as_ref().unwrap(),
+                    bytes.into(),
+                    offset,
+                    budget,
+                    reserved_io.as_ref(),
+                )
+                .await?;
                 offset += len;
             }
             if done {
@@ -177,6 +216,8 @@ impl SmallObjectStore {
             }
             tokio::task::yield_now().await;
         }
+        drop(access_relocation);
+        drop(reserved_io);
         if let Some(fd) = fd {
             self.sync_access(fd, budget).await?;
             if full {

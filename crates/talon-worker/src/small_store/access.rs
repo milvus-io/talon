@@ -394,7 +394,8 @@ impl SmallObjectStore {
         offset: u64,
         budget: Option<&crate::background::BackgroundBudget>,
     ) -> io::Result<()> {
-        self.write_access_chunks(&fd, bytes, offset, budget).await?;
+        self.write_access_chunks(&fd, bytes, offset, budget, None)
+            .await?;
         self.sync_access(fd, budget).await
     }
 
@@ -404,15 +405,16 @@ impl SmallObjectStore {
         bytes: Bytes,
         offset: u64,
         budget: Option<&crate::background::BackgroundBudget>,
+        reserved_io: Option<&tokio::sync::OwnedSemaphorePermit>,
     ) -> io::Result<()> {
         for start in (0..bytes.len()).step_by(64 << 10) {
             let end = (start + (64 << 10)).min(bytes.len());
             if let Some(budget) = budget {
                 budget.bytes(end - start).await;
             }
-            let _io = match budget {
-                Some(b) => Some(b.io().await),
-                None => None,
+            let _io = match (reserved_io, budget) {
+                (None, Some(b)) => Some(b.io().await),
+                _ => None,
             };
             disk_io::write(fd.clone(), bytes.slice(start..end), offset + start as u64).await?;
         }

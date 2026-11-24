@@ -1172,6 +1172,64 @@ mod tests {
             .unwrap(),
         )
     }
+
+    #[tokio::test]
+    async fn compact_exact_pin_and_eviction_preserve_ordinary_block_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = WorkerConfig {
+            backend: Some("s3".into()),
+            block_size: 1 << 20,
+            capacity_bytes: 16 << 20,
+            l2_page_size_bytes: 0,
+            small_object_threshold_bytes: 128 << 10,
+            small_object_segment_bytes: 2 << 20,
+            stale_gc_enabled: false,
+            ownership_gc_enabled: false,
+            ..Default::default()
+        };
+        config.validate().unwrap();
+        let root = open(dir.path(), &config, Arc::default());
+        let worker = root
+            .for_namespace(&NamespaceId::named("compact"))
+            .await
+            .unwrap();
+        let block = block(config.block_size);
+        let request = RangeRequest {
+            len: u64::from(config.block_size),
+            ..request()
+        };
+        worker
+            .serve_exact(&request, &block.version, 2 << 20)
+            .await
+            .unwrap();
+        let exact = CacheUnit::ExactRange(block.clone());
+        let pin = worker.lru.pin_guard(exact.clone()).unwrap();
+        worker
+            .serve_versioned(&request, &block.version, 2 << 20)
+            .await
+            .unwrap();
+        drop(pin);
+
+        assert_eq!(worker.index.policy_block_get(&block).unwrap().units, 1);
+        let ordinary = CacheUnit::Whole(block.clone());
+        let candidates = worker
+            .lru
+            .block_candidates(&block)
+            .into_iter()
+            .filter(|candidate| candidate.unit == ordinary)
+            .collect();
+        worker.unlink_units(candidates, 2).await;
+        assert!(worker.index.get(&block).is_none());
+        assert!(worker.index.policy_block_get(&block).is_none());
+        assert!(worker.small.as_ref().unwrap().contains(&exact));
+
+        let candidates = worker.lru.block_candidates(&block);
+        assert_eq!(candidates.len(), 1);
+        worker.unlink_units(candidates, 2).await;
+        assert_eq!(worker.lru.len(), 0);
+        assert_eq!(worker.lru.total_bytes(), 0);
+    }
+
     #[tokio::test]
     async fn unified_config_applies_hot_fields_and_reports_restart_changes() {
         use crate::dynamic_config::DynamicConfig;

@@ -21,7 +21,7 @@ mod page_tti_tests;
 mod small_tests;
 use crate::page_gc::{Mutations, PageGcConfig, PageGcMetrics};
 use crate::page_lifecycle::{AccessClock, PageLifecycle, ScanCursor};
-use crate::small_store::SmallObjectStore;
+use crate::small_store::{IdleRecencyCursor, SmallObjectStore};
 
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
@@ -155,9 +155,15 @@ pub struct WorkerRuntime {
     background_budget: Option<Arc<crate::background::BackgroundBudget>>,
     page_scan: Arc<tokio::sync::Mutex<ScanCursor>>,
     page_checkpoint: Arc<tokio::sync::Mutex<usize>>,
-    small_idle_cursor: Arc<tokio::sync::Mutex<(u64, u64)>>,
+    small_idle_cursor: Arc<tokio::sync::Mutex<SmallIdleCursor>>,
     small_capacity_eviction: Arc<tokio::sync::Mutex<async_eviction::SmallCapacityPhase>>,
     page_cleanup: Arc<tokio::sync::Mutex<crate::page_cleanup::CleanupCursor>>,
+}
+
+#[derive(Default)]
+struct SmallIdleCursor {
+    block: (u64, u64),
+    recency: IdleRecencyCursor,
 }
 
 /// Placement data published by the control plane; GC never performs discovery.
@@ -321,7 +327,7 @@ impl WorkerRuntime {
             background_budget: None,
             page_scan: Arc::new(tokio::sync::Mutex::new(ScanCursor::default())),
             page_checkpoint: Arc::new(tokio::sync::Mutex::new(0)),
-            small_idle_cursor: Arc::new(tokio::sync::Mutex::new((0, 0))),
+            small_idle_cursor: Arc::new(tokio::sync::Mutex::new(SmallIdleCursor::default())),
             small_capacity_eviction: Arc::new(tokio::sync::Mutex::new(Default::default())),
         }
     }
@@ -2860,12 +2866,11 @@ impl WorkerRuntime {
             return;
         }
         let mut cursor = self.small_idle_cursor.lock().await;
-        let mut position = *cursor;
-        let lru = self.lru.clone();
         let (scan, deletes) = self.maintenance_batch_limits();
         let scan = scan.min(4096);
         let deletes = deletes.min(256);
         if small.has_recency() {
+            let mut position = cursor.recency;
             let store = small.clone();
             let (next, candidates) = tokio::task::spawn_blocking(move || {
                 let candidates =
@@ -2874,13 +2879,15 @@ impl WorkerRuntime {
             })
             .await
             .expect("small object idle scan panicked");
-            *cursor = next;
+            cursor.recency = next;
             for (unit, ticket) in candidates {
                 self.unlink_idle_small(small.clone(), unit, ticket, now)
                     .await;
             }
             return;
         }
+        let mut position = cursor.block;
+        let lru = self.lru.clone();
         let (next, candidates) = tokio::task::spawn_blocking(move || {
             let candidates = lru.idle_candidates(&mut position, now, age, scan, deletes);
             (
@@ -2896,7 +2903,7 @@ impl WorkerRuntime {
         })
         .await
         .expect("small object idle scan panicked");
-        *cursor = next;
+        cursor.block = next;
         for candidate in candidates {
             self.unlink_idle_block(candidate, now).await;
         }

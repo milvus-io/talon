@@ -20,6 +20,7 @@ mod keys;
 mod records;
 mod rings;
 mod tickets;
+pub(crate) use recency::IdleRecencyCursor;
 pub use rings::SmallObjectStore;
 #[cfg(test)]
 pub(crate) mod tests;
@@ -793,6 +794,13 @@ impl SegmentStore {
         } else if self.flush_due().await {
             self.flush().await?;
         }
+        let tracks_access = self.journal.model.0.read().unwrap().recency.is_some();
+        // Wait before taking stream locks so snapshot I/O cannot stall appends.
+        let access_relocation = if tracks_access {
+            Some(self.journal.access_relocation.read().await)
+        } else {
+            None
+        };
         let _publication = self.publication.lock().await;
         // Pay before taking the mutation lock. A segment selected here cannot
         // gain new live bytes once sealed. Recheck identity and eligibility
@@ -895,6 +903,7 @@ impl SegmentStore {
             }
             self.entries.write().unwrap().retire_segment(old);
             drop(readers);
+            drop(access_relocation);
             let segment = state.segments.remove(&old).unwrap();
             let allocated = segment.allocated().await?;
             disk_io::remove(self.path(old, "data")).await?;
