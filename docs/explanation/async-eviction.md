@@ -178,9 +178,10 @@ blocks use a process-local block timestamp shared by the pages of each block.
 Packed whole objects and exact ranges use their own Small Store recency rows,
 including when TTI is disabled. Each round walks a fixed admission-ordered prefix
 of the ordinary block index and a bounded extent of the compact catalog, using
-independent cursors. A batch scans at most 4096 entries and retains at most 256
-candidates, subject to the configured scan and deletion limits. A paged block
-counts as one candidate regardless of its page count.
+independent cursors. A batch spends at most 4096 scan steps and retains at most
+256 candidates, subject to the configured scan and deletion limits. Each ordinary
+block or packed row costs one step. Passing a compact segment without visiting
+any rows also costs one step.
 
 Each scheduler slice issues at most one concurrent wave of HEAD requests,
 bounded by the configured concurrency, 32 distinct objects, and one second of
@@ -192,13 +193,14 @@ HEAD traffic. A whole-block removal charges deletion work for all resident pages
 even though they are removed together as a directory.
 
 A successful HEAD suppresses further GC verification for 24 hours across every
-cached offset and version of the same `(backend, bucket, key)`. Small Store
-allocates check metadata only for objects with a positive result, and expires
-those entries after the cooldown. Positive HEADs leave recency unchanged.
-A changed version
-still counts as an existing object. Only an explicit backend `NotFound` permits
-local reclamation; permission errors, transport failures, and timeouts retain the
-cache. Negative results and errors are shared only within the current batch.
+cached offset and version of the same `(backend, bucket, key)` in the namespace.
+One table covers ordinary and packed entries and retains only positive results.
+Cooldowns survive local eviction and expire 24 hours after the HEAD completes,
+including during an ongoing sweep. The sweep keeps its original idle cutoff.
+Positive HEADs leave recency unchanged. A changed version still counts as an
+existing object. Only an explicit backend `NotFound` permits local reclamation.
+Permission errors, transport failures, and timeouts retain the cache. Negative
+results and errors are shared only within the current batch.
 The task never deletes origin data.
 
 Before unlinking, the worker rechecks block admission identity, reader pins, and
@@ -243,8 +245,10 @@ work or a bounded deletion-credit payment. Protected blocks enter a retry set;
 one-second retries revisit only those admissions, not every resident block.
 Hourly supplements seek directly into a separate latest-admission index, so one
 new fill does not traverse older unchanged blocks. Refills move the block to its
-new admission position. Membership changes discard old progress and use the new
-event boundary; all unlinks still validate the current membership and activity.
+new admission position. Small Store supplements visit segment headers and scan
+the rows of segments with newer admissions. Membership changes discard old
+progress and use the new event boundary. Unlinks validate the current membership
+and activity.
 
 ## Clean access checkpoints
 

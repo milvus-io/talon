@@ -1038,7 +1038,7 @@ mod recovery_tests {
             let index = Arc::new(crate::BlockIndex::new());
             let mut units = Vec::new();
             store.restore_policy_units(&index, &mut units, false);
-            let policy = Arc::new(crate::Lru::from_recovered(index, units, 0, false, false));
+            let policy = Arc::new(crate::Lru::from_recovered(index, units, 0, false));
             store.bind_policy(policy.clone());
             for n in 0..6 {
                 store
@@ -1084,7 +1084,7 @@ mod recovery_tests {
         let mut units = Vec::new();
         store.restore_policy_units(&index, &mut units, false);
         assert!(units.is_empty());
-        let policy = Arc::new(crate::Lru::from_recovered(index, units, 0, false, false));
+        let policy = Arc::new(crate::Lru::from_recovered(index, units, 0, false));
         store.bind_policy(policy.clone());
         assert_eq!(policy.len(), 3);
         for n in 0..6 {
@@ -1124,7 +1124,7 @@ mod recovery_tests {
         let mut units = Vec::new();
         store.restore_policy_units(&index, &mut units, false);
         assert!(units.is_empty());
-        let policy = Arc::new(crate::Lru::from_recovered(index, units, 0, false, false));
+        let policy = Arc::new(crate::Lru::from_recovered(index, units, 0, false));
         store.bind_policy(policy.clone());
         assert_eq!(policy.len(), 1);
         assert_eq!(policy.total_bytes(), 4 + CHECKSUM_BYTES);
@@ -1228,7 +1228,6 @@ mod recovery_tests {
                 units,
                 1,
                 tracking,
-                tracking,
             ));
             store.bind_policy(policy.clone());
             store.enable_access_tracking().unwrap();
@@ -1276,13 +1275,7 @@ mod recovery_tests {
         for unit in &units {
             serial.insert_with_policy(unit.unit.materialize(), unit.bytes, true);
         }
-        let policy = Arc::new(crate::Lru::from_recovered(
-            index,
-            units,
-            store.len(),
-            true,
-            true,
-        ));
+        let policy = Arc::new(crate::Lru::from_recovered(index, units, store.len(), true));
         store.bind_policy(policy.clone());
         assert_eq!(policy.len(), 2050);
         assert_eq!(policy.total_bytes(), serial.total_bytes());

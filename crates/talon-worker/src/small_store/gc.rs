@@ -234,6 +234,14 @@ impl SmallAccess {
 }
 
 impl SmallObjectStore {
+    #[cfg(test)]
+    pub(crate) fn assert_no_resident_policy_allocations(&self) {
+        let catalog = self.journal.model.0.read().unwrap();
+        assert_eq!(catalog.policy.capacity(), 0);
+        assert_eq!(catalog.access.capacity(), 0);
+        assert_eq!(catalog.tickets.capacity(), 0);
+    }
+
     pub(crate) fn init_ownership(&self) {
         let mut catalog = self.journal.model.0.write().unwrap();
         catalog.ownership = Some(Ownership {
@@ -357,5 +365,71 @@ impl SmallObjectStore {
             })
             .collect();
         (done, candidates)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use talon_core::{Backend, ObjectId, Version};
+
+    #[tokio::test]
+    async fn stale_scan_charges_empty_segments_and_resumes_with_a_budget_of_one() {
+        const EMPTY_SEGMENTS: usize = 8;
+        let root = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            SmallObjectStore::open(root.path().to_owned(), 128 << 10, 256 << 10, 0, None).unwrap(),
+        );
+        let index = Arc::new(crate::BlockIndex::new());
+        store.restore_policy_units(&index, &mut Vec::new(), false);
+        store.init_recency();
+        store.bind_policy(Arc::new(crate::Lru::from_recovered(
+            index,
+            Vec::new(),
+            0,
+            true,
+        )));
+
+        let payload = Bytes::from(vec![1; 96 << 10]);
+        let block = |n| {
+            BlockId::new(
+                ObjectId::new(Backend::S3, "bucket", format!("key-{n}")),
+                0,
+                128 << 10,
+                Version::new("v1"),
+            )
+        };
+        for n in 0..=EMPTY_SEGMENTS * 2 {
+            store.put(&block(n), payload.clone()).await.unwrap();
+        }
+        for n in 0..EMPTY_SEGMENTS * 2 {
+            store.delete(&block(n)).await.unwrap();
+        }
+        {
+            let catalog = store.journal.model.0.read().unwrap();
+            assert_eq!(catalog.model.segments.len(), EMPTY_SEGMENTS + 1);
+            assert!(catalog
+                .model
+                .segments
+                .values()
+                .take(EMPTY_SEGMENTS)
+                .all(|segment| segment.records.slots() == 0));
+        }
+
+        let now = crate::eviction::access_millis() + 2;
+        let mut cursor = IdleRecencyCursor::default();
+        for _ in 0..EMPTY_SEGMENTS {
+            let (done, candidates) = store.stale_candidates(&mut cursor, now, 1, 1, 1);
+            assert!(!done);
+            assert!(candidates.is_empty());
+        }
+        let (_, candidates) = store.stale_candidates(&mut cursor, now, 1, 1, 1);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].0.unit,
+            CacheUnit::Whole(block(EMPTY_SEGMENTS * 2))
+        );
+        assert!(store.stale_candidates(&mut cursor, now, 1, 1, 1).0);
     }
 }

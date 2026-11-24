@@ -11,14 +11,13 @@
 //! is done by the caller with the returned unit list. Segmented-LRU / TinyLFU
 //! are deferred per DESIGN.md.
 
-use crate::block_key::{ObjectIdentity, ObjectKey};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 #[cfg(test)]
 use talon_core::Version;
-use talon_core::{BlockId, ObjectId, PageIndex};
+use talon_core::{BlockId, PageIndex};
 
 mod recovery;
 mod versions;
@@ -468,8 +467,6 @@ struct Inner {
     versions: VersionIndex,
     block_queue: BTreeMap<u64, BlockKey>,
     ownership_queue: BTreeMap<u64, BlockKey>,
-    object_checks: HashMap<ObjectKey, (usize, Option<u64>)>,
-    track_checks: bool,
     track_blocks: bool,
     track_small_clock: bool,
     total_bytes: u64,
@@ -544,16 +541,6 @@ impl Inner {
                 self.block_queue.remove(&activity.position);
             }
         }
-        if let Some(check) = self
-            .object_checks
-            .get_mut(&block.object as &dyn ObjectIdentity)
-        {
-            check.0 -= 1;
-            if check.0 == 0 {
-                self.object_checks
-                    .remove(&block.object as &dyn ObjectIdentity);
-            }
-        }
         if !entry.independent {
             self.remove_version(unit);
         }
@@ -605,10 +592,10 @@ impl Lru {
 
     /// Create an empty tracker.
     pub fn new() -> Self {
-        Self::with_tracking(true, true)
+        Self::with_tracking(true)
     }
 
-    fn with_tracking(track_checks: bool, track_blocks: bool) -> Self {
+    fn with_tracking(track_blocks: bool) -> Self {
         Self {
             inner: Mutex::new(Inner {
                 index: Arc::new(crate::BlockIndex::new()),
@@ -616,8 +603,6 @@ impl Lru {
                 versions: VersionIndex::default(),
                 block_queue: BTreeMap::new(),
                 ownership_queue: BTreeMap::new(),
-                object_checks: HashMap::new(),
-                track_checks,
                 track_blocks,
                 track_small_clock: track_blocks,
                 total_bytes: 0,
@@ -715,12 +700,10 @@ impl Lru {
     ) -> AccessHandle {
         let independent = independent || unit.kind() == UnitKind::ExactRange;
         if independent {
-            if let Some(access) = g.index.compact_small_admit(
-                &unit,
-                bytes,
-                g.track_small_clock,
-                !g.track_blocks && !g.track_checks,
-            ) {
+            if let Some(access) =
+                g.index
+                    .compact_small_admit(&unit, bytes, g.track_small_clock, !g.track_blocks)
+            {
                 return access;
             }
         }
@@ -827,12 +810,6 @@ impl Lru {
                 .unwrap_or_else(|| unit.shared_block()),
             kind: unit.kind(),
         };
-        if g.track_checks {
-            g.object_checks
-                .entry(ObjectKey(unit.block.clone()))
-                .or_insert((0, None))
-                .0 += 1;
-        }
         if !independent {
             g.versions.insert(unit.block.clone());
         }
@@ -1061,17 +1038,6 @@ impl Lru {
 
     /// Visit each block once, regardless of its number of cached pages. The
     /// admission-ordered block queue is separate from the capacity eviction hand.
-    pub(crate) fn stale_gc_candidates(
-        &self,
-        cursor: &mut (u64, u64),
-        now: u64,
-        age: u64,
-        scan_budget: usize,
-        delete_budget: usize,
-    ) -> Vec<StaleBlockCandidate> {
-        self.age_candidates(cursor, now, age, (scan_budget, delete_budget), true)
-    }
-
     pub(crate) fn idle_candidates(
         &self,
         cursor: &mut (u64, u64),
@@ -1079,17 +1045,6 @@ impl Lru {
         age: u64,
         scan_budget: usize,
         delete_budget: usize,
-    ) -> Vec<StaleBlockCandidate> {
-        self.age_candidates(cursor, now, age, (scan_budget, delete_budget), false)
-    }
-
-    fn age_candidates(
-        &self,
-        cursor: &mut (u64, u64),
-        now: u64,
-        age: u64,
-        (scan_budget, delete_budget): (usize, usize),
-        consider_verified: bool,
     ) -> Vec<StaleBlockCandidate> {
         let mut out = Vec::new();
         if cursor.0 >= cursor.1 {
@@ -1105,14 +1060,6 @@ impl Lru {
             let activity = g.index.policy_block_get(block).expect("tracked block");
             let access = activity.access.load(Ordering::Relaxed);
             if activity.pins != 0 || now.saturating_sub(access) <= age {
-                continue;
-            }
-            if consider_verified
-                && g.object_checks
-                    .get(&block.view().object as &dyn ObjectIdentity)
-                    .and_then(|check| check.1)
-                    .is_some_and(|at| now.saturating_sub(at) < age)
-            {
                 continue;
             }
             out.push(StaleBlockCandidate {
@@ -1221,29 +1168,6 @@ impl Lru {
             {
                 g.remove(&unit);
             }
-        }
-    }
-
-    pub(crate) fn stale_check_due(&self, object: &ObjectId, now: u64, age: u64) -> bool {
-        self.inner
-            .lock()
-            .unwrap()
-            .object_checks
-            .get(object as &dyn ObjectIdentity)
-            .map_or(true, |(_, at)| {
-                at.map_or(true, |at| now.saturating_sub(at) >= age)
-            })
-    }
-
-    pub(crate) fn stale_verified(&self, object: &ObjectId, now: u64) {
-        if let Some(check) = self
-            .inner
-            .lock()
-            .unwrap()
-            .object_checks
-            .get_mut(object as &dyn ObjectIdentity)
-        {
-            check.1 = Some(now);
         }
     }
 
@@ -1370,39 +1294,6 @@ mod tests {
         assert!(clock.upgrade().is_none());
     }
 
-    #[test]
-    fn object_checks_share_identity_across_versions_and_release_the_last_unit() {
-        let lru = Lru::new();
-        let first = CacheUnit::Page(blk(9), PageIndex(0));
-        lru.insert(first.clone(), 4096);
-        let alive = lru
-            .index()
-            .shared_identity(first.block())
-            .unwrap()
-            .downgrade();
-        lru.stale_verified(&first.block().object, 100);
-        let mut other = blk(9);
-        other.offset = 4096;
-        other.version = Version::new("v2");
-        let second = CacheUnit::Page(other, PageIndex(1));
-        lru.insert(second.clone(), 0);
-        {
-            let g = lru.inner.lock().unwrap();
-            assert_eq!(g.object_checks.len(), 1);
-            assert_eq!(
-                g.object_checks
-                    .get(&first.block().object as &dyn ObjectIdentity),
-                Some(&(2, Some(100)))
-            );
-        }
-        lru.remove(&first);
-        assert!(alive());
-        assert!(!lru.stale_check_due(&second.block().object, 101, 10));
-        lru.remove(&second);
-        assert!(!alive());
-        assert!(lru.inner.lock().unwrap().object_checks.is_empty());
-    }
-
     fn blk(n: u64) -> BlockId {
         BlockId::new(
             ObjectId::new(Backend::S3, "b", format!("o/{n}")),
@@ -1471,7 +1362,7 @@ mod tests {
             let mut units = Vec::new();
             store.restore_policy_units(&index, &mut units, false);
             store.init_recency();
-            let lru = Arc::new(Lru::from_recovered(index.clone(), units, 0, false, true));
+            let lru = Arc::new(Lru::from_recovered(index.clone(), units, 0, true));
             store.bind_policy(lru.clone());
 
             let payload = Bytes::from_static(b"payload");
@@ -1520,7 +1411,7 @@ mod tests {
 
     #[test]
     fn disabled_block_tracking_keeps_capacity_pins_and_version_eviction() {
-        let lru = Lru::with_tracking(false, false);
+        let lru = Lru::with_tracking(false);
         let old = CacheUnit::Page(blk(0), PageIndex(0));
         let mut new_block = blk(0);
         new_block.version = Version::new("v2");
@@ -1545,7 +1436,7 @@ mod tests {
     #[test]
     fn switching_whole_storage_policy_preserves_access_and_pins() {
         for tracking in [false, true] {
-            let lru = Arc::new(Lru::with_tracking(tracking, tracking));
+            let lru = Arc::new(Lru::with_tracking(tracking));
             let unit = whole(1);
             let access = lru.insert(unit.clone(), 10);
             let pin = lru.pin_guard(unit.clone());
@@ -1596,40 +1487,28 @@ mod tests {
 
     #[test]
     fn independent_keys_skip_version_index_and_preserve_exact_deletion() {
-        for track_checks in [false, true] {
-            let lru = Lru::with_tracking(track_checks, true);
-            let v1 = blk(1);
-            let mut v2 = v1.clone();
-            v2.version = Version::new("v2");
-            for id in [&v1, &v2] {
-                lru.insert_with_policy(CacheUnit::Whole(id.clone()), 4096, true);
-            }
-            assert!(lru.inner.lock().unwrap().versions.is_empty());
-            assert_eq!(
-                lru.inner.lock().unwrap().object_checks.len(),
-                usize::from(track_checks)
-            );
-            assert!(lru.superseded_candidates(&v2).is_empty());
-            assert!(lru.evict_superseded(&v2).is_empty());
-            let mut paged = v1.clone();
-            paged.version = Version::new("v3");
-            lru.insert(CacheUnit::Page(paged.clone(), PageIndex(0)), 100);
-            assert!(lru.superseded_candidates(&paged).is_empty());
-            assert!(lru.superseded_candidates(&v2).is_empty());
-            assert_eq!(lru.block_candidates(&v1).len(), 1);
-            if track_checks {
-                assert!(lru.stale_check_due(&v1.object, 100, 10));
-                lru.stale_verified(&v1.object, 100);
-                assert!(!lru.stale_check_due(&v2.object, 101, 10));
-            }
-            lru.remove_block(&v1);
-            assert!(lru.block_candidates(&v1).is_empty());
-            assert_eq!(lru.block_candidates(&v2).len(), 1);
-            lru.remove_block(&v2);
-            lru.remove_block(&paged);
-            assert!(lru.is_empty());
-            assert!(lru.inner.lock().unwrap().object_checks.is_empty());
+        let lru = Lru::new();
+        let v1 = blk(1);
+        let mut v2 = v1.clone();
+        v2.version = Version::new("v2");
+        for id in [&v1, &v2] {
+            lru.insert_with_policy(CacheUnit::Whole(id.clone()), 4096, true);
         }
+        assert!(lru.inner.lock().unwrap().versions.is_empty());
+        assert!(lru.superseded_candidates(&v2).is_empty());
+        assert!(lru.evict_superseded(&v2).is_empty());
+        let mut paged = v1.clone();
+        paged.version = Version::new("v3");
+        lru.insert(CacheUnit::Page(paged.clone(), PageIndex(0)), 100);
+        assert!(lru.superseded_candidates(&paged).is_empty());
+        assert!(lru.superseded_candidates(&v2).is_empty());
+        assert_eq!(lru.block_candidates(&v1).len(), 1);
+        lru.remove_block(&v1);
+        assert!(lru.block_candidates(&v1).is_empty());
+        assert_eq!(lru.block_candidates(&v2).len(), 1);
+        lru.remove_block(&v2);
+        lru.remove_block(&paged);
+        assert!(lru.is_empty());
     }
 
     #[test]
@@ -1741,10 +1620,8 @@ mod tests {
         lru.insert(second.clone(), 16);
         access.clock().store(100, Ordering::Relaxed);
         let mut cursor = (0, 0);
-        assert!(lru
-            .stale_gc_candidates(&mut cursor, 200, 100, 8, 8)
-            .is_empty());
-        let candidates = lru.stale_gc_candidates(&mut cursor, 201, 100, 8, 8);
+        assert!(lru.idle_candidates(&mut cursor, 200, 100, 8, 8).is_empty());
+        let candidates = lru.idle_candidates(&mut cursor, 201, 100, 8, 8);
         assert_eq!(candidates.len(), 1);
         assert!(candidates.iter().all(|c| lru.stale_candidate_is_current(c)));
         // A touch of either page invalidates the block candidate.
@@ -1761,26 +1638,17 @@ mod tests {
         let unit = whole(1);
         let old = lru.insert(unit.clone(), 16);
         old.clock().store(1, Ordering::Relaxed);
-        let candidates = lru.stale_gc_candidates(&mut (0, 0), 200, 100, 8, 8);
+        let candidates = lru.idle_candidates(&mut (0, 0), 200, 100, 8, 8);
         assert_eq!(candidates.len(), 1);
-        lru.stale_verified(&unit.block().object, 200);
         lru.remove(&unit);
         {
             let g = lru.inner.lock().unwrap();
             assert!(g.index.policy_block_get(unit.block()).is_none());
             assert!(g.block_queue.is_empty());
-            assert!(g.object_checks.is_empty());
         }
         let new = lru.insert(unit, 16);
         assert!(!Arc::ptr_eq(old.clock(), new.clock()));
         assert!(!lru.stale_candidate_is_current(&candidates[0]));
-        assert!(lru
-            .inner
-            .lock()
-            .unwrap()
-            .object_checks
-            .values()
-            .all(|(_, at)| at.is_none()));
     }
 
     #[test]

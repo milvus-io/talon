@@ -984,7 +984,7 @@ mod tests {
 
     async fn evict(worker: &WorkerRuntime, config: &WorkerConfig, stale: bool) {
         if stale {
-            let candidates = worker.lru.stale_gc_candidates(
+            let candidates = worker.lru.idle_candidates(
                 &mut (0, 0),
                 crate::eviction::access_millis() + 1,
                 0,

@@ -237,7 +237,6 @@ impl WorkerRuntime {
             l1_page_size_bytes,
             metrics,
             true,
-            true,
             false,
         )
     }
@@ -254,16 +253,19 @@ impl WorkerRuntime {
         l1_capacity_bytes: u64,
         l1_page_size_bytes: u64,
         metrics: WorkerMetrics,
-        track_checks: bool,
         track_blocks: bool,
         compact_small_recency: bool,
     ) -> Self {
         let lru_started = Instant::now();
         index.prepare_runtime_recovery();
         let mut units = index.restore_policy_units(track_blocks);
-        let blocks = index.len() + small.as_ref().map_or(0, |small| small.len());
+        let mut blocks = index.len();
         if let Some(small) = &small {
-            small.restore_policy_units(&index, &mut units, track_blocks && !compact_small_recency);
+            let track_small_blocks = track_blocks && !compact_small_recency;
+            if track_small_blocks {
+                blocks += small.len();
+            }
+            small.restore_policy_units(&index, &mut units, track_small_blocks);
             if compact_small_recency {
                 small.init_recency();
             }
@@ -272,7 +274,6 @@ impl WorkerRuntime {
             index.clone(),
             units,
             blocks,
-            track_checks,
             track_blocks,
         ));
         let lru_ms = lru_started.elapsed().as_secs_f64() * 1000.0;
@@ -445,6 +446,26 @@ impl WorkerRuntime {
                 .as_ref()
                 .and_then(|small| small.ownership_limit(true)),
         }
+    }
+
+    fn capture_supplemental_limits(
+        &self,
+        expected: &MembershipSnapshot,
+    ) -> Option<OwnershipLimits> {
+        // Keep the generation check and consumption of the admission marker
+        // atomic with respect to publication of a new event boundary.
+        let held = self.membership.lock().unwrap();
+        let current = held.as_ref()?;
+        if current.generation != expected.generation || Instant::now() >= current.valid_until {
+            return None;
+        }
+        Some(OwnershipLimits {
+            block: self.lru.ownership_admission_ceiling(),
+            small: self
+                .small
+                .as_ref()
+                .and_then(|small| small.ownership_limit(false)),
+        })
     }
 
     fn membership_snapshot(&self) -> Option<Arc<MembershipSnapshot>> {

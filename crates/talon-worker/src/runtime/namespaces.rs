@@ -241,7 +241,6 @@ impl NamespaceRuntimes {
             config.l1_capacity_bytes,
             config.l1_page_size_bytes,
             self.metrics.clone(),
-            config.stale_gc_enabled,
             true,
             true,
         )

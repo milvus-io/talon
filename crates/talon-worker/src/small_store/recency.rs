@@ -311,8 +311,8 @@ impl Catalog {
         true
     }
 
-    /// Visit bounded slices of segment rows before the exclusive end address.
-    /// The offset remains meaningful if deletion compacts the row array.
+    /// Charge one step per row, and charge a segment transition when no rows
+    /// were visited. Offsets remain meaningful if deletion compacts the rows.
     pub(super) fn visit_recency(
         &self,
         cursor: &mut Address,
@@ -324,6 +324,9 @@ impl Catalog {
             return true;
         }
         for (&id, segment) in self.model.segments.range(cursor.0..=end.0) {
+            if limit == 0 {
+                return false;
+            }
             let records = &segment.records;
             let start = if id == cursor.0 {
                 records.position(cursor.1)
@@ -348,9 +351,7 @@ impl Catalog {
                     return false;
                 }
             }
-            if id == end.0 {
-                break;
-            }
+            limit -= usize::from(start == stop);
             *cursor = (id + 1, 0);
         }
         true

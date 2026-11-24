@@ -109,7 +109,6 @@ fn runtime_with_tracking(
         1024,
         WorkerMetrics::new(capacity),
         tracking,
-        tracking,
         false,
     );
     if paged {

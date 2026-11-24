@@ -962,13 +962,7 @@ mod tests {
         let directory = Arc::new(RwLock::new(Directory::default()));
         let index = Arc::new(BlockIndex::new());
         index.register_small_directory(&directory);
-        let lru = Arc::new(Lru::from_recovered(
-            index.clone(),
-            Vec::new(),
-            0,
-            false,
-            false,
-        ));
+        let lru = Arc::new(Lru::from_recovered(index.clone(), Vec::new(), 0, false));
         let (entered, paused) = mpsc::channel();
         let (resume, resumed) = mpsc::channel();
         *lru.before_small_publish.lock().unwrap() = Some(Box::new(move || {

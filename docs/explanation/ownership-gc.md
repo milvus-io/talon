@@ -88,7 +88,7 @@ time in resident-cache size; normal membership validation still depends on the
 number of Workers. Reads and capacity-policy rotations do not advance this marker.
 
 When admissions exist, a supplemental pass captures a fixed new upper boundary
-and traverses only that range of the in-memory ownership index. Only blocks whose
+and traverses only that range of the ordinary in-memory ownership index. Only blocks whose
 latest admission revision is below the new boundary are hashed and checked
 against the cached placement tables. Unchanged residents are not revisited and
 there is no disk-directory scan.
@@ -111,8 +111,12 @@ Small Store groups admissions by segment and epoch. Each ordinary append
 inherits its segment's first epoch or stores an offset exception for a later epoch.
 Immutable re-admissions update the epoch even when their payload locator is
 unchanged. Publication advances the epoch after capturing the event boundary.
-Hourly supplements skip unchanged segments' rows and hash only entries admitted
-within the captured epoch range. A segment replacement keeps its logical place
+Hourly supplements visit segment headers up to the captured extent. They scan all
+rows in segments with newer admissions and hash only entries in the captured epoch
+range. Without relocation, a pass costs the number of segment headers plus the
+rows in those segments. A single immutable re-admission can require scanning every
+row in its segment, with at most 64 segment or row steps per slice.
+A segment replacement keeps its logical place
 in the scan and transfers row epochs and tickets to the copied extents. If the
 current segment moves between slices, the scan resumes at the beginning of its
 replacement.

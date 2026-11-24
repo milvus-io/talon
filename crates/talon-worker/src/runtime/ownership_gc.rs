@@ -1,5 +1,5 @@
 //! Event-driven reclamation of cache blocks outside current placement.
-use super::{MembershipSnapshot, WorkerRuntime};
+use super::{MembershipSnapshot, OwnershipLimits, WorkerRuntime};
 use crate::eviction::StaleBlockCandidate;
 use crate::small_store::{GcCheck, OwnershipCursor, OwnershipLimit, SmallGcCandidate};
 use std::{
@@ -126,6 +126,14 @@ impl OwnershipGc {
         let Some(view) = self.prepare_ownership(worker) else {
             return;
         };
+        self.run_slice_for_membership(worker, view).await;
+    }
+
+    async fn run_slice_for_membership(
+        &mut self,
+        worker: &WorkerRuntime,
+        view: Arc<MembershipSnapshot>,
+    ) {
         if self
             .pass
             .as_ref()
@@ -148,11 +156,13 @@ impl OwnershipGc {
                     limits.small.map(|limit| SmallPass::new(0, limit)),
                 )
             } else {
-                let limit = worker.lru.ownership_admission_ceiling();
-                let small = worker
-                    .small
-                    .as_ref()
-                    .and_then(|small| small.ownership_limit(false));
+                let Some(OwnershipLimits {
+                    block: limit,
+                    small,
+                }) = worker.capture_supplemental_limits(&view)
+                else {
+                    return;
+                };
                 if limit <= self.completed_limit && small.is_none() {
                     self.next_supplement = tokio::time::Instant::now() + SUPPLEMENT_INTERVAL;
                     return;
@@ -754,6 +764,35 @@ mod tests {
         gc.run_round(&worker).await;
         assert!(worker.small.as_ref().unwrap().contains(&foreign));
         assert!(gc.pass.is_none());
+    }
+
+    #[tokio::test]
+    async fn superseded_supplement_leaves_post_event_compact_admission_pending() {
+        let root = tempfile::tempdir().unwrap();
+        let (worker, fixture) = namespace_runtime(root.path(), false);
+        *fixture.members.lock().unwrap() = Some(vec!["a"]);
+        let mut gc = fixture.gc(&worker);
+        gc.run_round(&worker).await;
+        gc.next_supplement = tokio::time::Instant::now();
+        let old_view = gc.prepare_ownership(&worker).unwrap();
+
+        *fixture.members.lock().unwrap() = Some(vec!["a", "b"]);
+        fixture.publish(&worker);
+        let late = packed_placed("b", 0);
+        worker
+            .commit_cached_block(&late, Bytes::from_static(b"late"))
+            .await
+            .unwrap();
+        gc.run_slice_for_membership(&worker, old_view).await;
+
+        gc.run_round(&worker).await;
+        assert!(
+            worker.contains_block(&late),
+            "the event excludes the late fill"
+        );
+        gc.next_supplement = tokio::time::Instant::now();
+        gc.run_round(&worker).await;
+        assert!(!worker.contains_block(&late));
     }
 
     #[tokio::test]

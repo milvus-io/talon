@@ -174,7 +174,7 @@ async fn compact_journal_preserves_live_and_recovered_identity() {
         let mut units = Vec::new();
         let index = Arc::new(crate::BlockIndex::new());
         store.restore_policy_units(&index, &mut units, true);
-        let policy = Arc::new(Lru::from_recovered(index, units, store.len(), true, true));
+        let policy = Arc::new(Lru::from_recovered(index, units, store.len(), true));
         store.bind_policy(policy.clone());
         if !recovered {
             store
