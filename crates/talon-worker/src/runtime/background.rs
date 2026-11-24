@@ -290,7 +290,6 @@ impl WorkerRuntime {
         if *capacity != super::async_eviction::SmallCapacityPhase::Idle {
             return;
         }
-        let _io = self.background_io().await;
         if let Err(error) = self
             .maintain_small_budget(false, self.background_budget.clone())
             .await

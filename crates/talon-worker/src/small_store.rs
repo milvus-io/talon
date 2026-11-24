@@ -28,7 +28,7 @@ pub(crate) mod tests;
 use crate::eviction::{AccessHandle, CacheUnit, SharedUnit};
 use crate::small_store::key::{SmallIdentity, SmallKey};
 use crate::Lru;
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use format::invalid;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::OpenOptions;
@@ -48,16 +48,6 @@ fn checksum_len(legacy_checksum: Option<u64>) -> u64 {
     } else {
         0
     }
-}
-
-fn with_checksum(value: Bytes, checksum: u64) -> Bytes {
-    let mut bytes = value.try_into_mut().unwrap_or_else(|value| {
-        let mut bytes = BytesMut::with_capacity(value.len() + CHECKSUM_BYTES as usize);
-        bytes.extend_from_slice(&value);
-        bytes
-    });
-    bytes.extend_from_slice(&checksum.to_le_bytes());
-    bytes.freeze()
 }
 
 /// Borrowed identity accepted by packed storage. Ordinary callers keep using BlockId.
@@ -577,8 +567,7 @@ impl SegmentStore {
             self.pause_append().await;
             let (payload, record) = tokio::join!(
                 async {
-                    disk_io::write(data.clone(), with_checksum(value, checksum), loc.offset)
-                        .await?;
+                    disk_io::write_record(data.clone(), value, checksum, loc.offset).await?;
                     #[cfg(test)]
                     tests::crash("append_payload");
                     Ok::<_, io::Error>(())
@@ -780,6 +769,17 @@ impl SegmentStore {
         pressure: bool,
         budget: Option<Arc<crate::background::BackgroundBudget>>,
     ) -> io::Result<bool> {
+        let tracks_access = self.journal.model.0.read().unwrap().recency.is_some();
+        // Always take the relocation gate before competing with the snapshot for disk I/O.
+        let access_relocation = if tracks_access {
+            Some(self.journal.access_relocation.read().await)
+        } else {
+            None
+        };
+        let _io = match &budget {
+            Some(budget) => Some(budget.io().await),
+            None => None,
+        };
         let pressure_seal = if pressure {
             let state = self.state.lock().await;
             state
@@ -794,13 +794,6 @@ impl SegmentStore {
         } else if self.flush_due().await {
             self.flush().await?;
         }
-        let tracks_access = self.journal.model.0.read().unwrap().recency.is_some();
-        // Wait before taking stream locks so snapshot I/O cannot stall appends.
-        let access_relocation = if tracks_access {
-            Some(self.journal.access_relocation.read().await)
-        } else {
-            None
-        };
         let _publication = self.publication.lock().await;
         // Pay before taking the mutation lock. A segment selected here cannot
         // gain new live bytes once sealed. Recheck identity and eligibility

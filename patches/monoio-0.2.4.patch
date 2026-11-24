@@ -519,3 +519,81 @@
 +        self.fd.raw_fd()
 +    }
 +}
+--- a/src/driver/op/write.rs
++++ b/src/driver/op/write.rs
+@@ -188,3 +188,55 @@
+         .map(|_| bytes_sent)
+     }
+ }
++
++#[cfg(target_os = "linux")]
++pub(crate) struct WriteVectoredAt<T, const N: usize> {
++    fd: SharedFd,
++    offset: u64,
++    vectors: Box<[libc::iovec; N]>,
++    // Keep every backing allocation alive until kernel completion, even on cancellation.
++    buffers: [T; N],
++}
++
++#[cfg(target_os = "linux")]
++impl<T: IoBuf, const N: usize> Op<WriteVectoredAt<T, N>> {
++    pub(crate) async fn write_vectored_at(
++        fd: &SharedFd,
++        buffers: [T; N],
++        offset: u64,
++    ) -> io::Result<(usize, [T; N])> {
++        let vectors = Box::new(buffers.each_ref().map(|buf| libc::iovec {
++            iov_base: buf.read_ptr() as *mut _,
++            iov_len: buf.bytes_init(),
++        }));
++        let mut write = WriteVectoredAt { fd: fd.clone(), offset, vectors, buffers };
++        loop {
++            let completion = Op::submit_with(write)?.await;
++            write = completion.data;
++            match completion.meta.result {
++                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
++                result => return result.map(|n| (n as usize, write.buffers)),
++            }
++        }
++    }
++}
++
++#[cfg(target_os = "linux")]
++impl<T: IoBuf, const N: usize> OpAble for WriteVectoredAt<T, N> {
++    #[cfg(feature = "iouring")]
++    fn uring_op(&mut self) -> io_uring::squeue::Entry {
++        opcode::Writev::new(types::Fd(self.fd.raw_fd()), self.vectors.as_ptr(), N as _)
++            .offset(self.offset)
++            .build()
++    }
++
++    #[cfg(any(feature = "legacy", feature = "poll-io"))]
++    fn legacy_interest(&self) -> Option<(Direction, usize)> {
++        None
++    }
++
++    #[cfg(any(feature = "legacy", feature = "poll-io"))]
++    fn legacy_call(&mut self) -> io::Result<u32> {
++        syscall_u32!(pwritev64(self.fd.raw_fd(), self.vectors.as_ptr(), N as _, self.offset as _))
++    }
++}
+--- a/src/fs/file.rs
++++ b/src/fs/file.rs
+@@ -328,6 +328,17 @@
+         op.write().await
+     }
+ 
++    /// Write the initialized parts of owned buffers at a file offset.
++    /// Returns the number of bytes written and the original buffers on success.
++    #[cfg(target_os = "linux")]
++    pub async fn write_vectored_at<T: IoBuf, const N: usize>(
++        &self,
++        buffers: [T; N],
++        pos: u64,
++    ) -> io::Result<(usize, [T; N])> {
++        Op::write_vectored_at(&self.fd, buffers, pos).await
++    }
++
+     /// Attempts to write an entire buffer into this file at the specified
+     /// offset.
+     ///

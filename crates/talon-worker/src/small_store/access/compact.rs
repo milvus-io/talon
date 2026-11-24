@@ -124,12 +124,6 @@ impl SmallObjectStore {
         };
         let full = state.full
             || state.log_bytes >= MIN_COMPACT_BYTES.max(state.snapshot_bytes.div_ceil(2));
-        // Maintenance can already own a disk permit when it needs this gate.
-        // Take the permit first and reuse it for all writes until sampling ends.
-        let reserved_io = match (full, budget) {
-            (true, Some(budget)) => Some(budget.io().await),
-            _ => None,
-        };
         let access_relocation = if full {
             Some(self.journal.access_relocation.write().await)
         } else {
@@ -146,14 +140,6 @@ impl SmallObjectStore {
             .segments
             .last_key_value()
             .map_or((0, 0), |(&id, segment)| (id, segment.bytes));
-        #[cfg(test)]
-        {
-            let pause = self.access_pause.lock().unwrap().take();
-            if let Some((entered, release)) = pause {
-                entered.notify_one();
-                release.notified().await;
-            }
-        }
         let tmp = self.root.join("access.checkpoint.tmp");
         let mut fd = None;
         let mut offset = state.log_bytes;
@@ -162,17 +148,25 @@ impl SmallObjectStore {
                 .generation
                 .checked_add(1)
                 .ok_or_else(|| invalid("access generation exhausted"))?;
-            let file = disk_io::open(tmp.clone(), disk_io::Open::Replace).await?;
-            self.write_access_chunks(
-                &file,
-                header(MAGIC, state.generation).into(),
-                0,
-                budget,
-                reserved_io.as_ref(),
-            )
-            .await?;
+            let file = {
+                let _io = match budget {
+                    Some(b) => Some(b.io().await),
+                    None => None,
+                };
+                disk_io::open(tmp.clone(), disk_io::Open::Replace).await?
+            };
+            self.write_access_chunks(&file, header(MAGIC, state.generation).into(), 0, budget)
+                .await?;
             offset = HEADER;
             fd = Some(file);
+        }
+        #[cfg(test)]
+        {
+            let pause = self.access_pause.lock().unwrap().take();
+            if let Some((entered, release)) = pause {
+                entered.notify_one();
+                release.notified().await;
+            }
         }
         loop {
             let mut bytes = Vec::new();
@@ -201,14 +195,8 @@ impl SmallObjectStore {
                     fd = Some(disk_io::open(self.root.join(LOG), disk_io::Open::Update).await?);
                 }
                 let len = bytes.len() as u64;
-                self.write_access_chunks(
-                    fd.as_ref().unwrap(),
-                    bytes.into(),
-                    offset,
-                    budget,
-                    reserved_io.as_ref(),
-                )
-                .await?;
+                self.write_access_chunks(fd.as_ref().unwrap(), bytes.into(), offset, budget)
+                    .await?;
                 offset += len;
             }
             if done {
@@ -217,7 +205,6 @@ impl SmallObjectStore {
             tokio::task::yield_now().await;
         }
         drop(access_relocation);
-        drop(reserved_io);
         if let Some(fd) = fd {
             self.sync_access(fd, budget).await?;
             if full {

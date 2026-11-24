@@ -308,13 +308,26 @@ async fn full_access_checkpoint_and_relocation_share_the_publication_boundary() 
         }
         store.access_disk.lock().unwrap().full = true;
 
+        let budget = crate::background::BackgroundBudget::new(&talon_core::WorkerConfig {
+            background_io_concurrency: 1,
+            background_io_max_mb_per_sec: 1,
+            background_delete_max_per_sec: 0,
+            ..Default::default()
+        });
         let relocating = || {
             let store = store.clone();
-            tokio::spawn(async move { store.maintain(false).await.unwrap() })
+            let budget = budget.clone();
+            tokio::spawn(async move {
+                store
+                    .maintain_with_budget(false, Some(budget))
+                    .await
+                    .unwrap()
+            })
         };
         let checkpointing = || {
             let store = store.clone();
-            tokio::spawn(async move { flush(&store).await })
+            let budget = budget.clone();
+            tokio::spawn(async move { store.checkpoint_access(Some(budget)).await.unwrap() })
         };
         let source_is_journaled = || {
             store
@@ -349,9 +362,34 @@ async fn full_access_checkpoint_and_relocation_share_the_publication_boundary() 
             .await
             .unwrap()
             .unwrap();
+            // The snapshot has written its header and relocation is waiting for it.
+            // Another disk user can acquire the sole permit and keep it while
+            // the snapshot charges its next chunk against the byte rate.
+            let io = tokio::time::timeout(Duration::from_secs(5), budget.io())
+                .await
+                .unwrap();
+            let charged = budget.charged_bytes();
             release.notify_one();
-            checkpoint.await.unwrap();
-            assert!(relocate.await.unwrap());
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while budget.charged_bytes() == charged {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let fd = disk_io::open(dir.path().join(FILE), disk_io::Open::Read)
+                .await
+                .unwrap();
+            disk_io::sync(fd).await.unwrap();
+            drop(io);
+            tokio::time::timeout(Duration::from_secs(5), checkpoint)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(tokio::time::timeout(Duration::from_secs(5), relocate)
+                .await
+                .unwrap()
+                .unwrap());
         } else {
             let reader = store.journal.readers.read().await;
             let relocate = relocating();
@@ -447,7 +485,7 @@ async fn compact_full_checkpoint_retries_after_sampling_with_one_io_permit() {
             store.checkpoint_access(Some(budget.clone())),
         )
         .await
-        .expect("a full checkpoint must reuse its reserved I/O permit")
+        .expect("a full checkpoint must make progress with a single I/O permit")
     };
     let key = id(1);
     store

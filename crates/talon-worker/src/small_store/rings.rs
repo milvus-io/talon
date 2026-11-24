@@ -509,17 +509,12 @@ impl SmallObjectStore {
             .run(async move {
                 let before = store.stats()?.allocated_bytes;
                 let mut reclaimed = false;
-                let _io = match &budget {
-                    Some(b) => Some(b.io().await),
-                    None => None,
-                };
                 for stream in store.streams() {
                     if before.saturating_sub(store.stats()?.allocated_bytes) >= bytes {
                         break;
                     }
                     reclaimed |= stream.maintain_inner(false, true, budget.clone()).await?;
                 }
-                drop(_io);
                 if !reclaimed && before.saturating_sub(store.stats()?.allocated_bytes) < bytes {
                     store.journal.checkpoint().await?;
                     reclaimed |= store.stats()?.allocated_bytes < before;

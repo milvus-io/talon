@@ -1,6 +1,6 @@
 //! Buffered I/O on the current native ring; Tokio callers use its blocking pool.
 //! Never run filesystem syscalls on a reactor or require O_DIRECT alignment.
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use std::{
     io,
     os::fd::{AsRawFd, BorrowedFd, OwnedFd},
@@ -94,6 +94,67 @@ pub(super) async fn write(fd: Arc<OwnedFd>, bytes: Bytes, offset: u64) -> io::Re
     blocking(move || {
         use std::os::unix::fs::FileExt;
         std::fs::File::from(fd.try_clone()?).write_all_at(&bytes, offset)
+    })
+    .await
+}
+
+/// Append the checksum to the reserved record extent without copying the payload.
+pub(super) async fn write_record(
+    fd: Arc<OwnedFd>,
+    payload: Bytes,
+    checksum: u64,
+    mut offset: u64,
+) -> io::Result<()> {
+    let mut parts = [payload, Bytes::copy_from_slice(&checksum.to_le_bytes())];
+    while !parts[1].is_empty() {
+        let (written, returned) = write_vectored_at(fd.clone(), parts, offset).await?;
+        if written == 0 {
+            return Err(io::ErrorKind::WriteZero.into());
+        }
+        parts = returned;
+        let payload_bytes = written.min(parts[0].len());
+        parts[0].advance(payload_bytes);
+        parts[1].advance(written - payload_bytes);
+        offset += written as u64;
+    }
+    Ok(())
+}
+
+async fn write_vectored_at(
+    fd: Arc<OwnedFd>,
+    parts: [Bytes; 2],
+    offset: u64,
+) -> io::Result<(usize, [Bytes; 2])> {
+    #[cfg(target_os = "linux")]
+    if talon_uring::on_ring() {
+        return receive(talon_uring::spawn_local(async move {
+            let file = native(&fd)?;
+            let result = file.write_vectored_at(parts, offset).await?;
+            file.close().await?;
+            Ok(result)
+        }))
+        .await;
+    }
+    blocking(move || {
+        let offset = libc::off_t::try_from(offset)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "file offset out of range"))?;
+        let vectors = parts.each_ref().map(|bytes| libc::iovec {
+            iov_base: bytes.as_ptr() as *mut _,
+            iov_len: bytes.len(),
+        });
+        loop {
+            // SAFETY: pwritev only reads these slices and the call ends before parts is moved.
+            let n = unsafe {
+                libc::pwritev(fd.as_raw_fd(), vectors.as_ptr(), vectors.len() as _, offset)
+            };
+            if n >= 0 {
+                return Ok((n as usize, parts));
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
     })
     .await
 }
