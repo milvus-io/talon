@@ -1379,6 +1379,7 @@ mod tests {
                     Some(Arc::new(MembershipSnapshot {
                         members: vec![],
                         generation: 1,
+                        validity_epoch: 1,
                         scan_limits: Arc::default(),
                         valid_until: Instant::now() + Duration::from_millis(20),
                     })),

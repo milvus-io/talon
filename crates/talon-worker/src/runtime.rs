@@ -172,6 +172,7 @@ struct MembershipSnapshot {
     members: Vec<talon_transport::ZonedNodeInfo>,
     valid_until: Instant,
     generation: u64,
+    validity_epoch: u64,
     // Each namespace has an independent admission revision sequence.
     scan_limits: Arc<HashMap<namespaces::CacheIdentity, OwnershipLimits>>,
 }
@@ -384,10 +385,14 @@ impl WorkerRuntime {
         match snapshot {
             Ok(Some((members, valid_until))) => {
                 let changed = held.as_ref().map_or(true, |old| old.members != members);
-                let wake = changed
-                    || held
-                        .as_ref()
-                        .is_some_and(|old| Instant::now() >= old.valid_until);
+                let restored = held
+                    .as_ref()
+                    .is_some_and(|old| Instant::now() >= old.valid_until);
+                let validity_epoch = held.as_ref().map_or(1, |old| {
+                    old.validity_epoch
+                        .checked_add(u64::from(restored))
+                        .expect("membership validity epoch exhausted")
+                });
                 let (generation, scan_limits) = if changed {
                     (
                         held.as_ref().map_or(1, |old| {
@@ -421,10 +426,11 @@ impl WorkerRuntime {
                     members,
                     valid_until,
                     generation,
+                    validity_epoch,
                     scan_limits,
                 }));
                 drop(held);
-                if wake {
+                if changed || restored {
                     self.membership_changed.send_replace(());
                 }
                 Ok(())
