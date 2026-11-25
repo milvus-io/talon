@@ -766,6 +766,9 @@ impl WorkerRuntime {
         })
         .await
         .expect("access checkpoint preparation panicked");
+        // The remaining shards belong to the round, regardless of whether
+        // this shard can prepare or publish its checkpoint.
+        *inventory = round_inventory;
         let Some(PreparedCheckpoint {
             membership,
             snapshots,
@@ -774,7 +777,6 @@ impl WorkerRuntime {
             bytes,
         }) = prepared?
         else {
-            *inventory = round_inventory;
             return Ok((0, 0));
         };
         let dir = paged.root().join(format!("{shard:02x}"));
@@ -798,7 +800,6 @@ impl WorkerRuntime {
         })
         .await
         .expect("access checkpoint completion panicked");
-        *inventory = round_inventory;
         Ok((count, bytes))
     }
 
@@ -815,8 +816,7 @@ impl WorkerRuntime {
         if full && inventory.is_none() {
             *inventory = Some(CheckpointInventory::gather(life, shard, remaining));
         }
-        // Retire this shard's inventory after its turn, even on a clean or
-        // delta checkpoint. A failed checkpoint discards the whole inventory.
+        // Retire this shard's slots on its turn, including clean and delta ticks.
         let slots = inventory
             .as_mut()
             .map(|inventory| inventory.take_shard(shard));

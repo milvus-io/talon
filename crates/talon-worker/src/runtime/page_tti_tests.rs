@@ -294,6 +294,87 @@ async fn checkpoint_membership_scheduled_full_ticks_share_sparse_inventory() {
 }
 
 #[tokio::test]
+async fn scheduled_checkpoint_keeps_inventory_across_shard_failures() {
+    use crate::page_access_store::CacheRootLock;
+    use talon_core::WorkerConfig;
+
+    let root = tempfile::tempdir().unwrap();
+    let config = WorkerConfig {
+        small_object_threshold_bytes: 0,
+        block_size: 4096,
+        l2_page_size_bytes: 4096,
+        backend: Some("s3".into()),
+        page_tti_hours: 0,
+        ..Default::default()
+    };
+    let open = || {
+        WorkerRuntime::open_namespaces(
+            &config,
+            Arc::new(CacheRootLock::acquire(root.path()).unwrap()),
+            Arc::new(Origin::default()),
+            WorkerMetrics::new(config.capacity_bytes),
+        )
+        .unwrap()
+    };
+    let worker = open();
+    let paged = worker.paged.as_ref().unwrap();
+    let blocks = [
+        checkpoint_block(0),
+        checkpoint_block(1),
+        checkpoint_block(2),
+    ];
+    let ages = [10_000, 20_000, 30_000];
+    let payload = Bytes::from(vec![0x5a; 4096]);
+    for (block, age) in blocks.iter().zip(ages) {
+        worker.page_clock.set(age);
+        worker
+            .commit_fetched_page(block, PageIndex(0), 4096, payload.clone())
+            .await
+            .unwrap();
+    }
+    let blocked_paths = [&blocks[0], &blocks[1]].map(|block| {
+        let dir = paged.dir_for(block);
+        let path = dir
+            .parent()
+            .unwrap()
+            .join(crate::page_access_shard::FILE_NAME);
+        std::fs::create_dir(&path).unwrap();
+        path
+    });
+    for block in &blocks[..2] {
+        let failed = worker.checkpoint_next_shard().await;
+        assert_eq!((failed.blocks, failed.failures), (0, 1));
+        assert!(worker.page_lifecycle.get(block).unwrap().dirty().is_some());
+    }
+    let success = worker.checkpoint_next_shard().await;
+    assert_eq!((success.blocks, success.failures), (1, 0));
+    assert_eq!(worker.page_lifecycle.checkpoint_inventory_work(), (3, 1));
+
+    for path in blocked_paths {
+        std::fs::remove_dir(path).unwrap();
+    }
+    let retry = worker.checkpoint_access_times().await;
+    assert_eq!((retry.blocks, retry.failures), (2, 0));
+    worker.drain_page_mutations().await;
+    drop(worker);
+
+    let reopened = open();
+    for (block, age) in blocks.iter().zip(ages) {
+        assert_eq!(
+            reopened.page_lifecycle.get(block).unwrap().last_access(0),
+            Some(age)
+        );
+        assert_eq!(
+            reopened
+                .cached_page(block, PageIndex(0), 4096)
+                .await
+                .unwrap(),
+            Some(payload.clone()),
+        );
+    }
+}
+
+#[tokio::test]
 async fn checkpoint_membership_explicit_flush_includes_admission_before_later_gate() {
     use crate::page_access_store::CacheRootLock;
     use talon_core::WorkerConfig;
