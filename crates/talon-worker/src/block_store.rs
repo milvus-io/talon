@@ -113,6 +113,14 @@ impl WholeBlockStore {
         id: &BlockId,
         value: talon_uring::Payload,
     ) -> Result<(u64, DiskId)> {
+        let len = value.len() as u64;
+        if len > u64::from(id.block_size) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "whole block payload exceeds block size",
+            )
+            .into());
+        }
         if self.uring {
             talon_uring::require_ring()?;
         }
@@ -126,9 +134,7 @@ impl WholeBlockStore {
                     .begin(
                         &store.catalog_path,
                         &id,
-                        crate::catalog::Operation::PutWhole {
-                            len: value.len() as u64,
-                        },
+                        crate::catalog::Operation::PutWhole { len },
                     )
                     .await
                     .map_err(catalog_error)?;
@@ -721,6 +727,21 @@ mod tests {
         assert!(leaked.is_empty(), "leaked staging temp files: {leaked:?}");
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn oversized_put_leaves_the_journal_usable() {
+        let root = tempfile::tempdir().unwrap();
+        let store = WholeBlockStore::open(root.path()).unwrap();
+        let mut id = block(0);
+        id.block_size = 4;
+        assert!(store.put(&id, Bytes::from_static(b"12345")).await.is_err());
+        let valid = Bytes::from_static(b"1234");
+        store.put(&id, valid.clone()).await.unwrap();
+        drop(store);
+
+        let store = WholeBlockStore::open(root.path()).unwrap();
+        assert_eq!(store.get_bytes(&id).await.unwrap(), valid);
     }
 
     #[tokio::test]
