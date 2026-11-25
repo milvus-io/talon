@@ -1,5 +1,8 @@
 //! Worker maintenance registrations; scheduling policy lives in `background`.
-use super::{async_eviction::EvictionCycle, namespaces::CacheIdentity, WorkerRuntime};
+use super::{
+    async_eviction::EvictionCycle, namespaces::CacheIdentity, ownership_gc::OwnershipGc,
+    WorkerRuntime,
+};
 use crate::background::{BackgroundBudget, BackgroundHandle, BackgroundScheduler};
 use std::{
     collections::HashMap,
@@ -188,7 +191,7 @@ impl WorkerBackground {
             });
         }
         if config.ownership_gc_enabled {
-            let gc = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+            let states = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
             let config = Arc::new(config.clone());
             let w = worker.clone();
             scheduler.register_triggered(
@@ -196,21 +199,36 @@ impl WorkerBackground {
                 worker.membership_changed.subscribe(),
                 move || {
                     let w = w.clone();
-                    let gc = gc.clone();
+                    let states = states.clone();
                     let config = config.clone();
                     async move {
-                        let mut states = gc.lock().await;
+                        let view = w.membership_snapshot()?;
+                        let membership = (view.generation, view.validity_epoch);
+                        let mut states = states.lock().await;
                         let mut next = None;
                         for namespace in w.namespace_runtimes() {
-                            let gc = states
+                            let state = states
                                 .entry(namespace.cache_identity.clone())
-                                .or_insert_with(|| super::ownership_gc::OwnershipGc::new(&config));
-                            gc.run_slice(&namespace).await;
-                            if let Some(delay) = gc.next_delay(&namespace) {
-                                next = Some(next.map_or(delay, |old: Duration| old.min(delay)));
+                                .or_insert_with(|| NamespaceOwnership {
+                                    gc: OwnershipGc::new(&config),
+                                    membership: None,
+                                    next: None,
+                                });
+                            if state.membership != Some(membership)
+                                || state
+                                    .next
+                                    .is_some_and(|at| at <= tokio::time::Instant::now())
+                            {
+                                state.gc.run_slice(&namespace).await;
+                                state.membership = Some(membership);
+                                state.next = state
+                                    .gc
+                                    .next_delay(&namespace)
+                                    .map(|delay| tokio::time::Instant::now() + delay);
                             }
+                            next = next.into_iter().chain(state.next).min();
                         }
-                        next
+                        next.map(|at| at.saturating_duration_since(tokio::time::Instant::now()))
                     }
                 },
             );
@@ -264,6 +282,14 @@ impl WorkerBackground {
             }
         }
     }
+}
+
+struct NamespaceOwnership {
+    gc: OwnershipGc,
+    // Namespace publication shares the membership wake channel. Only a new
+    // placement generation or restored validity can interrupt an existing delay.
+    membership: Option<(u64, u64)>,
+    next: Option<tokio::time::Instant>,
 }
 
 impl WorkerRuntime {
@@ -336,6 +362,10 @@ impl SliceSchedule {
             .fold(idle, Duration::min)
     }
 }
+
+#[cfg(test)]
+#[path = "background/ownership_tests.rs"]
+mod ownership_tests;
 
 #[cfg(test)]
 mod tests {

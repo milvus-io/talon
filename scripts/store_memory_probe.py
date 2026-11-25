@@ -9,7 +9,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "crates/talon-worker/src"
 OUTPUT = ROOT / "target/memory-analysis/current"
 TYPES = {
-    "block_key.rs": ["Packed", "BlockKey", "ObjectKey"],
+    "block_key.rs": ["Packed", "BlockKey"],
     "index.rs": ["DirectoryEntry", "PolicyUnits", "Entry", "IndexedBlock", "ResidentMeta", "IndexedUnits", "UnitSlot", "PageUnit", "Option<PolicyState>", "Option<AccessHandle>", "RwLock<UnitSlot>"],
     "eviction.rs": ["SharedUnit", "AccessHandle", "PageAccessSlot", "Access", "PolicyState", "BlockPolicy", "Inner"],
     "page_lifecycle.rs": ["PageState", "PageAccess", "PageEntry", "BlockState", "BlockPages", "PageMutationGate", "BlockWork", "ShardWork", "Registry", "crate::page_table::PageMap", "RwLock<crate::page_table::PageMap>", "talon_core::BlockId", "talon_core::ObjectId"],
