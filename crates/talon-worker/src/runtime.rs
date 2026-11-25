@@ -15,6 +15,7 @@ mod ownership_gc;
 mod stale_gc;
 pub use background::WorkerBackground;
 mod page_maintenance;
+pub(crate) use page_maintenance::before_deadline;
 #[cfg(test)]
 mod page_tti_tests;
 #[cfg(test)]

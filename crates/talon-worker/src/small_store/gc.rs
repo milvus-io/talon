@@ -8,8 +8,13 @@ use super::SmallObjectStore;
 use crate::block_key::ObjectRef;
 use crate::eviction::CacheUnit;
 use std::collections::{BTreeMap, HashMap};
-use std::ops::Range;
-use std::sync::{atomic::Ordering::Relaxed, Arc};
+use std::sync::{
+    atomic::{
+        AtomicU64,
+        Ordering::{AcqRel, Acquire, Relaxed, Release},
+    },
+    Arc,
+};
 use talon_core::BlockId;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -31,182 +36,99 @@ pub(crate) struct SmallStaleCursor {
     end: Option<OwnershipCursor>,
 }
 
+const DIRTY: u64 = 1 << 63;
+
+#[derive(Default)]
+pub(super) struct OwnershipEpoch(AtomicU64);
+
+impl OwnershipEpoch {
+    fn current(&self) -> u64 {
+        self.0.load(Acquire) & !DIRTY
+    }
+
+    pub(super) fn admit(&self) -> u64 {
+        self.0.fetch_or(DIRTY, AcqRel) & !DIRTY
+    }
+
+    fn capture(&self, event: bool) -> Option<u64> {
+        // Tagging an admission and marking it dirty are one operation. An
+        // admission consumed here has already published its segment position.
+        let previous = self
+            .0
+            .fetch_update(AcqRel, Acquire, |state| {
+                (state != 0 && (event || state & DIRTY != 0)).then(|| {
+                    let epoch = (state & !DIRTY) + 1;
+                    assert!(epoch < DIRTY, "small admission epoch exhausted");
+                    epoch
+                })
+            })
+            .ok()?;
+        Some((previous & !DIRTY) + 1)
+    }
+}
+
 #[derive(Default)]
 pub(super) struct Ownership {
+    segments: HashMap<u64, SegmentAdmission>,
+    retries: OwnershipRetries,
+}
+
+#[derive(Default)]
+struct SegmentAdmission {
     epoch: u64,
-    dirty: bool,
-    segments: HashMap<u64, Admissions>,
+    cutoff: Option<u64>,
+}
+
+#[derive(Default)]
+pub(crate) struct OwnershipRetries {
+    epoch: u64,
+    addresses: BTreeMap<u64, Address>,
     // Only deferred admissions need an ID. The reverse index follows their
-    // physical offsets during publication, without retaining keys or tickets.
-    retries: BTreeMap<u64, Address>,
-    retry_ids: HashMap<Address, u64>,
-    next_retry: u64,
-}
-
-// Reservations can publish out of offset order. Adjacent published rows share
-// one range, and an unfinished reservation leaves a gap between ranges.
-#[derive(Clone, Default)]
-struct PublishedBytes(Vec<Range<u64>>);
-
-impl PublishedBytes {
-    fn include(&mut self, span: Range<u64>) {
-        let first = self.0.partition_point(|range| range.end < span.start);
-        let after = first + self.0[first..].partition_point(|range| range.start <= span.end);
-        if first == after {
-            self.0.insert(first, span);
-        } else {
-            self.0[first].start = self.0[first].start.min(span.start);
-            self.0[first].end = self.0[after - 1].end.max(span.end);
-            self.0.drain(first + 1..after);
-        }
-    }
-
-    fn ranges_from(&self, offset: u64) -> &[Range<u64>] {
-        &self.0[self.0.partition_point(|range| range.end <= offset)..]
-    }
-
-    fn contains(&self, offset: u64) -> bool {
-        self.ranges_from(offset)
-            .first()
-            .is_some_and(|range| range.start <= offset)
-    }
-}
-
-struct Admissions {
-    first: u64,
-    latest: u64,
-    published: PublishedBytes,
-    // Freeze the published extent lazily on the first post-boundary mutation.
-    saved: Option<(u64, PublishedBytes)>,
-    // Only segments that straddle a boundary need per-offset epoch metadata.
-    exceptions: HashMap<u64, u64>,
-}
-
-impl Admissions {
-    fn new(epoch: u64) -> Self {
-        Self {
-            first: epoch,
-            latest: epoch,
-            published: PublishedBytes::default(),
-            saved: None,
-            exceptions: HashMap::new(),
-        }
-    }
-
-    fn epoch(&self, offset: u64) -> u64 {
-        self.exceptions.get(&offset).copied().unwrap_or(self.first)
-    }
-
-    fn saved_at(&self, epoch: u64) -> Option<&PublishedBytes> {
-        self.saved
-            .as_ref()
-            .filter(|(boundary, _)| *boundary == epoch)
-            .map(|(_, bytes)| bytes)
-    }
-
-    fn insert(&mut self, offset: u64, len: u64, epoch: u64) {
-        self.latest = self.latest.max(epoch);
-        self.published.include(offset..offset + len);
-        if epoch != self.first {
-            self.exceptions.insert(offset, epoch);
-        }
-    }
+    // physical offsets during relocation without retaining keys or tickets.
+    ids: HashMap<Address, u64>,
+    next: u64,
 }
 
 impl Ownership {
-    fn epoch_at(&self, (segment, offset): Address) -> Option<u64> {
-        self.segments.get(&segment).map(|rows| rows.epoch(offset))
-    }
-
-    pub fn admit(&mut self, address @ (segment, offset): Address, len: u64) {
-        let rows = self
-            .segments
-            .entry(segment)
-            .or_insert_with(|| Admissions::new(self.epoch));
-        if rows.latest < self.epoch && rows.saved_at(self.epoch).is_none() {
-            rows.saved = Some((self.epoch, rows.published.clone()));
+    pub fn admit(&mut self, address: Address, epoch: u64, cutoff: Option<u64>) {
+        let segment = self.segments.entry(address.0).or_default();
+        if segment.epoch != epoch {
+            *segment = SegmentAdmission { epoch, cutoff };
         }
-        rows.insert(offset, len, self.epoch);
-        self.remove_retry(address);
-        self.dirty = true;
+        self.remove(address);
     }
 
-    pub fn remove(&mut self, address @ (segment, offset): Address) {
-        if let Some(rows) = self.segments.get_mut(&segment) {
-            rows.exceptions.remove(&offset);
-        }
-        self.remove_retry(address);
-    }
-
-    pub fn relocate(&mut self, old: Address, new: Address, len: u64) {
-        let source = &self.segments[&old.0];
-        let epoch = source.epoch(old.1);
-        let captured = source
-            .saved_at(self.epoch)
-            .map(|bytes| bytes.contains(old.1));
-        let rows = self
-            .segments
-            .entry(new.0)
-            .or_insert_with(|| Admissions::new(epoch));
-        if let Some(captured) = captured {
-            let (_, bytes) = rows
-                .saved
-                .get_or_insert_with(|| (self.epoch, PublishedBytes::default()));
-            if captured {
-                bytes.include(new.1..new.1 + len);
+    pub fn remove(&mut self, address: Address) {
+        if let Some(id) = self.retries.ids.remove(&address) {
+            self.retries.addresses.remove(&id);
+            let ids = &mut self.retries.ids;
+            if ids.capacity() > 64 && ids.len() < ids.capacity() / 4 {
+                ids.shrink_to_fit();
             }
         }
-        rows.insert(new.1, len, epoch);
-        if let Some(id) = self.retry_ids.remove(&old) {
-            self.retry_ids.insert(new, id);
-            self.retries.insert(id, new);
+    }
+
+    pub fn relocate_retry(&mut self, old: Address, new: Address) {
+        if let Some(id) = self.retries.ids.remove(&old) {
+            self.retries.ids.insert(new, id);
+            self.retries.addresses.insert(id, new);
+        }
+    }
+
+    pub fn relocate_segment(&mut self, old: u64, new: u64) {
+        if let Some(mut segment) = self.segments.remove(&old) {
+            segment.cutoff = None;
+            self.segments.insert(new, segment);
         }
     }
 
     pub fn remove_segment(&mut self, segment: u64) {
         self.segments.remove(&segment);
     }
-
-    fn remove_retry(&mut self, address: Address) {
-        if let Some(id) = self.retry_ids.remove(&address) {
-            self.retries.remove(&id);
-            if self.retry_ids.capacity() > 64
-                && self.retry_ids.len() < self.retry_ids.capacity() / 4
-            {
-                self.retry_ids.shrink_to_fit();
-            }
-        }
-    }
-
-    fn capture(&mut self, last_segment: u64) -> OwnershipLimit {
-        self.epoch = self
-            .epoch
-            .checked_add(1)
-            .expect("small admission epoch exhausted");
-        self.dirty = false;
-        self.retries = BTreeMap::new();
-        self.retry_ids = HashMap::new();
-        self.next_retry = 0;
-        OwnershipLimit {
-            epoch: self.epoch,
-            last_segment,
-        }
-    }
-
-    fn defer(&mut self, address: Address, epoch: u64) {
-        if self.epoch == epoch {
-            self.retry_ids.entry(address).or_insert_with(|| {
-                let id = self.next_retry;
-                self.next_retry = id.checked_add(1).expect("small retry ID exhausted");
-                self.retries.insert(id, address);
-                id
-            });
-        }
-    }
 }
 
-pub(crate) enum GcCheck<'a> {
-    Ownership(&'a Range<u64>),
+pub(crate) enum GcCheck {
+    Ownership(u64),
     Idle { now: u64, age: u64 },
 }
 
@@ -262,7 +184,7 @@ impl Catalog {
 impl SmallAccess {
     /// Arm the watch under the catalog lock. Consecutive observations share
     /// the same revision until a hit or a re-admission clears the watch.
-    pub(crate) fn observe_gc(&self, check: GcCheck<'_>) -> Option<u64> {
+    pub(crate) fn observe_gc(&self, check: GcCheck) -> Option<u64> {
         let catalog = self.catalog.upgrade()?;
         let catalog = catalog.write().unwrap();
         let slot = self.slot(&catalog)?;
@@ -273,7 +195,7 @@ impl SmallAccess {
             return None;
         }
         let (_, value) = catalog.recency_at(slot)?;
-        if Recency::watch_gc(value) {
+        if Recency::watch_gc(value) || self.gc_revision.load(Relaxed) == 0 {
             self.gc_revision.store(catalog.next_revision(), Relaxed);
         }
         Some(self.gc_revision.load(Relaxed))
@@ -294,13 +216,9 @@ impl SmallAccess {
         })
     }
 
-    fn gc_eligible(&self, catalog: &Catalog, slot: usize, check: GcCheck<'_>) -> bool {
+    fn gc_eligible(&self, catalog: &Catalog, slot: usize, check: GcCheck) -> bool {
         match check {
-            GcCheck::Ownership(epochs) => catalog.ownership.as_ref().is_some_and(|ownership| {
-                ownership
-                    .epoch_at(*self.address.lock().unwrap())
-                    .is_some_and(|epoch| epochs.contains(&epoch))
-            }),
+            GcCheck::Ownership(epoch) => catalog.shared.ownership.current() == epoch,
             GcCheck::Idle { now, age } => {
                 catalog.recency_at(slot).is_some_and(|(recency, value)| {
                     now.saturating_sub(recency.time(value.load(Relaxed))) > age
@@ -312,9 +230,33 @@ impl SmallAccess {
 
 impl SmallObjectStore {
     #[cfg(test)]
+    pub(crate) fn under_catalog_writer<T: Send>(&self, work: impl FnOnce() -> T + Send) -> T {
+        std::thread::scope(|scope| {
+            let (send, receive) = std::sync::mpsc::channel();
+            let result = {
+                let _catalog = self.journal.model.0.write().unwrap();
+                scope.spawn(move || send.send(work()).ok());
+                receive.recv_timeout(std::time::Duration::from_secs(2))
+            };
+            result.expect("operation waited for catalog writer")
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn packed_access_time(&self, key: &dyn SmallIdentity, set: Option<u64>) -> u64 {
+        let catalog = self.journal.model.0.write().unwrap();
+        let slot = catalog.find(key, VISIBLE).unwrap();
+        let (recency, value) = catalog.recency_at(slot).unwrap();
+        if let Some(timestamp) = set {
+            value.store(timestamp, Relaxed);
+        }
+        recency.time(value.load(Relaxed))
+    }
+
+    #[cfg(test)]
     pub(crate) fn ownership_retry_count(&self) -> usize {
         let catalog = self.journal.model.0.read().unwrap();
-        catalog.ownership.as_ref().unwrap().retries.len()
+        catalog.ownership.as_ref().unwrap().retries.addresses.len()
     }
 
     #[cfg(test)]
@@ -337,41 +279,49 @@ impl SmallObjectStore {
 
     pub(crate) fn init_ownership(&self) {
         let mut catalog = self.journal.model.0.write().unwrap();
-        catalog.ownership = Some(Ownership {
-            // A namespace opened after a membership event still needs an
-            // hourly pass for any recovered admissions.
-            dirty: catalog.live.values().any(|&count| count != 0),
-            segments: catalog
-                .published
-                .values()
-                .map(|&physical| {
-                    let mut rows = Admissions::new(0);
-                    rows.published
-                        .include(0..catalog.segment(physical).unwrap().bytes);
-                    (physical, rows)
-                })
-                .collect(),
-            ..Ownership::default()
-        });
+        catalog.ownership = Some(Ownership::default());
+        // Recovered segments can need a supplement even without an event.
+        let dirty = if self.len() != 0 { DIRTY } else { 0 };
+        catalog.shared.ownership.0.store(1 | dirty, Release);
     }
 
     pub(crate) fn ownership_limit(&self, event: bool) -> Option<OwnershipLimit> {
-        let mut catalog = self.journal.model.0.write().unwrap();
-        let last = catalog.published.last_key_value().map_or(0, |(&id, _)| id);
-        let ownership = catalog.ownership.as_mut()?;
-        (event || ownership.dirty).then(|| ownership.capture(last))
+        let shared = &self.journal.model.1;
+        let epoch = shared.ownership.capture(event)?;
+        Some(OwnershipLimit {
+            epoch,
+            last_segment: shared.last_publication.load(Acquire),
+        })
     }
 
-    pub(crate) fn defer_ownership(&self, candidate: &SmallGcCandidate, epochs: &Range<u64>) {
+    pub(crate) fn ownership_is_current(&self, limit: OwnershipLimit) -> bool {
+        self.journal.model.1.ownership.current() == limit.epoch
+    }
+
+    // The collector takes ownership of old maps after leaving the membership
+    // lock. Return them so their destruction also happens outside the catalog.
+    pub(crate) fn take_superseded_retries(
+        &self,
+        limit: OwnershipLimit,
+    ) -> Option<OwnershipRetries> {
         let mut catalog = self.journal.model.0.write().unwrap();
-        let address = *candidate.ticket.address.lock().unwrap();
-        let ownership = catalog.ownership.as_ref().unwrap();
-        if !ownership
-            .epoch_at(address)
-            .is_some_and(|epoch| epochs.contains(&epoch))
+        let retries = &mut catalog.ownership.as_mut()?.retries;
+        if !self.ownership_is_current(limit) || retries.epoch == limit.epoch {
+            return None;
+        }
+        let old = std::mem::take(retries);
+        retries.epoch = limit.epoch;
+        Some(old)
+    }
+
+    pub(crate) fn defer_ownership(&self, candidate: &SmallGcCandidate, limit: OwnershipLimit) {
+        let mut catalog = self.journal.model.0.write().unwrap();
+        if !self.ownership_is_current(limit)
+            || catalog.ownership.as_ref().unwrap().retries.epoch != limit.epoch
         {
             return;
         }
+        let address = *candidate.ticket.address.lock().unwrap();
         let visible = candidate
             .ticket
             .slot(&catalog)
@@ -385,18 +335,22 @@ impl SmallObjectStore {
                 .is_some_and(|ticket| Arc::ptr_eq(ticket, &candidate.ticket))
         };
         if visible || retained() {
-            catalog
-                .ownership
-                .as_mut()
-                .unwrap()
-                .defer(address, epochs.end);
+            let retries = &mut catalog.ownership.as_mut().unwrap().retries;
+            retries.ids.entry(address).or_insert_with(|| {
+                let id = retries.next;
+                retries.next = id.checked_add(1).expect("small retry ID exhausted");
+                retries.addresses.insert(id, address);
+                id
+            });
         }
     }
 
     pub(crate) fn has_ownership_retries(&self, limit: OwnershipLimit) -> bool {
         let catalog = self.journal.model.0.read().unwrap();
-        let ownership = catalog.ownership.as_ref().unwrap();
-        ownership.epoch == limit.epoch && !ownership.retries.is_empty()
+        let retries = &catalog.ownership.as_ref().unwrap().retries;
+        self.ownership_is_current(limit)
+            && retries.epoch == limit.epoch
+            && !retries.addresses.is_empty()
     }
 
     pub(crate) fn ownership_retry_candidates(
@@ -406,12 +360,12 @@ impl SmallObjectStore {
         budget: usize,
     ) -> (bool, Vec<SmallGcCandidate>) {
         let catalog = self.journal.model.0.read().unwrap();
-        let ownership = catalog.ownership.as_ref().unwrap();
-        if ownership.epoch != limit.epoch {
+        let retries = &catalog.ownership.as_ref().unwrap().retries;
+        if !self.ownership_is_current(limit) || retries.epoch != limit.epoch {
             return (true, Vec::new());
         }
         let mut candidates = Vec::new();
-        let mut retries = ownership.retries.range(*cursor..);
+        let mut retries = retries.addresses.range(*cursor..);
         for (&id, &address) in retries.by_ref().take(budget) {
             *cursor = id + 1;
             if let Some(candidate) = catalog.ownership_candidate_at(address) {
@@ -435,10 +389,9 @@ impl SmallObjectStore {
             .ownership
             .as_ref()
             .expect("small ownership tracking");
-        if cursor.segment > limit.last_segment || ownership.epoch != limit.epoch {
+        if cursor.segment > limit.last_segment || !self.ownership_is_current(limit) {
             return (true, candidates);
         }
-        let epochs = first_epoch..limit.epoch;
         for (&logical, &physical) in catalog.published.range(cursor.segment..=limit.last_segment) {
             if budget == 0 {
                 return (false, candidates);
@@ -451,45 +404,41 @@ impl SmallObjectStore {
                     offset: 0,
                 };
             }
-            let admissions = &ownership.segments[&physical];
-            if admissions.latest >= first_epoch {
+            let default = SegmentAdmission::default();
+            let admission = ownership.segments.get(&physical).unwrap_or(&default);
+            if admission.epoch >= first_epoch {
                 let records = &catalog.segment(physical).unwrap().records;
-                let published = admissions
-                    .saved_at(limit.epoch)
-                    .unwrap_or(&admissions.published);
-                for span in published.ranges_from(cursor.offset) {
-                    let start = span.start.max(cursor.offset);
-                    let mut rows = (records.position(start)..records.position(span.end))
-                        .map(|row| records.offset_at(row))
-                        .peekable();
-                    let mut retired = catalog
-                        .retired_addresses
-                        .range((physical, start)..(physical, span.end))
-                        .map(|(&(_, offset), _)| offset)
-                        .peekable();
-                    while let Some(offset) =
-                        rows.peek().into_iter().chain(retired.peek()).min().copied()
+                let end = admission
+                    .cutoff
+                    .filter(|_| admission.epoch == limit.epoch)
+                    .unwrap_or(u64::MAX)
+                    .max(cursor.offset);
+                let mut rows = (records.position(cursor.offset)..records.position(end))
+                    .map(|row| records.offset_at(row))
+                    .peekable();
+                let mut retired = catalog
+                    .retired_addresses
+                    .range((physical, cursor.offset)..(physical, end))
+                    .map(|(&(_, offset), _)| offset)
+                    .peekable();
+                while let Some(offset) =
+                    rows.peek().into_iter().chain(retired.peek()).min().copied()
+                {
+                    if budget == 0 {
+                        return (false, candidates);
+                    }
+                    budget -= 1;
+                    cursor.offset = offset + 1;
+                    if rows.peek() == Some(&offset) {
+                        rows.next();
+                    }
+                    if retired.peek() == Some(&offset) {
+                        retired.next();
+                    }
+                    if let Some(candidate) = catalog
+                        .ownership_candidate_at_if((physical, offset), |unit| !owns(unit.block()))
                     {
-                        if budget == 0 {
-                            return (false, candidates);
-                        }
-                        budget -= 1;
-                        cursor.offset = offset + 1;
-                        if rows.peek() == Some(&offset) {
-                            rows.next();
-                        }
-                        if retired.peek() == Some(&offset) {
-                            retired.next();
-                        }
-                        if epochs.contains(&admissions.epoch(offset)) {
-                            if let Some(candidate) = catalog
-                                .ownership_candidate_at_if((physical, offset), |unit| {
-                                    !owns(unit.block())
-                                })
-                            {
-                                candidates.push(candidate);
-                            }
-                        }
+                        candidates.push(candidate);
                     }
                 }
             }
@@ -645,70 +594,87 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ownership_event_skips_an_unfinished_reservation_through_relocation() {
+    async fn ownership_scans_mixed_admissions_across_relocation() {
         let root = tempfile::tempdir().unwrap();
         let store = compact_store(root.path());
         store.init_ownership();
-        let garbage = block(100);
+        create_compaction_work(&store, 1).await;
+        let id = block(1);
+        let limit = store.ownership_limit(true).unwrap();
+        let scan = |first, limit| {
+            store
+                .ownership_candidates(&mut OwnershipCursor::default(), first, limit, 8, |_| false)
+                .1
+        };
+        let candidate = scan(0, limit).pop().unwrap();
+        let ticket = &candidate.ticket;
+        let initial = ticket.observe_gc(GcCheck::Ownership(limit.epoch)).unwrap();
         store
-            .put(&garbage, Bytes::from(vec![2; 96 << 10]))
+            .put(&block(2), Bytes::from_static(b"late"))
             .await
             .unwrap();
-        let data = Bytes::from_static(b"packed");
-        store.put(&block(1), data.clone()).await.unwrap();
-        let late = block(0);
-        let expected = (1..=63)
-            .map(|n| CacheUnit::Whole(block(n)))
-            .collect::<Vec<_>>();
-        let check_event = |limit| {
-            let (done, rows) =
-                store
-                    .ownership_candidates(&mut OwnershipCursor::default(), 0, limit, 64, |_| false);
-            assert!(
-                done,
-                "the captured rows and segment header must fit in one slice"
-            );
-            assert_eq!(
-                rows.into_iter().map(|row| row.unit).collect::<Vec<_>>(),
-                expected
-            );
-        };
-
-        let pause = Arc::new(super::super::tests::AppendPause::default());
-        *store.streams()[0].append_pause.lock().unwrap() = Some(pause.clone());
-        let (write, limit) = tokio::join!(store.put(&late, data.clone()), async {
-            pause.entered.notified().await;
-            for n in 2..=63 {
-                store.put(&block(n), data.clone()).await.unwrap();
-            }
-            store.delete(&garbage).await.unwrap();
-            store.policy().unwrap().remove(&CacheUnit::Whole(garbage));
-            let limit = store.ownership_limit(true).unwrap();
-            check_event(limit);
-            pause.resume.notify_one();
-            limit
-        });
-        write.unwrap();
-        check_event(limit);
-        let source = store.lookup_entry(&late).unwrap().unwrap().segment();
         assert!(store.maintain(true).await.unwrap());
-        assert_ne!(
-            store.lookup_entry(&late).unwrap().unwrap().segment(),
-            source
-        );
-        check_event(limit);
-
+        assert_eq!(scan(0, limit).len(), 2);
+        assert!(ticket.gc_is_current(initial));
+        assert_eq!(store.len(), 2);
         let supplement = store.ownership_limit(false).unwrap();
-        let (done, rows) = store.ownership_candidates(
-            &mut OwnershipCursor::default(),
-            limit.epoch,
-            supplement,
-            128,
-            |_| false,
+        assert!(scan(0, limit).is_empty());
+        assert_eq!(scan(limit.epoch, supplement).len(), 2);
+
+        let observe = || {
+            ticket
+                .observe_gc(GcCheck::Ownership(supplement.epoch))
+                .unwrap()
+        };
+        store.put(&id, Bytes::from_static(b"packed")).await.unwrap();
+        assert!(!ticket.gc_is_current(initial));
+        let after_admission = observe();
+        drop(
+            store
+                .policy()
+                .unwrap()
+                .pin_guard(candidate.unit.clone())
+                .unwrap(),
         );
-        assert!(done);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].unit, CacheUnit::Whole(late));
+        assert!(!ticket.gc_is_current(after_admission));
+        let after_pin = observe();
+        assert!(store.read(&id).await.unwrap().is_some());
+        assert!(!ticket.gc_is_current(after_pin));
+
+        assert_eq!(store.len(), 2);
+        let next = store.ownership_limit(false).unwrap();
+        assert_eq!(scan(supplement.epoch, next).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn packed_ownership_deadline_bounds_stream_publication_wait() {
+        let root = tempfile::tempdir().unwrap();
+        let store = compact_store(root.path());
+        store.init_ownership();
+        let id = block(1);
+        store.put(&id, Bytes::from_static(b"packed")).await.unwrap();
+        let limit = store.ownership_limit(true).unwrap();
+        let (_, mut rows) =
+            store.ownership_candidates(&mut Default::default(), 0, limit, 8, |_| false);
+        let candidate = rows.pop().unwrap();
+        let revision = candidate
+            .ticket
+            .observe_gc(GcCheck::Ownership(limit.epoch))
+            .unwrap();
+        let streams = store.streams();
+        let _publication = streams[0].publication.lock().await;
+        use std::time::{Duration, Instant};
+        let deadline = Instant::now() + Duration::from_millis(50);
+        assert!(!tokio::time::timeout(
+            Duration::from_secs(2),
+            store.delete_gc(candidate, revision, Some(deadline), || panic!(
+                "authorization after a stalled wait"
+            ),)
+        )
+        .await
+        .unwrap()
+        .unwrap());
+        assert!(store.contains(&id));
     }
 
     #[tokio::test]

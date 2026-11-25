@@ -242,7 +242,7 @@ impl Catalog {
         self.lookup.set_flags(slot, flags | POLICY);
         if flags & VISIBLE != 0 {
             if let Some(ownership) = &mut self.ownership {
-                ownership.admit(address, stored_len);
+                ownership.admit(address, self.shared.ownership.admit(), None);
             }
         }
         let mut entry = self.compact_entry(slot);
@@ -271,7 +271,11 @@ impl Catalog {
         let ticket = entry.access.small().cloned().unwrap();
         let address = *ticket.address.lock().unwrap();
         let mut state = ticket.state.lock().unwrap();
+        let pins = state.pins;
         let result = update(&mut state);
+        if state.pins > pins {
+            ticket.gc_revision.store(0, Ordering::Relaxed);
+        }
         if state.pins == 0 {
             self.pins.remove(&address);
         } else {

@@ -345,7 +345,7 @@ impl SmallObjectStore {
         ticket: Arc<super::policy::SmallAccess>,
         expiry: impl FnOnce() -> (u64, u64) + Send + 'static,
     ) -> io::Result<bool> {
-        self.delete_if_current(id, ticket, move |current| {
+        self.delete_if_current(id, ticket, None, move |current| {
             let (now, age) = expiry();
             current.is_idle_at(now, age)
         })
@@ -356,9 +356,10 @@ impl SmallObjectStore {
         self: &Arc<Self>,
         candidate: super::SmallGcCandidate,
         revision: u64,
+        deadline: Option<Instant>,
         authorized: impl FnOnce() -> bool + Send + 'static,
     ) -> io::Result<bool> {
-        self.delete_if_current(candidate.unit, candidate.ticket, move |current| {
+        self.delete_if_current(candidate.unit, candidate.ticket, deadline, move |current| {
             current.gc_is_current(revision) && authorized()
         })
         .await
@@ -368,17 +369,22 @@ impl SmallObjectStore {
         self: &Arc<Self>,
         id: CacheUnit,
         ticket: Arc<super::policy::SmallAccess>,
+        deadline: Option<Instant>,
         eligible: impl FnOnce(&super::policy::SmallAccess) -> bool + Send + 'static,
     ) -> io::Result<bool> {
         let store = self.clone();
         self.tasks
             .run(async move {
-                let _guard = store.mutation(&id).await;
+                let Some(_guard) =
+                    crate::runtime::before_deadline(deadline, store.mutation(&id)).await
+                else {
+                    return Ok(false);
+                };
                 let Some(stream) = store.owner(&id) else {
                     return Ok(false);
                 };
                 let removed = stream
-                    .delete_inner_if(&id, |loc| {
+                    .delete_inner_if(&id, deadline, |loc| {
                         loc.access
                             .as_ref()
                             .and_then(AccessHandle::small)
@@ -475,13 +481,11 @@ impl SmallObjectStore {
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.streams
-            .read()
-            .unwrap()
-            .values()
-            .filter_map(|s| s.get())
-            .map(|s| s.entries.read().unwrap().len())
-            .sum()
+        self.journal
+            .model
+            .1
+            .live_count
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     #[cfg(test)]

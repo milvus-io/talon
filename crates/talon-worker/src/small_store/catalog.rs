@@ -5,7 +5,10 @@ use crate::eviction::{AccessHandle, PolicyEntry};
 use crate::small_store::key::{SmallIdentity, SmallKey};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{
+    AtomicU64, AtomicUsize,
+    Ordering::{Relaxed, Release},
+};
 use std::sync::{Arc, RwLock, Weak};
 
 pub(super) type Address = (u64, u64);
@@ -47,21 +50,31 @@ pub(super) struct Catalog {
     // first publication, and a replacement inherits its source's position.
     pub published: BTreeMap<u64, u64>,
     publication_positions: HashMap<u64, u64>,
-    last_publication: u64,
+    pub shared: Arc<CatalogState>,
     active: bool,
 }
 
+#[derive(Default)]
+pub(super) struct CatalogState {
+    pub live_count: AtomicUsize,
+    pub last_publication: AtomicU64,
+    pub ownership: super::gc::OwnershipEpoch,
+}
+
 #[derive(Clone)]
-pub(super) struct LiveModel(pub Arc<RwLock<Catalog>>);
+pub(super) struct LiveModel(pub Arc<RwLock<Catalog>>, pub Arc<CatalogState>);
 
 impl Default for LiveModel {
     fn default() -> Self {
-        Self(Arc::new_cyclic(|owner| {
+        let shared = Arc::new(CatalogState::default());
+        let catalog = Arc::new_cyclic(|owner| {
             RwLock::new(Catalog {
                 owner: owner.clone(),
+                shared: shared.clone(),
                 ..Default::default()
             })
-        }))
+        });
+        Self(catalog, shared)
     }
 }
 
@@ -413,6 +426,9 @@ impl Catalog {
     }
 
     pub fn replace_published_segment(&mut self, old: u64, new: u64) {
+        if let Some(ownership) = &mut self.ownership {
+            ownership.relocate_segment(old, new);
+        }
         if let Some(position) = self.publication_positions.remove(&old) {
             if let Some(previous) = self.publication_positions.insert(new, position) {
                 self.published.remove(&previous);
@@ -427,12 +443,14 @@ impl Catalog {
         self.publication_positions
             .entry(segment)
             .or_insert_with(|| {
-                self.last_publication = self
-                    .last_publication
+                let last = &self.shared.last_publication;
+                let position = last
+                    .load(Relaxed)
                     .checked_add(1)
                     .expect("small segment publication sequence exhausted");
-                self.published.insert(self.last_publication, segment);
-                self.last_publication
+                self.published.insert(position, segment);
+                last.store(position, Release);
+                position
             });
     }
 

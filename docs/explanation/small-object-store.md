@@ -399,9 +399,9 @@ accommodate those temporary allocations, normal large-object writes, and
 filesystem overhead; this cache budget is not a filesystem-wide reservation.
 The eviction policy weights a small item by its payload bytes plus the checksum
 trailer when present. Segment rollovers still account for record metadata.
-Under pressure, small objects, ordinary blocks, and pages share each namespace's
-second-chance eviction queue. Segment placement does not determine which objects
-are cold. Capacity reclamation has two phases:
+Under pressure, each namespace selects victims from its compact packed pool and
+ordinary block/page queue under one capacity target. Both use second chances.
+Capacity reclamation has two phases:
 
 1. Select victims in bounded batches. Whole blocks/pages release their files;
    small objects append tombstones. Carry the small-store reclaim estimate across
@@ -477,11 +477,9 @@ with packed objects in the same namespace.
 for more than 24 hours. A successful HEAD adds a temporary entry keyed by
 backend object, shared across offsets and versions. HEAD results leave access
 times and TTI eligibility unchanged.
-[Ownership GC](ownership-gc.md) scans the compact catalog within the membership
-event's admission boundary. A segment normally shares one admission epoch, with
-per-offset exceptions for appends and re-admissions across an epoch boundary.
-Relocation copies payloads from their stored locations and preserves the epoch,
-recency, and any active access token. Compaction publishes the replacement
-locators and their scan position together. Both GC tasks
-revalidate the exact packed unit before deleting it. The key and persisted record
-formats are unchanged.
+[Ownership GC](ownership-gc.md) traverses the compact catalog by logical
+segment publication. It can examine later appends and re-admissions within a
+captured segment. Hourly supplements use one latest admission epoch per
+segment. Compaction preserves that epoch, recency and active access tokens,
+and publishes replacement locators at the original scan position. Both GC
+tasks revalidate the exact packed unit before tombstone authorization.

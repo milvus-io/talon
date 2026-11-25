@@ -51,22 +51,15 @@ consumes validity. Missing/invalid observations expire the previous snapshot,
 but retain its topology and event boundary. Same-topology recovery renews validity
 and wakes pending work without expanding its scope.
 
-On each logical membership change, publication captures the ordinary block
-admission sequence and the compact Small Store admission epoch for each initialized
-cache namespace and credential scope. It assigns a new local generation. The first
-valid observation is an event too, covering cache present at publication, including
-recovered blocks. GC scans only that fixed prefix for ownership. It also excludes
-blocks whose admission revision is at or beyond the limit: a post-event replacement
-or page fill conservatively excludes the entire block. Reads do not change the
-admission revision. New data never expands an event's scan, including data written
-between publication and delayed GC startup. A packed segment enters the scan
-order when its first row becomes visible. A writer that reserved a file earlier
-can therefore publish after the event without adding work to its scan. An
-already visible segment freezes its published byte ranges on the first later
-admission. Concurrent appends can finish out of order, leaving gaps for
-unfinished writes. The event skips those gaps even after their writes finish.
-Compaction retains the logical scan position and translates the captured
-ranges to the surviving rows in the replacement.
+Each logical membership change assigns a local generation and captures the
+ordinary block admission sequence and the packed segment publication ceiling for
+each initialized cache scope. The first observation includes recovered data.
+Ordinary scans exclude blocks with later admission revisions, including
+post-event replacements and page fills. Packed segments enter the scan order
+when their first row becomes visible, and a replacement inherits its source's
+position. A tail append can set a cutoff for the captured epoch. Scans can
+still find later rows, including after relocation discards that cutoff. A fresh
+observation of a cold, unpinned foreign row can authorize reclamation.
 
 A complete pass marks the generation converged once all selected misplaced entries
 have been reclaimed or superseded by a later admission and the generation remains
@@ -117,26 +110,24 @@ and leaves it pending for a later pass. This preserves the fixed event boundary
 without moving the index for every page. Protected retries use queue positions,
 while deletion still validates the latest revision, activity and pins.
 
-Small Store groups admissions by segment and epoch. Each ordinary append
-inherits its segment's first epoch or stores an offset exception for a later epoch.
-Immutable re-admissions update the epoch even when their payload locator is
-unchanged. Publication advances the epoch after capturing the event boundary.
-Hourly supplements visit segment headers up to the captured extent. They scan all
-rows in segments with newer admissions and hash only entries in the captured epoch
-range. Without relocation, a pass costs the number of segment headers plus the
-rows in those segments. A single immutable re-admission can require scanning every
-row in its segment, with at most 64 segment or row steps per slice.
-A segment replacement keeps its logical place
-in the scan and transfers row epochs and tickets to the copied extents. If the
-current segment moves between slices, the scan resumes at the beginning of its
-replacement.
+Packed admission records the latest epoch per segment and sets a dirty marker,
+including for immutable re-admission. Capture advances the epoch and
+consumes the marker atomically. An admission racing capture is either covered
+by the captured publication ceiling or leaves a dirty marker for a later pass.
+Packed capture and the heartbeat count use atomics without locking the catalog.
+Hourly supplements visit segment headers through the captured ceiling and scan
+segments with admissions since the previous boundary, at most 64 segment or row
+steps per slice. Relocation keeps the latest segment epoch and remaps retry
+addresses. A scan in progress restarts a relocated segment at its first row.
+The collector detaches superseded retry indexes and releases them outside the
+catalog and membership locks.
 
 Supplemental passes use the same yielding, deletion budgets and protection checks
 as event passes. Reader/pin protection and unlink failure retry the fixed bounds
 after one second. Cancellation or a same-topology discovery outage preserves those
-bounds. Admissions during the pass are deferred to the next hourly pass, including
-page fills into older blocks. A new membership generation supersedes a pending
-supplemental pass and checks the new event's entire prefix immediately. Hourly
+bounds. Ordinary admissions during the pass, including page fills into older
+blocks, are deferred to the next hourly pass. A new generation supersedes the
+pending supplement and checks the new event's prefix immediately. Hourly
 timing restarts on completion; invalid or self-excluding membership pauses work.
 No timer waits occupy a background task slot. Continued admissions require work
 proportional to notified blocks, so cleanup under write load is not constant time.
@@ -179,8 +170,9 @@ pins, then claims all resident pages. An active page reader defers the block.
 Successful deletion clears L1, lifecycle, index and accounting entries. Failures
 retain conservative accounting and release page claims.
 
-For a packed entry, both collectors recheck the locator ticket, pins and read
-activity at tombstone publication. Ownership GC also requires current membership
+For a packed entry, both collectors recheck the locator ticket, pins and access
+revision at tombstone authorization. A read, re-admission or pin invalidates an
+earlier observation. Ownership GC also requires current membership
 of the expected generation. Stale GC can retire the entry on an authoritative
 backend `NotFound` even when membership is unavailable. Deletion retires just
 that whole object or exact range. An exact-range retirement leaves any ordinary
@@ -188,9 +180,10 @@ whole block, paged block or L1 data for the same block identity available.
 
 Ownership charges all deletion credits before reading the latest valid snapshot
 of the expected generation. This permits renewal while a large block waits for
-credits. Subsequent semaphore, disk-permit and mutation-gate waits are bounded by
-that snapshot's expiry. Before unlinking, the reclaimer verifies expiry and the
-current generation. An already-started unlink finishes its owned accounting
+credits. The snapshot expiry bounds semaphore, disk-permit and mutation-gate
+waits, including packed identity, publication and stream-state waits. Unlink
+authorization verifies expiry and the current generation. An authorized unlink
+finishes its owned accounting
 transaction even if the caller is cancelled or membership subsequently changes.
 
 Polling cannot detect every remote transition; the boundary reflects local

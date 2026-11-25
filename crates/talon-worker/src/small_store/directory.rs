@@ -3,6 +3,7 @@ use super::lookup::{POLICY, REFERENCED, VISIBLE};
 use super::Location;
 use crate::eviction::{AccessHandle, PolicyEntry, PolicyState};
 use crate::small_store::key::{SmallIdentity, SmallKey};
+use std::sync::atomic::Ordering::Relaxed;
 
 #[derive(Default)]
 pub(crate) struct Directory {
@@ -141,6 +142,7 @@ impl Directory {
         catalog.publish_segment(location.segment);
         catalog.lookup.set_flags(slot, flags | VISIBLE);
         *catalog.live.entry(self.slot).or_default() += 1;
+        catalog.shared.live_count.fetch_add(1, Relaxed);
         Ok(())
     }
 
@@ -288,10 +290,9 @@ impl Directory {
         location: Location,
     ) -> Option<Location> {
         let address = (location.segment, location.offset);
-        let stored_len = location.stored_len();
-        let old = self.stage_in(catalog, key.clone(), location);
+        let old = self.stage_in(catalog, key.clone(), location, true);
         if let (Some(old), Some(ownership)) = (&old, &mut catalog.ownership) {
-            ownership.relocate((old.segment, old.offset), address, stored_len);
+            ownership.relocate_retry((old.segment, old.offset), address);
         }
         #[cfg(test)]
         if let Some(pause) = self.before_relocation_publish.take() {
@@ -303,13 +304,14 @@ impl Directory {
     pub fn stage(&mut self, key: SmallKey, location: Location) -> Option<Location> {
         let model = self.catalog.clone();
         let mut catalog = model.0.write().unwrap();
-        self.stage_in(&mut catalog, key, location)
+        self.stage_in(&mut catalog, key, location, false)
     }
     fn stage_in(
         &mut self,
         catalog: &mut Catalog,
         key: SmallKey,
         location: Location,
+        relocating: bool,
     ) -> Option<Location> {
         catalog.activate().expect("validated small catalog");
         catalog
@@ -342,6 +344,9 @@ impl Directory {
                 .lookup
                 .set_flags(old_slot, flags & !(VISIBLE | POLICY | REFERENCED));
             *catalog.live.entry(self.slot).or_default() -= 1;
+            if !relocating {
+                catalog.shared.live_count.fetch_sub(1, Relaxed);
+            }
             catalog.relocate_recency(old_address, slot);
             catalog.relocate_policy(old_address, address, slot);
             if let Some(policy) = catalog.policy.remove(&old_address) {
@@ -375,13 +380,20 @@ impl Directory {
         let flags = catalog.lookup.flags(slot);
         if flags & VISIBLE == 0 {
             *catalog.live.entry(self.slot).or_default() += 1;
+            if admit {
+                catalog.shared.live_count.fetch_add(1, Relaxed);
+            }
         }
         catalog.lookup.set_flags(slot, flags | VISIBLE);
         if admit {
             let (address, stored_len) = self.staged.expect("published small address");
             catalog.publish_segment(address.0);
             if let Some(ownership) = &mut catalog.ownership {
-                ownership.admit(address, stored_len);
+                // A tail append can bound this pass without tracking holes or
+                // translating offsets when the segment moves.
+                let cutoff = (catalog.model.segments[&address.0].bytes == address.1 + stored_len)
+                    .then_some(address.1);
+                ownership.admit(address, catalog.shared.ownership.admit(), cutoff);
             }
         }
         self.staged = None;
@@ -409,6 +421,7 @@ impl Directory {
             let flags = catalog.lookup.flags(slot) & !VISIBLE;
             catalog.lookup.set_flags(slot, flags);
             *catalog.live.entry(self.slot).or_default() -= 1;
+            catalog.shared.live_count.fetch_sub(1, Relaxed);
             return location;
         }
         let retired = catalog.retired.get_mut(id)?;
@@ -425,6 +438,7 @@ impl Directory {
             catalog.retired.remove(id);
         }
         *catalog.live.entry(self.slot).or_default() -= 1;
+        catalog.shared.live_count.fetch_sub(1, Relaxed);
         Some(location)
     }
     pub fn policy_get(&self, id: &dyn SmallIdentity) -> Option<PolicyEntry> {

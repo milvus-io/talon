@@ -621,11 +621,16 @@ mod tests {
             .await
             .unwrap();
         let mut gc = StaleGc::default();
-        let now = cold_now();
+        let now = access_millis();
+        let original = now - DAY_MS - 1;
+        small.packed_access_time(&whole, Some(original));
+        small.packed_access_time(&exact, Some(original));
         assert!(gc.positive_heads.checked.read().unwrap().is_empty());
         gc.run_round_at(&worker, now).await;
         assert_eq!(origin.calls.load(Ordering::Relaxed), 1);
         assert_eq!(gc.positive_heads.checked.read().unwrap().len(), 1);
+        assert_eq!(small.packed_access_time(&whole, None), original);
+        assert_eq!(small.packed_access_time(&exact, None), original);
         origin.mode.store(0, Ordering::Relaxed);
         gc.run_round_at(&worker, now + DAY_MS - 1).await;
         assert_eq!(origin.calls.load(Ordering::Relaxed), 1);

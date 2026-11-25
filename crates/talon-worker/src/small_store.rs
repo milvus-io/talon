@@ -681,19 +681,25 @@ impl SegmentStore {
     }
 
     async fn delete_inner(&self, id: &(impl SmallStoreKey + ?Sized)) -> io::Result<()> {
-        self.delete_inner_if(id, |_| true).await.map(|_| ())
+        self.delete_inner_if(id, None, |_| true).await.map(|_| ())
     }
 
     async fn delete_inner_if(
         &self,
         id: &(impl SmallStoreKey + ?Sized),
+        deadline: Option<Instant>,
         eligible: impl FnOnce(&Location) -> bool,
     ) -> io::Result<bool> {
         format::validate_key(&id.view())?;
         // A tombstone must be either included in the sealing fsync or synced
         // after publication. Serialize logical publication with seal/relocation.
-        let _publication = self.publication.lock().await;
-        let mut state = self.state.lock().await;
+        use crate::runtime::before_deadline;
+        let Some(_publication) = before_deadline(deadline, self.publication.lock()).await else {
+            return Ok(false);
+        };
+        let Some(mut state) = before_deadline(deadline, self.state.lock()).await else {
+            return Ok(false);
+        };
         self.healthy(&state)?;
         let Some(loc) = self.entries.read().unwrap().get(&id.view()) else {
             return Ok(false);

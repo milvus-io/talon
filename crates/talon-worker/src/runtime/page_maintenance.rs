@@ -487,7 +487,7 @@ impl WorkerRuntime {
                     let validator = runtime.clone();
                     let small = runtime.small.as_ref().unwrap();
                     match small
-                        .delete_gc(candidate, revision, move || {
+                        .delete_gc(candidate, revision, deadline, move || {
                             membership.as_ref().map_or(true, |view| {
                                 Instant::now() < view.valid_until
                                     && validator.membership_is_current(view)
@@ -893,7 +893,7 @@ impl WorkerRuntime {
     }
 }
 
-async fn before_deadline<F: std::future::Future>(
+pub(crate) async fn before_deadline<F: std::future::Future>(
     deadline: Option<Instant>,
     work: F,
 ) -> Option<F::Output> {
