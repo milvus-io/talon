@@ -431,7 +431,10 @@ impl Directory {
                                         // The final unlink also retires the disk directory.
                                         self.page_work.detached(key, slot, None);
                                     } else {
-                                        self.page_work.invalidate_page(slot, page, state.pinned());
+                                        // Runtime single-page deletion claims
+                                        // the page before unlinking it.
+                                        debug_assert!(!state.pinned());
+                                        self.page_work.remove_selection(slot, page);
                                         if state.retry_pending() {
                                             self.page_work.cancel_retry(slot, page);
                                         }

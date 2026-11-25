@@ -387,6 +387,20 @@ fn paged_key_at(entries: &Directory, catalog: bool, slot: usize) -> Option<&Bloc
     }
 }
 
+pub(crate) struct PageReads {
+    first: PageReadGuard,
+    tail: Vec<PageReadGuard>,
+}
+
+impl PageReads {
+    pub(crate) fn record_access_and_release(self, now: Option<u64>) {
+        self.first.record_access_and_release(now);
+        for guard in self.tail {
+            guard.record_access_and_release(now);
+        }
+    }
+}
+
 impl BlockIndex {
     /// Startup only, before serving. Reusing a recovered index starts a new
     /// runtime generation without retaining the previous policy or lifecycle.
@@ -1085,13 +1099,13 @@ impl BlockIndex {
     }
 
     /// Page protection is acquired through the existing index/token lookup.
-    /// One ticket protects the entire resident range through the disk read.
+    /// In the catalog, one ticket protects the resident range through the read.
     pub(crate) fn page_reads_and_touch(
         self: &Arc<Self>,
         id: &BlockId,
         start: PageIndex,
         end: PageIndex,
-    ) -> Option<PageReadGuard> {
+    ) -> Option<PageReads> {
         self.page_reads_and_touch_at(id, start, end)
             .map(|(_, read)| read)
     }
@@ -1101,16 +1115,28 @@ impl BlockIndex {
         id: &BlockId,
         start: PageIndex,
         end: PageIndex,
-    ) -> Option<(Option<DiskId>, PageReadGuard)> {
+    ) -> Option<(Option<DiskId>, PageReads)> {
         if start.0 >= end.0 {
             return None;
         }
         if self.catalog {
-            return self.catalog_read_pages(id, start, end);
+            return self
+                .catalog_read_pages(id, start, end)
+                .map(|(disk_id, first)| {
+                    (
+                        disk_id,
+                        PageReads {
+                            first,
+                            tail: Vec::new(),
+                        },
+                    )
+                });
         }
-        // On a partial range miss, release acquired guards only after all
-        // directory, entry and page locks have gone out of scope.
-        let (disk_id, read) = {
+        // Public clear_page can retire a pinned standalone page. Give each
+        // page its own ticket and drop partial reads after unlocking the rows.
+        let first;
+        let mut tail = Vec::new();
+        let disk_id = {
             let entries = self.entries.read().unwrap();
             let slot = entries.slot(id)?;
             let (_, directory) = entries.at(slot)?;
@@ -1120,7 +1146,7 @@ impl BlockIndex {
                 return None;
             };
             let pages = pages.read().unwrap();
-            let rows = (start.0..end.0).map_while(|page| {
+            let acquire = |page| {
                 let row = pages.get(&page)?;
                 let access = directory
                     .legacy
@@ -1130,17 +1156,26 @@ impl BlockIndex {
                 {
                     return None;
                 }
-                Some((&row.state, (&row.unit, access)))
-            });
-            let read = PageReadGuard::acquire(self, slot, start.0, rows, |_, (unit, access)| {
-                unit.access.touch(entries.clock(slot));
-                if let Some(access) = access {
-                    access.touch();
-                }
-            })?;
-            (block.meta.disk_id, read)
+                PageReadGuard::acquire(
+                    self,
+                    slot,
+                    page,
+                    std::iter::once((&row.state, ())),
+                    |_, ()| {
+                        row.unit.access.touch(entries.clock(slot));
+                        if let Some(access) = access {
+                            access.touch();
+                        }
+                    },
+                )
+            };
+            first = acquire(start.0)?;
+            for page in start.0 + 1..end.0 {
+                tail.push(acquire(page)?);
+            }
+            block.meta.disk_id
         };
-        read.covers(end.0 - start.0).then_some((disk_id, read))
+        Some((disk_id, PageReads { first, tail }))
     }
 
     /// Startup only, before serving or starting maintenance. Attach policy
@@ -2653,6 +2688,35 @@ mod tests {
             block.claim(&first, 100, None),
             "partial range acquisition leaked the first pin"
         );
+    }
+
+    #[test]
+    fn standalone_clear_page_retires_only_the_removed_pages_readers() {
+        let index = Arc::new(BlockIndex::new());
+        let id = block(1);
+        index.init_paged(id.clone(), 4096, 8192);
+        for page in [PageIndex(0), PageIndex(1)] {
+            index.mark_page_allocated(&id, page, 4096);
+        }
+        let _policy = index.restore_lru();
+        let life = crate::page_lifecycle::PageLifecycle::with_index(index.clone(), true);
+        let block = life.block(&id);
+        let old = index
+            .page_reads_and_touch(&id, PageIndex(0), PageIndex(2))
+            .unwrap();
+        let overlapping = block.acquire(PageIndex(0)).unwrap();
+        assert!(index.clear_page(&id, PageIndex(0)));
+        assert!(index.mark_page_allocated(&id, PageIndex(0), 4096));
+        let new = block.acquire(PageIndex(0)).unwrap();
+        overlapping.record_access_and_release(Some(9));
+        old.record_access_and_release(Some(10));
+        assert_eq!(block.last_access(0), None);
+        assert_eq!(block.last_access(1), Some(10));
+        assert!(block.candidate(PageIndex(0)).is_none());
+        assert!(block.candidate(PageIndex(1)).is_some());
+        new.record_access_and_release(Some(20));
+        assert_eq!(block.last_access(0), Some(20));
+        assert!(block.candidate(PageIndex(0)).is_some());
     }
 
     #[test]

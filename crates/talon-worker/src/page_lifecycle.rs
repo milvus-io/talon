@@ -440,19 +440,15 @@ impl Drop for PageReadGuard {
                 }
             };
             if range.len == 1 {
-                if let Some(row) = rows.get(range.start).filter(|_| range.discarded.is_empty()) {
+                if let Some(row) = rows.get(range.start) {
                     release(range.start, row);
                 }
             } else {
-                let mut discarded = range.discarded.into_iter().peekable();
                 for (page, row) in rows.iter_from(range.start) {
                     if page - range.start >= range.len {
                         break;
                     }
-                    while discarded.next_if(|&retired| retired < page).is_some() {}
-                    if discarded.next_if_eq(&page).is_none() {
-                        release(page, row);
-                    }
+                    release(page, row);
                 }
             }
             if changed_age {
@@ -782,8 +778,7 @@ const OPERATION_SHARDS: usize = 64;
 const FIRST_READ_TICKET: u64 = u32::MAX as u64 + 1;
 type OperationTree = BTreeMap<(usize, u64), ActivePage>;
 
-// One operation fits in a stripe without allocating a tree. Overlap or
-// forced retirement of a pinned page can promote the stripe.
+// One operation fits in a stripe without allocating a tree.
 #[derive(Default)]
 enum ActivePages {
     #[default]
@@ -813,7 +808,7 @@ impl ActivePages {
                     start,
                     len,
                 } => {
-                    tree.insert((slot, ticket), ActivePage::Read(ReadRange::new(start, len)));
+                    tree.insert((slot, ticket), ActivePage::Read(ReadRange { start, len }));
                 }
                 Self::Selected {
                     slot,
@@ -842,7 +837,7 @@ impl ActivePages {
             };
         } else {
             self.tree_mut()
-                .insert((slot, ticket), ActivePage::Read(ReadRange::new(start, len)));
+                .insert((slot, ticket), ActivePage::Read(ReadRange { start, len }));
         }
     }
 
@@ -855,7 +850,7 @@ impl ActivePages {
                 len,
             } if (current, id) == (slot, ticket) => {
                 *self = Self::Empty;
-                Some(ReadRange::new(start, len))
+                Some(ReadRange { start, len })
             }
             Self::Tree(_) => match self.remove((slot, ticket))? {
                 ActivePage::Read(range) => Some(range),
@@ -875,9 +870,7 @@ impl ActivePages {
                 len: 1,
             } if (current, id) == (slot, ticket) => Some(start),
             Self::Tree(tree) => match tree.get(&(slot, ticket)) {
-                Some(ActivePage::Read(range)) if range.len == 1 && range.discarded.is_empty() => {
-                    Some(range.start)
-                }
+                Some(ActivePage::Read(ReadRange { start, len: 1 })) => Some(*start),
                 _ => None,
             },
             _ => None,
@@ -937,18 +930,30 @@ impl ActivePages {
         }
     }
 
-    fn invalidate_page(&mut self, slot: usize, page: u32, pinned: bool) {
+    fn invalidate_legacy_page(&mut self, slot: usize, page: u32, pinned: bool) {
         self.remove_selection(slot, page);
-        if pinned {
-            for (_, op) in self
-                .tree_mut()
-                .range_mut((slot, FIRST_READ_TICKET)..=(slot, u64::MAX))
-            {
-                let ActivePage::Read(range) = op else {
-                    unreachable!()
-                };
-                range.discard(page);
+        if !pinned {
+            return;
+        }
+        match self {
+            Self::Read {
+                slot: current,
+                start,
+                len: 1,
+                ..
+            } if (*current, *start) == (slot, page) => {
+                *self = Self::Empty;
             }
+            Self::Tree(tree) => {
+                tree.retain(|&(current, _), op| {
+                    current != slot
+                        || !matches!(op, ActivePage::Read(ReadRange { start, len: 1 }) if *start == page)
+                });
+                if tree.is_empty() {
+                    *self = Self::Empty;
+                }
+            }
+            _ => {}
         }
     }
 
@@ -980,30 +985,6 @@ enum ActivePage {
 struct ReadRange {
     start: u32,
     len: u32,
-    // Only forced retirement can discard a pinned page. Keep a sorted list
-    // for this ticket so a later fill at the same index cannot inherit a pin.
-    discarded: Vec<u32>,
-}
-
-impl ReadRange {
-    fn new(start: u32, len: u32) -> Self {
-        Self {
-            start,
-            len,
-            discarded: Vec::new(),
-        }
-    }
-
-    fn discard(&mut self, page: u32) {
-        if page
-            .checked_sub(self.start)
-            .is_some_and(|offset| offset < self.len)
-        {
-            if let Err(at) = self.discarded.binary_search(&page) {
-                self.discarded.insert(at, page);
-            }
-        }
-    }
 }
 
 struct PageSelection {
@@ -1177,12 +1158,12 @@ impl PageWork {
             [slot % OPERATION_SHARDS]
     }
 
-    pub(crate) fn invalidate_page(&self, slot: usize, page: u32, pinned: bool) {
+    pub(crate) fn remove_selection(&self, slot: usize, page: u32) {
         if let Some(shards) = self.active.get() {
             shards[slot % OPERATION_SHARDS]
                 .lock()
                 .unwrap()
-                .invalidate_page(slot, page, pinned);
+                .remove_selection(slot, page);
         }
     }
 
@@ -1262,7 +1243,12 @@ impl PageWork {
         flags: u32,
         attached: &AtomicBool,
     ) {
-        self.invalidate_page(slot, page, flags & PINNED != 0);
+        if let Some(shards) = self.active.get() {
+            shards[slot % OPERATION_SHARDS]
+                .lock()
+                .unwrap()
+                .invalidate_legacy_page(slot, page, flags & PINNED != 0);
+        }
         let retry = flags & RETRY != 0;
         if !retry && !empty && !self.tracking() {
             return;

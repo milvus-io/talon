@@ -125,7 +125,7 @@ fn descending_large_page_map_roundtrips_a_frozen_snapshot() {
 }
 
 #[test]
-fn range_release_skips_replaced_pages_and_keeps_overlapping_pins() {
+fn range_pins_survive_chunk_promotion_and_exclude_page_deletion() {
     let mut id = block(0);
     id.block_size = 4096 * 512;
     let directory = Arc::new(std::sync::RwLock::new(crate::index::Directory::default()));
@@ -155,20 +155,12 @@ fn range_release_skips_replaced_pages_and_keeps_overlapping_pins() {
     for page in 254..258 {
         assert!(block.candidate(PageIndex(page)).is_none());
     }
-    directory.write().unwrap().apply(
-        &id,
-        StoreKind::Paged,
-        &Operation::DeletePage { page: 255 },
-        None,
-        Some(0),
-    );
-    put(255);
     let overlap = index
         .page_reads_and_touch(&id, PageIndex(255), PageIndex(257))
         .unwrap();
     old.record_access_and_release(Some(10));
     assert_eq!(block.last_access(254), Some(10));
-    assert_eq!(block.last_access(255), None);
+    assert_eq!(block.last_access(255), Some(10));
     assert_eq!(block.last_access(256), Some(10));
     assert_eq!(block.last_access(257), Some(10));
     assert!(block.candidate(PageIndex(254)).is_some());
@@ -178,7 +170,22 @@ fn range_release_skips_replaced_pages_and_keeps_overlapping_pins() {
     overlap.record_access_and_release(Some(20));
     assert_eq!(block.last_access(255), Some(20));
     assert_eq!(block.last_access(256), Some(20));
-    assert!(block.candidate(PageIndex(255)).is_some());
+    let delete = block.candidate(PageIndex(255)).unwrap();
+    assert!(block.claim(&delete, 30, None));
+    assert!(index
+        .page_reads_and_touch(&id, PageIndex(254), PageIndex(257))
+        .is_none());
+    assert!(block.candidate(PageIndex(254)).is_some());
+    directory.write().unwrap().apply(
+        &id,
+        StoreKind::Paged,
+        &Operation::DeletePage { page: 255 },
+        None,
+        Some(0),
+    );
+    put(255);
+    assert_eq!(block.last_access(255), None);
+    assert_eq!(block.last_access(256), Some(20));
     assert!(block.candidate(PageIndex(256)).is_some());
 }
 

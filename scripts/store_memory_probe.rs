@@ -193,18 +193,17 @@ fn scenario(count: usize, pages: u32, tracked: bool, checkpoint: bool) {
     if pages != 0 {
         let id = identity(0);
         let before_read = Snapshot::now();
-        let (_, first, tail) = index
+        let (_, read) = index
             .page_reads_and_touch_at(&id, talon_core::PageIndex(0), talon_core::PageIndex(pages))
             .unwrap();
-        assert_eq!(tail.len(), (pages - 1) as usize);
         Snapshot::now().report("range_while_pinned", 1, before_read);
-        drop((first, tail));
+        drop(read);
         Snapshot::now().report("range_after_pin_release", 1, before_read);
 
-        let (_, first, _) = index
+        let (_, read) = index
             .page_reads_and_touch_at(&id, talon_core::PageIndex(0), talon_core::PageIndex(1))
             .unwrap();
-        first.record_access_and_release(checkpoint.then_some(100));
+        read.record_access_and_release(checkpoint.then_some(100));
         assert_eq!(lifecycle.block(&id).last_access(0), checkpoint.then_some(100));
     }
     std::hint::black_box((&catalog, &index, &lru, &lifecycle));
