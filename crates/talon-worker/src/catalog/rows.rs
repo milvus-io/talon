@@ -75,7 +75,7 @@ impl InlinePage {
         let page = CompactPage::new(index, bytes)?;
         let sectors = page.sectors();
         (index <= u32::MAX >> Self::SECTOR_BITS && sectors <= Self::SECTOR_MASK)
-            .then(|| Self((index << Self::SECTOR_BITS) | sectors))
+            .then_some(Self((index << Self::SECTOR_BITS) | sectors))
     }
 
     fn index(self) -> u32 {
@@ -262,7 +262,7 @@ impl Geometry {
                 let (index, bytes) = page.unpack();
                 (
                     after
-                        .is_none_or(|last| index > last)
+                        .map_or(true, |last| index > last)
                         .then_some((index, bytes)),
                     None,
                 )

@@ -1187,7 +1187,7 @@ impl Lru {
             if include_compact
                 || g.index
                     .policy_get(&unit)
-                    .is_none_or(|entry| entry.access.small().is_none())
+                    .map_or(true, |entry| entry.access.small().is_none())
             {
                 g.remove(&unit);
             }

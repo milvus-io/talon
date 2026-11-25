@@ -922,11 +922,10 @@ impl PageWork {
 
     fn invalidate_block(&self, slot: usize) {
         if let Some(shards) = self.active.get() {
-            shards[slot % OPERATION_SHARDS]
-                .lock()
-                .unwrap()
-                .extract_if((slot, 0)..=(slot, u32::MAX), |_, _| true)
-                .for_each(drop);
+            let mut active = shards[slot % OPERATION_SHARDS].lock().unwrap();
+            while let Some((&address, _)) = active.range((slot, 0)..=(slot, u32::MAX)).next() {
+                active.remove(&address);
+            }
         }
     }
 

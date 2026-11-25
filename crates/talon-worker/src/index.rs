@@ -90,12 +90,16 @@ impl LegacyPolicy {
         self.units.len() + self.small.count_ones() as usize
     }
 
+    fn has_units(&self) -> bool {
+        !self.units.is_empty() || self.small != 0
+    }
+
     fn is_empty(&self) -> bool {
         #[cfg(test)]
         if !self.attached.is_empty() {
             return false;
         }
-        self.len() == 0 && self.activity.access.is_none()
+        !self.has_units() && self.activity.access.is_none()
     }
 }
 
@@ -687,7 +691,7 @@ impl BlockIndex {
         let entries = self.entries.read().unwrap();
         entries.versions(id, |slot, key, entry| {
             if (self.compact_enabled.load(Ordering::Relaxed) && entries.resident_at(slot).is_some())
-                || entry.legacy.as_ref().is_some_and(|p| p.len() > 0)
+                || entry.legacy.as_deref().is_some_and(LegacyPolicy::has_units)
                 || entry.resident.as_ref().is_some_and(|entry| {
                     entry.block.read().unwrap().as_ref().unwrap().policy_units > 0
                 })

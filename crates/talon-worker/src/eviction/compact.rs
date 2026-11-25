@@ -148,7 +148,7 @@ impl Drop for Pin {
 
 fn release(active: &mut Active, address: Address, generation: Option<u64>) {
     update_active(active, address, |op| {
-        if op.pins > 0 && generation.is_none_or(|g| g == op.pin_generation) {
+        if op.pins > 0 && generation.map_or(true, |g| g == op.pin_generation) {
             op.pins -= 1;
         }
     });
@@ -243,11 +243,10 @@ impl CompactPolicy {
     }
 
     pub fn invalidate_block(&self, slot: usize) {
-        self.active
-            .lock()
-            .unwrap()
-            .extract_if(block_addresses(slot), |_, _| true)
-            .for_each(drop);
+        let mut active = self.active.lock().unwrap();
+        while let Some((&address, _)) = active.range(block_addresses(slot)).next() {
+            active.remove(&address);
+        }
     }
 
     pub fn select(
