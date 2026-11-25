@@ -163,7 +163,7 @@ pub struct WorkerRuntime {
 
 #[derive(Default)]
 struct SmallIdleCursor {
-    block: (u64, u64),
+    block: (usize, usize),
     recency: IdleRecencyCursor,
 }
 
@@ -447,7 +447,7 @@ impl WorkerRuntime {
 
     fn capture_ownership_limits(&self) -> OwnershipLimits {
         OwnershipLimits {
-            block: self.lru.block_scan_ceiling(),
+            block: self.lru.ownership_admission_ceiling(),
             small: self
                 .small
                 .as_ref()
@@ -916,7 +916,7 @@ impl WorkerRuntime {
                             "short exact range fetch"
                         );
                         let state = runtime.page_lifecycle.block(&block);
-                        let gate = state.gate.lock().await;
+                        let gate = state.lock().await;
                         small.put(&unit, bytes.clone()).await?;
                         small.track_access(&unit)?;
                         let _pin = runtime.lru.pin_guard(unit.clone());
@@ -1980,9 +1980,9 @@ impl WorkerRuntime {
                     .scope(async move {
                         let state = runtime.page_lifecycle.block(&id);
                         let _gate = if warm_only {
-                            state.gate.lock_page_fill().await
+                            state.lock_page_fill().await
                         } else {
-                            state.gate.lock().await
+                            state.lock().await
                         };
                         if runtime
                             .small
@@ -2280,7 +2280,7 @@ impl WorkerRuntime {
     /// Drop stale metadata after an index-hit/file-miss eviction race.
     async fn forget_missing_l2_parent(&self, block: &BlockId, disk_id: Option<DiskId>) {
         let state = self.page_lifecycle.block(block);
-        let gate = state.gate.lock().await;
+        let gate = state.lock().await;
         if self.index.whole_and_touch(block) == Some(disk_id) {
             self.invalidate_l1(block);
             self.index.remove(block);
@@ -2478,7 +2478,7 @@ impl WorkerRuntime {
                 let result = operation
                     .scope(async move {
                         let state = runtime.page_lifecycle.block(&id);
-                        let gate = state.gate.lock().await;
+                        let gate = state.lock().await;
                         let independent = runtime.accepts_small(&id, len);
                         if independent && runtime.index.get(&id).is_some() {
                             anyhow::bail!(

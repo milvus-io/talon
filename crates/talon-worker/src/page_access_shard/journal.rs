@@ -49,11 +49,11 @@ pub(super) fn unwrap_snapshot(bytes: &[u8]) -> anyhow::Result<(&[u8], u64)> {
 /// just dirty page times after reads. Empty replacements are deletion markers.
 pub(crate) fn encode_delta<'a>(
     page_size: u32,
-    records: impl Iterator<Item = (&'a BlockId, &'a AccessSnapshot, bool)>,
+    records: impl Iterator<Item = (impl serde::Serialize, &'a AccessSnapshot, bool)>,
 ) -> anyhow::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     for (id, snapshot, replace) in records {
-        let record = PageAccessStore::encode(id, page_size, snapshot)?;
+        let record = PageAccessStore::encode(&id, page_size, snapshot)?;
         anyhow::ensure!(
             bytes.len() + record.len() + 13 <= MAX_BYTES,
             "access delta exceeds 64 MiB limit"

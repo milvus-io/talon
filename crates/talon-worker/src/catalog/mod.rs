@@ -5,6 +5,7 @@
 mod benchmark;
 mod model;
 mod reconcile;
+mod rows;
 #[cfg(test)]
 mod tests;
 
@@ -306,7 +307,7 @@ impl Catalog {
                             .blocks
                             .get(&block as &dyn crate::block_key::BlockIdentity)
                     })
-                    .map(|block| block.pages.keys().copied().collect())
+                    .map(|block| block.pages_after(None).map(|(page, _)| page).collect())
                     .unwrap_or_default())
             })
             .await?)

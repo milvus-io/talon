@@ -56,7 +56,7 @@ struct DirectoryEntry {
     resident: Option<Arc<Entry>>,
     lifecycle: Option<Arc<BlockState>>,
     policy: PolicyUnits,
-    activity: Option<Box<BlockPolicy>>,
+    activity: BlockPolicy,
 }
 
 #[derive(Default)]
@@ -65,6 +65,7 @@ struct PolicyUnits {
     exact: Option<Box<PolicyEntry>>,
     pages: Option<PageTable>,
     len: usize,
+    legacy: u8,
 }
 
 impl DirectoryEntry {
@@ -72,7 +73,7 @@ impl DirectoryEntry {
         self.resident.is_none()
             && self.lifecycle.is_none()
             && self.policy.len == 0
-            && self.activity.is_none()
+            && self.activity.access.is_none()
     }
 }
 
@@ -311,7 +312,7 @@ impl BlockIndex {
         entries.retain(|_, directory| {
             if directory.lifecycle.is_none()
                 && directory.policy.len == 0
-                && directory.activity.is_none()
+                && directory.activity.access.is_none()
             {
                 return true;
             }
@@ -338,47 +339,87 @@ impl BlockIndex {
             }
             directory.lifecycle = None;
             directory.policy = PolicyUnits::default();
-            directory.activity = None;
+            directory.activity = BlockPolicy::default();
             directory.resident.is_some()
         });
     }
 
-    fn tracked_small_units(&self, id: &dyn BlockIdentity) -> usize {
-        [UnitKind::Whole, UnitKind::ExactRange]
-            .into_iter()
-            .filter(|&kind| {
-                self.small_policy(&SmallRef {
-                    block: id.view(),
-                    kind,
-                })
-                .is_some_and(|entry| entry.access.small().is_none())
-            })
-            .count()
-    }
-
     pub(crate) fn policy_block_get(&self, id: &dyn BlockIdentity) -> Option<BlockActivity> {
-        let small = self.tracked_small_units(id);
         let entries = self.entries.read().unwrap();
         let entry = entries.get(id)?;
-        Some(
-            entry
-                .activity
-                .as_deref()?
-                .snapshot(entry.policy.len + small),
-        )
+        entry.activity.snapshot(entry.policy.len)
     }
 
-    pub(crate) fn policy_block_observe_ownership(
-        &self,
-        id: &dyn BlockIdentity,
-        admission_limit: u64,
-    ) -> Option<BlockActivity> {
-        let small = self.tracked_small_units(id);
+    pub(crate) fn policy_scan_ceiling(&self) -> usize {
+        self.entries.read().unwrap().slot_count()
+    }
+
+    pub(crate) fn policy_block_at(&self, slot: usize) -> Option<(BlockKey, BlockActivity)> {
         let entries = self.entries.read().unwrap();
-        let entry = entries.get(id)?;
-        let activity = entry.activity.as_deref()?;
-        activity.observe_ownership(admission_limit);
-        Some(activity.snapshot(entry.policy.len + small))
+        let (id, entry) = entries.at(slot)?;
+        Some((id.clone(), entry.activity.snapshot(entry.policy.len)?))
+    }
+
+    /// Take one step within a stable slab slot. The page key is used as the
+    /// cursor, so inserting or deleting pages cannot shift a sibling past it.
+    pub(crate) fn policy_unit_at(&self, cursor: &mut (usize, u64)) -> Option<SharedUnit> {
+        let advance_slot = |cursor: &mut (usize, u64)| {
+            cursor.0 += 1;
+            cursor.1 = 0;
+        };
+        let entries = self.entries.read().unwrap();
+        let Some((block, entry)) = entries.at(cursor.0) else {
+            advance_slot(cursor);
+            return None;
+        };
+        let slots = &entry.policy;
+        let unit = |kind| SharedUnit {
+            block: block.clone(),
+            kind,
+        };
+        if cursor.1 == 0 {
+            cursor.1 = 1;
+            if slots.legacy & 1 != 0
+                || slots
+                    .whole
+                    .as_ref()
+                    .is_some_and(|whole| whole.read().unwrap().policy.is_some())
+            {
+                if slots.legacy & 2 == 0 && slots.exact.is_none() && slots.pages.is_none() {
+                    advance_slot(cursor);
+                }
+                return Some(unit(UnitKind::Whole));
+            }
+        }
+        if cursor.1 == 1 {
+            cursor.1 = 2;
+            if slots.legacy & 2 != 0 || slots.exact.is_some() {
+                if slots.pages.is_none() {
+                    advance_slot(cursor);
+                }
+                return Some(unit(UnitKind::ExactRange));
+            }
+        }
+        if let (Some(pages), Ok(start)) = (&slots.pages, u32::try_from(cursor.1 - 2)) {
+            let pages = pages.read().unwrap();
+            if let Some((&page, entry)) = pages.range(start..).next() {
+                if pages
+                    .last_key_value()
+                    .is_some_and(|(&last, _)| last == page)
+                {
+                    advance_slot(cursor);
+                } else {
+                    cursor.1 = u64::from(page) + 3;
+                }
+                return entry
+                    .unit
+                    .policy
+                    .is_some()
+                    .then(|| unit(UnitKind::Page(PageIndex(page))));
+            };
+        }
+        advance_slot(cursor);
+        None
     }
 
     pub(crate) fn policy_block_update<T>(
@@ -387,17 +428,13 @@ impl BlockIndex {
         update: impl FnOnce(&mut BlockPolicy) -> T,
     ) -> Option<T> {
         let mut entries = self.entries.write().unwrap();
-        Some(update(entries.get_mut(id)?.activity.as_deref_mut()?))
+        let activity = &mut entries.get_mut(id)?.activity;
+        activity.access.as_ref()?;
+        Some(update(activity))
     }
 
-    pub(crate) fn policy_block_insert(&self, id: BlockKey, activity: BlockPolicy) -> BlockKey {
-        let mut entries = self.entries.write().unwrap();
-        let id = entries
-            .get_key_value(&id)
-            .map(|(id, _)| id.clone())
-            .unwrap_or(id);
-        entries.get_or_insert(id.clone()).1.activity = Some(Box::new(activity));
-        id
+    pub(crate) fn policy_block_insert(&self, id: BlockKey, activity: BlockPolicy) {
+        self.entries.write().unwrap().get_or_insert(id).1.activity = activity;
     }
 
     pub(crate) fn policy_block_remove(&self, id: &dyn BlockIdentity) {
@@ -405,7 +442,7 @@ impl BlockIndex {
         let Some(entry) = entries.get_mut(id) else {
             return;
         };
-        entry.activity = None;
+        entry.activity = BlockPolicy::default();
         if entry.is_empty() {
             entries.remove(id);
         }
@@ -491,20 +528,26 @@ impl BlockIndex {
         None
     }
 
-    pub(crate) fn policy_has_versioned_units(&self, id: &dyn BlockIdentity) -> bool {
-        let entries = self.entries.read().unwrap();
-        let Some(entry) = entries.get(id) else {
-            return false;
-        };
-        let independent_whole = entry.policy.whole.as_ref().is_some_and(|whole| {
-            whole
-                .read()
-                .unwrap()
-                .policy
-                .is_some_and(|policy| policy.independent)
+    pub(crate) fn policy_version_blocks(&self, id: &dyn BlockIdentity) -> Vec<BlockKey> {
+        let mut blocks = Vec::new();
+        self.entries.read().unwrap().versions(id, |key, entry| {
+            if entry.policy.len > 0 {
+                blocks.push(key.clone());
+            }
         });
-        entry.policy.len
-            > usize::from(independent_whole) + usize::from(entry.policy.exact.is_some())
+        blocks
+    }
+
+    #[cfg(test)]
+    pub(crate) fn policy_versioned_count(&self, id: &dyn BlockIdentity) -> usize {
+        self.policy_version_blocks(id)
+            .iter()
+            .filter(|block| {
+                self.policy_units(*block)
+                    .iter()
+                    .any(|(_, unit)| !unit.independent)
+            })
+            .count()
     }
 
     pub(crate) fn policy_insert(&self, unit: &SharedUnit, entry: PolicyEntry) -> AccessHandle {
@@ -515,6 +558,13 @@ impl BlockIndex {
                     .unwrap()
                     .policy_insert(&SmallRef::from_unit(unit), entry.clone())
                 {
+                    let mut entries = self.entries.write().unwrap();
+                    let (_, directory) = entries.get_or_insert(unit.block.clone());
+                    let flag = if unit.kind == UnitKind::Whole { 1 } else { 2 };
+                    if directory.policy.legacy & flag == 0 {
+                        directory.policy.legacy |= flag;
+                        directory.policy.len += 1;
+                    }
                     return access;
                 }
             }
@@ -629,6 +679,19 @@ impl BlockIndex {
                     .unwrap()
                     .policy_remove(&SmallRef::from_unit(unit))
                 {
+                    if entry.access.small().is_none() {
+                        let mut entries = self.entries.write().unwrap();
+                        if let Some(directory) = entries.get_mut(unit.block()) {
+                            let flag = if unit.kind() == UnitKind::Whole { 1 } else { 2 };
+                            if directory.policy.legacy & flag != 0 {
+                                directory.policy.legacy &= !flag;
+                                directory.policy.len -= 1;
+                            }
+                            if directory.is_empty() {
+                                entries.remove(unit.block());
+                            }
+                        }
+                    }
                     return Some(entry);
                 }
             }
@@ -834,7 +897,7 @@ impl BlockIndex {
 
     // Caller owns the lifecycle registry. Retirement checks maintenance work
     // while the directory and registry are the only remaining owners.
-    pub(crate) fn retire_lifecycle(&self, id: &BlockId, block: &Arc<BlockState>) -> bool {
+    pub(crate) fn retire_lifecycle(&self, id: &dyn BlockIdentity, block: &Arc<BlockState>) -> bool {
         if Arc::strong_count(block) != 2 || !block.retirement_candidate() {
             return false;
         }
@@ -1640,27 +1703,12 @@ mod tests {
         let limit = lru.ownership_admission_ceiling();
         lru.insert(CacheUnit::Whole(id.clone()), 4096);
         with_directory_reader(&index, || {
-            let (_, candidate) = lru.next_ownership_block(&mut (0, limit), limit).unwrap();
-            assert!(candidate.revision >= limit);
-            assert!(lru.next_ownership_block(&mut (0, limit), limit).is_none());
+            assert!(lru.first_ownership_candidate(0..limit).is_none());
             let next_limit = lru.ownership_admission_ceiling();
-            let (position, candidate) = lru
-                .next_ownership_block(&mut (limit, next_limit), next_limit)
-                .unwrap();
+            let candidate = lru.first_ownership_candidate(limit..next_limit).unwrap();
             assert_eq!(candidate.block, id);
             assert!(lru.stale_candidate_is_current(&candidate));
-            assert!(lru
-                .next_ownership_block(&mut (position, position + 1), next_limit)
-                .is_some());
-        });
-        let limit = lru.ownership_admission_ceiling();
-        lru.insert(CacheUnit::Whole(id.clone()), 4096);
-        with_directory_reader(&index, || {
-            let next_limit = lru.ownership_admission_ceiling();
-            let (_, candidate) = lru
-                .next_ownership_block(&mut (limit, next_limit), next_limit)
-                .unwrap();
-            assert_eq!(candidate.block, id);
+            assert!(lru.refresh_ownership_candidate(&candidate).is_some());
         });
     }
 

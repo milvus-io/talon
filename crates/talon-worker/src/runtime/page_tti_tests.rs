@@ -446,7 +446,7 @@ async fn cancelling_request_cannot_split_commit_transaction() {
     let root = tempfile::tempdir().unwrap();
     let r = runtime(root.path(), false, 0, 100);
     let state = r.page_lifecycle.block(&id());
-    let gate = state.gate.lock().await;
+    let gate = state.lock().await;
     let task = {
         let r = r.clone();
         tokio::spawn(async move {
@@ -641,7 +641,8 @@ fn page_tti_metadata_scale() {
                     .collect(),
             };
             drop(state);
-            bytes += PageAccessStore::checkpoint(&dir, &block.id, 16, &snapshot).unwrap();
+            bytes +=
+                PageAccessStore::checkpoint(&dir, &block.id.materialize(), 16, &snapshot).unwrap();
         }
         println!(
             "{{\"pages\":{count},\"checkpoint_bytes\":{bytes},\"checkpoint_ms\":{:.3}}}",
@@ -715,7 +716,7 @@ async fn cancelled_admission_must_finish_capacity_enforcement() {
     let r = runtime(root.path(), false, 16, 0);
     r.serve_range(&request(0, 16)).await.unwrap();
     let state = r.page_lifecycle.block(&id());
-    let gate = state.gate.lock().await;
+    let gate = state.lock().await;
     let task = {
         let r = r.clone();
         tokio::spawn(async move {
@@ -813,7 +814,7 @@ async fn cancelled_whole_admission_finishes_capacity_and_paged_fallback() {
             body = Bytes::from_static(&[2; 16]);
         }
         let state = r.page_lifecycle.block(&target);
-        let gate = state.gate.lock().await;
+        let gate = state.lock().await;
         let task = {
             let r = r.clone();
             let target = target.clone();
@@ -1067,7 +1068,7 @@ async fn orphan_cleanup_waits_for_active_checkpoint_and_commit_gate() {
     r.serve_range(&request(0, 16)).await.unwrap();
     let dir = r.paged.as_ref().unwrap().dir_for(&id());
     let state = r.page_lifecycle.block(&id());
-    let gate = state.gate.lock().await;
+    let gate = state.lock().await;
     let tmp = dir.join("access.meta.tmp.inflight");
     std::fs::write(&tmp, b"new checkpoint").unwrap();
     let cleanup = {

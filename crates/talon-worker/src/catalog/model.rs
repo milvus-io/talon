@@ -1,4 +1,5 @@
 //! File-cache residency state and codec; the shared journal owns ordering and I/O.
+use super::rows::{BlockRow, BlockRows, Slab};
 use super::DiskId;
 use crate::block_key::{BlockIdentity, BlockKey};
 use crate::{
@@ -7,12 +8,7 @@ use crate::{
 };
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::{BTreeMap, HashMap},
-    io,
-    path::Path,
-    sync::Arc,
-};
+use std::{collections::BTreeMap, io, path::Path, sync::Arc};
 use talon_core::{BlockForm, BlockId, PageIndex, PresentBitmap};
 use talon_journal::Machine;
 
@@ -60,7 +56,7 @@ pub(super) enum Record {
 pub(super) struct Store {
     /// Zero denotes whole blocks, represented by one allocation at index zero.
     pub(super) page_size: u32,
-    pub(super) blocks: HashMap<BlockKey, Arc<Block>>,
+    pub(super) blocks: BlockRows,
 }
 
 #[derive(Default)]
@@ -173,18 +169,7 @@ impl State {
                 let store = self.stores.get_mut(&intent.store).unwrap();
                 match intent.operation {
                     Operation::Put { page, .. } | Operation::DeletePage { page } => {
-                        if let Some(block) =
-                            store.blocks.get_mut(&intent.block as &dyn BlockIdentity)
-                        {
-                            Arc::make_mut(block).pages.remove(&page);
-                        }
-                        if store
-                            .blocks
-                            .get(&intent.block as &dyn BlockIdentity)
-                            .is_some_and(|b| b.pages.is_empty())
-                        {
-                            store.blocks.remove(&intent.block as &dyn BlockIdentity);
-                        }
+                        store.blocks.remove_page(&intent.block, page);
                     }
                     Operation::DeleteBlock | Operation::PutWhole { .. } => {
                         store.blocks.remove(&intent.block as &dyn BlockIdentity);
@@ -202,59 +187,29 @@ impl State {
                 let store = self.stores.get_mut(&intent.store).unwrap();
                 match intent.operation {
                     Operation::PutWhole { len } => {
-                        let entry = store
-                            .blocks
-                            .entry(BlockKey::new(&intent.block as &dyn BlockIdentity));
-                        let id = entry.key().clone();
-                        let block = Arc::new(Block {
-                            id,
-                            disk_id: intent.disk_id,
+                        store.blocks.insert(BlockRow::new(
+                            BlockKey::new(&intent.block),
+                            intent.disk_id,
                             len,
-                            pages: [(0, allocated)].into(),
-                        });
-                        match entry {
-                            std::collections::hash_map::Entry::Occupied(mut entry) => {
-                                entry.insert(block);
-                            }
-                            std::collections::hash_map::Entry::Vacant(entry) => {
-                                entry.insert(block);
-                            }
-                        }
+                            0,
+                            allocated,
+                        ));
                     }
                     Operation::Put { page, len } => {
-                        use std::collections::hash_map::Entry;
-                        let block = match store
-                            .blocks
-                            .entry(BlockKey::new(&intent.block as &dyn BlockIdentity))
-                        {
-                            Entry::Occupied(entry) => entry.into_mut(),
-                            Entry::Vacant(entry) => {
-                                let id = entry.key().clone();
-                                entry.insert(Arc::new(Block {
-                                    id,
-                                    disk_id: intent.disk_id,
-                                    len,
-                                    pages: PageMap::default(),
-                                }))
-                            }
-                        };
-                        let block = Arc::make_mut(block);
-                        block.len = len;
-                        block.pages.insert(page, allocated);
+                        if let Some(row) = store.blocks.get_mut(&intent.block) {
+                            row.put(len, page, allocated);
+                        } else {
+                            store.blocks.insert(BlockRow::new(
+                                BlockKey::new(&intent.block),
+                                intent.disk_id,
+                                len,
+                                page,
+                                allocated,
+                            ));
+                        }
                     }
                     Operation::DeletePage { page } => {
-                        if let Some(block) =
-                            store.blocks.get_mut(&intent.block as &dyn BlockIdentity)
-                        {
-                            Arc::make_mut(block).pages.remove(&page);
-                        }
-                        if store
-                            .blocks
-                            .get(&intent.block as &dyn BlockIdentity)
-                            .is_some_and(|b| b.pages.is_empty())
-                        {
-                            store.blocks.remove(&intent.block as &dyn BlockIdentity);
-                        }
+                        store.blocks.remove_page(&intent.block, page);
                     }
                     Operation::DeleteBlock => {
                         store.blocks.remove(&intent.block as &dyn BlockIdentity);
@@ -277,42 +232,36 @@ impl State {
         let Some(store) = self.stores.get(path) else {
             return Ok(None);
         };
-        let blocks: Vec<_> = store
-            .blocks
-            .values()
-            .filter(|b| !b.pages.is_empty())
-            .collect();
+        let blocks: Vec<_> = store.blocks.values().collect();
         Ok(Some(crate::recovery::map(blocks, threads, |b| {
             if store.page_size == 0 {
                 return StoredBlock {
                     meta: StoredMeta {
                         id: b.id.clone(),
                         disk_id: b.disk_id,
-                        len: b.len,
+                        len: b.len(),
                         form: BlockForm::Whole,
                     },
-                    allocated: vec![(None, b.pages[&0])],
+                    allocated: vec![(None, b.pages_after(None).next().unwrap().1)],
                 };
             }
             let mut present = PresentBitmap::new(b.id.view().page_count(store.page_size));
-            for page in b.pages.keys() {
-                present.set(PageIndex(*page));
+            let mut allocated = Vec::with_capacity(b.page_count());
+            for (page, bytes) in b.pages_after(None) {
+                present.set(PageIndex(page));
+                allocated.push((Some(PageIndex(page)), bytes));
             }
             StoredBlock {
                 meta: StoredMeta {
                     id: b.id.clone(),
                     disk_id: b.disk_id,
-                    len: b.len,
+                    len: b.len(),
                     form: BlockForm::Paged {
                         page_size: store.page_size,
                         present,
                     },
                 },
-                allocated: b
-                    .pages
-                    .iter()
-                    .map(|(p, n)| (Some(PageIndex(*p)), *n))
-                    .collect(),
+                allocated,
             }
         })))
     }
@@ -347,15 +296,22 @@ pub(super) enum SnapshotRecord {
 
 enum Frozen {
     Store(String, u32),
-    Block(Arc<str>, Arc<Block>),
+    Slab(Arc<str>, Slab),
     Pending(u64, Intent),
 }
 
-/// Freeze references to blocks; only a concurrently mutated block is copied.
-/// Encoding runs on the journal's snapshot CPU thread, one record at a time.
+/// Freeze references to slabs. Subsequent writes clone touched slabs, and
+/// shared multipage arrays clone only when their row changes.
 pub(super) struct Snapshot {
     records: std::vec::IntoIter<Frozen>,
-    block: Option<(Arc<str>, Arc<Block>, Option<u32>)>,
+    slab: Option<FrozenSlab>,
+}
+
+struct FrozenSlab {
+    store: Arc<str>,
+    rows: Slab,
+    slot: usize,
+    after: Option<u32>,
 }
 
 // A page mapping needs at most 35 JSON bytes (u32 index and u64 allocation).
@@ -366,37 +322,49 @@ impl Iterator for Snapshot {
     type Item = io::Result<Bytes>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        use std::ops::Bound::{Excluded, Unbounded};
         let record = loop {
-            if let Some((store, block, after)) = &mut self.block {
-                let pages: PageMap<_> = block
-                    .pages
-                    .range((after.map_or(Unbounded, Excluded), Unbounded))
-                    .take(SNAPSHOT_PAGES)
-                    .map(|(&page, &bytes)| (page, bytes))
-                    .collect();
-                if let Some((&last, _)) = pages.last_key_value() {
-                    let continuation = after.is_some();
-                    *after = Some(last);
-                    break SnapshotRecord::Block {
-                        store: store.to_string(),
-                        block: Block {
-                            id: block.id.clone(),
-                            disk_id: block.disk_id,
-                            len: block.len,
-                            pages,
-                        },
-                        continuation,
-                    };
+            if let Some(slab) = &mut self.slab {
+                while let Some(row) = slab.rows.get(slab.slot) {
+                    if let Some(row) = row {
+                        let pages: PageMap<_> =
+                            row.pages_after(slab.after).take(SNAPSHOT_PAGES).collect();
+                        if let Some((&last, _)) = pages.last_key_value() {
+                            let continuation = slab.after.replace(last).is_some();
+                            let record = SnapshotRecord::Block {
+                                store: slab.store.to_string(),
+                                block: Block {
+                                    id: row.id.clone(),
+                                    disk_id: row.disk_id,
+                                    len: row.len(),
+                                    pages,
+                                },
+                                continuation,
+                            };
+                            return Some(
+                                serde_json::to_vec(&record)
+                                    .map(Bytes::from)
+                                    .map_err(io::Error::other),
+                            );
+                        }
+                    }
+                    slab.slot += 1;
+                    slab.after = None;
                 }
-                self.block = None;
+                self.slab = None;
             }
             match self.records.next()? {
                 Frozen::Store(path, 0) => break SnapshotRecord::WholeStore { path, page_size: 0 },
                 Frozen::Store(path, page_size) => {
                     break SnapshotRecord::PagedStore { path, page_size }
                 }
-                Frozen::Block(store, block) => self.block = Some((store, block, None)),
+                Frozen::Slab(store, rows) => {
+                    self.slab = Some(FrozenSlab {
+                        store,
+                        rows,
+                        slot: 0,
+                        after: None,
+                    });
+                }
                 Frozen::Pending(transaction, intent) => {
                     break SnapshotRecord::Pending {
                         transaction,
@@ -462,8 +430,8 @@ impl Machine for State {
             records.extend(
                 store
                     .blocks
-                    .values()
-                    .map(|block| Frozen::Block(path.clone(), block.clone())),
+                    .slabs()
+                    .map(|slab| Frozen::Slab(path.clone(), slab)),
             );
         }
         records.extend(
@@ -473,7 +441,7 @@ impl Machine for State {
         );
         Ok(Snapshot {
             records: records.into_iter(),
-            block: None,
+            slab: None,
         })
     }
 
@@ -523,19 +491,26 @@ impl Machine for State {
                         .blocks
                         .get_mut(&block.id)
                         .ok_or_else(|| invalid("snapshot continuation without block"))?;
-                    if previous.len != block.len
+                    if previous.len() != block.len
                         || previous.disk_id != block.disk_id
-                        || previous.pages.last_key_value().unwrap().0
-                            >= block.pages.first_key_value().unwrap().0
+                        || previous.last_page() >= *block.pages.first_key_value().unwrap().0
                     {
                         return Err(invalid("invalid/duplicate snapshot page chunk"));
                     }
-                    Arc::make_mut(previous).pages.extend(block.pages);
+                    for (page, bytes) in block.pages {
+                        previous.put(block.len, page, bytes);
+                    }
                 } else {
-                    if store.blocks.contains_key(&block.id) {
+                    if store.blocks.get(&block.id).is_some() {
                         return Err(invalid("duplicate snapshot block"));
                     }
-                    store.blocks.insert(block.id.clone(), Arc::new(block));
+                    let mut pages = block.pages.into_iter();
+                    let (first, bytes) = pages.next().unwrap();
+                    let mut row = BlockRow::new(block.id, block.disk_id, block.len, first, bytes);
+                    for (page, bytes) in pages {
+                        row.put(block.len, page, bytes);
+                    }
+                    store.blocks.insert(row);
                 }
                 Ok(())
             }

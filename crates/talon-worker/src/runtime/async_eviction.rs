@@ -503,7 +503,7 @@ mod tests {
             fill(&r, 0, paged).await;
             fill(&r, 1, paged).await;
             let state = r.page_lifecycle.block(&block(0));
-            let gate = state.gate.lock().await;
+            let gate = state.lock().await;
             let r = Arc::new(r);
             let worker = r.clone();
             let task = tokio::spawn(async move {
@@ -730,7 +730,7 @@ mod tests {
             fill(&r, 0, paged).await;
             fill(&r, 1, paged).await;
             let state = r.page_lifecycle.block(&block(0));
-            let gate = state.gate.lock().await;
+            let gate = state.lock().await;
             let config = WorkerConfig {
                 async_eviction_enabled: true,
                 background_task_concurrency: 4,

@@ -1,8 +1,9 @@
 //! Page residency and idle age. Disk operations never run under these locks.
-use std::collections::{BTreeMap, BTreeSet};
+use crate::block_key::{BlockIdentity, BlockKey};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use talon_core::{BlockId, PageIndex};
 
@@ -16,42 +17,69 @@ pub(crate) fn disk_shard(id: &BlockId) -> usize {
 }
 const DIRECTORY_SHARDS: usize = 256;
 
-/// Mutations in different blocks share the directory stripe in read mode, so
-/// only orphan cleanup serializes them. Physical directory names suffice for
-/// cleanup even if block.meta is missing or corrupt.
-pub(crate) struct PageMutationGate {
+/// Active mutations share a gate for the exact block identity. The pool
+/// retains no gates or key references after the last operation releases one.
+struct MutationGates {
+    blocks: Mutex<HashMap<BlockKey, Weak<PageMutationGate>>>,
+    directories: Vec<Arc<tokio::sync::RwLock<()>>>,
+}
+
+impl MutationGates {
+    fn gate(self: &Arc<Self>, id: &BlockKey, stripe: usize) -> Arc<PageMutationGate> {
+        let mut active = self.blocks.lock().unwrap();
+        if let Some(gate) = active.get(id).and_then(Weak::upgrade) {
+            return gate;
+        }
+        let gate = Arc::new(PageMutationGate {
+            owner: Arc::downgrade(self),
+            id: id.clone(),
+            directory: self.directories[stripe].clone(),
+            block: Arc::default(),
+        });
+        active.insert(id.clone(), Arc::downgrade(&gate));
+        gate
+    }
+
+    fn active(&self, id: &BlockKey) -> bool {
+        self.blocks
+            .lock()
+            .unwrap()
+            .get(id)
+            .is_some_and(|gate| gate.strong_count() != 0)
+    }
+}
+
+/// The directory stripe is shared with orphan cleanup. The block lock allows
+/// page fills with disjoint InFlightGuards to run concurrently.
+struct PageMutationGate {
+    owner: Weak<MutationGates>,
+    id: BlockKey,
     directory: Arc<tokio::sync::RwLock<()>>,
-    block: tokio::sync::RwLock<()>,
+    block: Arc<tokio::sync::RwLock<()>>,
 }
-pub(crate) struct PageMutationGuard<'a> {
-    _directory: tokio::sync::OwnedRwLockReadGuard<()>,
+
+impl Drop for PageMutationGate {
+    fn drop(&mut self) {
+        if let Some(owner) = self.owner.upgrade() {
+            let mut active = owner.blocks.lock().unwrap();
+            if active
+                .get(&self.id)
+                .is_some_and(|gate| std::ptr::eq(gate.as_ptr(), self))
+            {
+                active.remove(&self.id);
+            }
+        }
+    }
+}
+
+pub(crate) struct PageMutationGuard {
     _block: futures::future::Either<
-        tokio::sync::RwLockReadGuard<'a, ()>,
-        tokio::sync::RwLockWriteGuard<'a, ()>,
+        tokio::sync::OwnedRwLockReadGuard<()>,
+        tokio::sync::OwnedRwLockWriteGuard<()>,
     >,
+    _directory: tokio::sync::OwnedRwLockReadGuard<()>,
+    _gate: Arc<PageMutationGate>,
 }
-impl PageMutationGate {
-    /// Only for fills owning disjoint page-level InFlightGuards. GC, whole-block
-    /// promotion and ordinary commits continue to take the exclusive block lock.
-    pub async fn lock_page_fill(&self) -> PageMutationGuard<'_> {
-        let directory = self.directory.clone().read_owned().await;
-        let block = futures::future::Either::Left(self.block.read().await);
-        PageMutationGuard {
-            _directory: directory,
-            _block: block,
-        }
-    }
-
-    pub async fn lock(&self) -> PageMutationGuard<'_> {
-        let directory = self.directory.clone().read_owned().await;
-        let block = futures::future::Either::Right(self.block.write().await);
-        PageMutationGuard {
-            _directory: directory,
-            _block: block,
-        }
-    }
-}
-
 /// Anchored wall time: monotonic during a process, portable across restarts.
 pub(crate) struct AccessClock {
     started: Instant,
@@ -432,8 +460,9 @@ impl BlockPages {
     }
 }
 pub(crate) struct BlockState {
-    pub id: Arc<BlockId>,
-    pub gate: Arc<PageMutationGate>,
+    pub id: BlockKey,
+    gates: Arc<MutationGates>,
+    stripe: u8,
     pub inner: Mutex<BlockPages>,
 }
 /// Holds every page closed until the owning block mutation either commits or
@@ -469,11 +498,37 @@ impl Drop for BlockPageClaim {
 }
 
 impl BlockState {
+    fn gate(&self) -> Arc<PageMutationGate> {
+        self.gates.gate(&self.id, usize::from(self.stripe))
+    }
+
+    pub async fn lock(&self) -> PageMutationGuard {
+        let gate = self.gate();
+        let directory = gate.directory.clone().read_owned().await;
+        let block = futures::future::Either::Right(gate.block.clone().write_owned().await);
+        PageMutationGuard {
+            _block: block,
+            _directory: directory,
+            _gate: gate,
+        }
+    }
+
+    pub async fn lock_page_fill(&self) -> PageMutationGuard {
+        let gate = self.gate();
+        let directory = gate.directory.clone().read_owned().await;
+        let block = futures::future::Either::Left(gate.block.clone().read_owned().await);
+        PageMutationGuard {
+            _block: block,
+            _directory: directory,
+            _gate: gate,
+        }
+    }
+
     fn retirement_ready(&self, state: &BlockPages, pages_empty: bool) -> bool {
         (!state.work.track_access || pages_empty)
             && !state.cleanup_pending
             && state.retries.is_empty()
-            && Arc::strong_count(&self.gate) == 1
+            && !self.gates.active(&self.id)
     }
 
     pub(crate) fn retirement_candidate(&self) -> bool {
@@ -769,19 +824,20 @@ struct Registry {
     journal: crate::page_access_shard::JournalState,
 }
 impl Registry {
-    fn removed(&mut self, id: &BlockId) {
+    fn removed(&mut self, id: &dyn BlockIdentity) {
         self.membership += 1;
         // No journal exists until TTI is enabled and its first base is published.
         // Disabled TTI and whole-only traffic must not retain deletion identities.
         if self.journal.generation == 0 {
             return;
         }
-        let bytes = id.object.bucket.len() + id.object.object_path.len() + id.version.0.len() + 128;
+        let id = id.view();
+        let bytes = id.object.bucket.len() + id.object.object_path.len() + id.version.len() + 128;
         if self.removed_bytes + bytes > (1 << 20) {
             self.removal_overflow = self.membership;
         } else {
             self.removed_bytes += bytes;
-            self.removed.insert(self.membership, id.clone());
+            self.removed.insert(self.membership, id.materialize());
         }
     }
 }
@@ -823,7 +879,7 @@ pub(crate) struct PageLifecycle {
     index: Arc<crate::BlockIndex>,
     shards: Vec<Mutex<Registry>>,
     work: Vec<Arc<ShardWork>>,
-    directories: Vec<Arc<tokio::sync::RwLock<()>>>,
+    gates: Arc<MutationGates>,
     checkpoints: Vec<Arc<tokio::sync::Mutex<()>>>,
 }
 impl PageLifecycle {
@@ -842,9 +898,10 @@ impl PageLifecycle {
             checkpoints: (0..SHARDS)
                 .map(|_| Arc::new(tokio::sync::Mutex::new(())))
                 .collect(),
-            directories: (0..DIRECTORY_SHARDS)
-                .map(|_| Arc::new(tokio::sync::RwLock::new(())))
-                .collect(),
+            gates: Arc::new(MutationGates {
+                blocks: Mutex::default(),
+                directories: (0..DIRECTORY_SHARDS).map(|_| Arc::default()).collect(),
+            }),
         }
     }
     /// Startup only, before resident page ages are restored.
@@ -852,7 +909,7 @@ impl PageLifecycle {
         self.track_access.store(true, Ordering::Relaxed);
     }
     pub fn directory_gate(&self, digest: u64) -> Arc<tokio::sync::RwLock<()>> {
-        self.directories[digest as usize % DIRECTORY_SHARDS].clone()
+        self.gates.directories[digest as usize % DIRECTORY_SHARDS].clone()
     }
     #[cfg(test)]
     pub fn get(&self, id: &BlockId) -> Option<Arc<BlockState>> {
@@ -896,11 +953,9 @@ impl PageLifecycle {
                 page.handle.bind_work(work.clone());
             }
             let block = Arc::new(BlockState {
-                id: Arc::new(id.materialize()),
-                gate: Arc::new(PageMutationGate {
-                    directory: self.directory_gate(hash.finish()),
-                    block: tokio::sync::RwLock::new(()),
-                }),
+                id,
+                gates: self.gates.clone(),
+                stripe: (hash.finish() as usize % DIRECTORY_SHARDS) as u8,
                 inner: Mutex::new(BlockPages {
                     pages,
                     work,
@@ -1393,8 +1448,8 @@ mod tests {
             .unwrap();
         let a = life.block(&first);
         let b = life.block(&second);
-        let _a = a.gate.lock().await;
-        let _b = tokio::time::timeout(std::time::Duration::from_secs(1), b.gate.lock())
+        let _a = a.lock().await;
+        let _b = tokio::time::timeout(std::time::Duration::from_secs(1), b.lock())
             .await
             .unwrap();
         assert!(life.directory_gate(digest(&first)).try_write().is_err());
@@ -1404,22 +1459,19 @@ mod tests {
     async fn disjoint_fills_overlap_but_exclude_gc_and_whole_commits() {
         let life = PageLifecycle::new();
         let state = life.block(&id());
-        let a = state.gate.lock_page_fill().await;
-        let b = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            state.gate.lock_page_fill(),
-        )
-        .await
-        .unwrap();
-        let exclusive = state.gate.lock();
+        let a = state.lock_page_fill().await;
+        let b = tokio::time::timeout(std::time::Duration::from_secs(1), state.lock_page_fill())
+            .await
+            .unwrap();
+        let exclusive = state.lock();
         tokio::pin!(exclusive);
         assert!(futures::poll!(&mut exclusive).is_pending());
-        assert!(state.gate.directory.try_write().is_err());
+        assert!(state.gate().directory.try_write().is_err());
         drop(a);
         assert!(futures::poll!(&mut exclusive).is_pending());
         drop(b);
         let _exclusive = exclusive.await;
-        assert!(futures::poll!(std::pin::pin!(state.gate.lock_page_fill())).is_pending());
+        assert!(futures::poll!(std::pin::pin!(state.lock_page_fill())).is_pending());
     }
 
     #[test]
@@ -1499,7 +1551,7 @@ mod tests {
             .clone();
         assert!(handle.access.get().is_none());
         assert!(block.claim_all_pages().is_none());
-        let gate = block.gate.clone();
+        let gate = block.gate();
         drop(block);
         life.scan(&mut ScanCursor::default(), 100, 100, None, 10);
         assert!(

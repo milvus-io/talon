@@ -1,5 +1,6 @@
 //! Page mutations are owned worker tasks: cancellation never splits disk and index updates.
 use super::*;
+use crate::block_key::BlockIdentity;
 use crate::page_access_store::{AccessSnapshot, PageAccessStore};
 use crate::page_gc::{CheckpointReport, GcReport};
 use crate::page_lifecycle::{GcCandidate, PageCheckpoint};
@@ -90,8 +91,9 @@ impl WorkerRuntime {
                         break;
                     }
                     for state in blocks {
+                        let id = state.id.materialize();
                         let recovered = match &mut recovered_shard {
-                            Some(shard) => shard.records.remove(&state.id).unwrap_or_else(|| {
+                            Some(shard) => shard.records.remove(&id).unwrap_or_else(|| {
                                 crate::page_access_store::AccessRecovery {
                                     corrupt: shard.corrupt,
                                     ..Default::default()
@@ -99,8 +101,8 @@ impl WorkerRuntime {
                             }),
                             None if paged.journaled() => Default::default(),
                             None => PageAccessStore::load(
-                                &paged.dir_for(&state.id),
-                                &state.id,
+                                &paged.dir_for(&id),
+                                &id,
                                 paged.page_size(),
                                 now,
                             ),
@@ -310,7 +312,7 @@ impl WorkerRuntime {
             runtime.background_delete().await;
             let _background_io = runtime.background_io().await;
             let block = &candidate.block;
-            let _gate = block.gate.lock().await;
+            let _gate = block.lock().await;
             if reason == 1 && (runtime.capacity_bytes == 0 || runtime.resident_bytes() <= target) { return None; }
             let age = runtime.current_tti_ms();
             if reason == 0 && age == 0 { return None; }
@@ -318,7 +320,7 @@ impl WorkerRuntime {
             if !block.claim(&candidate, runtime.page_clock.now(), tti) {return None;}
             let paged = runtime.paged.as_ref()?;
             let page = candidate.page;
-            let id = block.id.as_ref();
+            let id = &block.id.materialize();
             let bytes = runtime.index.get(id).map(|m| talon_core::page_len(m.len, paged.page_size(), page)).unwrap_or(0);
             if let Err(error) = paged.evict_page_async(id, page).await {
                 block.abort(&candidate, reason); runtime.page_gc_metrics.delete_errors.inc();
@@ -349,22 +351,23 @@ impl WorkerRuntime {
             .run(async move {
                 runtime.background_delete().await;
                 let _background_io = runtime.background_io().await;
-                let _gate = block.gate.lock().await;
+                let _gate = block.lock().await;
                 if !block.inner.lock().unwrap().pages.read().unwrap().is_empty() {
                     return;
                 }
                 let Some(paged) = &runtime.paged else {
                     return;
                 };
-                match paged.delete_block_async(&block.id).await {
+                let id = block.id.materialize();
+                match paged.delete_block_async(&id).await {
                     Ok(()) => {
                         block.inner.lock().unwrap().cleanup_pending = false;
                         if runtime
                             .index
-                            .get(&block.id)
+                            .get(&id)
                             .is_some_and(|m| matches!(m.form, BlockForm::Paged { .. }))
                         {
-                            runtime.index.remove(&block.id);
+                            runtime.index.remove(&id);
                         }
                     }
                     Err(error) => {
@@ -432,7 +435,7 @@ impl WorkerRuntime {
                 let whole = matches!(&unit, CacheUnit::Whole(_));
                 let state = runtime.page_lifecycle.block(&block);
                 {
-                    let _gate = state.gate.lock().await;
+                    let _gate = state.lock().await;
                     let settings = runtime.clone();
                     match small
                         .delete_idle(unit, ticket, move || {
@@ -483,7 +486,7 @@ impl WorkerRuntime {
                 let block = candidate.unit.block().clone();
                 let whole = matches!(candidate.unit, CacheUnit::Whole(_));
                 let state = runtime.page_lifecycle.block(&block);
-                if let Some(_gate) = before_deadline(deadline, state.gate.lock()).await {
+                if let Some(_gate) = before_deadline(deadline, state.lock()).await {
                     let validator = runtime.clone();
                     let small = runtime.small.as_ref().unwrap();
                     match small
@@ -541,7 +544,7 @@ impl WorkerRuntime {
             let Some(_background_io) = before_deadline(ownership_deadline, runtime.background_io()).await else { return; };
             let state = runtime.page_lifecycle.block(&candidate.block);
             {
-                let Some(_gate) = before_deadline(ownership_deadline, state.gate.lock()).await else { return; };
+                let Some(_gate) = before_deadline(ownership_deadline, state.lock()).await else { return; };
                 if idle_at.is_some_and(|now| !candidate.is_idle(now.max(crate::eviction::access_millis()), runtime.current_tti_ms())) { return; }
                 if !runtime.lru.stale_candidate_is_current(&candidate) { return; }
                 let Some(claim) = state.claim_all_pages() else { return; };
@@ -639,7 +642,7 @@ impl WorkerRuntime {
                         self.page_mutations.run(async move {
                             runtime.background_delete().await;
                             let _background_io = runtime.background_io().await;
-                            let _gate = state.gate.lock().await;
+                            let _gate = state.lock().await;
                             if reason == 1 && (runtime.capacity_bytes == 0 || runtime.resident_bytes() <= target) {
                                 return;
                             }
@@ -661,7 +664,7 @@ impl WorkerRuntime {
                         .run(async move {
                             runtime.background_delete().await;
                             let _background_io = runtime.background_io().await;
-                            let _gate = state.gate.lock().await;
+                            let _gate = state.lock().await;
                             if reason == 1
                                 && (runtime.capacity_bytes == 0
                                     || runtime.resident_bytes() <= target)
@@ -783,7 +786,7 @@ impl WorkerRuntime {
                     let replace = full || state.revision != state.checkpointed_revision;
                     // Bound construction before retaining page guards or encoding.
                     let records = state.pages.read().unwrap().len();
-                    size += serde_json::to_vec(block.id.as_ref())?.len() + records * 12 + 52;
+                    size += serde_json::to_vec(&block.id)?.len() + records * 12 + 52;
                     anyhow::ensure!(
                         size <= crate::page_access_shard::MAX_BYTES,
                         "access shard exceeds 64 MiB limit"
@@ -832,7 +835,7 @@ impl WorkerRuntime {
                     snapshots
                         .iter()
                         .filter(|(_, _, resident, _, _, _)| *resident)
-                        .map(|(block, snapshot, _, _, _, _)| (block.id.as_ref(), snapshot)),
+                        .map(|(block, snapshot, _, _, _, _)| (block.id.view(), snapshot)),
                 )?
             } else {
                 let empty = AccessSnapshot {
@@ -846,9 +849,9 @@ impl WorkerRuntime {
                     paged.page_size(),
                     removed
                         .iter()
-                        .map(|id| (id, &empty, true))
+                        .map(|id| (id.view(), &empty, true))
                         .chain(snapshots.iter().map(|(block, snapshot, _, _, _, replace)| {
-                            (block.id.as_ref(), snapshot, *replace)
+                            (block.id.view(), snapshot, *replace)
                         })),
                 )?
             };

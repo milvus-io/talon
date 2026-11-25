@@ -1,5 +1,5 @@
 use super::*;
-use crate::block_key::{BlockIdentity, BlockKey};
+use crate::block_key::BlockKey;
 use crate::PagedBlockStore;
 use bytes::Bytes;
 use talon_core::{Backend, ObjectId, PageIndex, Version};
@@ -42,13 +42,12 @@ fn repeated_whole_put_preserves_canonical_identity() {
                 },
             )
             .unwrap();
-        let (key, value) = state.stores["whole"].blocks.iter().next().unwrap();
-        assert!(key.ptr_eq(&value.id));
-        assert_eq!(value.disk_id, DiskId::new(2, 0).ok());
+        let row = state.stores["whole"].blocks.get(&block(0)).unwrap();
+        assert_eq!(row.disk_id, DiskId::new(2, 0).ok());
         if let Some(old) = previous {
-            assert!(BlockKey::ptr_eq(&old, key));
+            assert!(BlockKey::ptr_eq(&old, &row.id));
         }
-        previous = Some(key.clone());
+        previous = Some(row.id.clone());
     }
 }
 
@@ -189,13 +188,19 @@ async fn large_block_checkpoint_reopens_without_an_oversized_frame() {
     assert!(serde_json::to_vec(&block).unwrap().len() > 16 << 20);
     let path = "paged";
     let mut state = State::default();
-    state.stores.insert(
-        path.into(),
-        model::Store {
+    state
+        .restore(model::SnapshotRecord::PagedStore {
+            path: path.into(),
             page_size: 1024,
-            blocks: [(BlockKey::new(&id), Arc::new(block))].into(),
-        },
-    );
+        })
+        .unwrap();
+    state
+        .restore(model::SnapshotRecord::Block {
+            store: path.into(),
+            block,
+            continuation: false,
+        })
+        .unwrap();
     let root = tempfile::tempdir().unwrap();
     let service = service(Arc::new(CacheRootLock::acquire(root.path()).unwrap())).unwrap();
     let handle = service
@@ -234,14 +239,11 @@ async fn large_block_checkpoint_reopens_without_an_oversized_frame() {
     catalog
         .journal
         .query(move |state| {
-            let restored = &state.stores[path].blocks[&id as &dyn BlockIdentity];
-            assert_eq!(restored.pages.len(), count as usize - 1);
-            assert_eq!(restored.len, u64::from(id.block_size));
-            assert!(!restored.pages.contains_key(&0));
+            let restored = state.stores[path].blocks.get(&id).unwrap();
+            assert_eq!(restored.page_count(), count as usize - 1);
+            assert_eq!(restored.len(), u64::from(id.block_size));
             assert!(restored
-                .pages
-                .iter()
-                .map(|(&page, &bytes)| (page, bytes))
+                .pages_after(None)
                 .eq((1..count).map(|page| (page, 4096))));
             Ok(())
         })
@@ -287,8 +289,13 @@ fn snapshot_page_chunks_validate_identity_order_and_legacy_records() {
     state.restore(chunk(2, 16, true)).unwrap();
     assert!(state.restore(chunk(1, 16, true)).is_err());
     assert_eq!(
-        state.stores[path].blocks[&block(0) as &dyn BlockIdentity].pages,
-        [(0, 4096), (2, 4096)].into()
+        state.stores[path]
+            .blocks
+            .get(&block(0))
+            .unwrap()
+            .pages_after(None)
+            .collect::<Vec<_>>(),
+        [(0, 4096), (2, 4096)]
     );
 }
 

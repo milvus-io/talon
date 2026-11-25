@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-    eviction::{Lru, SharedUnit, UnitKind},
+    eviction::Lru,
     index::BlockIndex,
     page_lifecycle::{PageEntry, PageLifecycle},
 };
@@ -112,22 +112,43 @@ fn scenario(count: usize, pages: u32, tracked: bool, tti: bool) {
     eprintln!("SCENARIO|{label}|blocks={count}|pages={pages}|text=144");
     let mut index = BlockIndex::new();
     let baseline = Snapshot::now();
-    let keys: Vec<_> = measure("identity_with_temporary_vec", count, || {
-        (0..count).map(|n| BlockKey::new(&identity(n))).collect()
-    });
-    let catalog: HashMap<_, _> = measure("catalog_excluding_identity", count, || {
-        keys.iter()
-            .enumerate()
-            .map(|(n, key)| {
-                let block = Block {
-                    id: key.clone(),
+    let mut keys = Vec::with_capacity(count);
+    let before_keys = Snapshot::now();
+    keys.extend((0..count).map(|n| BlockKey::new(&identity(n))));
+    let after_keys = Snapshot::now();
+    after_keys.report("identity_heap", count, before_keys);
+    eprintln!(
+        "KEY|{label}|{count}|{}|{}|{}",
+        144 * count,
+        after_keys.requested - before_keys.requested,
+        after_keys.usable - before_keys.usable
+    );
+    let catalog = measure("catalog_excluding_identity", count, || {
+        let mut catalog = State::default();
+        let store = if pages == 0 {
+            catalog.restore(SnapshotRecord::WholeStore {
+                path: "whole".into(), page_size: 0,
+            }).unwrap();
+            "whole"
+        } else {
+            catalog.restore(SnapshotRecord::PagedStore {
+                path: "paged".into(), page_size: 1 << 20,
+            }).unwrap();
+            "paged"
+        };
+        for (n, id) in keys.iter().enumerate() {
+            catalog.restore(SnapshotRecord::Block {
+                store: store.into(),
+                block: Block {
+                    id: id.clone(),
                     disk_id: DiskId::new(n as u64 + 1, 0).ok(),
                     len: u64::from(pages.max(1)) << 20,
                     pages: (0..pages.max(1)).map(|p| (p, 1 << 20)).collect(),
-                };
-                (key.clone(), Arc::new(block))
-            })
-            .collect()
+                },
+                continuation: false,
+            }).unwrap();
+        }
+        catalog
     });
     measure("resident_index_excluding_identity", count, || {
         let blocks = keys
@@ -200,8 +221,8 @@ fn scenario(count: usize, pages: u32, tracked: bool, tti: bool) {
     if !tti {
         measure("on_demand_lifecycle_binding", count, || {
             if pages == 0 {
-                for key in catalog.keys() {
-                    lifecycle.block(&key.materialize());
+                for row in catalog.stores["whole"].blocks.values() {
+                    lifecycle.block(&row.id.materialize());
                 }
             } else {
                 index.restore_page_states(&lifecycle);
@@ -218,11 +239,12 @@ fn store_memory_breakdown() {
     crate::index::memory_probe_layouts();
     crate::eviction::memory_probe_layouts();
     crate::page_lifecycle::memory_probe_layouts();
+    crate::catalog::rows::memory_probe_layouts();
     crate::fd_cache::memory_probe_layouts();
     crate::runtime::memory_probe_layouts();
     for (name, size) in [
-        ("CatalogBlock", std::mem::size_of::<Block>()),
-        ("CatalogPageMap", std::mem::size_of::<PageMap<u64>>()),
+        ("SnapshotBlock", std::mem::size_of::<Block>()),
+        ("SnapshotPageMap", std::mem::size_of::<PageMap<u64>>()),
         ("Store", std::mem::size_of::<Store>()),
         ("State", std::mem::size_of::<State>()),
     ] {
@@ -243,46 +265,9 @@ fn store_memory_breakdown() {
             scenario(count, pages, tracked, tti);
         }
     }
-    let key = BlockKey::new(&identity(0));
     for n in [1_usize, 2, 4, 16, 64, 256, 16_384] {
-        let map: BTreeMap<_, _> = measure("capacity_queue_bulk", n, || {
-            (0..n)
-                .map(|p| {
-                    (
-                        p as u64,
-                        SharedUnit {
-                            block: key.clone(),
-                            kind: UnitKind::Page(PageIndex(p as u32)),
-                        },
-                    )
-                })
-                .collect()
-        });
-        drop(map);
-        let map = measure("capacity_queue_incremental", n, || {
-            let mut map = BTreeMap::new();
-            for p in 0..n {
-                map.insert(
-                    p as u64,
-                    SharedUnit {
-                        block: key.clone(),
-                        kind: UnitKind::Page(PageIndex(p as u32)),
-                    },
-                );
-            }
-            map
-        });
-        drop(map);
-        let map: BTreeMap<_, _> = measure("block_queue_bulk", n, || {
-            (0..n).map(|p| (p as u64, key.clone())).collect()
-        });
-        drop(map);
         let map: PageMap = measure("page_table_nodes_and_states", n, || {
             (0..n).map(|p| (p as u32, PageEntry::unbound())).collect()
-        });
-        drop(map);
-        let map: PageMap<u64> = measure("catalog_page_nodes", n, || {
-            (0..n).map(|p| (p as u32, 4096)).collect()
         });
         drop(map);
     }

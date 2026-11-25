@@ -1,5 +1,4 @@
-//! Startup-only construction. Build independent policy indexes without taking
-//! the live policy mutex for each unit; sorted queues are collected in bulk.
+//! Startup-only construction before publishing the policy.
 use super::*;
 
 pub(crate) struct RecoveredUnit {
@@ -31,10 +30,8 @@ impl Lru {
     #[cfg(test)]
     pub(crate) fn assert_empty_ordinary_policy(&self) {
         let inner = self.inner.lock().unwrap();
-        assert!(inner.queue.is_empty());
-        assert!(inner.block_queue.is_empty());
-        assert!(inner.ownership_queue.is_empty());
-        assert_eq!(inner.versions.capacity(), 0);
+        assert_eq!(inner.ordinary_units, 0);
+        assert_eq!(inner.index.policy_scan_ceiling(), 0);
     }
 
     #[cfg(test)]
@@ -56,108 +53,37 @@ impl Lru {
         track_blocks: bool,
     ) -> Self {
         let started = std::time::Instant::now();
-        let unit_index = || {
-            let started = std::time::Instant::now();
-            for (position, u) in units.iter().enumerate() {
-                index.policy_insert(
-                    &u.unit,
-                    PolicyEntry {
-                        state: PolicyState {
-                            independent: u.independent,
-                            bytes: u.bytes,
-                            position: position as u64,
-                            revision: position as u64,
-                            pins: 0,
-                        },
-                        access: u.access.clone(),
+        for (revision, unit) in units.iter().enumerate() {
+            let revision = revision as u64;
+            index.policy_insert(
+                &unit.unit,
+                PolicyEntry {
+                    state: PolicyState {
+                        independent: unit.independent,
+                        bytes: unit.bytes,
+                        revision,
+                        pins: 0,
+                    },
+                    access: unit.access.clone(),
+                },
+            );
+            if track_blocks
+                && index
+                    .policy_block_update(unit.unit.block(), |activity| {
+                        activity.revision = revision;
+                    })
+                    .is_none()
+            {
+                index.policy_block_insert(
+                    unit.unit.block.clone(),
+                    BlockPolicy {
+                        pins: 0,
+                        revision,
+                        access: Some(unit.access.clock().clone()),
                     },
                 );
             }
-            let queue = units
-                .iter()
-                .enumerate()
-                .map(|(position, u)| (position as u64, u.unit.clone()))
-                .collect();
-            tracing::info!(
-                units = units.len(),
-                workers,
-                phase = "membership",
-                elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
-                "cache policy index restored"
-            );
-            queue
-        };
-        let version_index = || {
-            let started = std::time::Instant::now();
-            let mut versions = VersionIndex::with_capacity(
-                units.iter().filter(|u| !u.independent).count().min(blocks),
-            );
-            for u in &units {
-                if !u.independent {
-                    versions.insert(u.unit.block.clone());
-                }
-            }
-            tracing::info!(
-                units = units.len(),
-                workers,
-                phase = "versions",
-                version_blocks = versions.len(),
-                elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
-                "cache policy index restored"
-            );
-            versions
-        };
-        let block_index = || {
-            if !track_blocks {
-                return (BTreeMap::new(), BTreeMap::new());
-            }
-            let started = std::time::Instant::now();
-            let mut queue = Vec::with_capacity(units.len().min(blocks));
-            for (position, u) in units.iter().enumerate() {
-                let position = position as u64;
-                if index
-                    .policy_block_update(u.unit.block(), |activity| {
-                        activity.revision = position;
-                    })
-                    .is_none()
-                {
-                    let key = index.policy_block_insert(
-                        u.unit.block.clone(),
-                        BlockPolicy {
-                            pins: 0,
-                            position,
-                            revision: position,
-                            ownership_position: AtomicU64::new(position),
-                            ownership_pending: AtomicBool::new(true),
-                            access: u.access.clock().clone(),
-                        },
-                    );
-                    queue.push((position, key));
-                }
-            }
-            let ownership = queue.iter().cloned().collect();
-            let queue = queue.into_iter().collect();
-            tracing::info!(
-                units = units.len(),
-                workers,
-                phase = "blocks",
-                elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
-                "cache policy index restored"
-            );
-            (queue, ownership)
-        };
-        // Version construction runs beside membership recovery. Both unit and
-        // block state now share the directory, so update them on this thread.
-        let (queue, versions, (block_queue, ownership_queue)) = std::thread::scope(|scope| {
-            let version_task = (workers > 1).then(|| scope.spawn(version_index));
-            let units = unit_index();
-            let blocks = block_index();
-            let versions = match version_task {
-                Some(task) => task.join().expect("version recovery panicked"),
-                None => version_index(),
-            };
-            (units, versions, blocks)
-        });
+        }
         let total_bytes = units
             .iter()
             .fold(0u64, |total, u| total.saturating_add(u.bytes));
@@ -165,10 +91,8 @@ impl Lru {
         let lru = Self {
             inner: Mutex::new(Inner {
                 index,
-                queue,
-                versions,
-                block_queue,
-                ownership_queue,
+                ordinary_units: units.len(),
+                capacity_hand: (0, 0),
                 track_blocks,
                 track_small_clock: track_blocks,
                 total_bytes,
@@ -187,8 +111,8 @@ impl Lru {
             blocks,
             units = clock,
             workers,
-            temporary_drop_ms = drop_started.elapsed().as_secs_f64() * 1000.0,
             elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            temporary_drop_ms = drop_started.elapsed().as_secs_f64() * 1000.0,
             "cache policy indexes completed"
         );
         lru
@@ -228,9 +152,7 @@ mod tests {
         let access = lru.insert(unit.clone(), 8192);
         assert!(!access.tracks_clock());
         assert_eq!(lru.evict_to_fit(0), [unit]);
-        let g = lru.inner.lock().unwrap();
-        assert!(g.block_queue.is_empty());
-        assert!(g.ownership_queue.is_empty());
+        assert!(lru.is_empty());
     }
 
     #[test]
@@ -257,8 +179,8 @@ mod tests {
             {
                 let a = ordinary.inner.lock().unwrap();
                 let b = recovered.inner.lock().unwrap();
-                assert!(b.versions.is_empty());
-                assert_eq!(b.versions.capacity(), 0);
+                assert_eq!(b.index.policy_versioned_count(&first), 0);
+                assert_eq!(b.index.policy_versioned_count(&second), 0);
                 assert_eq!(a.total_bytes, b.total_bytes);
             }
             assert!(recovered.superseded_candidates(&second).is_empty());
@@ -303,51 +225,18 @@ mod tests {
             {
                 let a = ordinary.inner.lock().unwrap();
                 let b = recovered.inner.lock().unwrap();
-                assert_eq!(a.queue, b.queue);
-                assert_eq!(a.block_queue, b.block_queue);
-                assert_eq!(a.ownership_queue, b.ownership_queue);
-                assert_eq!(a.clock, b.clock);
+                assert_eq!(a.ordinary_units, b.ordinary_units);
                 assert_eq!(a.admission_ceiling, b.admission_ceiling);
                 assert_eq!(a.total_bytes, b.total_bytes);
-                assert!(a.versions == b.versions);
-                for id in a.block_queue.values() {
-                    let activity = a.index.policy_block_get(id).unwrap();
-                    let restored = b.index.policy_block_get(id).unwrap();
-                    assert_eq!(
-                        (
-                            activity.units,
-                            activity.pins,
-                            activity.position,
-                            activity.revision,
-                            activity.ownership_position,
-                            activity.ownership_pending
-                        ),
-                        (
-                            restored.units,
-                            restored.pins,
-                            restored.position,
-                            restored.revision,
-                            restored.ownership_position,
-                            restored.ownership_pending
-                        )
-                    );
-                }
-                for unit in a.queue.values() {
+                for (unit, _) in &input {
                     let entry = a.index.policy_get(unit).unwrap();
                     let restored = b.index.policy_get(unit).unwrap();
                     assert_eq!(
-                        (entry.bytes, entry.position, entry.revision, entry.pins),
-                        (
-                            restored.bytes,
-                            restored.position,
-                            restored.revision,
-                            restored.pins
-                        )
+                        (entry.bytes, entry.revision, entry.pins),
+                        (restored.bytes, restored.revision, restored.pins)
                     );
-                    assert!(Arc::ptr_eq(
-                        restored.access.clock(),
-                        &b.index.policy_block_get(unit.block()).unwrap().access
-                    ));
+                    let activity = b.index.policy_block_get(unit.block()).unwrap();
+                    assert!(Arc::ptr_eq(restored.access.clock(), &activity.access));
                 }
             }
             for lru in [&ordinary, &recovered] {
@@ -363,12 +252,7 @@ mod tests {
                 assert_eq!(lru.len(), 3);
                 assert_eq!(lru.evict_to_fit(0).len(), 3);
                 assert_eq!(lru.total_bytes(), 0);
-                let g = lru.inner.lock().unwrap();
-                assert!(
-                    g.versions.is_empty()
-                        && g.block_queue.is_empty()
-                        && g.ownership_queue.is_empty()
-                );
+                assert!(lru.is_empty());
             }
         }
     }
@@ -413,18 +297,9 @@ mod tests {
                 lru.insert(second.clone(), 8192);
                 lru
             };
-            let identity = {
-                let inner = lru.inner.lock().unwrap();
-                let activity = inner.index.policy_block_get(&id).unwrap();
-                let key = &inner.block_queue[&activity.position];
-                assert!(BlockKey::ptr_eq(
-                    key,
-                    &inner.ownership_queue[&activity.ownership_position]
-                ));
-                key.downgrade()
-            };
+            let identity = lru.index().shared_identity(&id).unwrap().downgrade();
             let limit = lru.ownership_admission_ceiling();
-            let candidate = lru.next_ownership_block(&mut (0, limit), limit).unwrap().1;
+            let candidate = lru.first_ownership_candidate(0..limit).unwrap();
             assert_eq!(candidate.units, 2);
             assert_eq!(lru.remove(&first), Some(4096));
             assert_eq!(

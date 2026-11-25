@@ -151,12 +151,10 @@ the same-key gates. Transaction IDs are never reused after a checkpoint.
 The shared engine checkpoints after its configured log-byte threshold and at
 orderly Worker background shutdown. Before acknowledging writes into a new log,
 it publishes a recovery set containing the old snapshot, old log and new log.
-The adapter freezes block references and pending intents at that boundary;
-subsequent block mutations use copy-on-write. A CPU thread incrementally encodes
-snapshot records through a bounded channel while the ring continues other work.
-Freezing still builds an O(live blocks + pending intents) reference vector on the
-shared I/O thread. This avoids a deep metadata copy but can briefly pause other
-streams; it is not a claim of complete CPU isolation during checkpoint setup.
+The adapter freezes a reference per 256-slot slab and copies pending intents at
+that boundary. Subsequent writes copy only a touched slab and any shared page
+array they modify. A CPU thread incrementally encodes snapshot records through a
+bounded channel while the ring continues other work.
 The engine publishes the new snapshot and tail set only after synchronization,
 then deletes the exact obsolete paths recorded for cleanup. No business adapter
 implements a second checkpoint protocol.

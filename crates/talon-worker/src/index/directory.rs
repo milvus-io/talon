@@ -1,78 +1,149 @@
 use super::DirectoryEntry;
 use crate::block_key::{BlockIdentity, BlockKey};
-use std::collections::{hash_map::Entry, HashMap};
+use crate::small_store::lookup::Lookup;
+use std::hash::{BuildHasher, RandomState};
 #[cfg(test)]
 use talon_core::BlockId;
 
-/// Keep large records out of spare hash buckets. Slots never escape the
-/// directory lock; externally retained resident/lifecycle objects use Arcs.
+#[derive(Default)]
+struct Slot {
+    key: Option<BlockKey>,
+    entry: DirectoryEntry,
+}
+
+/// The lookup stores only stable slab handles. Hashing omits the source
+/// version so exact lookups and superseded-version walks share one probe chain.
 #[derive(Default)]
 pub(super) struct Directory {
-    keys: HashMap<BlockKey, usize>,
-    slots: Vec<DirectoryEntry>,
-    free: Vec<usize>,
+    lookup: Lookup,
+    hash: RandomState,
+    slots: Vec<Slot>,
+    free: Vec<u32>,
 }
 
 impl Directory {
-    pub fn len(&self) -> usize {
-        self.keys.len()
+    fn hash(&self, id: &dyn BlockIdentity) -> u32 {
+        let id = id.view();
+        self.hash.hash_one((id.object, id.offset, id.block_size)) as u32
     }
+
+    fn find(&self, id: &dyn BlockIdentity) -> Option<usize> {
+        let view = id.view();
+        self.lookup.find(self.hash(id), |handle, _| {
+            self.slots[handle as usize - 1].key.as_ref().unwrap().view() == view
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.lookup.len()
+    }
+
     #[cfg(test)]
     pub fn is_empty(&self) -> bool {
-        self.keys.is_empty()
+        self.len() == 0
     }
+
     pub fn reserve(&mut self, additional: usize) {
-        self.keys.reserve(additional);
+        if self.lookup.needs_reserve(additional) {
+            let growth = additional.max(self.lookup.len() / 8);
+            self.lookup.rebuild(growth, |handle| {
+                let id = self.slots[handle as usize - 1].key.as_ref().unwrap().view();
+                self.hash.hash_one((id.object, id.offset, id.block_size)) as u32
+            });
+        }
         self.slots
             .reserve(additional.saturating_sub(self.free.len()));
     }
+
     pub fn get(&self, id: &dyn BlockIdentity) -> Option<&DirectoryEntry> {
-        Some(&self.slots[*self.keys.get(id)?])
+        self.get_key_value(id).map(|(_, entry)| entry)
     }
+
     pub fn get_mut(&mut self, id: &dyn BlockIdentity) -> Option<&mut DirectoryEntry> {
-        Some(&mut self.slots[*self.keys.get(id)?])
+        let handle = self.lookup.handle(self.find(id)?);
+        Some(&mut self.slots[handle as usize - 1].entry)
     }
+
     pub fn get_key_value(&self, id: &dyn BlockIdentity) -> Option<(&BlockKey, &DirectoryEntry)> {
-        let (key, slot) = self.keys.get_key_value(id)?;
-        Some((key, &self.slots[*slot]))
+        self.at(self.lookup.handle(self.find(id)?) as usize - 1)
     }
+
     pub fn get_or_insert(&mut self, id: BlockKey) -> (BlockKey, &mut DirectoryEntry) {
-        let (key, slot) = match self.keys.entry(id) {
-            Entry::Occupied(entry) => (entry.key().clone(), *entry.get()),
-            Entry::Vacant(entry) => {
-                let slot = self.free.pop().unwrap_or_else(|| {
-                    self.slots.push(DirectoryEntry::default());
-                    self.slots.len() - 1
+        let handle = match self.find(&id) {
+            Some(i) => self.lookup.handle(i),
+            None => {
+                self.reserve(1);
+                let handle = self.free.pop().unwrap_or_else(|| {
+                    let handle = u32::try_from(self.slots.len() + 1)
+                        .expect("block directory handle exhausted");
+                    assert!(handle < u32::MAX);
+                    self.slots.push(Slot::default());
+                    handle
                 });
-                let key = entry.key().clone();
-                entry.insert(slot);
-                (key, slot)
+                self.lookup.insert(self.hash(&id), handle, 0);
+                self.slots[handle as usize - 1].key = Some(id);
+                handle
             }
         };
-        (key, &mut self.slots[slot])
+        let slot = &mut self.slots[handle as usize - 1];
+        (slot.key.as_ref().unwrap().clone(), &mut slot.entry)
     }
+
     pub fn remove(&mut self, id: &dyn BlockIdentity) -> Option<DirectoryEntry> {
-        let slot = self.keys.remove(id)?;
-        self.free.push(slot);
-        Some(std::mem::take(&mut self.slots[slot]))
+        let i = self.find(id)?;
+        let handle = self.lookup.handle(i);
+        self.lookup.remove(i);
+        self.free.push(handle);
+        Some(std::mem::take(&mut self.slots[handle as usize - 1]).entry)
     }
-    pub fn iter(&self) -> impl Iterator<Item = (&BlockKey, &DirectoryEntry)> {
-        self.keys
-            .iter()
-            .map(|(key, slot)| (key, &self.slots[*slot]))
+
+    pub fn slot_count(&self) -> usize {
+        self.slots.len()
     }
-    pub fn values(&self) -> impl Iterator<Item = &DirectoryEntry> {
-        self.keys.values().map(|slot| &self.slots[*slot])
+
+    pub fn at(&self, cursor: usize) -> Option<(&BlockKey, &DirectoryEntry)> {
+        let slot = self.slots.get(cursor)?;
+        Some((slot.key.as_ref()?, &slot.entry))
     }
-    pub fn retain(&mut self, mut keep: impl FnMut(&BlockKey, &mut DirectoryEntry) -> bool) {
-        self.keys.retain(|key, slot| {
-            if keep(key, &mut self.slots[*slot]) {
-                return true;
+
+    pub fn versions(
+        &self,
+        id: &dyn BlockIdentity,
+        mut visit: impl FnMut(&BlockKey, &DirectoryEntry),
+    ) {
+        let view = id.view();
+        self.lookup.find_all(self.hash(id), |_, handle| {
+            let (key, entry) = self.at(handle as usize - 1).unwrap();
+            let candidate = key.view();
+            if (candidate.object, candidate.offset, candidate.block_size)
+                == (view.object, view.offset, view.block_size)
+            {
+                visit(key, entry);
             }
-            self.slots[*slot] = DirectoryEntry::default();
-            self.free.push(*slot);
             false
         });
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&BlockKey, &DirectoryEntry)> {
+        self.slots
+            .iter()
+            .filter_map(|slot| Some((slot.key.as_ref()?, &slot.entry)))
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &DirectoryEntry> {
+        self.iter().map(|(_, entry)| entry)
+    }
+
+    pub fn retain(&mut self, mut keep: impl FnMut(&BlockKey, &mut DirectoryEntry) -> bool) {
+        for cursor in 0..self.slots.len() {
+            let slot = &mut self.slots[cursor];
+            if let Some(key) = &slot.key {
+                if !keep(key, &mut slot.entry) {
+                    let id = key.clone();
+                    self.remove(&id);
+                }
+            }
+        }
     }
 }
 
@@ -114,7 +185,7 @@ mod tests {
             .iter()
             .map(|(id, entry)| (id.clone(), entry.policy.len))
             .collect();
-        let free = directory.free.len();
+        let free = directory.slots.len() - directory.len();
         for n in 100..100 + free {
             let entry = directory.get_or_insert(id(n)).1;
             assert!(
@@ -129,6 +200,6 @@ mod tests {
         }
         directory.retain(|_, _| false);
         assert!(directory.is_empty());
-        assert_eq!(directory.free.len(), 100);
+        assert_eq!(directory.slots.len() - directory.len(), 100);
     }
 }

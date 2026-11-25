@@ -613,7 +613,7 @@ mod tests {
             let (_root, runtime) = setup_backend(paged, origin.backend());
             let runtime = runtime.with_load_inflight_bytes(8).unwrap();
             let state = runtime.page_lifecycle.block(&block(0));
-            let gate = state.gate.lock().await;
+            let gate = state.lock().await;
             let clone = runtime.clone();
             let task = tokio::spawn(async move { clone.load_block(&block(0), 8).await });
             origin.wait_for_calls(1).await;
@@ -1179,7 +1179,7 @@ mod tests {
             assert!(!runtime.load_range_cached(&target, 0, 8, 8));
             if paged {
                 let state = runtime.page_lifecycle.block(&target);
-                let _gate = state.gate.lock().await;
+                let _gate = state.lock().await;
                 let candidate = state.candidate(PageIndex(1)).unwrap();
                 assert!(state.claim(&candidate, runtime.page_clock.now(), None));
                 // GC has claimed deletion, but has not unlinked or cleared the bit.

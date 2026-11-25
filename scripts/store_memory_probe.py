@@ -13,6 +13,8 @@ TYPES = {
     "index.rs": ["DirectoryEntry", "PolicyUnits", "Entry", "IndexedBlock", "ResidentMeta", "IndexedUnits", "UnitSlot", "PageUnit", "Option<PolicyState>", "Option<AccessHandle>", "RwLock<UnitSlot>"],
     "eviction.rs": ["SharedUnit", "AccessHandle", "PageAccessSlot", "Access", "PolicyState", "BlockPolicy", "Inner"],
     "page_lifecycle.rs": ["PageState", "PageAccess", "PageEntry", "BlockState", "BlockPages", "PageMutationGate", "BlockWork", "ShardWork", "Registry", "crate::page_table::PageMap", "RwLock<crate::page_table::PageMap>", "talon_core::BlockId", "talon_core::ObjectId"],
+    "catalog/rows.rs": ["BlockRow", "Option<BlockRow>", "BlockRows", "CompactPage", "PageRows"],
+    "index/directory.rs": ["Directory", "Slot", "Lookup"],
     "fd_cache.rs": ["CachedFd", "Shard", "(PathBuf, CachedFd)", "OwnedFd"],
     "runtime.rs": ["CachedVersion", "(ObjectId, CachedVersion)", "crate::WholeBlockStore", "crate::PagedBlockStore"],
 }
@@ -26,8 +28,8 @@ FIELDS = {
         "PageUnit": "allocated access policy",
     },
     "eviction.rs": {
-        "PolicyState": "independent bytes position revision pins",
-        "BlockPolicy": "pins position revision ownership_position ownership_pending access",
+        "PolicyState": "independent bytes revision pins",
+        "BlockPolicy": "pins revision access",
     },
     "page_lifecycle.rs": {
         "PageState": "state recency access",
@@ -56,6 +58,8 @@ def main():
             for ty, fields in FIELDS.get(name, {}).items():
                 for field in fields.split():
                     lines.append(f'    eprintln!("FIELD|{ty}|{field}|{{}}", std::mem::offset_of!({ty}, {field}));')
+            if name == "index.rs":
+                lines.append("    directory::memory_probe_layouts();")
             lines.append("}\n")
             originals[path] = original
             installed[path] = original + "\n".join(lines)
@@ -77,6 +81,15 @@ def main():
                 for line in (output / "probe.log").read_text().splitlines()
                 if line.startswith("TOTAL|")
             ]
+            keys = [
+                line.split("|")[1:]
+                for line in (output / "probe.log").read_text().splitlines()
+                if line.startswith("KEY|")
+            ]
+            (output / "keys.tsv").write_text(
+                "scenario\tblocks\ttext_bytes\trequested_bytes\tusable_bytes\n"
+                + "".join("\t".join(row) + "\n" for row in keys)
+            )
             (output / "totals.tsv").write_text(
                 "scenario\tblocks\tpages_per_block\trequested_bytes\tusable_bytes\trequested_per_block\tusable_per_block\n"
                 + "".join("\t".join(row) + "\n" for row in rows)

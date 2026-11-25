@@ -1,14 +1,26 @@
-//! Shared resident-page storage: inline one page, sorted arrays up to four.
+//! Resident pages keep a single entry inline and common multipage blocks in sorted arrays.
 use crate::page_lifecycle::PageEntry;
 use std::collections::BTreeMap;
 use std::ops::{Index, RangeBounds};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+// Keep the worst-case bytes moved during a nonsequential fill or delete
+// bounded. Very large resident blocks use a tree, including in legacy stores.
+const MAX_FLAT_PAGES: usize = 512;
+
+#[derive(Clone, Debug)]
 pub(crate) enum PageMap<V = PageEntry> {
     One(Option<(u32, V)>),
-    Few(Vec<(u32, V)>),
+    Flat(Vec<(u32, V)>),
     Many(BTreeMap<u32, V>),
 }
+impl<V: PartialEq> PartialEq for PageMap<V> {
+    fn eq(&self, other: &Self) -> bool {
+        self.len() == other.len() && self.iter().eq(other.iter())
+    }
+}
+
+impl<V: Eq> Eq for PageMap<V> {}
+
 impl<V> Default for PageMap<V> {
     fn default() -> Self {
         Self::One(None)
@@ -26,21 +38,21 @@ impl<V> PageMap<V> {
     pub fn first_key_value(&self) -> Option<(&u32, &V)> {
         match self {
             Self::One(one) => one.as_ref().map(|(k, v)| (k, v)),
-            Self::Few(few) => few.first().map(|(k, v)| (k, v)),
+            Self::Flat(few) => few.first().map(|(k, v)| (k, v)),
             Self::Many(many) => many.first_key_value(),
         }
     }
     pub fn last_key_value(&self) -> Option<(&u32, &V)> {
         match self {
             Self::One(one) => one.as_ref().map(|(k, v)| (k, v)),
-            Self::Few(few) => few.last().map(|(k, v)| (k, v)),
+            Self::Flat(few) => few.last().map(|(k, v)| (k, v)),
             Self::Many(many) => many.last_key_value(),
         }
     }
     pub fn len(&self) -> usize {
         match self {
             Self::One(one) => usize::from(one.is_some()),
-            Self::Few(few) => few.len(),
+            Self::Flat(few) => few.len(),
             Self::Many(many) => many.len(),
         }
     }
@@ -53,7 +65,7 @@ impl<V> PageMap<V> {
     pub fn get(&self, key: &u32) -> Option<&V> {
         match self {
             Self::One(one) => one.as_ref().filter(|(k, _)| k == key).map(|(_, v)| v),
-            Self::Few(few) => few
+            Self::Flat(few) => few
                 .binary_search_by_key(key, |(k, _)| *k)
                 .ok()
                 .map(|i| &few[i].1),
@@ -63,7 +75,7 @@ impl<V> PageMap<V> {
     pub fn get_mut(&mut self, key: &u32) -> Option<&mut V> {
         match self {
             Self::One(one) => one.as_mut().filter(|(k, _)| k == key).map(|(_, v)| v),
-            Self::Few(few) => few
+            Self::Flat(few) => few
                 .binary_search_by_key(key, |(k, _)| *k)
                 .ok()
                 .map(|i| &mut few[i].1),
@@ -77,23 +89,22 @@ impl<V> PageMap<V> {
                 unreachable!()
             };
             few.push(old);
-            *self = Self::Few(few);
+            *self = Self::Flat(few);
         }
-        if matches!(self, Self::Few(few) if few.len() == 4 && few.binary_search_by_key(&key, |(k, _)| *k).is_err())
+        if matches!(self, Self::Flat(few) if few.len() == MAX_FLAT_PAGES && few.binary_search_by_key(&key, |(k, _)| *k).is_err())
         {
-            let Self::Few(few) = std::mem::take(self) else {
+            let Self::Flat(few) = std::mem::take(self) else {
                 unreachable!()
             };
             *self = Self::Many(few.into_iter().collect());
         }
         match self {
             Self::One(one) => &mut one.get_or_insert_with(|| (key, create())).1,
-            Self::Few(few) => {
+            Self::Flat(few) => {
                 let i = match few.binary_search_by_key(&key, |(k, _)| *k) {
                     Ok(i) => i,
                     Err(i) => {
                         let value = create();
-                        few.reserve_exact(1);
                         few.insert(i, (key, value));
                         i
                     }
@@ -112,22 +123,22 @@ impl<V> PageMap<V> {
                     None
                 }
             }
-            Self::Few(few) => few
+            Self::Flat(few) => few
                 .binary_search_by_key(key, |(k, _)| *k)
                 .ok()
                 .map(|i| few.remove(i).1),
             Self::Many(many) => many.remove(key),
         };
-        if matches!(self, Self::Many(many) if many.len() <= 4) {
+        if matches!(self, Self::Many(many) if many.len() <= MAX_FLAT_PAGES / 2) {
             let Self::Many(many) = std::mem::take(self) else {
                 unreachable!()
             };
-            *self = Self::Few(many.into_iter().collect());
+            *self = Self::Flat(many.into_iter().collect());
         }
-        if let Self::Few(few) = self {
+        if let Self::Flat(few) = self {
             if few.len() <= 1 {
                 *self = Self::One(few.pop());
-            } else if removed.is_some() {
+            } else if removed.is_some() && few.len() <= few.capacity() / 4 {
                 few.shrink_to_fit();
             }
         }
@@ -136,7 +147,7 @@ impl<V> PageMap<V> {
     pub fn iter(&self) -> impl Iterator<Item = (&u32, &V)> {
         let (one, few, many) = match self {
             Self::One(one) => (one.as_ref().map(|(k, v)| (k, v)), None, None),
-            Self::Few(few) => (None, Some(few.iter()), None),
+            Self::Flat(few) => (None, Some(few.iter()), None),
             Self::Many(many) => (None, None, Some(many.iter())),
         };
         one.into_iter()
@@ -146,7 +157,7 @@ impl<V> PageMap<V> {
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (&u32, &mut V)> {
         let (one, few, many) = match self {
             Self::One(one) => (one.as_mut().map(|(k, v)| (&*k, v)), None, None),
-            Self::Few(few) => (None, Some(few.iter_mut()), None),
+            Self::Flat(few) => (None, Some(few.iter_mut()), None),
             Self::Many(many) => (None, None, Some(many.iter_mut())),
         };
         one.into_iter()
@@ -154,6 +165,7 @@ impl<V> PageMap<V> {
             .chain(many.into_iter().flatten())
     }
     pub fn range(&self, range: impl RangeBounds<u32>) -> impl Iterator<Item = (&u32, &V)> {
+        use std::ops::Bound::{Excluded, Included, Unbounded};
         let bounds = (range.start_bound().cloned(), range.end_bound().cloned());
         let (one, few, many) = match self {
             Self::One(one) => (
@@ -163,16 +175,23 @@ impl<V> PageMap<V> {
                 None,
                 None,
             ),
-            Self::Few(few) => (None, Some(few.iter()), None),
+            Self::Flat(few) => {
+                let start = match bounds.0 {
+                    Included(start) => few.partition_point(|(page, _)| *page < start),
+                    Excluded(start) => few.partition_point(|(page, _)| *page <= start),
+                    Unbounded => 0,
+                };
+                let end = match bounds.1 {
+                    Included(end) => few.partition_point(|(page, _)| *page <= end),
+                    Excluded(end) => few.partition_point(|(page, _)| *page < end),
+                    Unbounded => few.len(),
+                };
+                (None, Some(few[start..end.max(start)].iter()), None)
+            }
             Self::Many(many) => (None, None, Some(many.range(bounds))),
         };
         one.into_iter()
-            .chain(
-                few.into_iter()
-                    .flatten()
-                    .filter(move |(k, _)| range.contains(k))
-                    .map(|(k, v)| (k, v)),
-            )
+            .chain(few.into_iter().flatten().map(|(k, v)| (k, v)))
             .chain(many.into_iter().flatten())
     }
     pub fn keys(&self) -> impl Iterator<Item = &u32> {
@@ -210,7 +229,7 @@ impl<V> Extend<(u32, V)> for PageMap<V> {
 }
 pub(crate) enum PageIntoIter<V> {
     One(std::option::IntoIter<(u32, V)>),
-    Few(std::vec::IntoIter<(u32, V)>),
+    Flat(std::vec::IntoIter<(u32, V)>),
     Many(std::collections::btree_map::IntoIter<u32, V>),
 }
 impl<V> Iterator for PageIntoIter<V> {
@@ -218,7 +237,7 @@ impl<V> Iterator for PageIntoIter<V> {
     fn next(&mut self) -> Option<Self::Item> {
         match self {
             Self::One(one) => one.next(),
-            Self::Few(few) => few.next(),
+            Self::Flat(few) => few.next(),
             Self::Many(many) => many.next(),
         }
     }
@@ -229,7 +248,7 @@ impl<V> IntoIterator for PageMap<V> {
     fn into_iter(self) -> Self::IntoIter {
         match self {
             Self::One(one) => PageIntoIter::One(one.into_iter()),
-            Self::Few(few) => PageIntoIter::Few(few.into_iter()),
+            Self::Flat(few) => PageIntoIter::Flat(few.into_iter()),
             Self::Many(many) => PageIntoIter::Many(many.into_iter()),
         }
     }
@@ -316,13 +335,34 @@ mod tests {
                     serde_json::from_slice::<PageMap<u64>>(&json).unwrap(),
                     pages
                 );
-                if let PageMap::Few(few) = &pages {
-                    assert_eq!(few.capacity(), few.len());
+                if let PageMap::Flat(few) = &pages {
+                    assert!(few.capacity() < few.len() * 4);
                 }
             }
             assert!(pages.is_empty());
         }
     }
+    #[test]
+    fn sparse_flat_and_tree_transitions_keep_the_same_ordered_contents() {
+        let mut pages = PageMap::default();
+        let indexes = (0..=MAX_FLAT_PAGES as u32).map(|page| page * 1024);
+        for key in indexes.clone().rev() {
+            pages.insert(key, key);
+        }
+        assert!(matches!(pages, PageMap::Many(_)));
+        pages.remove(&0);
+        let roundtrip = serde_json::from_slice(&serde_json::to_vec(&pages).unwrap()).unwrap();
+        assert!(matches!(roundtrip, PageMap::Flat(_)));
+        assert_eq!(pages, roundtrip);
+        for key in indexes.skip(1).take(MAX_FLAT_PAGES / 2) {
+            pages.remove(&key);
+        }
+        assert!(matches!(pages, PageMap::Flat(_)));
+        assert_eq!(pages.len(), MAX_FLAT_PAGES / 2);
+        let last = MAX_FLAT_PAGES as u32 * 1024;
+        assert_eq!(pages.last_key_value(), Some((&last, &last)));
+    }
+
     #[test]
     fn catalog_encoding_matches_legacy_maps_across_sparse_transitions() {
         let mut pages = PageMap::<u64>::default();

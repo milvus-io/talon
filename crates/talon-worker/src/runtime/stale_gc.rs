@@ -134,7 +134,7 @@ impl PositiveHeads {
 }
 
 pub(super) struct StaleGc {
-    cursor: (u64, u64),
+    cursor: (usize, usize),
     blocks_done: bool,
     small_cursor: SmallStaleCursor,
     small_done: bool,
@@ -1350,7 +1350,7 @@ mod tests {
         let r = Arc::new(runtime(root.path(), true, origin));
         fill(&r, &block(0), true).await;
         let state = r.page_lifecycle.block(&block(0));
-        let gate = state.gate.lock().await;
+        let gate = state.lock().await;
         let task = tokio::spawn({
             let r = r.clone();
             async move {

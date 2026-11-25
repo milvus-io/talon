@@ -3,7 +3,7 @@ use super::{MembershipSnapshot, OwnershipLimits, WorkerRuntime};
 use crate::eviction::StaleBlockCandidate;
 use crate::small_store::{OwnershipCursor, OwnershipLimit, SmallGcCandidate};
 use std::{
-    collections::{BTreeSet, VecDeque},
+    collections::{BTreeMap, VecDeque},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -29,13 +29,13 @@ pub(super) struct OwnershipGc {
 struct OwnershipPass {
     generation: u64,
     range: std::ops::Range<u64>,
-    cursor: (u64, u64),
+    cursor: std::ops::Range<usize>,
     scanning: bool,
     retry_cursor: u64,
-    retries: BTreeSet<u64>,
+    retries: BTreeMap<u64, StaleBlockCandidate>,
     // Publish before awaiting so cancellation cannot lose a selected block.
-    // Queue position, observed block, and deletion credits already paid.
-    attempt: Option<(u64, StaleBlockCandidate, u64)>,
+    // Observed block and deletion credits already paid.
+    attempt: Option<(StaleBlockCandidate, u64)>,
     block_round_done: bool,
     small: Option<SmallPass>,
 }
@@ -188,11 +188,11 @@ impl OwnershipGc {
             }
             self.pass = Some(OwnershipPass {
                 generation: view.generation,
-                cursor: (range.start, range.end),
+                cursor: 0..worker.lru.block_scan_ceiling(),
                 retry_cursor: range.start,
                 range,
                 scanning: true,
-                retries: BTreeSet::new(),
+                retries: BTreeMap::new(),
                 attempt: None,
                 block_round_done: false,
                 small,
@@ -219,41 +219,35 @@ impl OwnershipGc {
             }
             let pass = self.pass.as_mut().unwrap();
             if pass.attempt.is_none() {
-                let next = if pass.scanning {
-                    worker
-                        .lru
-                        .next_ownership_block(&mut pass.cursor, pass.range.end)
+                let candidate = if pass.scanning {
+                    let Some(slot) = pass.cursor.next() else {
+                        pass.scanning = false;
+                        self.finish_block_round(&view);
+                        return;
+                    };
+                    let Some(candidate) = worker.lru.ownership_block_at(slot, &pass.range) else {
+                        continue;
+                    };
+                    candidate
                 } else {
-                    let Some(position) = pass.retries.range(pass.retry_cursor..).next().copied()
+                    let Some((&revision, retry)) = pass.retries.range(pass.retry_cursor..).next()
                     else {
                         self.finish_block_round(&view);
                         return;
                     };
-                    pass.retry_cursor = position + 1;
-                    // A newer admission or independent deletion retires the old retry.
-                    let candidate = worker
-                        .lru
-                        .next_ownership_block(&mut (position, position + 1), pass.range.end);
-                    if candidate.is_none() {
-                        pass.retries.remove(&position);
+                    pass.retry_cursor = revision + 1;
+                    // A later admission belongs to a future pass. Re-read the
+                    // access age and pin state for this incarnation's retry.
+                    let Some(candidate) = worker.lru.refresh_ownership_candidate(retry) else {
+                        pass.retries.remove(&revision);
                         continue;
-                    }
+                    };
                     candidate
                 };
-                let Some((position, candidate)) = next else {
-                    pass.scanning = false;
-                    self.finish_block_round(&view);
-                    return;
-                };
-                if candidate.revision >= pass.range.end {
-                    // Coalesced post-boundary fills were moved to a later pass.
-                    pass.retries.remove(&position);
-                    continue;
-                }
                 worker.page_gc_metrics.ownership_checked.inc();
-                pass.attempt = Some((position, candidate, 0));
+                pass.attempt = Some((candidate, 0));
             }
-            let (position, candidate, paid) = self
+            let (candidate, paid) = self
                 .pass
                 .as_ref()
                 .unwrap()
@@ -270,7 +264,7 @@ impl OwnershipGc {
             } else {
                 if let Some(budget) = &worker.background_budget {
                     let credits = budget.delete_slice(candidate.units as u64 - paid).await;
-                    self.pass.as_mut().unwrap().attempt.as_mut().unwrap().2 += credits;
+                    self.pass.as_mut().unwrap().attempt.as_mut().unwrap().1 += credits;
                     if paid + credits < candidate.units as u64 {
                         return;
                     }
@@ -280,9 +274,9 @@ impl OwnershipGc {
             let pass = self.pass.as_mut().unwrap();
             pass.attempt = None;
             if success {
-                pass.retries.remove(&position);
+                pass.retries.remove(&candidate.revision);
             } else {
-                pass.retries.insert(position);
+                pass.retries.insert(candidate.revision, candidate);
             }
             if started.elapsed() >= Duration::from_millis(10) {
                 return;
@@ -1531,7 +1525,7 @@ mod tests {
         fill(&r, &old, true).await;
         fill(&r, &rewritten, true).await;
         let state = r.page_lifecycle.block(&old);
-        let gate = state.gate.lock().await;
+        let gate = state.lock().await;
         gc.next_supplement = tokio::time::Instant::now();
         {
             let round = gc.run_round(&r);
@@ -1616,7 +1610,7 @@ mod tests {
         let mut gc = fixture.gc(&r);
         let event = r.membership_snapshot().unwrap();
         let state = r.page_lifecycle.block(&old);
-        let gate = state.gate.lock().await;
+        let gate = state.lock().await;
         {
             let round = gc.run_round(&r);
             tokio::pin!(round);
@@ -1653,14 +1647,10 @@ mod tests {
             let mut gc = fixture.gc(&r);
             let candidate = r
                 .lru
-                .next_ownership_block(
-                    &mut (0, r.lru.block_scan_ceiling()),
-                    r.lru.block_scan_ceiling(),
-                )
-                .unwrap()
-                .1;
+                .first_ownership_candidate(0..r.lru.ownership_admission_ceiling())
+                .unwrap();
             let state = r.page_lifecycle.block(&id);
-            let gate = state.gate.lock().await;
+            let gate = state.lock().await;
             // Both policies already selected the same block; hold commit until
             // both owned mutations are waiting behind the gate.
             tokio::time::timeout(Duration::from_secs(2), async {
@@ -1735,18 +1725,14 @@ mod tests {
             r.background_budget = Some(budget);
             let state = r.page_lifecycle.block(&id);
             let held_gate = if gate_wait {
-                Some(state.gate.lock().await)
+                Some(state.lock().await)
             } else {
                 None
             };
             let candidate = r
                 .lru
-                .next_ownership_block(
-                    &mut (0, r.lru.block_scan_ceiling()),
-                    r.lru.block_scan_ceiling(),
-                )
-                .unwrap()
-                .1;
+                .first_ownership_candidate(0..r.lru.ownership_admission_ceiling())
+                .unwrap();
             tokio::time::timeout(
                 Duration::from_secs(1),
                 r.unlink_stale_block_for(
@@ -1969,7 +1955,7 @@ mod tests {
             let id = placed("b", 0);
             fill(&r, &id, true).await;
             let state = r.page_lifecycle.block(&id);
-            let gate = state.gate.lock().await;
+            let gate = state.lock().await;
             let mut gc = fixture.gc(&r);
             let run = gc.run_round(&r);
             let change = async {
