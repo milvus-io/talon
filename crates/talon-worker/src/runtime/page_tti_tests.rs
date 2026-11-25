@@ -196,6 +196,174 @@ async fn clean_checkpoint_does_not_traverse_page_states() {
     assert_eq!(report.bytes, 0);
 }
 
+fn checkpoint_block(shard: usize) -> BlockId {
+    (0..)
+        .map(|offset| BlockId {
+            offset: offset * 4096,
+            block_size: 4096,
+            ..id()
+        })
+        .find(|block| crate::page_lifecycle::disk_shard(block) == shard)
+        .unwrap()
+}
+
+#[tokio::test]
+async fn checkpoint_membership_scheduled_full_ticks_share_sparse_inventory() {
+    use crate::catalog::{Operation, StoreKind};
+
+    const HISTORICAL_SLOTS: u64 = 8192;
+    let root = tempfile::tempdir().unwrap();
+    let directory = Arc::new(std::sync::RwLock::new(crate::index::Directory::default()));
+    directory.write().unwrap().attach(16);
+    let r = WorkerRuntime::new_with_l1(
+        WholeBlockStore::open(root.path().join("whole")).unwrap(),
+        Arc::new(BlockIndex::from_catalog(directory.clone())),
+        Arc::new(InFlightLoads::new()),
+        Arc::new(Origin::default()),
+        4096,
+        0,
+        0,
+        16,
+        WorkerMetrics::new(0),
+    )
+    .with_paged_store(PagedBlockStore::open(root.path().join("paged"), 16).unwrap())
+    .with_page_gc(PageGcConfig::default())
+    .unwrap();
+    r.page_clock.set(20_000);
+    let early = checkpoint_block(0);
+    let later = checkpoint_block(1);
+    let admit = |block, now| {
+        directory.write().unwrap().apply(
+            block,
+            StoreKind::Paged,
+            &Operation::Put { page: 0, len: 4096 },
+            None,
+            Some(512),
+        );
+        r.page_lifecycle
+            .block(block)
+            .register(PageIndex(0), Some(now), now, true);
+        std::fs::create_dir_all(r.paged.as_ref().unwrap().dir_for(block).parent().unwrap())
+            .unwrap();
+    };
+    admit(&early, 10_000);
+    let filler = |offset| BlockId { offset, ..id() };
+    {
+        let mut rows = directory.write().unwrap();
+        for offset in 0..HISTORICAL_SLOTS {
+            rows.apply(
+                &filler(offset),
+                StoreKind::Whole,
+                &Operation::PutWhole { len: 1 },
+                None,
+                Some(512),
+            );
+        }
+        for offset in 0..HISTORICAL_SLOTS - 64 {
+            rows.apply(
+                &filler(offset),
+                StoreKind::Whole,
+                &Operation::DeleteBlock,
+                None,
+                None,
+            );
+        }
+    }
+    let ceiling = r.index.policy_scan_ceiling();
+    assert_eq!(ceiling, HISTORICAL_SLOTS as usize + 1);
+    let first = r.checkpoint_next_shard().await;
+    let first_work = r.page_lifecycle.checkpoint_inventory_work();
+
+    // The preceding tick could not inventory this new paged member in a
+    // reused hole. Its first full scheduled checkpoint must still include it.
+    admit(&later, 20_000);
+    assert_eq!(r.index.policy_scan_ceiling(), ceiling);
+    let second = r.checkpoint_next_shard().await;
+    let second_work = r.page_lifecycle.checkpoint_inventory_work();
+    eprintln!("scheduled directory visits/locks first={first_work:?} cumulative={second_work:?}");
+    for report in [first, second] {
+        assert_eq!(report.failures, 0);
+        assert_eq!(report.blocks, 1);
+        assert!(report.bytes > 0);
+    }
+    assert_eq!(first_work, (65, 2));
+    assert_eq!(second_work, first_work);
+    let dir = r.paged.as_ref().unwrap().dir_for(&later);
+    let shard = crate::page_access_shard::load(dir.parent().unwrap(), 1, 16, 20_000).unwrap();
+    assert_eq!(shard.records[&later].records, [(0, 20_000)].into());
+}
+
+#[tokio::test]
+async fn checkpoint_membership_explicit_flush_includes_admission_before_later_gate() {
+    use crate::page_access_store::CacheRootLock;
+    use talon_core::WorkerConfig;
+
+    let root = tempfile::tempdir().unwrap();
+    let config = WorkerConfig {
+        small_object_threshold_bytes: 0,
+        block_size: 4096,
+        l2_page_size_bytes: 4096,
+        backend: Some("s3".into()),
+        page_tti_hours: 0,
+        ..Default::default()
+    };
+    let open = || {
+        WorkerRuntime::open_namespaces(
+            &config,
+            Arc::new(CacheRootLock::acquire(root.path()).unwrap()),
+            Arc::new(Origin::default()),
+            WorkerMetrics::new(config.capacity_bytes),
+        )
+        .unwrap()
+    };
+    let r = open();
+    assert!(r.index.uses_catalog());
+    let early = checkpoint_block(0);
+    let later = checkpoint_block(1);
+    let body = Bytes::from(vec![0x5a; 4096]);
+    r.page_clock.set(10_000);
+    r.commit_fetched_page(&early, PageIndex(0), 4096, body.clone())
+        .await
+        .unwrap();
+    let ceiling = r.index.policy_scan_ceiling();
+    let gate = r.page_lifecycle.checkpoint_gate(1);
+    let held = gate.lock().await;
+    let worker = r.clone();
+    let flush = tokio::spawn(async move { worker.checkpoint_access_times().await });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while r.page_lifecycle.checkpoint_start(0).2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    r.page_clock.set(20_000);
+    r.commit_fetched_page(&later, PageIndex(0), 4096, body.clone())
+        .await
+        .unwrap();
+    assert_eq!(r.index.policy_scan_ceiling(), ceiling + 1);
+    drop(held);
+    let report = flush.await.unwrap();
+    assert_eq!(report.failures, 0);
+    r.drain_page_mutations().await;
+    drop(r);
+
+    // Reopen without another flush. The later page's exact age must come
+    // from this flush, and the catalog must still locate its payload.
+    let restarted = open();
+    let block = restarted.page_lifecycle.get(&later).unwrap();
+    assert_eq!(block.last_access(0), Some(20_000));
+    assert_eq!(report.blocks, 2);
+    assert_eq!(
+        restarted
+            .cached_page(&later, PageIndex(0), 4096)
+            .await
+            .unwrap(),
+        Some(body),
+    );
+}
+
 #[tokio::test]
 async fn access_only_checkpoint_failure_retries_without_structural_changes() {
     let root = tempfile::tempdir().unwrap();

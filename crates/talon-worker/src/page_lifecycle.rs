@@ -1359,6 +1359,8 @@ pub(crate) struct PageLifecycle {
     index: Arc<crate::BlockIndex>,
     gates: Arc<MutationGates>,
     checkpoints: Vec<Arc<tokio::sync::Mutex<()>>>,
+    #[cfg(test)]
+    checkpoint_inventory_work: [std::sync::atomic::AtomicUsize; 2],
 }
 
 fn disk_shard_key(id: &BlockKey) -> usize {
@@ -1380,6 +1382,8 @@ impl PageLifecycle {
         Self {
             index,
             checkpoints: (0..SHARDS).map(|_| Arc::default()).collect(),
+            #[cfg(test)]
+            checkpoint_inventory_work: Default::default(),
             gates: Arc::new(MutationGates {
                 blocks: Mutex::default(),
                 directories: (0..DIRECTORY_SHARDS).map(|_| Arc::default()).collect(),
@@ -1558,24 +1562,42 @@ impl PageLifecycle {
         self.checkpoints[shard].clone()
     }
 
-    pub fn checkpoint_start(&self, shard: usize) -> (usize, u64, bool) {
-        let ceiling = self.index.policy_scan_ceiling();
-        let work = self.index.page_work.shard(shard).lock().unwrap();
+    #[cfg(test)]
+    fn count_inventory_batch(&self, visits: usize) {
+        self.checkpoint_inventory_work[0].fetch_add(visits, Ordering::Relaxed);
+        self.checkpoint_inventory_work[1].fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub fn checkpoint_inventory_work(&self) -> (usize, usize) {
+        let [visits, locks] = &self.checkpoint_inventory_work;
         (
-            ceiling,
-            work.membership,
-            work.membership != work.checkpointed_membership || !work.dirty.is_empty(),
+            visits.load(Ordering::Relaxed),
+            locks.load(Ordering::Relaxed),
         )
+    }
+
+    pub fn checkpoint_start(&self, shard: usize) -> (usize, u64, bool) {
+        self.index.with_slot_ceiling(|ceiling| {
+            let work = self.index.page_work.shard(shard).lock().unwrap();
+            (
+                ceiling,
+                work.membership,
+                work.membership != work.checkpointed_membership || !work.dirty.is_empty(),
+            )
+        })
     }
 
     /// Startup groups compact slab indices once, so restoring many shards does
     /// not rescan the directory 256 times or retain a second set of block keys.
     pub fn recovery_slots(&self) -> [Vec<usize>; SHARDS] {
         let mut shards = std::array::from_fn(|_| Vec::new());
-        self.index
-            .visit_paged_slots(0..self.index.policy_scan_ceiling(), |slot, id| {
-                shards[disk_shard_key(id)].push(slot);
-            });
+        self.index.visit_paged_slots(
+            0,
+            self.index.policy_scan_ceiling(),
+            usize::MAX,
+            |slot, id| shards[disk_shard_key(id)].push(slot),
+        );
         shards
     }
 
@@ -1772,43 +1794,34 @@ impl PageLifecycle {
 
 const CHECKPOINT_BATCH: usize = 64;
 
-/// The first compaction in a round groups the physical slab once. Keep only
-/// compact slot numbers and revalidate membership when sampling each slot.
-pub(crate) struct CheckpointRound {
-    only_shard: Option<usize>,
-    full: OnceLock<Box<[Vec<u32>; SHARDS]>>,
-    #[cfg(test)]
-    visited_slots: std::sync::atomic::AtomicUsize,
-}
+/// A round's inventory lets compaction find clean members. It only holds
+/// physical slots, which can be reused between inventory and sampling.
+pub(crate) struct CheckpointInventory(Box<[Vec<u32>; SHARDS]>);
 
-impl CheckpointRound {
-    pub fn new(only_shard: Option<usize>) -> Self {
-        Self {
-            only_shard,
-            full: OnceLock::new(),
+impl CheckpointInventory {
+    pub fn gather(life: &PageLifecycle, first_shard: usize, remaining: usize) -> Self {
+        let mut groups = Box::new(std::array::from_fn(|_| Vec::new()));
+        let ceiling = life.index.policy_scan_ceiling();
+        let mut cursor = 0;
+        while cursor < ceiling {
+            let (next, _visited) =
+                life.index
+                    .visit_paged_slots(cursor, ceiling, CHECKPOINT_BATCH, |slot, id| {
+                        let shard = disk_shard_key(id);
+                        if (shard + SHARDS - first_shard) % SHARDS < remaining {
+                            groups[shard]
+                                .push(u32::try_from(slot).expect("directory slot fits in u32"));
+                        }
+                    });
+            cursor = next;
             #[cfg(test)]
-            visited_slots: std::sync::atomic::AtomicUsize::new(0),
+            life.count_inventory_batch(_visited);
         }
+        Self(groups)
     }
 
-    pub fn full_slots(&self, life: &PageLifecycle, shard: usize) -> &[u32] {
-        &self.full.get_or_init(|| {
-            let mut groups = Box::new(std::array::from_fn(|_| Vec::new()));
-            let ceiling = life.index.policy_scan_ceiling();
-            for start in (0..ceiling).step_by(CHECKPOINT_BATCH) {
-                let end = (start + CHECKPOINT_BATCH).min(ceiling);
-                #[cfg(test)]
-                self.visited_slots.fetch_add(end - start, Ordering::Relaxed);
-                life.index.visit_paged_slots(start..end, |slot, id| {
-                    let shard = disk_shard_key(id);
-                    if self.only_shard.map_or(true, |only| only == shard) {
-                        groups[shard]
-                            .push(u32::try_from(slot).expect("directory slot fits in u32"));
-                    }
-                });
-            }
-            groups
-        })[shard]
+    pub fn take_shard(&mut self, shard: usize) -> Vec<u32> {
+        std::mem::take(&mut self.0[shard])
     }
 }
 
@@ -2050,7 +2063,7 @@ mod tests {
                 .record_access_and_release(Some(clock.now()));
             let (ceiling, membership, _) = life.checkpoint_start(shard);
             let slot = if full {
-                CheckpointRound::new(Some(shard)).full_slots(&life, shard)[0] as usize
+                CheckpointInventory::gather(&life, shard, 1).take_shard(shard)[0] as usize
             } else {
                 life.checkpoint_dirty_slots(shard, &mut 0, ceiling)[0]
             };
@@ -2092,8 +2105,7 @@ mod tests {
             life.block(id).register_fixture(page, Some(age), age, true);
         }
         let (_, membership, _) = life.checkpoint_start(shard);
-        let round = CheckpointRound::new(None);
-        let slots = round.full_slots(&life, shard);
+        let slots = CheckpointInventory::gather(&life, shard, 1).take_shard(shard);
         assert_eq!(slots, &[0, 1, 2]);
         let clock = AccessClock::new();
         clock.set(100);
@@ -2166,18 +2178,19 @@ mod tests {
             life.block(&id)
                 .register_fixture(PageIndex(0), Some(10), 10, true);
         }
-        let round = CheckpointRound::new(None);
-        assert_eq!(round.visited_slots.load(Ordering::Relaxed), 0);
+        assert_eq!(life.checkpoint_inventory_work(), (0, 0));
+        let mut inventory = CheckpointInventory::gather(&life, 0, SHARDS);
         let mut slots = BTreeSet::new();
         for shard in 0..SHARDS {
-            for &slot in round.full_slots(&life, shard) {
+            for slot in inventory.take_shard(shard) {
                 let block = life.recovery_block(slot as usize).unwrap();
                 assert_eq!(disk_shard_key(&block.id), shard);
                 assert!(slots.insert(slot));
             }
         }
         assert_eq!(slots.len(), SLOT_COUNT);
-        let visits = round.visited_slots.load(Ordering::Relaxed);
+        let (visits, locks) = life.checkpoint_inventory_work();
+        assert_eq!(locks, SLOT_COUNT / CHECKPOINT_BATCH);
         assert_eq!(visits, SLOT_COUNT);
         eprintln!(
             "full-round directory visits: old={}, current={visits}",

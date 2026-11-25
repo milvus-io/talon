@@ -455,7 +455,12 @@ impl BlockIndex {
     }
 
     pub(crate) fn policy_scan_ceiling(&self) -> usize {
-        self.entries.read().unwrap().slot_count()
+        self.with_slot_ceiling(std::convert::identity)
+    }
+
+    pub(crate) fn with_slot_ceiling<T>(&self, capture: impl FnOnce(usize) -> T) -> T {
+        let entries = self.entries.read().unwrap();
+        capture(entries.slot_count())
     }
 
     pub(crate) fn policy_block_at(&self, slot: usize) -> Option<(BlockKey, BlockActivity)> {
@@ -1025,17 +1030,30 @@ impl BlockIndex {
         Some(table.clone())
     }
 
+    /// Visit at most `limit` occupied rows under one directory lock, skipping
+    /// holes via the slab occupancy tree. Return the next cursor and work done.
     pub(crate) fn visit_paged_slots(
         &self,
-        slots: std::ops::Range<usize>,
+        mut cursor: usize,
+        ceiling: usize,
+        limit: usize,
         mut visit: impl FnMut(usize, &BlockKey),
-    ) {
+    ) -> (usize, usize) {
         let entries = self.entries.read().unwrap();
-        for slot in slots {
+        for visited in 0..limit {
+            let Some((slot, _)) = entries
+                .rows
+                .at_or_after(cursor)
+                .filter(|(slot, _)| *slot < ceiling)
+            else {
+                return (ceiling, visited);
+            };
             if let Some(id) = paged_key_at(&entries, self.catalog, slot) {
                 visit(slot, id);
             }
+            cursor = slot + 1;
         }
+        (cursor, limit)
     }
 
     fn entry(&self, id: &BlockId) -> Option<Arc<Entry>> {

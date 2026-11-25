@@ -156,7 +156,7 @@ pub struct WorkerRuntime {
     page_gc_io: Arc<tokio::sync::Semaphore>,
     background_budget: Option<Arc<crate::background::BackgroundBudget>>,
     page_scan: Arc<tokio::sync::Mutex<ScanCursor>>,
-    page_checkpoint: Arc<tokio::sync::Mutex<usize>>,
+    page_checkpoint: Arc<tokio::sync::Mutex<page_maintenance::CheckpointCursor>>,
     small_idle_cursor: Arc<tokio::sync::Mutex<SmallIdleCursor>>,
     small_capacity_eviction: Arc<tokio::sync::Mutex<async_eviction::SmallCapacityPhase>>,
     page_cleanup: Arc<tokio::sync::Mutex<crate::page_cleanup::CleanupCursor>>,
@@ -337,7 +337,7 @@ impl WorkerRuntime {
             page_gc_io: Arc::new(tokio::sync::Semaphore::new(4)),
             background_budget: None,
             page_scan: Arc::new(tokio::sync::Mutex::new(ScanCursor::default())),
-            page_checkpoint: Arc::new(tokio::sync::Mutex::new(0)),
+            page_checkpoint: Arc::default(),
             small_idle_cursor: Arc::new(tokio::sync::Mutex::new(SmallIdleCursor::default())),
             small_capacity_eviction: Arc::new(tokio::sync::Mutex::new(Default::default())),
         }

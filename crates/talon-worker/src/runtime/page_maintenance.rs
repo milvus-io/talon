@@ -3,7 +3,23 @@ use super::*;
 use crate::block_key::BlockIdentity;
 use crate::page_access_store::{AccessSnapshot, PageAccessStore};
 use crate::page_gc::{CheckpointReport, GcReport};
-use crate::page_lifecycle::{CheckpointRound, GcCandidate, PageSnapshot, PagedMutation, SHARDS};
+use crate::page_lifecycle::{
+    CheckpointInventory, GcCandidate, PageSnapshot, PagedMutation, SHARDS,
+};
+
+#[derive(Default)]
+pub(super) struct CheckpointCursor {
+    shard: usize,
+    inventory: Option<CheckpointInventory>,
+}
+
+struct PreparedCheckpoint {
+    membership: u64,
+    snapshots: Vec<PageSnapshot>,
+    journal: crate::page_access_shard::JournalState,
+    full: bool,
+    bytes: Vec<u8>,
+}
 
 impl WorkerRuntime {
     pub(super) async fn background_io(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
@@ -696,12 +712,15 @@ impl WorkerRuntime {
         // Retain serialization and dirty-state ownership even if the caller is cancelled.
         self.page_mutations.run(async move {
             let mut report = CheckpointReport::default();
-            let slots = Arc::new(CheckpointRound::new((!all).then_some(*cursor)));
-            for _ in 0..if all { SHARDS } else { 1 } {
-                let shard = *cursor;
-                *cursor = (shard + 1) % SHARDS;
+            if all {
+                cursor.inventory = None;
+            }
+            for step in 0..if all { SHARDS } else { 1 } {
+                let shard = cursor.shard;
+                cursor.shard = (shard + 1) % SHARDS;
+                let remaining = if all { SHARDS - step } else { SHARDS - shard };
                 let _background_io = runtime.background_io().await;
-                let result = runtime.checkpoint_shard(shard, slots.clone()).await;
+                let result = runtime.checkpoint_shard(shard, remaining, &mut cursor.inventory).await;
                 match result {
                     Ok((blocks, bytes)) => {
                         report.blocks += blocks;
@@ -718,7 +737,10 @@ impl WorkerRuntime {
                     }
                 }
             }
-            if all || *cursor == 0 { runtime.refresh_checkpoint_metrics().await; }
+            if all || cursor.shard == 0 {
+                cursor.inventory = None;
+                runtime.refresh_checkpoint_metrics().await;
+            }
             report
         }).await
     }
@@ -726,91 +748,29 @@ impl WorkerRuntime {
     async fn checkpoint_shard(
         &self,
         shard: usize,
-        slots: Arc<CheckpointRound>,
+        remaining: usize,
+        inventory: &mut Option<CheckpointInventory>,
     ) -> anyhow::Result<(usize, usize)> {
         let paged = self.paged.as_ref().expect("paged TTI");
         let gate = self.page_lifecycle.checkpoint_gate(shard);
         let _guard = gate.lock().await;
         let worker = self.clone();
-        let prepared = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            let (ceiling, membership, dirty) = worker.page_lifecycle.checkpoint_start(shard);
-            let (journal, removed) = worker.page_lifecycle.checkpoint_journal(shard, membership);
-            if !dirty {
-                return Ok(None);
-            }
-            let full = journal.compact();
-            let mut retry = journal;
-            retry.full = true;
-            worker.page_lifecycle.set_checkpoint_journal(shard, retry);
-            let mut snapshots = Vec::new();
-            let mut size = 24;
-            let mut sample_slot = |slot| -> anyhow::Result<()> {
-                if let Some(snapshot) = worker.page_lifecycle.checkpoint_snapshot(
-                    shard,
-                    slot,
-                    full,
-                    membership,
-                    &worker.page_clock,
-                    &mut size,
-                )? {
-                    snapshots.push(snapshot);
-                }
-                Ok(())
-            };
-            if full {
-                for &slot in slots.full_slots(&worker.page_lifecycle, shard) {
-                    sample_slot(slot as usize)?;
-                }
-                PageSnapshot::keep_latest(&mut snapshots);
-            } else {
-                let mut cursor = 0;
-                while cursor < ceiling {
-                    for slot in
-                        worker
-                            .page_lifecycle
-                            .checkpoint_dirty_slots(shard, &mut cursor, ceiling)
-                    {
-                        sample_slot(slot)?;
-                    }
-                }
-            }
-            let paged = worker.paged.as_ref().expect("paged TTI");
-            let dir = paged.root().join(format!("{shard:02x}"));
-            if !dir.exists() && snapshots.iter().all(|sample| !sample.resident) {
-                for sample in snapshots {
-                    sample.commit();
-                }
-                worker.page_lifecycle.checkpoint_finished(shard, membership);
-                return Ok(None);
-            }
-            let bytes = if full {
-                crate::page_access_shard::encode(
-                    paged.page_size(),
-                    snapshots
-                        .iter()
-                        .filter(|sample| sample.resident)
-                        .map(|sample| (sample.block.view(), &sample.snapshot)),
-                )?
-            } else {
-                let empty = AccessSnapshot {
-                    revision: 0,
-                    sampled_at: worker.page_clock.now(),
-                    records: Vec::new(),
-                };
-                crate::page_access_shard::encode_delta(
-                    paged.page_size(),
-                    removed.iter().map(|id| (id.view(), &empty, true)).chain(
-                        snapshots
-                            .iter()
-                            .map(|sample| (sample.block.view(), &sample.snapshot, sample.replace)),
-                    ),
-                )?
-            };
-            Ok(Some((membership, snapshots, journal, full, bytes)))
+        let mut round_inventory = inventory.take();
+        let (round_inventory, prepared) = tokio::task::spawn_blocking(move || {
+            let prepared = worker.prepare_checkpoint(shard, remaining, &mut round_inventory);
+            (round_inventory, prepared)
         })
         .await
-        .expect("access checkpoint preparation panicked")?;
-        let Some((membership, snapshots, journal, full, bytes)) = prepared else {
+        .expect("access checkpoint preparation panicked");
+        let Some(PreparedCheckpoint {
+            membership,
+            snapshots,
+            journal,
+            full,
+            bytes,
+        }) = prepared?
+        else {
+            *inventory = round_inventory;
             return Ok((0, 0));
         };
         let dir = paged.root().join(format!("{shard:02x}"));
@@ -823,17 +783,127 @@ impl WorkerRuntime {
         )
         .await?;
         let worker = self.clone();
-        tokio::task::spawn_blocking(move || {
+        let count = tokio::task::spawn_blocking(move || {
             let count = snapshots.iter().filter(|sample| sample.resident).count();
             worker.page_lifecycle.set_checkpoint_journal(shard, journal);
             for sample in snapshots {
                 sample.commit();
             }
             worker.page_lifecycle.checkpoint_finished(shard, membership);
-            Ok((count, bytes))
+            count
         })
         .await
-        .expect("access checkpoint completion panicked")
+        .expect("access checkpoint completion panicked");
+        *inventory = round_inventory;
+        Ok((count, bytes))
+    }
+
+    fn prepare_checkpoint(
+        &self,
+        shard: usize,
+        remaining: usize,
+        inventory: &mut Option<CheckpointInventory>,
+    ) -> anyhow::Result<Option<PreparedCheckpoint>> {
+        let life = &self.page_lifecycle;
+        let (mut ceiling, mut membership, dirty) = life.checkpoint_start(shard);
+        let (journal, removed) = life.checkpoint_journal(shard, membership);
+        let full = dirty && journal.compact();
+        if full && inventory.is_none() {
+            *inventory = Some(CheckpointInventory::gather(life, shard, remaining));
+        }
+        // Retire this shard's inventory after its turn, even on a clean or
+        // delta checkpoint. A failed checkpoint discards the whole inventory.
+        let slots = inventory
+            .as_mut()
+            .map(|inventory| inventory.take_shard(shard));
+        if !dirty {
+            return Ok(None);
+        }
+        let slots = if full {
+            slots.unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if full {
+            // The inventory can predate this gate by many ticks. Capture
+            // the shard cut after gathering it, under directory -> shard order.
+            (ceiling, membership, _) = life.checkpoint_start(shard);
+        }
+        let mut retry = journal;
+        retry.full = true;
+        life.set_checkpoint_journal(shard, retry);
+        let mut snapshots = Vec::new();
+        let mut size = 24;
+        let mut sample_slot = |slot| -> anyhow::Result<()> {
+            if let Some(snapshot) = life.checkpoint_snapshot(
+                shard,
+                slot,
+                full,
+                membership,
+                &self.page_clock,
+                &mut size,
+            )? {
+                snapshots.push(snapshot);
+            }
+            Ok(())
+        };
+        for &slot in &slots {
+            sample_slot(slot as usize)?;
+        }
+        // New paged members publish existing dirty bits. A bit persists until
+        // a sample consumes it or removal records a tombstone. Any pre-cut
+        // member the inventory missed is therefore found by this same walk
+        // used for deltas. Inventory slots have already had their sample.
+        let mut cursor = 0;
+        while cursor < ceiling {
+            for slot in life.checkpoint_dirty_slots(shard, &mut cursor, ceiling) {
+                if slots.binary_search(&(slot as u32)).is_err() {
+                    sample_slot(slot)?;
+                }
+            }
+        }
+        if full {
+            PageSnapshot::keep_latest(&mut snapshots);
+        }
+        let paged = self.paged.as_ref().expect("paged TTI");
+        let dir = paged.root().join(format!("{shard:02x}"));
+        if !dir.exists() && snapshots.iter().all(|sample| !sample.resident) {
+            for sample in snapshots {
+                sample.commit();
+            }
+            life.checkpoint_finished(shard, membership);
+            return Ok(None);
+        }
+        let bytes = if full {
+            crate::page_access_shard::encode(
+                paged.page_size(),
+                snapshots
+                    .iter()
+                    .filter(|sample| sample.resident)
+                    .map(|sample| (sample.block.view(), &sample.snapshot)),
+            )?
+        } else {
+            let empty = AccessSnapshot {
+                revision: 0,
+                sampled_at: self.page_clock.now(),
+                records: Vec::new(),
+            };
+            crate::page_access_shard::encode_delta(
+                paged.page_size(),
+                removed.iter().map(|id| (id.view(), &empty, true)).chain(
+                    snapshots
+                        .iter()
+                        .map(|sample| (sample.block.view(), &sample.snapshot, sample.replace)),
+                ),
+            )?
+        };
+        Ok(Some(PreparedCheckpoint {
+            membership,
+            snapshots,
+            journal,
+            full,
+            bytes,
+        }))
     }
 
     async fn refresh_checkpoint_metrics(&self) {
