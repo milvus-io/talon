@@ -620,6 +620,84 @@ mod tests {
             })
     }
 
+    #[tokio::test]
+    async fn ownership_event_excludes_segments_first_published_after_capture() {
+        let root = tempfile::tempdir().unwrap();
+        let store = open(root.path());
+        let index = Arc::new(crate::BlockIndex::new());
+        store.restore_policy_units(&index, &mut Vec::new(), false);
+        store.init_recency();
+        store.bind_policy(Arc::new(crate::Lru::from_recovered(
+            index,
+            Vec::new(),
+            0,
+            true,
+        )));
+        store.init_ownership();
+
+        let delayed = store.writer(1).await.unwrap();
+        let ready = store.writer(2).await.unwrap();
+        let pause = Arc::new(super::super::tests::AppendPause::default());
+        *delayed.append_pause.lock().unwrap() = Some(pause.clone());
+        let first_write = {
+            let stream = delayed.clone();
+            let policy = store.policy().cloned();
+            tokio::spawn(async move {
+                stream
+                    .put_inner(&id("late-0"), Bytes::from_static(b"L"), policy)
+                    .await
+                    .unwrap();
+            })
+        };
+        pause.entered.notified().await;
+        let before = id("before");
+        ready
+            .put_inner(&before, Bytes::from_static(b"B"), store.policy().cloned())
+            .await
+            .unwrap();
+        let event = store.ownership_limit(true).unwrap();
+        pause.resume.notify_one();
+        first_write.await.unwrap();
+        let late_segment = store
+            .lookup_entry(&id("late-0"))
+            .unwrap()
+            .unwrap()
+            .segment();
+        assert!(late_segment < store.lookup_entry(&before).unwrap().unwrap().segment());
+        for n in 1..130 {
+            let block = id(&format!("late-{n}"));
+            delayed
+                .put_inner(&block, Bytes::from_static(b"L"), store.policy().cloned())
+                .await
+                .unwrap();
+            assert_eq!(
+                store.lookup_entry(&block).unwrap().unwrap().segment(),
+                late_segment
+            );
+        }
+
+        let (done, rows) =
+            store.ownership_candidates(&mut Default::default(), 0, event, 64, |_| false);
+        assert!(
+            done,
+            "post-event publication consumed the event scan budget"
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].unit.block(), &before);
+
+        let supplement = store.ownership_limit(false).unwrap();
+        let (done, rows) = store.ownership_candidates(
+            &mut Default::default(),
+            event.epoch,
+            supplement,
+            256,
+            |_| false,
+        );
+        assert!(done);
+        assert_eq!(rows.len(), 130);
+        assert!(rows.iter().all(|row| row.unit.block() != &before));
+    }
+
     #[test]
     fn relocation_budget_covers_payload_and_actual_journal_bytes() {
         let rt = tokio::runtime::Builder::new_current_thread()

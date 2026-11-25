@@ -59,8 +59,11 @@ recovered blocks. GC scans only that fixed prefix for ownership. It also exclude
 blocks whose admission revision is at or beyond the limit: a post-event replacement
 or page fill conservatively excludes the entire block. Reads do not change the
 admission revision. New data never expands an event's scan, including data written
-between publication and delayed GC startup. A packed segment freezes its published
-offset extent on the first later admission. When compaction moves the segment,
+between publication and delayed GC startup. A packed segment enters the scan
+order when its first row becomes visible. A writer that reserved a file earlier
+can therefore publish after the event without adding work to its scan. An
+already visible segment freezes its offset extent on the first later admission.
+When compaction moves the segment,
 the replacement keeps its logical scan position and the extent follows the
 surviving rows of the original prefix.
 

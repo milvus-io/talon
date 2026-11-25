@@ -43,9 +43,11 @@ pub(super) struct Catalog {
     pub retired: HashMap<SmallKey, Retired>,
     pub retired_addresses: BTreeMap<Address, SmallKey>,
     retired_segments: BTreeMap<u64, Arc<SegmentMeta>>,
-    // A sealed replacement inherits its source's place in policy scans.
+    // Streams reserve physical IDs before publication. GC orders segments by
+    // first publication, and a replacement inherits its source's position.
     pub published: BTreeMap<u64, u64>,
-    relocated: HashMap<u64, u64>,
+    publication_positions: HashMap<u64, u64>,
+    last_publication: u64,
     active: bool,
 }
 
@@ -395,9 +397,8 @@ impl Catalog {
         self.unindex_rows(segment, 0, usize::MAX);
         self.retired_segments.remove(&segment);
         self.files.remove(&segment);
-        let logical = self.relocated.remove(&segment).unwrap_or(segment);
-        if self.published.get(&logical) == Some(&segment) {
-            self.published.remove(&logical);
+        if let Some(position) = self.publication_positions.remove(&segment) {
+            self.published.remove(&position);
         }
         if let Some(ownership) = &mut self.ownership {
             ownership.remove_segment(segment);
@@ -412,15 +413,27 @@ impl Catalog {
     }
 
     pub fn replace_published_segment(&mut self, old: u64, new: u64) {
-        let logical = self.relocated.remove(&old).unwrap_or(old);
-        self.published.insert(logical, new);
-        self.relocated.insert(new, logical);
+        if let Some(position) = self.publication_positions.remove(&old) {
+            if let Some(previous) = self.publication_positions.insert(new, position) {
+                self.published.remove(&previous);
+            }
+            self.published.insert(position, new);
+        } else {
+            self.publish_segment(new);
+        }
     }
 
     pub fn publish_segment(&mut self, segment: u64) {
-        if !self.relocated.contains_key(&segment) {
-            self.published.insert(segment, segment);
-        }
+        self.publication_positions
+            .entry(segment)
+            .or_insert_with(|| {
+                self.last_publication = self
+                    .last_publication
+                    .checked_add(1)
+                    .expect("small segment publication sequence exhausted");
+                self.published.insert(self.last_publication, segment);
+                self.last_publication
+            });
     }
 
     fn trim_index(&mut self) {
