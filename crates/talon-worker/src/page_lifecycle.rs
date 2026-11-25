@@ -1365,7 +1365,7 @@ impl PageLifecycle {
         slot: usize,
         full: bool,
         membership: u64,
-        now: u64,
+        clock: &AccessClock,
         size: &mut usize,
     ) -> anyhow::Result<Option<PageSnapshot>> {
         self.index
@@ -1411,7 +1411,8 @@ impl PageLifecycle {
                     replace,
                     snapshot: crate::page_access_store::AccessSnapshot {
                         revision: 0,
-                        sampled_at: now,
+                        // Recovery rejects ages later than the sample timestamp.
+                        sampled_at: clock.now(),
                         records,
                     },
                     rollback: touched.map(|(oldest, _)| CheckpointRetry {
@@ -1544,7 +1545,9 @@ mod tests {
 
     fn sample(life: &PageLifecycle, id: &BlockId, membership: u64, full: bool) -> PageSnapshot {
         let slot = life.recovery_slots()[disk_shard(id)][0];
-        life.checkpoint_snapshot(disk_shard(id), slot, full, membership, 100, &mut 0)
+        let clock = AccessClock::new();
+        clock.set(100);
+        life.checkpoint_snapshot(disk_shard(id), slot, full, membership, &clock, &mut 0)
             .unwrap()
             .unwrap()
     }
@@ -1649,6 +1652,49 @@ mod tests {
         assert!(!block.claim(&stale, 100, None));
         drop(block.acquire(page).unwrap());
         assert!(block.claim(&current, 100, None));
+    }
+
+    #[test]
+    fn checkpoint_recovers_access_completed_after_slot_selection() {
+        use crate::page_access_store::PageAccessStore;
+
+        for full in [true, false] {
+            let life = PageLifecycle::new();
+            let id = id();
+            let block = life.block(&id);
+            let shard = disk_shard(&id);
+            let page = PageIndex(0);
+            block.register_fixture(page, Some(10), 10, true);
+            let clock = AccessClock::new();
+            clock.set(100);
+            let (_, generation, _) = life.checkpoint_start(shard);
+            sample(&life, &id, generation, true).commit();
+            block
+                .acquire(page)
+                .unwrap()
+                .record_access_and_release(Some(clock.now()));
+            let (ceiling, membership, _) = life.checkpoint_start(shard);
+            let slot = life.checkpoint_slots(shard, &mut 0, ceiling, full)[0];
+
+            // A reader completes after the checkpointer selects the slot but
+            // before it acquires the row lock and consumes the dirty age.
+            clock.set(101);
+            block
+                .acquire(page)
+                .unwrap()
+                .record_access_and_release(Some(clock.now()));
+            let snapshot = life
+                .checkpoint_snapshot(shard, slot, full, membership, &clock, &mut 0)
+                .unwrap()
+                .unwrap();
+            assert_eq!(snapshot.replace, full);
+            let bytes = PageAccessStore::encode(&id, 16, &snapshot.snapshot).unwrap();
+            snapshot.commit();
+
+            let restored = PageAccessStore::decode_bytes(&bytes, &id, 16, 102).unwrap();
+            assert_eq!(restored.records.get(&page.0), Some(&101));
+            assert_eq!(restored.future, 0);
+        }
     }
 
     #[test]

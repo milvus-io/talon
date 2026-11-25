@@ -748,7 +748,7 @@ impl WorkerRuntime {
                         sampled,
                         full,
                         membership,
-                        worker.page_clock.now(),
+                        &worker.page_clock,
                         &mut size,
                     )? {
                         snapshots.push(snapshot);
