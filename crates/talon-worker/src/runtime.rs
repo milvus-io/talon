@@ -3070,10 +3070,12 @@ fn disk_unit() -> u64 {
     use std::{io::Write, os::unix::fs::MetadataExt, sync::OnceLock};
     static UNIT: OnceLock<u64> = OnceLock::new();
     *UNIT.get_or_init(|| {
-        let mut file = tempfile::tempfile().unwrap();
+        // Keep the file linked until the allocation is measured. Shared
+        // filesystems may reject metadata lookups on unlinked open files.
+        let mut file = tempfile::NamedTempFile::new().unwrap();
         file.write_all(&[0; 16]).unwrap();
-        file.sync_all().unwrap();
-        file.metadata().unwrap().blocks() * 512
+        file.as_file().sync_all().unwrap();
+        file.as_file().metadata().unwrap().blocks() * 512
     })
 }
 

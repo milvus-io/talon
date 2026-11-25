@@ -14,10 +14,7 @@ impl IndexedBlock {
             IndexedUnits::Paged(pages) => {
                 for (&page, entry) in pages.read().unwrap().iter() {
                     if entry.unit.access.admitted() {
-                        visit(
-                            UnitKind::Page(PageIndex(page)),
-                            entry.unit.allocated,
-                        );
+                        visit(UnitKind::Page(PageIndex(page)), entry.unit.allocated);
                     }
                 }
             }

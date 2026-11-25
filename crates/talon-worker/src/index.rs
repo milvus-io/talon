@@ -459,7 +459,10 @@ impl BlockIndex {
                             if let Ok(page) = u32::try_from(start.saturating_sub(2)) {
                                 let pages = pages.read().unwrap();
                                 consider(
-                                    pages.range(page..).next().map(|(&page, _)| u64::from(page) + 2),
+                                    pages
+                                        .range(page..)
+                                        .next()
+                                        .map(|(&page, _)| u64::from(page) + 2),
                                     pages.last_key_value().map(|(&page, _)| u64::from(page) + 2),
                                 );
                             }
@@ -937,9 +940,7 @@ impl BlockIndex {
         if !self.compact_enabled.load(Ordering::Relaxed) {
             return self.write_entry(id, |entry| write(entry, None));
         }
-        self.with_compact_block_write(id, |entry, slot, clock| {
-            write(entry, Some((slot, clock)))
-        })
+        self.with_compact_block_write(id, |entry, slot, clock| write(entry, Some((slot, clock))))
     }
 
     fn write_entry<T>(
@@ -2718,7 +2719,10 @@ mod tests {
             });
             assert_eq!(index.resident_bytes(), 4096);
             assert_eq!(index.page_count(), 1);
-            assert_eq!(index.compact.totals(), if compact { (4096, 1) } else { (0, 0) });
+            assert_eq!(
+                index.compact.totals(),
+                if compact { (4096, 1) } else { (0, 0) }
+            );
         }
     }
 

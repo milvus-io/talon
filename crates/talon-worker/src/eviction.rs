@@ -1220,8 +1220,9 @@ impl Lru {
                 let current = if let Some(ticket) = &candidate.compact {
                     g.index.compact_is_current(&candidate.unit, ticket)
                 } else {
-                    g.index.policy_get(&candidate.unit)
-                        .is_some_and(|entry| entry.pins == 0 && entry.revision == candidate.revision)
+                    g.index.policy_get(&candidate.unit).is_some_and(|entry| {
+                        entry.pins == 0 && entry.revision == candidate.revision
+                    })
                 };
                 if current {
                     g.remove(&candidate.unit);

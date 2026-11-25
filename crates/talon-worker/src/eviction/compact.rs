@@ -97,11 +97,7 @@ struct Operation {
     pins: u32,
 }
 
-fn update_active(
-    active: &mut Active,
-    address: Address,
-    update: impl FnOnce(&mut Operation),
-) {
+fn update_active(active: &mut Active, address: Address, update: impl FnOnce(&mut Operation)) {
     if let Some(operation) = active.get_mut(&address) {
         update(operation);
         if operation.pins == 0 && operation.selection.is_none() {
@@ -135,7 +131,11 @@ pub(crate) struct Pin {
 
 impl Drop for Pin {
     fn drop(&mut self) {
-        release(&mut self.active.lock().unwrap(), self.address, Some(self.generation));
+        release(
+            &mut self.active.lock().unwrap(),
+            self.address,
+            Some(self.generation),
+        );
     }
 }
 
@@ -191,13 +191,17 @@ impl CompactPolicy {
     }
 
     pub fn pins(&self, slot: usize, kind: UnitKind) -> u32 {
-        self.active.lock().unwrap()
+        self.active
+            .lock()
+            .unwrap()
             .get(&(slot, kind.order()))
             .map_or(0, |op| op.pins)
     }
 
     pub fn block_pins(&self, slot: usize) -> usize {
-        self.active.lock().unwrap()
+        self.active
+            .lock()
+            .unwrap()
             .range(block_addresses(slot))
             .map(|(_, op)| op.pins as usize)
             .sum()
@@ -230,7 +234,11 @@ impl CompactPolicy {
     }
 
     pub fn invalidate_block(&self, slot: usize) {
-        self.active.lock().unwrap().extract_if(block_addresses(slot), |_, _| true).for_each(drop);
+        self.active
+            .lock()
+            .unwrap()
+            .extract_if(block_addresses(slot), |_, _| true)
+            .for_each(drop);
     }
 
     pub fn select(
