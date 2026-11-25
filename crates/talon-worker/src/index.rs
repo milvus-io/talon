@@ -1085,16 +1085,15 @@ impl BlockIndex {
     }
 
     /// Page protection is acquired through the existing index/token lookup.
-    /// No block lifecycle lock or second page-table lookup is needed. The single
-    /// page case keeps its guard inline and does not allocate a vector buffer.
+    /// One ticket protects the entire resident range through the disk read.
     pub(crate) fn page_reads_and_touch(
         self: &Arc<Self>,
         id: &BlockId,
         start: PageIndex,
         end: PageIndex,
-    ) -> Option<(PageReadGuard, Vec<PageReadGuard>)> {
+    ) -> Option<PageReadGuard> {
         self.page_reads_and_touch_at(id, start, end)
-            .map(|(_, first, tail)| (first, tail))
+            .map(|(_, read)| read)
     }
 
     pub(crate) fn page_reads_and_touch_at(
@@ -1102,7 +1101,7 @@ impl BlockIndex {
         id: &BlockId,
         start: PageIndex,
         end: PageIndex,
-    ) -> Option<(Option<DiskId>, PageReadGuard, Vec<PageReadGuard>)> {
+    ) -> Option<(Option<DiskId>, PageReadGuard)> {
         if start.0 >= end.0 {
             return None;
         }
@@ -1111,9 +1110,7 @@ impl BlockIndex {
         }
         // On a partial range miss, release acquired guards only after all
         // directory, entry and page locks have gone out of scope.
-        let first;
-        let mut tail = Vec::new();
-        let disk_id = {
+        let (disk_id, read) = {
             let entries = self.entries.read().unwrap();
             let slot = entries.slot(id)?;
             let (_, directory) = entries.at(slot)?;
@@ -1123,7 +1120,7 @@ impl BlockIndex {
                 return None;
             };
             let pages = pages.read().unwrap();
-            let acquire = |page| {
+            let rows = (start.0..end.0).map_while(|page| {
                 let row = pages.get(&page)?;
                 let access = directory
                     .legacy
@@ -1133,20 +1130,17 @@ impl BlockIndex {
                 {
                     return None;
                 }
-                let guard = PageReadGuard::acquire(self, slot, page, &row.state)?;
-                row.unit.access.touch(entries.clock(slot));
+                Some((&row.state, (&row.unit, access)))
+            });
+            let read = PageReadGuard::acquire(self, slot, start.0, rows, |_, (unit, access)| {
+                unit.access.touch(entries.clock(slot));
                 if let Some(access) = access {
                     access.touch();
                 }
-                Some(guard)
-            };
-            first = acquire(start.0)?;
-            for page in start.0 + 1..end.0 {
-                tail.push(acquire(page)?);
-            }
-            block.meta.disk_id
+            })?;
+            (block.meta.disk_id, read)
         };
-        Some((disk_id, first, tail))
+        read.covers(end.0 - start.0).then_some((disk_id, read))
     }
 
     /// Startup only, before serving or starting maintenance. Attach policy
@@ -1694,14 +1688,14 @@ impl BlockIndex {
                         clock.store(0, Ordering::Relaxed);
                     }
                 }
-                let retry = pages.forget_page(page.0);
+                let flags = pages.forget_page(page.0);
                 pages.remove(&page.0);
                 self.page_work.removed_page(
                     &entry.meta.id,
                     cursor,
                     page.0,
                     entry.charged_pages == 0,
-                    retry,
+                    flags,
                     attached,
                 );
                 self.replace_bytes(bytes, 0);
@@ -2426,7 +2420,7 @@ mod tests {
 
             let mut candidates = lru.block_candidates(&paged);
             assert_eq!(index.compact.active_units(), 2);
-            let (reader, _) = index
+            let reader = index
                 .page_reads_and_touch(&paged, PageIndex(0), PageIndex(1))
                 .unwrap();
             assert!(!lru.candidate_is_current(&candidates[0]));
@@ -2509,7 +2503,7 @@ mod tests {
         let lru = index.restore_lru();
         let unit = CacheUnit::Page(id.clone(), PageIndex(0));
         let old = lru.insert(unit.clone(), 4096);
-        let (reader, _) = index
+        let reader = index
             .page_reads_and_touch(&id, PageIndex(0), PageIndex(1))
             .unwrap();
         let life = crate::page_lifecycle::PageLifecycle::with_index(index.clone(), false);

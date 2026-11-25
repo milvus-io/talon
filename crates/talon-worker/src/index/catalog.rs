@@ -43,30 +43,32 @@ impl BlockIndex {
         id: &BlockId,
         start: PageIndex,
         end: PageIndex,
-    ) -> Option<(Option<DiskId>, PageReadGuard, Vec<PageReadGuard>)> {
+    ) -> Option<(Option<DiskId>, PageReadGuard)> {
         // Drop any partially acquired range after releasing the directory lock.
-        let first;
-        let mut tail = Vec::new();
-        let disk_id = {
+        let (disk_id, read) = {
             let entries = self.entries.read().unwrap();
             let slot = entries.slot(id)?;
             let (_, geometry, _) = entries.resident_at(slot)?;
-            let mut rows = geometry.page_rows_from(start.0, entries.inline_age(slot));
-            let mut acquire = |page| {
-                let (found, row) = rows.next()?;
-                if found != page {
-                    return None;
-                }
-                let guard = PageReadGuard::acquire(self, slot, page, row.state)?;
-                row.state.touch(entries.clock(slot));
-                Some(guard)
+            let touch = |state: &crate::page_lifecycle::PageWord, ()| {
+                state.touch(entries.clock(slot));
             };
-            first = acquire(start.0)?;
-            for page in start.0 + 1..end.0 {
-                tail.push(acquire(page)?);
+            if start.0 + 1 == end.0 {
+                let row = geometry.page_row(start.0, None)?;
+                let read = PageReadGuard::acquire(
+                    self,
+                    slot,
+                    start.0,
+                    std::iter::once((row.state, ())),
+                    touch,
+                )?;
+                return Some((geometry.disk_id, read));
             }
-            geometry.disk_id
+            let rows = (start.0..end.0)
+                .zip(geometry.page_rows_from(start.0, entries.inline_age(slot)))
+                .map_while(|(want, (found, row))| (want == found).then_some((row.state, ())));
+            let read = PageReadGuard::acquire(self, slot, start.0, rows, touch)?;
+            (geometry.disk_id, read)
         };
-        Some((disk_id, first, tail))
+        read.covers(end.0 - start.0).then_some((disk_id, read))
     }
 }

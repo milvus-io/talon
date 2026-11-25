@@ -221,16 +221,13 @@ impl WorkerRuntime {
         let page_size = u64::from(paged.page_size());
         let first = PageIndex((offset / page_size) as u32);
         let end = PageIndex((offset + len).div_ceil(page_size) as u32);
-        let Some((first_guard, guards)) = self.index.page_reads_and_touch(block, first, end) else {
+        let Some(read) = self.index.page_reads_and_touch(block, first, end) else {
             return false;
         };
         // Preserve read/delete arbitration and access tracking. No guard crosses
         // a wait for the payload budget, including for partially resident ranges.
         let now = self.page_access_time();
-        first_guard.record_access_and_release(now);
-        for guard in guards {
-            guard.record_access_and_release(now);
-        }
+        read.record_access_and_release(now);
         self.record_l2_hit();
         true
     }

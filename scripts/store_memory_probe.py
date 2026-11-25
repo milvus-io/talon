@@ -13,7 +13,7 @@ TYPES = {
     "index.rs": ["DirectoryEntry", "LegacyPolicy", "Entry", "IndexedBlock", "ResidentMeta", "IndexedUnits", "UnitSlot", "PageUnit", "Option<PolicyState>", "Option<AccessHandle>", "RwLock<UnitSlot>"],
     "eviction.rs": ["SharedUnit", "AccessHandle", "Access", "PolicyState", "LegacyBlockActivity", "Inner"],
     "page_lifecycle.rs": ["PageWord", "PageAge", "PageEntry", "PageRows", "PageReadGuard", "PageMutationGate", "PageWork", "DirtyGroup", "CheckpointShard", "talon_core::BlockId", "talon_core::ObjectId"],
-    "catalog/rows.rs": ["BlockRow", "Option<BlockRow>", "BlockRows", "Geometry", "Pages", "InlinePage", "CompactPage", "PageRows", "SharedPages"],
+    "catalog/rows.rs": ["BlockRow", "Option<BlockRow>", "BlockRows", "Geometry", "Pages", "InlinePage", "CompactPage", "PageRows", "SharedPages", "ChunkedPages"],
     "index/directory.rs": ["Directory", "CatalogRevisions", "AtomicU64", "u32"],
     "fd_cache.rs": ["CachedFd", "Shard", "(PathBuf, CachedFd)", "OwnedFd"],
     "runtime.rs": ["CachedVersion", "(ObjectId, CachedVersion)", "crate::WholeBlockStore", "crate::PagedBlockStore"],
@@ -44,8 +44,9 @@ impl BlockRows {
         let mut states = (0, 0);
         let mut ages = (0, 0);
         let mut shared = 0;
+        let mut chunked = 0;
         for (_, row) in self.iter() {
-            if let Pages::Multiple(pages) = &row.geometry.pages {
+            let mut record = |pages: &SharedPages| {
                 shared += 1;
                 let geometry = match &pages.rows {
                     PageRows::Compact(rows) => (&mut compact, rows.len(), rows.capacity()),
@@ -57,6 +58,16 @@ impl BlockRows {
                 states.1 += pages.states.capacity();
                 ages.0 += pages.ages.len();
                 ages.1 += pages.ages.capacity();
+            };
+            match &row.geometry.pages {
+                Pages::Multiple(pages) => record(pages),
+                Pages::Chunked(pages) => {
+                    chunked += 1;
+                    for chunk in pages.chunks.values() {
+                        record(chunk);
+                    }
+                }
+                _ => {}
             }
         }
         eprintln!("COMPONENT|slabs|{}|{}|{}", self.slabs.len(), self.slabs.capacity(), SLAB_ROWS);
@@ -64,6 +75,7 @@ impl BlockRows {
         eprintln!("COMPONENT|free_handles|{}|{}", self.free.len(), self.free.capacity());
         eprintln!("COMPONENT|whole_overlap|{}|{}", self.whole_overlap.len(), self.whole_overlap.capacity());
         eprintln!("COMPONENT|shared_page_headers|{shared}");
+        eprintln!("COMPONENT|chunked_page_headers|{chunked}");
         for (name, (len, capacity)) in [
             ("compact_page_rows", compact),
             ("wide_page_rows", wide),

@@ -12,6 +12,14 @@ use talon_core::PageIndex;
 const SLAB_ROWS: usize = 256;
 const OCCUPANCY_WORDS: usize = SLAB_ROWS / u64::BITS as usize;
 const SECTOR: u64 = 512;
+// A large block allocates only populated chunks. An insertion or removal
+// shifts at most PAGE_CHUNK - 1 rows, independent of the block's page count.
+const PAGE_CHUNK: usize = 256;
+
+fn page_chunk(index: u32) -> (u32, u32) {
+    let local = index % PAGE_CHUNK as u32;
+    (index - local, local)
+}
 
 #[derive(Clone)]
 pub(crate) struct BlockRow {
@@ -63,6 +71,7 @@ enum Pages {
         state: PageWord,
     },
     Multiple(Arc<SharedPages>),
+    Chunked(Arc<ChunkedPages>),
 }
 
 #[derive(Clone, Copy)]
@@ -121,6 +130,110 @@ struct SharedPages {
     // Snapshot serialization reads only the geometry.
     states: Vec<PageWord>,
     ages: Vec<PageAge>,
+}
+
+#[derive(Clone)]
+struct ChunkedPages {
+    len: u32,
+    count: usize,
+    track_ages: bool,
+    chunks: BTreeMap<u32, Arc<SharedPages>>,
+}
+
+impl ChunkedPages {
+    fn new(pages: &SharedPages) -> Self {
+        let mut result = Self {
+            len: pages.len,
+            count: pages.states.len(),
+            track_ages: !pages.ages.is_empty(),
+            chunks: BTreeMap::new(),
+        };
+        for at in 0..pages.states.len() {
+            let (index, bytes) = pages.rows.at(at);
+            let (base, local) = page_chunk(index);
+            let chunk = result
+                .chunks
+                .entry(base)
+                .or_insert_with(|| Arc::new(SharedPages::empty(0)));
+            Arc::get_mut(chunk)
+                .unwrap()
+                .push(local, bytes, pages.row(at));
+        }
+        result
+    }
+
+    fn chunks_from(&self, start: u32) -> impl Iterator<Item = (u32, &SharedPages, usize)> {
+        let (start_base, local) = page_chunk(start);
+        self.chunks.range(start_base..).map(move |(&base, chunk)| {
+            let first = if base == start_base {
+                chunk.lower_bound(local)
+            } else {
+                0
+            };
+            (base, chunk.as_ref(), first)
+        })
+    }
+}
+
+impl SharedPages {
+    fn empty(len: u32) -> Self {
+        Self {
+            len,
+            rows: PageRows::Compact(Vec::new()),
+            states: Vec::new(),
+            ages: Vec::new(),
+        }
+    }
+
+    fn row(&self, at: usize) -> PageRow<'_> {
+        PageRow {
+            state: &self.states[at],
+            age: self.ages.get(at),
+        }
+    }
+
+    fn lower_bound(&self, start: u32) -> usize {
+        self.rows.position(start).unwrap_or_else(|at| at)
+    }
+
+    fn push(&mut self, index: u32, bytes: u64, row: PageRow<'_>) {
+        self.rows.put(Err(self.states.len()), index, bytes);
+        self.states.push(row.state.clone());
+        if let Some(age) = row.age {
+            self.ages.push(age.clone());
+        }
+    }
+
+    fn put(&mut self, index: u32, bytes: u64, track_ages: bool) -> bool {
+        let position = self.rows.position(index);
+        self.rows.put(position, index, bytes);
+        if let Err(at) = position {
+            self.states.insert(at, PageWord::default());
+            if track_ages {
+                self.ages.insert(at, PageAge::unknown());
+            }
+        }
+        position.is_err()
+    }
+
+    fn remove(&mut self, at: usize) {
+        self.rows.remove(at);
+        remove_row(&mut self.states, at);
+        if !self.ages.is_empty() {
+            remove_row(&mut self.ages, at);
+        }
+    }
+
+    fn enable_ages(&mut self) {
+        if self.ages.is_empty() {
+            self.ages = (0..self.states.len()).map(|_| PageAge::unknown()).collect();
+        }
+    }
+
+    fn reset_states(&mut self) {
+        self.states.fill_with(PageWord::default);
+        self.ages = Vec::new();
+    }
 }
 
 #[derive(Clone)]
@@ -240,6 +353,7 @@ impl Geometry {
             Pages::Whole { len, .. } | Pages::Inline { len, .. } => *len,
             Pages::WholeWide(pair) => pair.0,
             Pages::Multiple(pages) => pages.len,
+            Pages::Chunked(pages) => pages.len,
         })
     }
 
@@ -248,35 +362,41 @@ impl Geometry {
             Pages::Empty => 0,
             Pages::Whole { .. } | Pages::WholeWide(_) | Pages::Inline { .. } => 1,
             Pages::Multiple(pages) => pages.states.len(),
+            Pages::Chunked(pages) => pages.count,
         }
     }
 
     pub fn pages_after(&self, after: Option<u32>) -> impl Iterator<Item = (u32, u64)> + '_ {
-        let (one, multiple) = match &self.pages {
-            Pages::Empty => (None, None),
+        let start = after.map_or(Some(0), |page| page.checked_add(1));
+        let (one, multiple, chunked) = match &self.pages {
+            Pages::Empty => (None, None, None),
             Pages::Whole { sectors, .. } => (
                 after.is_none().then_some((0, u64::from(*sectors) * SECTOR)),
                 None,
+                None,
             ),
-            Pages::WholeWide(pair) => (after.is_none().then_some((0, pair.1)), None),
-            Pages::Inline { page, .. } => {
-                let (index, bytes) = page.unpack();
-                (
-                    after
-                        .map_or(true, |last| index > last)
-                        .then_some((index, bytes)),
-                    None,
-                )
-            }
-            Pages::Multiple(pages) => (None, Some(pages)),
+            Pages::WholeWide(pair) => (after.is_none().then_some((0, pair.1)), None, None),
+            Pages::Inline { page, .. } => (
+                start
+                    .filter(|&start| page.index() >= start)
+                    .map(|_| page.unpack()),
+                None,
+                None,
+            ),
+            Pages::Multiple(pages) => (None, start.map(|start| (pages.as_ref(), start)), None),
+            Pages::Chunked(pages) => (None, None, start.map(|start| (pages.as_ref(), start))),
         };
         one.into_iter()
-            .chain(multiple.into_iter().flat_map(move |pages| {
-                let start = after.map_or(0, |index| match pages.rows.position(index) {
-                    Ok(at) => at + 1,
-                    Err(at) => at,
-                });
-                (start..pages.states.len()).map(|at| pages.rows.at(at))
+            .chain(multiple.into_iter().flat_map(|(pages, start)| {
+                (pages.lower_bound(start)..pages.states.len()).map(|at| pages.rows.at(at))
+            }))
+            .chain(chunked.into_iter().flat_map(|(pages, start)| {
+                pages.chunks_from(start).flat_map(|(base, chunk, first)| {
+                    (first..chunk.states.len()).map(move |at| {
+                        let (local, bytes) = chunk.rows.at(at);
+                        (base + local, bytes)
+                    })
+                })
             }))
     }
 
@@ -286,13 +406,28 @@ impl Geometry {
             Pages::Whole { .. } | Pages::WholeWide(_) => 0,
             Pages::Inline { page, .. } => page.index(),
             Pages::Multiple(pages) => pages.rows.at(pages.states.len() - 1).0,
+            Pages::Chunked(pages) => {
+                let (&base, chunk) = pages.chunks.last_key_value().unwrap();
+                base + chunk.rows.at(chunk.states.len() - 1).0
+            }
         }
     }
 
     pub fn allocation(&self, page: u32) -> Option<u64> {
-        self.pages_after(page.checked_sub(1))
-            .next()
-            .and_then(|(index, bytes)| (index == page).then_some(bytes))
+        match &self.pages {
+            Pages::Empty => None,
+            Pages::Whole { sectors, .. } => (page == 0).then_some(u64::from(*sectors) * SECTOR),
+            Pages::WholeWide(pair) => (page == 0).then_some(pair.1),
+            Pages::Inline { page: resident, .. } => {
+                (page == resident.index()).then(|| resident.unpack().1)
+            }
+            Pages::Multiple(pages) => Some(pages.rows.at(pages.rows.position(page).ok()?).1),
+            Pages::Chunked(pages) => {
+                let (base, local) = page_chunk(page);
+                let chunk = pages.chunks.get(&base)?;
+                Some(chunk.rows.at(chunk.rows.position(local).ok()?).1)
+            }
+        }
     }
 
     pub(crate) fn policy_state(&self, kind: UnitKind) -> Option<&PageWord> {
@@ -332,12 +467,11 @@ impl Geometry {
                 state,
                 age: inline_age,
             }),
-            Pages::Multiple(pages) => {
-                let at = pages.rows.position(page).ok()?;
-                Some(PageRow {
-                    state: &pages.states[at],
-                    age: pages.ages.get(at),
-                })
+            Pages::Multiple(pages) => Some(pages.row(pages.rows.position(page).ok()?)),
+            Pages::Chunked(pages) => {
+                let (base, local) = page_chunk(page);
+                let chunk = pages.chunks.get(&base)?;
+                Some(chunk.row(chunk.rows.position(local).ok()?))
             }
             _ => None,
         }
@@ -348,7 +482,7 @@ impl Geometry {
         start: u32,
         inline_age: Option<&'a PageAge>,
     ) -> impl Iterator<Item = (u32, PageRow<'a>)> {
-        let (one, many) = match &self.pages {
+        let (one, many, chunked) = match &self.pages {
             Pages::Inline { page, state, .. } if page.index() >= start => (
                 Some((
                     page.index(),
@@ -358,32 +492,34 @@ impl Geometry {
                     },
                 )),
                 None,
+                None,
             ),
-            Pages::Multiple(pages) => (None, Some(pages)),
-            _ => (None, None),
+            Pages::Multiple(pages) => (None, Some(pages), None),
+            Pages::Chunked(pages) => (None, None, Some(pages)),
+            _ => (None, None, None),
         };
         one.into_iter()
             .chain(many.into_iter().flat_map(move |pages| {
-                let first = pages.rows.position(start).unwrap_or_else(|at| at);
-                (first..pages.states.len()).map(|at| {
-                    (
-                        pages.rows.at(at).0,
-                        PageRow {
-                            state: &pages.states[at],
-                            age: pages.ages.get(at),
-                        },
-                    )
+                (pages.lower_bound(start)..pages.states.len())
+                    .map(|at| (pages.rows.at(at).0, pages.row(at)))
+            }))
+            .chain(chunked.into_iter().flat_map(move |pages| {
+                pages.chunks_from(start).flat_map(|(base, chunk, first)| {
+                    (first..chunk.states.len())
+                        .map(move |at| (base + chunk.rows.at(at).0, chunk.row(at)))
                 })
             }))
     }
 
     pub(crate) fn enable_page_ages(&mut self) {
         match &mut self.pages {
-            Pages::Multiple(pages) if pages.ages.is_empty() => {
+            Pages::Multiple(pages) if pages.ages.is_empty() => Arc::make_mut(pages).enable_ages(),
+            Pages::Chunked(pages) if !pages.track_ages => {
                 let pages = Arc::make_mut(pages);
-                pages.ages = (0..pages.states.len())
-                    .map(|_| PageAge::unknown())
-                    .collect();
+                pages.track_ages = true;
+                for chunk in pages.chunks.values_mut() {
+                    Arc::make_mut(chunk).enable_ages();
+                }
             }
             _ => {}
         }
@@ -392,10 +528,13 @@ impl Geometry {
     pub(crate) fn reset_page_states(&mut self) {
         match &mut self.pages {
             Pages::Inline { state, .. } => *state = PageWord::default(),
-            Pages::Multiple(pages) => {
+            Pages::Multiple(pages) => Arc::make_mut(pages).reset_states(),
+            Pages::Chunked(pages) => {
                 let pages = Arc::make_mut(pages);
-                pages.states.fill_with(PageWord::default);
-                pages.ages = Vec::new();
+                pages.track_ages = false;
+                for chunk in pages.chunks.values_mut() {
+                    Arc::make_mut(chunk).reset_states();
+                }
             }
             _ => {}
         }
@@ -425,41 +564,78 @@ impl Geometry {
                 ages: inline_age.map_or_else(Vec::new, |age| start_pair(age.clone())),
             }));
         }
-        let Pages::Multiple(pages) = &mut self.pages else {
-            unreachable!()
-        };
-        let pages = Arc::make_mut(pages);
-        pages.len = len;
-        let position = pages.rows.position(index);
-        pages.rows.put(position, index, bytes);
-        if let Err(at) = position {
-            pages.states.insert(at, PageWord::default());
-            if !pages.ages.is_empty() {
-                pages.ages.insert(at, PageAge::unknown());
+        if let Pages::Multiple(pages) = &self.pages {
+            if pages.states.len() == PAGE_CHUNK && pages.rows.position(index).is_err() {
+                self.pages = Pages::Chunked(Arc::new(ChunkedPages::new(pages)));
             }
+        }
+        match &mut self.pages {
+            Pages::Multiple(pages) => {
+                let pages = Arc::make_mut(pages);
+                pages.len = len;
+                pages.put(index, bytes, !pages.ages.is_empty());
+            }
+            Pages::Chunked(pages) => {
+                let pages = Arc::make_mut(pages);
+                let (base, local) = page_chunk(index);
+                let chunk = pages
+                    .chunks
+                    .entry(base)
+                    .or_insert_with(|| Arc::new(SharedPages::empty(0)));
+                pages.len = len;
+                pages.count +=
+                    usize::from(Arc::make_mut(chunk).put(local, bytes, pages.track_ages));
+            }
+            _ => unreachable!(),
         }
     }
 
     /// Return true when the block has no remaining pages.
     pub fn remove_page(&mut self, index: u32, inline_age: Option<&mut PageAge>) -> bool {
+        if let Pages::Chunked(pages) = &mut self.pages {
+            let pages = Arc::make_mut(pages);
+            let (base, local) = page_chunk(index);
+            let std::collections::btree_map::Entry::Occupied(mut entry) = pages.chunks.entry(base)
+            else {
+                return false;
+            };
+            let Ok(at) = entry.get().rows.position(local) else {
+                return false;
+            };
+            let chunk = Arc::make_mut(entry.get_mut());
+            chunk.remove(at);
+            if chunk.states.is_empty() {
+                entry.remove();
+            }
+            pages.count -= 1;
+            // Hysteresis prevents a fill/delete near the promotion threshold
+            // from repeatedly converting the entire block.
+            if pages.count == PAGE_CHUNK / 2 {
+                let mut compact = SharedPages::empty(pages.len);
+                for (base, chunk, first) in pages.chunks_from(0) {
+                    for at in first..chunk.states.len() {
+                        let (local, bytes) = chunk.rows.at(at);
+                        compact.push(base + local, bytes, chunk.row(at));
+                    }
+                }
+                self.pages = Pages::Multiple(Arc::new(compact));
+            }
+            return false;
+        }
         if let Pages::Inline { page, .. } = self.pages {
             return page.index() == index;
         }
         let Pages::Multiple(pages) = &mut self.pages else {
             unreachable!()
         };
-        let pages = Arc::make_mut(pages);
         let Ok(at) = pages.rows.position(index) else {
             return false;
         };
         if pages.states.len() == 1 {
             return true;
         }
-        pages.rows.remove(at);
-        remove_row(&mut pages.states, at);
-        if !pages.ages.is_empty() {
-            remove_row(&mut pages.ages, at);
-        }
+        let pages = Arc::make_mut(pages);
+        pages.remove(at);
         if pages.states.len() == 1 {
             let (index, bytes) = pages.rows.at(0);
             if let Some(page) = InlinePage::new(index, bytes) {
@@ -754,6 +930,35 @@ impl BlockRows {
 mod tests {
     use super::*;
     use talon_core::{Backend, BlockId, ObjectId, Version};
+
+    #[test]
+    fn descending_fills_keep_edits_within_one_bounded_chunk() {
+        const COUNT: u32 = 65_536;
+        const LEN: u64 = COUNT as u64 * 4096;
+        let mut row = Geometry::new(StoreKind::Paged, None, LEN, COUNT - 1, 4096);
+        for page in (0..COUNT - 1).rev() {
+            row.put(LEN, page, 4096, None);
+        }
+        let Pages::Chunked(chunks) = &row.pages else {
+            panic!("large block stayed flat")
+        };
+        assert_eq!(chunks.chunks.len(), COUNT as usize / PAGE_CHUNK);
+        for chunk in chunks.chunks.values() {
+            let PageRows::Compact(rows) = &chunk.rows else {
+                panic!("dense chunk widened")
+            };
+            assert_eq!(rows.len(), PAGE_CHUNK);
+            assert_eq!(rows.capacity(), PAGE_CHUNK);
+            assert_eq!(chunk.states.capacity(), PAGE_CHUNK);
+            assert!(chunk.ages.is_empty());
+        }
+        for page in 0..COUNT - (PAGE_CHUNK / 2) as u32 {
+            assert!(!row.remove_page(page, None));
+        }
+        assert!(matches!(row.pages, Pages::Multiple(_)));
+        assert_eq!(row.page_count(), PAGE_CHUNK / 2);
+        assert_eq!(row.allocation(COUNT - 1), Some(4096));
+    }
 
     #[test]
     fn inline_layout_and_sparse_wide_page_roundtrip() {

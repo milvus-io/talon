@@ -1080,7 +1080,7 @@ impl WorkerRuntime {
                             .page_reads_and_touch_at(&block, first, PageIndex(last.0 + 1))
                     })
                     .flatten();
-                if let Some((disk_id, first_guard, guards)) = state {
+                if let Some((disk_id, read)) = state {
                     match paged
                         .get_range_at(&block, disk_id, offset_in_block, request.len)
                         .await
@@ -1092,10 +1092,7 @@ impl WorkerRuntime {
                             // eviction, so fall through and re-fetch.
                             if served == request.len {
                                 let now = self.page_access_time();
-                                first_guard.record_access_and_release(now);
-                                for guard in guards {
-                                    guard.record_access_and_release(now);
-                                }
+                                read.record_access_and_release(now);
                                 self.metrics.record_l2_hit();
                                 talon_telemetry::cache_tier("l2");
                                 self.metrics.record_cache_hit();
@@ -1742,7 +1739,7 @@ impl WorkerRuntime {
         page: PageIndex,
         block_len: u64,
     ) -> anyhow::Result<Option<bytes::Bytes>> {
-        let Some((disk_id, access, _)) =
+        let Some((disk_id, access)) =
             self.index
                 .page_reads_and_touch_at(block, page, PageIndex(page.0 + 1))
         else {

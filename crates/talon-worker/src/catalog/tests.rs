@@ -54,6 +54,135 @@ fn repeated_whole_put_preserves_canonical_identity() {
 }
 
 #[test]
+fn descending_large_page_map_roundtrips_a_frozen_snapshot() {
+    const PAGE: u32 = 4096;
+    const BLOCK: u32 = 256 << 20;
+    const COUNT: u32 = BLOCK / PAGE;
+    let mut state = State::default();
+    state
+        .apply(
+            1,
+            Record::PagedStore {
+                path: "paged".into(),
+                page_size: PAGE,
+            },
+        )
+        .unwrap();
+    let mut id = block(0);
+    id.block_size = BLOCK + 2 * PAGE;
+    let disk_id = Some(DiskId::new(2, 0).unwrap());
+    let put = |directory: &mut crate::index::Directory, page, bytes| {
+        directory.apply(
+            &id,
+            StoreKind::Paged,
+            &Operation::Put {
+                page,
+                len: u64::from(BLOCK),
+            },
+            disk_id,
+            Some(bytes),
+        );
+    };
+    {
+        let mut directory = state.live.directory.write().unwrap();
+        for page in (0..COUNT).rev() {
+            put(&mut directory, page, u64::from(PAGE));
+        }
+        put(&mut directory, COUNT + 1, u64::MAX);
+    }
+    let frozen = state.snapshot().unwrap();
+    {
+        let mut directory = state.live.directory.write().unwrap();
+        directory.apply(
+            &id,
+            StoreKind::Paged,
+            &Operation::DeletePage { page: 255 },
+            disk_id,
+            Some(0),
+        );
+        put(&mut directory, 256, 2 * u64::from(PAGE));
+        let live = directory.store_geometry(StoreKind::Paged, &id).unwrap();
+        assert_eq!(live.allocation(255), None);
+        assert_eq!(live.allocation(256), Some(8192));
+    }
+    let mut restored = State::default();
+    for bytes in frozen {
+        restored
+            .restore(State::decode_snapshot(&bytes.unwrap()).unwrap())
+            .unwrap();
+    }
+    let directory = restored.live.directory.read().unwrap();
+    let row = directory.store_geometry(StoreKind::Paged, &id).unwrap();
+    assert_eq!(row.page_count(), COUNT as usize + 1);
+    assert_eq!(row.last_page(), COUNT + 1);
+    assert_eq!(row.disk_id, disk_id);
+    assert!(row.pages_after(None).eq((0..COUNT)
+        .map(|page| (page, 4096))
+        .chain([(COUNT + 1, u64::MAX)])));
+    assert!(row
+        .pages_after(Some(COUNT - 2))
+        .eq([(COUNT - 1, 4096), (COUNT + 1, u64::MAX)]));
+}
+
+#[test]
+fn range_release_skips_replaced_pages_and_keeps_overlapping_pins() {
+    let mut id = block(0);
+    id.block_size = 4096 * 512;
+    let directory = Arc::new(std::sync::RwLock::new(crate::index::Directory::default()));
+    directory.write().unwrap().attach(4096);
+    let index = Arc::new(crate::BlockIndex::from_catalog(directory.clone()));
+    let lifecycle = crate::page_lifecycle::PageLifecycle::with_index(index.clone(), true);
+    let put = |page| {
+        directory.write().unwrap().apply(
+            &id,
+            StoreKind::Paged,
+            &Operation::Put {
+                page,
+                len: u64::from(id.block_size),
+            },
+            None,
+            Some(4096),
+        );
+    };
+    for page in 2..258 {
+        put(page);
+    }
+    let block = lifecycle.block(&id);
+    let old = index
+        .page_reads_and_touch(&id, PageIndex(254), PageIndex(258))
+        .unwrap();
+    put(0); // Moves held rows from the flat arrays into chunks.
+    for page in 254..258 {
+        assert!(block.candidate(PageIndex(page)).is_none());
+    }
+    directory.write().unwrap().apply(
+        &id,
+        StoreKind::Paged,
+        &Operation::DeletePage { page: 255 },
+        None,
+        Some(0),
+    );
+    put(255);
+    let overlap = index
+        .page_reads_and_touch(&id, PageIndex(255), PageIndex(257))
+        .unwrap();
+    old.record_access_and_release(Some(10));
+    assert_eq!(block.last_access(254), Some(10));
+    assert_eq!(block.last_access(255), None);
+    assert_eq!(block.last_access(256), Some(10));
+    assert_eq!(block.last_access(257), Some(10));
+    assert!(block.candidate(PageIndex(254)).is_some());
+    assert!(block.candidate(PageIndex(255)).is_none());
+    assert!(block.candidate(PageIndex(256)).is_none());
+    assert!(block.candidate(PageIndex(257)).is_some());
+    overlap.record_access_and_release(Some(20));
+    assert_eq!(block.last_access(255), Some(20));
+    assert_eq!(block.last_access(256), Some(20));
+    assert!(block.candidate(PageIndex(255)).is_some());
+    assert!(block.candidate(PageIndex(256)).is_some());
+}
+
+#[test]
 fn frozen_snapshot_preserves_pages_and_pending_transaction_ids() {
     let mut state = State::default();
     state
@@ -687,7 +816,7 @@ async fn catalog_page_pins_survive_row_moves_and_ignore_reused_slots() {
         .as_slice()
         .try_into()
         .unwrap();
-    let (_, old, _) = index
+    let (_, old) = index
         .page_reads_and_touch_at(&id, PageIndex(2), PageIndex(3))
         .unwrap();
 
