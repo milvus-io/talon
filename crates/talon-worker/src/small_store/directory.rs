@@ -8,7 +8,7 @@ use crate::small_store::key::{SmallIdentity, SmallKey};
 pub(crate) struct Directory {
     pub(super) catalog: LiveModel,
     slot: usize,
-    staged: Option<super::catalog::Address>,
+    staged: Option<(super::catalog::Address, u64)>,
     clock: usize,
     #[cfg(test)]
     before_relocation_publish: Option<Box<dyn FnOnce() + Send + Sync>>,
@@ -184,7 +184,7 @@ impl Directory {
         })
     }
     fn pending(&self, catalog: &Catalog, id: &dyn SmallIdentity) -> Option<usize> {
-        let slot = catalog.at(self.staged?)?;
+        let slot = catalog.at(self.staged?.0)?;
         catalog
             .matches(catalog.lookup.handle(slot), &super::key_codec::encode(id))
             .then_some(slot)
@@ -288,9 +288,10 @@ impl Directory {
         location: Location,
     ) -> Option<Location> {
         let address = (location.segment, location.offset);
+        let stored_len = location.stored_len();
         let old = self.stage_in(catalog, key.clone(), location);
         if let (Some(old), Some(ownership)) = (&old, &mut catalog.ownership) {
-            ownership.relocate((old.segment, old.offset), address);
+            ownership.relocate((old.segment, old.offset), address, stored_len);
         }
         #[cfg(test)]
         if let Some(pause) = self.before_relocation_publish.take() {
@@ -315,7 +316,7 @@ impl Directory {
             .files
             .insert(location.segment, location.file.clone());
         let address = (location.segment, location.offset);
-        self.staged = Some(address);
+        self.staged = Some((address, location.stored_len()));
         #[cfg(test)]
         if catalog.at(address).is_none() {
             catalog
@@ -377,10 +378,10 @@ impl Directory {
         }
         catalog.lookup.set_flags(slot, flags | VISIBLE);
         if admit {
-            let address = self.staged.expect("published small address");
+            let (address, stored_len) = self.staged.expect("published small address");
             catalog.publish_segment(address.0);
             if let Some(ownership) = &mut catalog.ownership {
-                ownership.admit(address);
+                ownership.admit(address, stored_len);
             }
         }
         self.staged = None;

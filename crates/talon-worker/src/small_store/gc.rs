@@ -43,12 +43,41 @@ pub(super) struct Ownership {
     next_retry: u64,
 }
 
+// Reservations can publish out of offset order. Adjacent published rows share
+// one range, and an unfinished reservation leaves a gap between ranges.
+#[derive(Clone, Default)]
+struct PublishedBytes(Vec<Range<u64>>);
+
+impl PublishedBytes {
+    fn include(&mut self, span: Range<u64>) {
+        let first = self.0.partition_point(|range| range.end < span.start);
+        let after = first + self.0[first..].partition_point(|range| range.start <= span.end);
+        if first == after {
+            self.0.insert(first, span);
+        } else {
+            self.0[first].start = self.0[first].start.min(span.start);
+            self.0[first].end = self.0[after - 1].end.max(span.end);
+            self.0.drain(first + 1..after);
+        }
+    }
+
+    fn ranges_from(&self, offset: u64) -> &[Range<u64>] {
+        &self.0[self.0.partition_point(|range| range.end <= offset)..]
+    }
+
+    fn contains(&self, offset: u64) -> bool {
+        self.ranges_from(offset)
+            .first()
+            .is_some_and(|range| range.start <= offset)
+    }
+}
+
 struct Admissions {
     first: u64,
     latest: u64,
-    end: u64,
+    published: PublishedBytes,
     // Freeze the published extent lazily on the first post-boundary mutation.
-    saved_end: Option<(u64, u64)>,
+    saved: Option<(u64, PublishedBytes)>,
     // Only segments that straddle a boundary need per-offset epoch metadata.
     exceptions: HashMap<u64, u64>,
 }
@@ -58,8 +87,8 @@ impl Admissions {
         Self {
             first: epoch,
             latest: epoch,
-            end: 0,
-            saved_end: None,
+            published: PublishedBytes::default(),
+            saved: None,
             exceptions: HashMap::new(),
         }
     }
@@ -68,15 +97,16 @@ impl Admissions {
         self.exceptions.get(&offset).copied().unwrap_or(self.first)
     }
 
-    fn end_at(&self, epoch: u64) -> u64 {
-        self.saved_end
-            .filter(|&(boundary, _)| boundary == epoch)
-            .map_or(self.end, |(_, end)| end)
+    fn saved_at(&self, epoch: u64) -> Option<&PublishedBytes> {
+        self.saved
+            .as_ref()
+            .filter(|(boundary, _)| *boundary == epoch)
+            .map(|(_, bytes)| bytes)
     }
 
-    fn insert(&mut self, offset: u64, epoch: u64) {
+    fn insert(&mut self, offset: u64, len: u64, epoch: u64) {
         self.latest = self.latest.max(epoch);
-        self.end = self.end.max(offset + 1);
+        self.published.include(offset..offset + len);
         if epoch != self.first {
             self.exceptions.insert(offset, epoch);
         }
@@ -88,15 +118,15 @@ impl Ownership {
         self.segments.get(&segment).map(|rows| rows.epoch(offset))
     }
 
-    pub fn admit(&mut self, address @ (segment, offset): Address) {
+    pub fn admit(&mut self, address @ (segment, offset): Address, len: u64) {
         let rows = self
             .segments
             .entry(segment)
             .or_insert_with(|| Admissions::new(self.epoch));
-        if rows.latest < self.epoch {
-            rows.saved_end = Some((self.epoch, rows.end));
+        if rows.latest < self.epoch && rows.saved_at(self.epoch).is_none() {
+            rows.saved = Some((self.epoch, rows.published.clone()));
         }
-        rows.insert(offset, self.epoch);
+        rows.insert(offset, len, self.epoch);
         self.remove_retry(address);
         self.dirty = true;
     }
@@ -108,23 +138,25 @@ impl Ownership {
         self.remove_retry(address);
     }
 
-    pub fn relocate(&mut self, old: Address, new: Address) {
+    pub fn relocate(&mut self, old: Address, new: Address, len: u64) {
         let source = &self.segments[&old.0];
         let epoch = source.epoch(old.1);
-        let prefix = source
-            .saved_end
-            .filter(|&(boundary, _)| boundary == self.epoch);
+        let captured = source
+            .saved_at(self.epoch)
+            .map(|bytes| bytes.contains(old.1));
         let rows = self
             .segments
             .entry(new.0)
             .or_insert_with(|| Admissions::new(epoch));
-        if let Some((boundary, end)) = prefix {
-            let (_, moved_end) = rows.saved_end.get_or_insert((boundary, 0));
-            if old.1 < end {
-                *moved_end = (*moved_end).max(new.1 + 1);
+        if let Some(captured) = captured {
+            let (_, bytes) = rows
+                .saved
+                .get_or_insert_with(|| (self.epoch, PublishedBytes::default()));
+            if captured {
+                bytes.include(new.1..new.1 + len);
             }
         }
-        rows.insert(new.1, epoch);
+        rows.insert(new.1, len, epoch);
         if let Some(id) = self.retry_ids.remove(&old) {
             self.retry_ids.insert(new, id);
             self.retries.insert(id, new);
@@ -314,7 +346,8 @@ impl SmallObjectStore {
                 .values()
                 .map(|&physical| {
                     let mut rows = Admissions::new(0);
-                    rows.end = catalog.segment(physical).unwrap().bytes;
+                    rows.published
+                        .include(0..catalog.segment(physical).unwrap().bytes);
                     (physical, rows)
                 })
                 .collect(),
@@ -420,37 +453,42 @@ impl SmallObjectStore {
             }
             let admissions = &ownership.segments[&physical];
             if admissions.latest >= first_epoch {
-                let end = admissions.end_at(limit.epoch);
                 let records = &catalog.segment(physical).unwrap().records;
-                let mut rows = (records.position(cursor.offset)..records.position(end))
-                    .map(|row| records.offset_at(row))
-                    .peekable();
-                let mut retired = catalog
-                    .retired_addresses
-                    .range((physical, cursor.offset.min(end))..(physical, end))
-                    .map(|(&(_, offset), _)| offset)
-                    .peekable();
-                while let Some(offset) =
-                    rows.peek().into_iter().chain(retired.peek()).min().copied()
-                {
-                    if budget == 0 {
-                        return (false, candidates);
-                    }
-                    budget -= 1;
-                    cursor.offset = offset + 1;
-                    if rows.peek() == Some(&offset) {
-                        rows.next();
-                    }
-                    if retired.peek() == Some(&offset) {
-                        retired.next();
-                    }
-                    if epochs.contains(&admissions.epoch(offset)) {
-                        if let Some(candidate) = catalog
-                            .ownership_candidate_at_if((physical, offset), |unit| {
-                                !owns(unit.block())
-                            })
-                        {
-                            candidates.push(candidate);
+                let published = admissions
+                    .saved_at(limit.epoch)
+                    .unwrap_or(&admissions.published);
+                for span in published.ranges_from(cursor.offset) {
+                    let start = span.start.max(cursor.offset);
+                    let mut rows = (records.position(start)..records.position(span.end))
+                        .map(|row| records.offset_at(row))
+                        .peekable();
+                    let mut retired = catalog
+                        .retired_addresses
+                        .range((physical, start)..(physical, span.end))
+                        .map(|(&(_, offset), _)| offset)
+                        .peekable();
+                    while let Some(offset) =
+                        rows.peek().into_iter().chain(retired.peek()).min().copied()
+                    {
+                        if budget == 0 {
+                            return (false, candidates);
+                        }
+                        budget -= 1;
+                        cursor.offset = offset + 1;
+                        if rows.peek() == Some(&offset) {
+                            rows.next();
+                        }
+                        if retired.peek() == Some(&offset) {
+                            retired.next();
+                        }
+                        if epochs.contains(&admissions.epoch(offset)) {
+                            if let Some(candidate) = catalog
+                                .ownership_candidate_at_if((physical, offset), |unit| {
+                                    !owns(unit.block())
+                                })
+                            {
+                                candidates.push(candidate);
+                            }
                         }
                     }
                 }
@@ -604,6 +642,73 @@ mod tests {
         }
         store.delete(&garbage).await.unwrap();
         store.policy().unwrap().remove(&CacheUnit::Whole(garbage));
+    }
+
+    #[tokio::test]
+    async fn ownership_event_skips_an_unfinished_reservation_through_relocation() {
+        let root = tempfile::tempdir().unwrap();
+        let store = compact_store(root.path());
+        store.init_ownership();
+        let garbage = block(100);
+        store
+            .put(&garbage, Bytes::from(vec![2; 96 << 10]))
+            .await
+            .unwrap();
+        let data = Bytes::from_static(b"packed");
+        store.put(&block(1), data.clone()).await.unwrap();
+        let late = block(0);
+        let expected = (1..=63)
+            .map(|n| CacheUnit::Whole(block(n)))
+            .collect::<Vec<_>>();
+        let check_event = |limit| {
+            let (done, rows) =
+                store
+                    .ownership_candidates(&mut OwnershipCursor::default(), 0, limit, 64, |_| false);
+            assert!(
+                done,
+                "the captured rows and segment header must fit in one slice"
+            );
+            assert_eq!(
+                rows.into_iter().map(|row| row.unit).collect::<Vec<_>>(),
+                expected
+            );
+        };
+
+        let pause = Arc::new(super::super::tests::AppendPause::default());
+        *store.streams()[0].append_pause.lock().unwrap() = Some(pause.clone());
+        let (write, limit) = tokio::join!(store.put(&late, data.clone()), async {
+            pause.entered.notified().await;
+            for n in 2..=63 {
+                store.put(&block(n), data.clone()).await.unwrap();
+            }
+            store.delete(&garbage).await.unwrap();
+            store.policy().unwrap().remove(&CacheUnit::Whole(garbage));
+            let limit = store.ownership_limit(true).unwrap();
+            check_event(limit);
+            pause.resume.notify_one();
+            limit
+        });
+        write.unwrap();
+        check_event(limit);
+        let source = store.lookup_entry(&late).unwrap().unwrap().segment();
+        assert!(store.maintain(true).await.unwrap());
+        assert_ne!(
+            store.lookup_entry(&late).unwrap().unwrap().segment(),
+            source
+        );
+        check_event(limit);
+
+        let supplement = store.ownership_limit(false).unwrap();
+        let (done, rows) = store.ownership_candidates(
+            &mut OwnershipCursor::default(),
+            limit.epoch,
+            supplement,
+            128,
+            |_| false,
+        );
+        assert!(done);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].unit, CacheUnit::Whole(late));
     }
 
     #[tokio::test]

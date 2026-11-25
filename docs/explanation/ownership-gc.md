@@ -62,10 +62,11 @@ admission revision. New data never expands an event's scan, including data writt
 between publication and delayed GC startup. A packed segment enters the scan
 order when its first row becomes visible. A writer that reserved a file earlier
 can therefore publish after the event without adding work to its scan. An
-already visible segment freezes its offset extent on the first later admission.
-When compaction moves the segment,
-the replacement keeps its logical scan position and the extent follows the
-surviving rows of the original prefix.
+already visible segment freezes its published byte ranges on the first later
+admission. Concurrent appends can finish out of order, leaving gaps for
+unfinished writes. The event skips those gaps even after their writes finish.
+Compaction retains the logical scan position and translates the captured
+ranges to the surviving rows in the replacement.
 
 A complete pass marks the generation converged once all selected misplaced entries
 have been reclaimed or superseded by a later admission and the generation remains

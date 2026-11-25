@@ -242,7 +242,7 @@ impl Catalog {
         self.lookup.set_flags(slot, flags | POLICY);
         if flags & VISIBLE != 0 {
             if let Some(ownership) = &mut self.ownership {
-                ownership.admit(address);
+                ownership.admit(address, stored_len);
             }
         }
         let mut entry = self.compact_entry(slot);
