@@ -10,10 +10,10 @@ SOURCE = ROOT / "crates/talon-worker/src"
 OUTPUT = ROOT / "target/memory-analysis/current"
 TYPES = {
     "block_key.rs": ["Packed", "BlockKey"],
-    "index.rs": ["DirectoryEntry", "PolicyUnits", "Entry", "IndexedBlock", "ResidentMeta", "IndexedUnits", "UnitSlot", "PageUnit", "Option<PolicyState>", "Option<AccessHandle>", "RwLock<UnitSlot>"],
+    "index.rs": ["DirectoryEntry", "PolicyUnits", "PolicyPages", "Entry", "IndexedBlock", "ResidentMeta", "IndexedUnits", "UnitSlot", "PageUnit", "Option<PolicyState>", "Option<AccessHandle>", "RwLock<UnitSlot>"],
     "eviction.rs": ["SharedUnit", "AccessHandle", "PageAccessSlot", "Access", "PolicyState", "BlockPolicy", "Inner"],
-    "page_lifecycle.rs": ["PageState", "PageAccess", "PageEntry", "BlockState", "BlockPages", "PageMutationGate", "BlockWork", "ShardWork", "Registry", "crate::page_table::PageMap", "RwLock<crate::page_table::PageMap>", "talon_core::BlockId", "talon_core::ObjectId"],
-    "catalog/rows.rs": ["BlockRow", "Option<BlockRow>", "BlockRows", "Geometry", "CompactPage", "PageRows"],
+    "page_lifecycle.rs": ["PageWord", "PageAge", "PageEntry", "PageRows", "PageReadGuard", "PageMutationGate", "PageWork", "DirtyGroup", "CheckpointShard", "talon_core::BlockId", "talon_core::ObjectId"],
+    "catalog/rows.rs": ["BlockRow", "Option<BlockRow>", "BlockRows", "Geometry", "Pages", "CompactPage", "PageRows", "SharedPages"],
     "index/directory.rs": ["Directory"],
     "fd_cache.rs": ["CachedFd", "Shard", "(PathBuf, CachedFd)", "OwnedFd"],
     "runtime.rs": ["CachedVersion", "(ObjectId, CachedVersion)", "crate::WholeBlockStore", "crate::PagedBlockStore"],
@@ -21,7 +21,7 @@ TYPES = {
 FIELDS = {
     "block_key.rs": {"Packed": "text bucket_end path_end offset block_size backend"},
     "index.rs": {
-        "DirectoryEntry": "resident lifecycle policy activity",
+        "DirectoryEntry": "resident policy activity",
         "IndexedBlock": "meta units charged_bytes charged_pages",
         "ResidentMeta": "id len page_size page_count",
         "UnitSlot": "resident allocated access policy",
@@ -31,11 +31,7 @@ FIELDS = {
         "PolicyState": "independent bytes revision pins",
         "BlockPolicy": "pins revision access",
     },
-    "page_lifecycle.rs": {
-        "PageState": "state recency access",
-        "PageEntry": "unit handle selection",
-        "PageAccess": "last_access dirty_since work",
-    },
+    "page_lifecycle.rs": {"PageEntry": "unit state", "PageRows": "rows ages"},
 }
 
 

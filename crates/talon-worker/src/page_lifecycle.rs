@@ -1,5 +1,6 @@
 //! Page residency and idle age. Disk operations never run under these locks.
 use crate::block_key::{BlockIdentity, BlockKey};
+use crate::catalog::Geometry;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -38,14 +39,6 @@ impl MutationGates {
         });
         active.insert(id.clone(), Arc::downgrade(&gate));
         gate
-    }
-
-    fn active(&self, id: &BlockKey) -> bool {
-        self.blocks
-            .lock()
-            .unwrap()
-            .get(id)
-            .is_some_and(|gate| gate.strong_count() != 0)
     }
 }
 
@@ -118,388 +111,332 @@ impl AccessClock {
     }
 }
 
-// One word arbitrates readers and deletion. A successful read sets ACCESSED;
-// selection consumes that bit under the block lock, never on the hot path.
-const READERS: u64 = u32::MAX as u64;
-const RETRY_SHIFT: u32 = 32;
+// Read pins, closure, recent access, retry reason and the checkpoint marker
+// travel with the row. The high bits name the active reader/candidate cohort.
+// A guard looks up by slab slot and page key, then checks this identity.
+const READERS: u64 = (1 << 16) - 1;
+const CLOSED: u64 = 1 << 16;
+const ACCESSED: u64 = 1 << 17;
+const DIRTY: u64 = 1 << 18;
+const RETRY_SHIFT: u32 = 19;
 const RETRY: u64 = 3 << RETRY_SHIFT;
-const BOUND: u64 = 1 << 61;
-const CLOSED: u64 = 1 << 62;
-const ACCESSED: u64 = 1 << 63;
+const FLAGS: u64 = (1 << 21) - 1;
+const IDENTITY: u64 = !FLAGS;
 const UNKNOWN: u64 = u64::MAX;
+const UNTRACKED: u64 = u64::MAX - 1;
 
 #[derive(Default)]
-struct ShardWork {
-    dirty: Mutex<BTreeMap<u64, u64>>,
-    pending: Mutex<BTreeSet<u64>>,
-}
+pub(crate) struct PageWord(AtomicU64);
 
-pub(crate) struct BlockWork {
-    track_access: bool,
-    shard: Arc<ShardWork>,
-    slot: u64,
-    retired: AtomicBool,
-    dirty_since: AtomicU64,
-}
-impl Default for BlockWork {
-    fn default() -> Self {
-        Self {
-            track_access: true,
-            shard: Arc::default(),
-            slot: 0,
-            retired: AtomicBool::new(false),
-            dirty_since: AtomicU64::new(UNKNOWN),
-        }
-    }
-}
-impl BlockWork {
-    fn dirty(&self, now: u64) {
-        if !self.track_access {
-            return;
-        }
-        // Coalesce different pages of an already dirty block without taking the
-        // shard lock. An RMW (not a load/skip) orders this publication against
-        // checkpoint's reset before it samples pages. Older timestamps still
-        // update the summary, notably when failed checkpoints restore dirtiness.
-        if self.dirty_since.fetch_min(now, Ordering::Release) <= now {
-            return;
-        }
-        let mut dirty = self.shard.dirty.lock().unwrap();
-        if self.retired.load(Ordering::Relaxed) {
-            return;
-        }
-        dirty
-            .entry(self.slot)
-            .and_modify(|old| *old = (*old).min(now))
-            .or_insert(now);
-    }
-    fn pending(&self) {
-        self.shard.pending.lock().unwrap().insert(self.slot);
-    }
-    fn retire(&self) {
-        // Serialize retirement with late checkpoint rollback. A snapshot can
-        // release its BlockState before its page/summary guards are dropped.
-        let mut dirty = self.shard.dirty.lock().unwrap();
-        self.retired.store(true, Ordering::Relaxed);
-        dirty.remove(&self.slot);
-        self.shard.pending.lock().unwrap().remove(&self.slot);
-    }
-    pub fn checkpoint(self: &Arc<Self>) -> BlockCheckpoint {
-        let mut dirty = self.shard.dirty.lock().unwrap();
-        let since = dirty.remove(&self.slot);
-        self.dirty_since.swap(UNKNOWN, Ordering::AcqRel);
-        // A publisher waiting for this lock can conservatively reinsert an old
-        // summary. That may cause an extra checkpoint, but cannot lose a touch.
-        drop(dirty);
-        BlockCheckpoint {
-            work: self.clone(),
-            since,
-        }
+impl Clone for PageWord {
+    fn clone(&self) -> Self {
+        Self(AtomicU64::new(self.load(Ordering::Relaxed)))
     }
 }
 
-/// Removing the summary before sampling pages lets concurrent changes register
-/// a later checkpoint. Failure and cancellation restore the consumed summary.
-pub(crate) struct BlockCheckpoint {
-    work: Arc<BlockWork>,
-    since: Option<u64>,
-}
-impl BlockCheckpoint {
-    pub fn commit(mut self) {
-        self.since = None;
+impl std::ops::Deref for PageWord {
+    type Target = AtomicU64;
+    fn deref(&self) -> &AtomicU64 {
+        &self.0
     }
 }
-impl Drop for BlockCheckpoint {
-    fn drop(&mut self) {
-        if let Some(since) = self.since {
-            self.work.dirty(since);
+
+pub(crate) struct PageAge(AtomicU64);
+
+impl Clone for PageAge {
+    fn clone(&self) -> Self {
+        Self(AtomicU64::new(self.0.load(Ordering::Relaxed)))
+    }
+}
+
+impl PageAge {
+    pub(crate) fn unknown() -> Self {
+        Self(AtomicU64::new(UNKNOWN))
+    }
+
+    pub(crate) fn untracked() -> Self {
+        Self(AtomicU64::new(UNTRACKED))
+    }
+
+    pub(crate) fn tracked(&self) -> bool {
+        self.0.load(Ordering::Relaxed) != UNTRACKED
+    }
+
+    pub(crate) fn enable(&mut self) {
+        if !self.tracked() {
+            *self = Self::unknown();
         }
     }
 }
 
 #[derive(Default)]
-pub(crate) struct PageState {
-    state: AtomicU64,
-    recency: AtomicU64,
-    access: OnceLock<Box<PageAccess>>,
-}
-
-struct PageAccess {
-    last_access: AtomicU64,
-    dirty_since: AtomicU64,
-    work: OnceLock<Arc<BlockWork>>,
-}
-impl Default for PageAccess {
-    fn default() -> Self {
-        Self {
-            last_access: AtomicU64::new(UNKNOWN),
-            dirty_since: AtomicU64::new(UNKNOWN),
-            work: OnceLock::new(),
-        }
-    }
-}
-impl PageState {
-    pub(crate) fn policy_generation(&self) -> u64 {
-        let old = self
-            .recency
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
-                Some(
-                    (old & !1)
-                        .checked_add(2)
-                        .expect("policy generation exhausted"),
-                )
-            })
-            .unwrap();
-        (old & !1) + 2
-    }
-    pub(crate) fn retire_policy(&self, generation: u64) {
-        let _ = self
-            .recency
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                (current & !1 == generation).then(|| {
-                    generation
-                        .checked_add(2)
-                        .expect("policy generation exhausted")
-                })
-            });
-    }
-    pub(crate) fn referenced(&self, generation: u64) -> bool {
-        self.recency.load(Ordering::Relaxed) == generation | 1
-    }
-    pub(crate) fn reference(&self, generation: u64) {
-        let _ = self.recency.compare_exchange(
-            generation,
-            generation | 1,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        );
-    }
-    pub(crate) fn take_reference(&self, generation: u64) -> bool {
-        self.recency
-            .compare_exchange(
-                generation | 1,
-                generation,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            )
-            .is_ok()
-    }
-    fn access(&self) -> &PageAccess {
-        self.access.get_or_init(Box::default)
-    }
-    pub(crate) fn is_bound(&self) -> bool {
-        self.state.load(Ordering::Relaxed) & BOUND != 0
-    }
-    pub(crate) fn bind_work(&self, work: Arc<BlockWork>) {
-        if work.track_access {
-            let access = self.access();
-            if let Some(old) = access.work.get() {
-                assert!(Arc::ptr_eq(old, &work));
-            } else {
-                access
-                    .work
-                    .set(work.clone())
-                    .ok()
-                    .expect("page work bound twice");
-                let dirty = access.dirty_since.load(Ordering::Acquire);
-                if dirty != UNKNOWN {
-                    work.dirty(dirty);
-                }
-            }
-        }
-        self.state.fetch_or(BOUND, Ordering::Relaxed);
-    }
-
-    #[cfg(test)]
-    fn new(access: Option<u64>) -> Self {
-        Self::with_work(access, Arc::default())
-    }
-    #[cfg(test)]
-    fn with_work(access: Option<u64>, work: Arc<BlockWork>) -> Self {
-        Self {
-            state: AtomicU64::new(BOUND),
-            recency: AtomicU64::new(0),
-            access: OnceLock::from(Box::new(PageAccess {
-                last_access: AtomicU64::new(access.map_or(UNKNOWN, |t| t.min(UNKNOWN - 1))),
-                dirty_since: AtomicU64::new(UNKNOWN),
-                work: OnceLock::from(work),
-            })),
-        }
-    }
-    pub fn last_access(&self) -> Option<u64> {
-        let t = self.access.get()?.last_access.load(Ordering::Acquire);
-        (t != UNKNOWN).then_some(t)
-    }
-    #[cfg(test)]
-    fn dirty_since(&self) -> Option<u64> {
-        let t = self.access.get()?.dirty_since.load(Ordering::Acquire);
-        (t != UNKNOWN).then_some(t)
-    }
-    fn touch(&self, now: u64) {
-        let access = self.access();
-        let now = now.min(UNKNOWN - 1);
-        // Out-of-order readers must not move access time backwards. Coalesce
-        // same-millisecond hits without another timestamp or dirty-state write.
-        let mut old = access.last_access.load(Ordering::Relaxed);
-        while old == UNKNOWN || old < now {
-            match access.last_access.compare_exchange_weak(
-                old,
-                now,
-                Ordering::Release,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    // Always a release RMW: a checkpoint consuming this marker
-                    // must also see this timestamp. Only the first dirty touch
-                    // per page/checkpoint notifies the coalesced block summary.
-                    if access.dirty_since.fetch_min(now, Ordering::Release) == UNKNOWN {
-                        if let Some(work) = access.work.get() {
-                            work.dirty(now);
-                        }
-                    }
-                    break;
-                }
-                Err(actual) => old = actual,
-            }
-        }
-    }
-    pub fn acquire(self: &Arc<Self>) -> Option<PageReadGuard> {
-        let mut old = self.state.load(Ordering::Relaxed);
-        loop {
-            if old & CLOSED != 0 || old & READERS == READERS {
-                return None;
-            }
-            match self.state.compare_exchange_weak(
-                old,
-                old + 1,
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    return Some(PageReadGuard {
-                        handle: self.clone(),
-                        successful: false,
-                    })
-                }
-                Err(actual) => old = actual,
-            }
-        }
-    }
-    fn release(&self, successful: bool) {
-        if !successful {
-            let old = self.state.fetch_sub(1, Ordering::Release);
-            debug_assert_ne!(old & READERS, 0);
-            return;
-        }
-        let mut old = self.state.load(Ordering::Relaxed);
-        loop {
-            debug_assert_ne!(old & READERS, 0);
-            let next = ((old - 1) & !RETRY) | ACCESSED;
-            match self
-                .state
-                .compare_exchange_weak(old, next, Ordering::Release, Ordering::Relaxed)
-            {
-                Ok(_) => break,
-                Err(actual) => old = actual,
-            }
-        }
-    }
-    fn retry(state: u64) -> Option<usize> {
-        let value = (state & RETRY) >> RETRY_SHIFT;
-        (value != 0).then(|| value as usize - 1)
-    }
-}
-
 pub(crate) struct PageEntry {
     pub(crate) unit: crate::index::PageUnit,
-    pub handle: Arc<PageState>,
-    // Only candidate selection changes this counter. It prevents one selection
-    // from making an older candidate valid by consuming the ACCESSED bit again.
-    selection: u64,
+    pub(crate) state: PageWord,
 }
-impl PageEntry {
-    pub(crate) fn unbound() -> Self {
-        Self::with_handle(Arc::default())
-    }
-    pub(crate) fn with_handle(handle: Arc<PageState>) -> Self {
-        Self {
-            unit: Default::default(),
-            selection: 0,
-            handle,
-        }
-    }
-}
-pub(crate) type PageTable = Arc<RwLock<crate::page_table::PageMap>>;
 
-pub(crate) struct BlockPages {
-    pub pages: PageTable,
-    // Structural changes only: hot reads never lock or modify their block.
-    pub revision: u64,
-    pub checkpointed_revision: u64,
-    pub cleanup_pending: bool,
-    retries: BTreeSet<u32>,
-    pub work: Arc<BlockWork>,
+/// In-memory index fixtures use these rows. The journal-backed index borrows
+/// its geometry and lifecycle state directly from the catalog.
+#[derive(Default)]
+pub(crate) struct PageRows {
+    rows: crate::page_table::PageMap<PageEntry>,
+    ages: crate::page_table::PageMap<PageAge>,
 }
-impl BlockPages {
-    pub fn changed(&mut self, now: u64) {
-        self.revision = self
-            .revision
-            .checked_add(1)
-            .expect("access revision exhausted");
-        self.work.dirty(now);
-    }
-    #[cfg(test)]
-    pub fn dirty_since(&self) -> Option<u64> {
-        self.work
-            .shard
-            .dirty
-            .lock()
-            .unwrap()
-            .get(&self.work.slot)
-            .copied()
+impl std::ops::Deref for PageRows {
+    type Target = crate::page_table::PageMap<PageEntry>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.rows
     }
 }
-pub(crate) struct BlockState {
-    pub id: BlockKey,
-    gates: Arc<MutationGates>,
-    stripe: u8,
-    pub inner: Mutex<BlockPages>,
+impl std::ops::DerefMut for PageRows {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.rows
+    }
 }
-/// Holds every page closed until the owning block mutation either commits or
-/// fails. A failed claim or unlink reopens all pages, without scheduling page GC.
-pub(crate) struct BlockPageClaim {
-    block: Arc<BlockState>,
-    handles: Vec<Arc<PageState>>,
-    committed: bool,
-}
-impl BlockPageClaim {
-    pub fn len(&self) -> usize {
-        self.handles.len()
+impl PageRows {
+    pub(crate) fn track_age(&mut self, page: u32) {
+        self.ages.get_or_insert_with(page, PageAge::unknown);
     }
 
-    pub fn finish(mut self, now: u64) {
-        let mut g = self.block.inner.lock().unwrap();
-        g.pages.write().unwrap().clear();
-        g.retries.clear();
-        g.cleanup_pending = false;
-        g.work.pending();
-        g.changed(now);
-        self.committed = true;
-    }
-}
-impl Drop for BlockPageClaim {
-    fn drop(&mut self) {
-        if !self.committed {
-            for handle in &self.handles {
-                handle.state.fetch_and(!CLOSED, Ordering::Release);
+    pub(crate) fn track_resident_ages(&mut self) {
+        for (&page, row) in self.rows.iter() {
+            if row.unit.resident() {
+                self.ages.get_or_insert_with(page, PageAge::unknown);
             }
         }
     }
+
+    pub(crate) fn forget_page(&mut self, page: u32) -> bool {
+        self.ages.remove(&page);
+        let row = self.rows.get_mut(&page).expect("resident page");
+        std::mem::take(row.state.0.get_mut()) & RETRY != 0
+    }
 }
 
-impl BlockState {
+#[derive(Clone, Copy)]
+pub(crate) struct PageRow<'a> {
+    pub state: &'a PageWord,
+    pub age: Option<&'a PageAge>,
+}
+
+impl PageRow<'_> {
+    fn age(self) -> Option<u64> {
+        let time = self.age?.0.load(Ordering::Relaxed);
+        (time < UNTRACKED).then_some(time)
+    }
+
+    fn restore(self, access: Option<u64>) {
+        if let Some(age) = self.age.filter(|age| age.tracked()) {
+            age.0.store(
+                access.map_or(UNKNOWN, |t| t.min(UNTRACKED - 1)),
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    fn touch(self, now: u64) -> bool {
+        let Some(age) = self.age else { return false };
+        let mut old = age.0.load(Ordering::Relaxed);
+        let now = now.min(UNTRACKED - 1);
+        while old != UNTRACKED && (old == UNKNOWN || old < now) {
+            match age
+                .0
+                .compare_exchange_weak(old, now, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => return self.state.fetch_or(DIRTY, Ordering::Relaxed) & DIRTY == 0,
+                Err(actual) => old = actual,
+            }
+        }
+        false
+    }
+
+    pub(crate) fn retry_pending(self) -> bool {
+        self.state.load(Ordering::Relaxed) & RETRY != 0
+    }
+}
+
+pub(crate) enum PageSet<'a> {
+    Catalog(&'a Geometry),
+    Legacy(&'a PageRows),
+}
+
+impl PageSet<'_> {
+    fn get(&self, page: u32) -> Option<PageRow<'_>> {
+        match self {
+            Self::Catalog(geometry) => geometry.page_row(page),
+            Self::Legacy(rows) => {
+                let row = rows.get(&page)?;
+                row.unit.resident().then_some(PageRow {
+                    state: &row.state,
+                    age: rows.ages.get(&page),
+                })
+            }
+        }
+    }
+
+    fn count(&self) -> usize {
+        match self {
+            Self::Catalog(geometry) => geometry.page_count(),
+            Self::Legacy(rows) => rows.len(),
+        }
+    }
+
+    fn iter_from(&self, start: u32) -> impl Iterator<Item = (u32, PageRow<'_>)> {
+        let (catalog, legacy) = match self {
+            Self::Catalog(geometry) => (Some(geometry.page_rows_from(start)), None),
+            Self::Legacy(rows) => (
+                None,
+                Some(rows.range(start..).filter_map(|(&page, row)| {
+                    row.unit.resident().then_some((
+                        page,
+                        PageRow {
+                            state: &row.state,
+                            age: rows.ages.get(&page),
+                        },
+                    ))
+                })),
+            ),
+        };
+        catalog
+            .into_iter()
+            .flatten()
+            .chain(legacy.into_iter().flatten())
+    }
+}
+
+pub(crate) type PageTable = Arc<RwLock<PageRows>>;
+
+pub(crate) struct PageReadGuard {
+    index: Arc<crate::BlockIndex>,
+    slot: usize,
+    page: u32,
+    identity: u64,
+    accessed_at: Option<u64>,
+    successful: bool,
+}
+
+impl PageReadGuard {
+    pub(crate) fn acquire(
+        index: &Arc<crate::BlockIndex>,
+        slot: usize,
+        page: u32,
+        entry: &PageWord,
+    ) -> Option<Self> {
+        let mut old = entry.load(Ordering::Relaxed);
+        let mut identity = 0;
+        loop {
+            if old & CLOSED != 0 {
+                return None;
+            }
+            if old & READERS == READERS {
+                // Fall back to a miss without handing out an uncounted pin.
+                static REPORTED: AtomicBool = AtomicBool::new(false);
+                if !REPORTED.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(page, "resident page reader limit reached");
+                }
+                return None;
+            }
+            let mut next = old + 1;
+            if old & IDENTITY == 0 {
+                if identity == 0 {
+                    identity = index.page_work.next_identity();
+                }
+                next |= identity;
+            }
+            match entry.compare_exchange_weak(old, next, Ordering::Acquire, Ordering::Relaxed) {
+                Ok(_) => {
+                    return Some(Self {
+                        index: index.clone(),
+                        slot,
+                        page,
+                        identity: next & IDENTITY,
+                        accessed_at: None,
+                        successful: false,
+                    });
+                }
+                Err(actual) => old = actual,
+            }
+        }
+    }
+
+    pub fn record_access_and_release(mut self, now: Option<u64>) {
+        self.accessed_at = now;
+        self.successful = true;
+    }
+
+    #[cfg(test)]
+    pub fn record_access(&self, now: u64) {
+        self.update(Some(now), true, false);
+    }
+
+    fn update(&self, now: Option<u64>, successful: bool, release: bool) {
+        self.index.with_page_slot(self.slot, false, |id, rows| {
+            let Some(row) = rows.get(self.page) else {
+                return;
+            };
+            let mut flags = row.state.load(Ordering::Relaxed);
+            if flags & IDENTITY != self.identity {
+                return;
+            }
+            if let Some(now) = now {
+                if row.touch(now) {
+                    self.index.page_work.mark(id, self.slot, now, false);
+                }
+            }
+            loop {
+                debug_assert_ne!(flags & READERS, 0);
+                let mut next = flags - u64::from(release);
+                if successful {
+                    next = (next & !RETRY) | ACCESSED;
+                }
+                match row.state.compare_exchange_weak(
+                    flags,
+                    next,
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => flags = actual,
+                }
+            }
+            if successful && flags & RETRY != 0 {
+                self.index.page_work.cancel_retry(self.slot, self.page);
+            }
+        });
+    }
+}
+
+impl Drop for PageReadGuard {
+    fn drop(&mut self) {
+        self.update(self.accessed_at, self.successful, true);
+    }
+}
+
+fn retry(flags: u64) -> Option<usize> {
+    let value = (flags & RETRY) >> RETRY_SHIFT;
+    (value != 0).then(|| value as usize - 1)
+}
+
+pub(crate) fn expired(last: Option<u64>, now: u64, tti: u64) -> bool {
+    last.map_or(true, |last| now.saturating_sub(last) > tti)
+}
+
+/// A lookup key and the mutation gate pool. Creating this value does not
+/// publish an index row. Only async mutations allocate a gate.
+#[derive(Clone)]
+pub(crate) struct PagedMutation {
+    pub id: BlockKey,
+    index: Arc<crate::BlockIndex>,
+    gates: Arc<MutationGates>,
+}
+
+impl PagedMutation {
     fn gate(&self) -> Arc<PageMutationGate> {
-        self.gates.gate(&self.id, usize::from(self.stripe))
+        let mut hash = DefaultHasher::new();
+        self.id.hash(&mut hash);
+        self.gates
+            .gate(&self.id, hash.finish() as usize % DIRECTORY_SHARDS)
     }
 
     pub async fn lock(&self) -> PageMutationGuard {
@@ -524,298 +461,253 @@ impl BlockState {
         }
     }
 
-    fn retirement_ready(&self, state: &BlockPages, pages_empty: bool) -> bool {
-        (!state.work.track_access || pages_empty)
-            && !state.cleanup_pending
-            && state.retries.is_empty()
-            && !self.gates.active(&self.id)
+    pub fn has_pages(&self) -> bool {
+        self.index
+            .with_pages(&self.id, false, |_, rows| {
+                rows.iter_from(0).next().is_some()
+            })
+            .unwrap_or(false)
     }
 
-    pub(crate) fn retirement_candidate(&self) -> bool {
-        let state = self.inner.lock().unwrap();
-        let pages = state.pages.read().unwrap();
-        self.retirement_ready(&state, pages.is_empty())
+    pub fn cleanup_finished(&self) {
+        self.index.with_pages(&self.id, true, |slot, _| {
+            self.index.page_work.clear_pending(slot)
+        });
     }
 
-    pub(crate) fn retire_if_idle(&self) -> bool {
-        let state = self.inner.lock().unwrap();
-        let pages = state.pages.write().unwrap();
-        if !self.retirement_ready(&state, pages.is_empty()) {
-            return false;
-        }
-        for page in pages.values() {
-            page.handle.state.fetch_and(!BOUND, Ordering::Relaxed);
-        }
-        state.work.retire();
-        true
+    #[cfg(test)]
+    pub fn page_keys(&self) -> Vec<u32> {
+        self.index
+            .with_pages(&self.id, false, |_, rows| {
+                rows.iter_from(0).map(|(page, _)| page).collect()
+            })
+            .unwrap_or_default()
     }
 
-    /// Caller holds the block mutation gate and rechecks block activity after
-    /// claiming. CAS with each reader counter prevents partial block eviction.
-    pub fn claim_all_pages(self: &Arc<Self>) -> Option<BlockPageClaim> {
-        let g = self.inner.lock().unwrap();
-        let table = g.pages.clone();
-        let pages = table.read().unwrap();
-        let mut claim = BlockPageClaim {
-            block: self.clone(),
-            handles: Vec::with_capacity(pages.len()),
-            committed: false,
-        };
-        for entry in pages.values() {
-            let flags = entry.handle.state.load(Ordering::Acquire);
-            if flags & (READERS | CLOSED) != 0
-                || entry
-                    .handle
-                    .state
-                    .compare_exchange(flags, flags | CLOSED, Ordering::AcqRel, Ordering::Relaxed)
-                    .is_err()
-            {
-                return None;
+    pub fn restore_ages(&self, records: &BTreeMap<u32, u64>) -> (u64, u64) {
+        self.index
+            .with_pages(&self.id, true, |_, rows| {
+                let mut resident = 0;
+                let mut missing = 0;
+                for (page, row) in rows.iter_from(0) {
+                    let access = records.get(&page).copied();
+                    row.restore(access);
+                    resident += 1;
+                    missing += u64::from(access.is_none());
+                }
+                (resident, missing)
+            })
+            .unwrap_or_default()
+    }
+
+    /// A fill preserves any newer read age recorded after the durable row
+    /// became visible. Startup restores the age before serving reads.
+    pub fn register(&self, page: PageIndex, access: Option<u64>, now: u64, fill: bool) {
+        self.index.with_pages(&self.id, true, |slot, rows| {
+            let Some(row) = rows.get(page.0) else { return };
+            if fill {
+                if access.is_some_and(|access| row.touch(access)) {
+                    self.index.page_work.mark(&self.id, slot, now, false);
+                }
+                let state = row.state.load(Ordering::Relaxed);
+                row.state
+                    .store((state & !RETRY) | ACCESSED, Ordering::Release);
+                if state & RETRY != 0 {
+                    self.index.page_work.cancel_retry(slot, page.0);
+                }
+            } else {
+                row.restore(access);
             }
-            claim.handles.push(entry.handle.clone());
-        }
-        Some(claim)
+        });
     }
-    pub fn register(
-        &self,
-        page: PageIndex,
-        access: Option<u64>,
-        now: u64,
-        dirty: bool,
-    ) -> Arc<PageState> {
-        let mut g = self.inner.lock().unwrap();
-        let table = g.pages.clone();
-        let mut pages = table.write().unwrap();
-        g.cleanup_pending = false;
-        let work = g.work.clone();
-        let track_access = work.track_access;
-        // A duplicate same-version fill preserves existing guards and identity.
-        let e = pages.get_or_insert_with(page.0, PageEntry::unbound);
-        e.handle.bind_work(work);
-        if dirty {
-            if let Some(access) = access.filter(|_| track_access) {
-                e.handle.touch(access);
-            }
-            e.handle.state.fetch_or(ACCESSED, Ordering::Release);
-        } else {
-            // Startup recovery runs before publication to serving threads.
-            if track_access {
-                e.handle.access().last_access.store(
-                    access.map_or(UNKNOWN, |t| t.min(UNKNOWN - 1)),
-                    Ordering::Relaxed,
-                );
-            }
-        }
-        let handle = e.handle.clone();
-        if dirty {
-            g.changed(now);
-        }
-        handle
+
+    #[cfg(test)]
+    pub fn register_fixture(&self, page: PageIndex, access: Option<u64>, now: u64, fill: bool) {
+        let id = self.id.materialize();
+        self.index
+            .init_paged(id.clone(), 1, u64::from(id.block_size));
+        self.index.mark_page_allocated(&id, page, 0);
+        self.register(page, access, now, fill);
     }
-    pub fn acquire(self: &Arc<Self>, page: PageIndex) -> Option<PageReadGuard> {
-        self.inner
-            .lock()
-            .unwrap()
-            .pages
-            .read()
-            .unwrap()
-            .get(&page.0)?
-            .handle
-            .acquire()
+
+    pub fn acquire(&self, page: PageIndex) -> Option<PageReadGuard> {
+        self.index.with_pages(&self.id, false, |slot, rows| {
+            PageReadGuard::acquire(&self.index, slot, page.0, rows.get(page.0)?.state)
+        })?
     }
-    pub fn candidate(self: &Arc<Self>, page: PageIndex) -> Option<GcCandidate> {
-        let g = self.inner.lock().unwrap();
-        let table = g.pages.clone();
-        let mut pages = table.write().unwrap();
-        let e = pages.get_mut(&page.0)?;
-        let flags = e.handle.state.load(Ordering::Acquire);
-        if flags & CLOSED != 0 {
-            return None;
-        }
-        self.select(page, e, 0, flags)
+
+    pub fn candidate(&self, page: PageIndex) -> Option<GcCandidate> {
+        self.index.with_pages(&self.id, false, |_, rows| {
+            let row = rows.get(page.0)?;
+            let flags = row.state.load(Ordering::Acquire);
+            self.select(page.0, row.state, 0, flags)
+        })?
     }
+
     fn select(
-        self: &Arc<Self>,
-        page: PageIndex,
-        entry: &mut PageEntry,
+        &self,
+        page: u32,
+        state: &PageWord,
         reason: usize,
         flags: u64,
     ) -> Option<GcCandidate> {
-        // A read can cancel an unlink retry without taking the block lock.
-        // Consume ACCESSED only if the state used for selection is still valid;
-        // otherwise a scan could revive a retry that the read just cancelled.
-        entry
-            .handle
-            .state
-            .compare_exchange(
-                flags,
-                flags & !ACCESSED,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            )
+        if flags & (CLOSED | READERS) != 0 {
+            return None;
+        }
+        let identity = self.index.page_work.next_identity();
+        let next = (flags & (FLAGS & !ACCESSED)) | identity;
+        state
+            .compare_exchange(flags, next, Ordering::AcqRel, Ordering::Relaxed)
             .ok()?;
-        entry.selection = entry
-            .selection
-            .checked_add(1)
-            .expect("page selection exhausted");
         Some(GcCandidate {
             block: self.clone(),
-            page,
-            handle: entry.handle.clone(),
-            selection: entry.selection,
+            page: PageIndex(page),
+            identity,
             reason,
         })
     }
-    /// Called under the mutation gate. The CAS is the read/delete arbitration
-    /// point; timestamp validation follows successful exclusive ownership.
+
     pub fn claim(&self, c: &GcCandidate, now: u64, tti: Option<u64>) -> bool {
-        let g = self.inner.lock().unwrap();
-        let table = g.pages.clone();
-        let pages = table.read().unwrap();
-        let Some(e) = pages.get(&c.page.0) else {
-            return false;
-        };
-        if !Arc::ptr_eq(&e.handle, &c.handle) || e.selection != c.selection {
-            return false;
-        }
-        let state = e.handle.state.load(Ordering::Acquire);
-        if state & (READERS | CLOSED | ACCESSED) != 0
-            || e.handle
-                .state
-                .compare_exchange(state, state | CLOSED, Ordering::AcqRel, Ordering::Relaxed)
-                .is_err()
-        {
-            return false;
-        }
-        if tti.is_some_and(|tti| !expired(e.handle.last_access(), now, tti)) {
-            e.handle.state.fetch_and(!CLOSED, Ordering::Release);
-            return false;
-        }
-        true
-    }
-    pub fn finish(&self, c: &GcCandidate, now: u64) {
-        let mut g = self.inner.lock().unwrap();
-        let table = g.pages.clone();
-        let mut pages = table.write().unwrap();
-        if pages.get(&c.page.0).is_some_and(|e| {
-            Arc::ptr_eq(&e.handle, &c.handle)
-                && e.selection == c.selection
-                && e.handle.state.load(Ordering::Acquire) & CLOSED != 0
-        }) {
-            // Removed handles stay closed forever, even after the same page is
-            // admitted again. Outstanding old handles cannot pin a new file.
-            pages.remove(&c.page.0);
-            g.retries.remove(&c.page.0);
-            g.cleanup_pending = pages.is_empty();
-            if g.cleanup_pending {
-                g.work.pending();
-            }
-            g.changed(now);
-        }
-    }
-    pub fn abort(&self, c: &GcCandidate, reason: usize) {
-        let mut g = self.inner.lock().unwrap();
-        let table = g.pages.clone();
-        let pages = table.read().unwrap();
-        if let Some(e) = pages.get(&c.page.0) {
-            if Arc::ptr_eq(&e.handle, &c.handle) && e.selection == c.selection {
-                e.handle
-                    .state
-                    .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |old| {
-                        Some((old & !(CLOSED | RETRY)) | ((reason as u64 + 1) << RETRY_SHIFT))
-                    })
-                    .unwrap();
-                g.retries.insert(c.page.0);
-                g.work.pending();
-            }
-        }
-    }
-}
-
-pub(crate) fn expired(last: Option<u64>, now: u64, tti: u64) -> bool {
-    last.map_or(true, |last| now.saturating_sub(last) > tti)
-}
-pub(crate) struct PageReadGuard {
-    handle: Arc<PageState>,
-    successful: bool,
-}
-impl PageReadGuard {
-    pub fn record_access_and_release(mut self, now: Option<u64>) {
-        if let Some(now) = now {
-            self.handle.touch(now);
-        }
-        self.successful = true;
-    }
-    #[cfg(test)]
-    pub fn record_access(&self, now: u64) {
-        self.handle.touch(now);
-        self.handle
-            .state
-            .fetch_update(Ordering::Release, Ordering::Relaxed, |old| {
-                Some((old & !RETRY) | ACCESSED)
+        self.index
+            .with_pages(&self.id, false, |_, rows| {
+                let Some(row) = rows.get(c.page.0) else {
+                    return false;
+                };
+                let flags = row.state.load(Ordering::Acquire);
+                if flags & (IDENTITY | CLOSED | READERS | ACCESSED) != c.identity
+                    || tti.is_some_and(|tti| !expired(row.age(), now, tti))
+                {
+                    return false;
+                }
+                row.state
+                    .compare_exchange(flags, flags | CLOSED, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
             })
-            .unwrap();
+            .unwrap_or(false)
     }
-}
-impl Drop for PageReadGuard {
-    fn drop(&mut self) {
-        self.handle.release(self.successful);
+
+    pub fn abort(&self, c: &GcCandidate, reason: usize) {
+        self.index.with_pages(&self.id, true, |slot, rows| {
+            if let Some(row) = rows.get(c.page.0) {
+                let old = row.state.load(Ordering::Relaxed);
+                if old & (IDENTITY | CLOSED) == c.identity | CLOSED {
+                    row.state.store(
+                        (old & !(CLOSED | RETRY)) | ((reason as u64 + 1) << RETRY_SHIFT),
+                        Ordering::Release,
+                    );
+                    self.index.page_work.schedule_retry(slot, c.page.0);
+                }
+            }
+        });
+    }
+
+    pub fn claim_all_pages(&self) -> Option<BlockPageClaim> {
+        let mut claim = BlockPageClaim {
+            block: self.clone(),
+            identity: 0,
+            len: 0,
+            committed: false,
+        };
+        let valid = self.index.with_pages(&self.id, true, |_, rows| {
+            if rows
+                .iter_from(0)
+                .any(|(_, row)| row.state.load(Ordering::Relaxed) & (CLOSED | READERS) != 0)
+            {
+                return false;
+            }
+            claim.identity = self.index.page_work.next_identity();
+            for (_, row) in rows.iter_from(0) {
+                let state = row.state.load(Ordering::Relaxed);
+                row.state
+                    .store((state & FLAGS) | CLOSED | claim.identity, Ordering::Relaxed);
+                claim.len += 1;
+            }
+            true
+        });
+        valid.unwrap_or(true).then_some(claim)
+    }
+
+    #[cfg(test)]
+    pub fn last_access(&self, page: u32) -> Option<u64> {
+        self.index
+            .with_pages(&self.id, false, |_, rows| rows.get(page)?.age())?
+    }
+
+    #[cfg(test)]
+    pub fn dirty(&self) -> Option<(u64, bool)> {
+        self.index.with_pages(&self.id, false, |slot, _| {
+            self.index
+                .page_work
+                .shard(disk_shard_key(&self.id))
+                .lock()
+                .unwrap()
+                .get(slot)
+        })?
+    }
+
+    #[cfg(test)]
+    pub fn hold_rows(&self) -> PageTable {
+        self.index.legacy_pages(&self.id).unwrap()
     }
 }
 
-/// Consumes dirtiness before sampling. New touches mark a later checkpoint;
-/// failed/cancelled snapshot construction restores the consumed marker on Drop.
-pub(crate) struct PageCheckpoint {
-    pub page: u32,
-    pub access: Option<u64>,
-    handle: Arc<PageState>,
-    dirty_since: u64,
+pub(crate) struct BlockPageClaim {
+    block: PagedMutation,
+    identity: u64,
+    len: usize,
+    committed: bool,
 }
-impl PageCheckpoint {
-    pub fn new(page: u32, handle: &Arc<PageState>) -> Self {
-        let dirty_since = handle.access.get().map_or(UNKNOWN, |access| {
-            access.dirty_since.swap(UNKNOWN, Ordering::AcqRel)
-        });
-        Self {
-            page,
-            access: handle.last_access(),
-            handle: handle.clone(),
-            dirty_since,
-        }
+impl BlockPageClaim {
+    pub fn len(&self) -> usize {
+        self.len
     }
-    pub fn dirty(&self) -> bool {
-        self.dirty_since != UNKNOWN
-    }
-    pub fn commit(mut self) {
-        self.dirty_since = UNKNOWN;
+
+    /// The caller already removed the exact claimed residency from the index.
+    pub fn finish(mut self) {
+        self.committed = true;
     }
 }
-impl Drop for PageCheckpoint {
+impl Drop for BlockPageClaim {
     fn drop(&mut self) {
-        if self.dirty_since != UNKNOWN {
-            let access = self.handle.access();
-            access
-                .dirty_since
-                .fetch_min(self.dirty_since, Ordering::Release);
-            if let Some(work) = access.work.get() {
-                work.dirty(self.dirty_since);
-            }
+        if !self.committed && self.len != 0 {
+            self.block
+                .index
+                .with_pages(&self.block.id, true, |_, rows| {
+                    for (_, row) in rows.iter_from(0) {
+                        if row.state.load(Ordering::Relaxed) & IDENTITY == self.identity {
+                            row.state.fetch_and(!CLOSED, Ordering::Relaxed);
+                        }
+                    }
+                });
         }
     }
 }
+
 #[derive(Clone)]
 pub(crate) struct GcCandidate {
-    pub block: Arc<BlockState>,
+    pub block: PagedMutation,
     pub page: PageIndex,
-    handle: Arc<PageState>,
-    selection: u64,
+    identity: u64,
     pub reason: usize,
 }
 
 #[derive(Default)]
-struct Registry {
-    ordered: BTreeMap<u64, Arc<BlockState>>,
-    next: u64,
+struct Pending {
+    cleanup: bool,
+    retries: BTreeSet<u32>,
+}
+
+// One record covers 64 directory slots. Clean resident blocks own no
+// checkpoint or retry records. Oldest is conservative within a dirty group.
+struct DirtyGroup {
+    slots: u64,
+    replace: u64,
+    oldest: u64,
+}
+
+#[derive(Default)]
+struct CheckpointShard {
+    dirty: BTreeMap<usize, DirtyGroup>,
     membership: u64,
     checkpointed_membership: u64,
     removed: BTreeMap<u64, BlockId>,
@@ -823,30 +715,258 @@ struct Registry {
     removal_overflow: u64,
     journal: crate::page_access_shard::JournalState,
 }
-impl Registry {
-    fn removed(&mut self, id: &dyn BlockIdentity) {
+impl CheckpointShard {
+    fn mark(&mut self, slot: usize, now: u64, replace: bool) {
+        let mask = 1 << (slot % 64);
+        let group = self.dirty.entry(slot / 64).or_insert(DirtyGroup {
+            slots: 0,
+            replace: 0,
+            oldest: now,
+        });
+        group.slots |= mask;
+        group.oldest = group.oldest.min(now);
+        if replace {
+            group.replace |= mask;
+        }
+    }
+
+    fn get(&self, slot: usize) -> Option<(u64, bool)> {
+        let mask = 1 << (slot % 64);
+        let group = self.dirty.get(&(slot / 64))?;
+        (group.slots & mask != 0).then_some((group.oldest, group.replace & mask != 0))
+    }
+
+    fn take(&mut self, slot: usize) -> Option<(u64, bool)> {
+        let mask = 1 << (slot % 64);
+        let group = self.dirty.get_mut(&(slot / 64))?;
+        if group.slots & mask == 0 {
+            return None;
+        }
+        let result = (group.oldest, group.replace & mask != 0);
+        group.slots &= !mask;
+        group.replace &= !mask;
+        if group.slots == 0 {
+            self.dirty.remove(&(slot / 64));
+        }
+        Some(result)
+    }
+
+    fn next_dirty(&self, start: usize, ceiling: usize) -> Option<usize> {
+        if start >= ceiling {
+            return None;
+        }
+        let group_start = start / 64;
+        let slot = self
+            .dirty
+            .range(group_start..)
+            .find_map(|(&group, dirty)| {
+                let slots = if group == group_start {
+                    dirty.slots & (u64::MAX << (start % 64))
+                } else {
+                    dirty.slots
+                };
+                (slots != 0).then(|| group * 64 + slots.trailing_zeros() as usize)
+            })?;
+        (slot < ceiling).then_some(slot)
+    }
+
+    fn removed(&mut self, id: &BlockKey) {
         self.membership += 1;
-        // No journal exists until TTI is enabled and its first base is published.
-        // Disabled TTI and whole-only traffic must not retain deletion identities.
         if self.journal.generation == 0 {
+            // A first base may already be encoding this block. If this
+            // removal is newer than that base, force the next checkpoint full.
+            self.removal_overflow = self.membership;
             return;
         }
-        let id = id.view();
-        let bytes = id.object.bucket.len() + id.object.object_path.len() + id.version.len() + 128;
+        let view = id.view();
+        let bytes =
+            view.object.bucket.len() + view.object.object_path.len() + view.version.len() + 128;
         if self.removed_bytes + bytes > (1 << 20) {
             self.removal_overflow = self.membership;
         } else {
             self.removed_bytes += bytes;
-            self.removed.insert(self.membership, id.materialize());
+            self.removed.insert(self.membership, view.materialize());
         }
     }
 }
+
+pub(crate) struct PageWork {
+    track_access: AtomicBool,
+    next_identity: AtomicU64,
+    shards: OnceLock<Box<[Mutex<CheckpointShard>; SHARDS]>>,
+    pending: Mutex<BTreeMap<usize, Pending>>,
+    has_pending: AtomicBool,
+}
+impl Default for PageWork {
+    fn default() -> Self {
+        Self {
+            track_access: AtomicBool::new(false),
+            next_identity: AtomicU64::new(0),
+            shards: OnceLock::new(),
+            pending: Mutex::default(),
+            has_pending: AtomicBool::new(false),
+        }
+    }
+}
+impl PageWork {
+    pub(crate) fn tracking(&self) -> bool {
+        self.track_access.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn enable_tracking(&self) {
+        self.shards
+            .get_or_init(|| Box::new(std::array::from_fn(|_| Mutex::default())));
+        self.track_access.store(true, Ordering::Release);
+    }
+
+    fn shard(&self, shard: usize) -> &Mutex<CheckpointShard> {
+        &self.shards.get().expect("access tracking configured")[shard]
+    }
+
+    fn next_identity(&self) -> u64 {
+        self.next_identity
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                old.checked_add(FLAGS + 1)
+            })
+            .expect("page identity exhausted")
+            + FLAGS
+            + 1
+    }
+
+    pub(crate) fn mark(&self, id: &BlockKey, slot: usize, now: u64, replace: bool) {
+        if self.tracking() {
+            self.shard(disk_shard_key(id))
+                .lock()
+                .unwrap()
+                .mark(slot, now, replace);
+        }
+    }
+
+    fn schedule_retry(&self, slot: usize, page: u32) {
+        let mut pending = self.pending.lock().unwrap();
+        pending.entry(slot).or_default().retries.insert(page);
+        self.has_pending.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn cancel_retry(&self, slot: usize, page: u32) {
+        let mut pending = self.pending.lock().unwrap();
+        if let Some(work) = pending.get_mut(&slot) {
+            work.retries.remove(&page);
+            if work.retries.is_empty() && !work.cleanup {
+                pending.remove(&slot);
+                self.has_pending
+                    .store(!pending.is_empty(), Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn clear_pending(&self, slot: usize) {
+        if self.has_pending.load(Ordering::Relaxed) {
+            let mut pending = self.pending.lock().unwrap();
+            pending.remove(&slot);
+            self.has_pending
+                .store(!pending.is_empty(), Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn added_page(&self, id: &BlockKey, slot: usize, attached: &AtomicBool) {
+        if !self.tracking() && !self.has_pending.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut pending = self.pending.lock().unwrap();
+        if !attached.load(Ordering::Relaxed) {
+            return;
+        }
+        if pending.get(&slot).is_some_and(|work| work.cleanup) {
+            pending.remove(&slot);
+            self.has_pending
+                .store(!pending.is_empty(), Ordering::Relaxed);
+        }
+        self.mark_structural(id, slot);
+    }
+
+    pub(crate) fn mark_structural(&self, id: &BlockKey, slot: usize) {
+        if self.tracking() {
+            self.mark(id, slot, crate::eviction::access_millis(), true);
+        }
+    }
+
+    pub(crate) fn removed_page(
+        &self,
+        id: &BlockKey,
+        slot: usize,
+        page: u32,
+        empty: bool,
+        retry: bool,
+        attached: &AtomicBool,
+    ) {
+        if !retry && !empty && !self.tracking() {
+            return;
+        }
+        let mut pending = self.pending.lock().unwrap();
+        if !attached.load(Ordering::Relaxed) {
+            return;
+        }
+        if retry || empty {
+            if empty {
+                pending.insert(
+                    slot,
+                    Pending {
+                        cleanup: true,
+                        retries: BTreeSet::new(),
+                    },
+                );
+            } else if let Some(work) = pending.get_mut(&slot) {
+                work.retries.remove(&page);
+                if work.retries.is_empty() {
+                    pending.remove(&slot);
+                }
+            }
+            self.has_pending
+                .store(!pending.is_empty(), Ordering::Relaxed);
+        }
+        self.mark_structural(id, slot);
+    }
+
+    pub(crate) fn detached(&self, id: &BlockKey, slot: usize, attached: Option<&AtomicBool>) {
+        // Writers can retain an old entry without holding the directory.
+        // Serialize their work publication with this slot's detachment.
+        let mut pending = self.pending.lock().unwrap();
+        if let Some(attached) = attached {
+            attached.store(false, Ordering::Release);
+        }
+        pending.remove(&slot);
+        self.has_pending
+            .store(!pending.is_empty(), Ordering::Relaxed);
+        if self.tracking() {
+            let mut work = self.shard(disk_shard_key(id)).lock().unwrap();
+            work.take(slot);
+            // An empty table may have a removal snapshot in flight. Its
+            // tombstone must survive even if that snapshot ultimately fails.
+            work.removed(id);
+        }
+    }
+
+    pub(crate) fn reset(&self) {
+        self.track_access.store(false, Ordering::Relaxed);
+        for shard in self
+            .shards
+            .get()
+            .into_iter()
+            .flat_map(|shards| shards.iter())
+        {
+            *shard.lock().unwrap() = CheckpointShard::default();
+        }
+        self.pending.lock().unwrap().clear();
+        self.has_pending.store(false, Ordering::Relaxed);
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct ScanCursor {
-    shard: usize,
-    block: u64,
+    slot: usize,
     page: u64,
-    ceiling: Option<u64>,
+    ceiling: Option<usize>,
     scan_seconds: f64,
     scan_retries: usize,
 }
@@ -867,111 +987,83 @@ impl ScanCursor {
         })
     }
 }
+
 #[derive(Default)]
 pub(crate) struct ScanReport {
     pub checked: usize,
     pub completed: bool,
     pub retries: usize,
-    pub empty: Vec<Arc<BlockState>>,
+    pub empty: Vec<PagedMutation>,
 }
+
 pub(crate) struct PageLifecycle {
-    track_access: AtomicBool,
     index: Arc<crate::BlockIndex>,
-    shards: Vec<Mutex<Registry>>,
-    work: Vec<Arc<ShardWork>>,
     gates: Arc<MutationGates>,
     checkpoints: Vec<Arc<tokio::sync::Mutex<()>>>,
 }
+
+fn disk_shard_key(id: &BlockKey) -> usize {
+    let mut hash = DefaultHasher::new();
+    id.hash(&mut hash);
+    (hash.finish() >> 56) as usize
+}
+
 impl PageLifecycle {
     #[cfg(test)]
     pub fn new() -> Self {
         Self::with_index(Arc::new(crate::BlockIndex::new()), true)
     }
+
     pub fn with_index(index: Arc<crate::BlockIndex>, track_access: bool) -> Self {
+        if track_access {
+            index.enable_page_ages();
+        }
         Self {
-            track_access: AtomicBool::new(track_access),
             index,
-            work: (0..SHARDS).map(|_| Arc::default()).collect(),
-            shards: (0..SHARDS)
-                .map(|_| Mutex::new(Registry::default()))
-                .collect(),
-            checkpoints: (0..SHARDS)
-                .map(|_| Arc::new(tokio::sync::Mutex::new(())))
-                .collect(),
+            checkpoints: (0..SHARDS).map(|_| Arc::default()).collect(),
             gates: Arc::new(MutationGates {
                 blocks: Mutex::default(),
                 directories: (0..DIRECTORY_SHARDS).map(|_| Arc::default()).collect(),
             }),
         }
     }
-    /// Startup only, before resident page ages are restored.
+
+    /// Startup, before durable ages are restored and reads can begin.
     pub fn enable_access_tracking(&self) {
-        self.track_access.store(true, Ordering::Relaxed);
+        self.index.enable_page_ages();
     }
+
+    pub fn tracks_access(&self) -> bool {
+        self.index.page_work.tracking()
+    }
+
     pub fn directory_gate(&self, digest: u64) -> Arc<tokio::sync::RwLock<()>> {
         self.gates.directories[digest as usize % DIRECTORY_SHARDS].clone()
     }
-    #[cfg(test)]
-    pub fn get(&self, id: &BlockId) -> Option<Arc<BlockState>> {
-        self.index.lifecycle(id)
+
+    pub fn block(&self, id: &BlockId) -> PagedMutation {
+        self.mutation(
+            self.index
+                .canonical_key(id)
+                .unwrap_or_else(|| BlockKey::new(id)),
+        )
     }
-    pub fn retire_empty(&self, id: &BlockId) {
-        let mut g = self.shards[disk_shard(id)].lock().unwrap();
-        let Some(block) = self.index.lifecycle(id) else {
-            return;
-        };
-        let n = block.inner.lock().unwrap().work.slot;
-        // Drop the lookup's temporary owner before checking for external users.
-        drop(block);
-        if let Some(block) = g.ordered.get(&n) {
-            if !self.index.retire_lifecycle(id, block) {
-                return;
-            }
-            g.ordered.remove(&n);
-            g.removed(id);
+
+    fn mutation(&self, id: BlockKey) -> PagedMutation {
+        PagedMutation {
+            id,
+            index: self.index.clone(),
+            gates: self.gates.clone(),
         }
     }
 
-    pub fn block(&self, id: &BlockId) -> Arc<BlockState> {
-        let mut hash = DefaultHasher::new();
-        id.hash(&mut hash);
-        let shard = disk_shard(id);
-        let mut g = self.shards[shard].lock().unwrap();
-        self.index.lifecycle_or_insert(id, |id, pages| {
-            g.next += 1;
-            g.membership += 1;
-            let n = g.next;
-            let pages = pages.unwrap_or_default();
-            let work = Arc::new(BlockWork {
-                track_access: self.track_access.load(Ordering::Relaxed),
-                shard: self.work[shard].clone(),
-                slot: n,
-                retired: AtomicBool::new(false),
-                dirty_since: AtomicU64::new(UNKNOWN),
-            });
-            for page in pages.read().unwrap().values() {
-                page.handle.bind_work(work.clone());
-            }
-            let block = Arc::new(BlockState {
-                id,
-                gates: self.gates.clone(),
-                stripe: (hash.finish() as usize % DIRECTORY_SHARDS) as u8,
-                inner: Mutex::new(BlockPages {
-                    pages,
-                    work,
-                    revision: 0,
-                    checkpointed_revision: 0,
-                    cleanup_pending: false,
-                    retries: BTreeSet::new(),
-                }),
-            });
-            g.ordered.insert(n, block.clone());
-            self.work[shard].pending.lock().unwrap().insert(n);
-            block
-        })
+    #[cfg(test)]
+    pub fn get(&self, id: &BlockId) -> Option<PagedMutation> {
+        let block = self.block(id);
+        self.index.with_pages(id, false, |_, _| ())?;
+        Some(block)
     }
-    /// Ordered block slots and page keys let a batch resume without copying the registry.
-    /// Idle maintenance state is retired only without outside owners, preserving gate identity.
+
     pub fn scan(
         &self,
         cursor: &mut ScanCursor,
@@ -982,249 +1074,374 @@ impl PageLifecycle {
     ) -> (Vec<GcCandidate>, ScanReport) {
         let mut out = Vec::new();
         let mut report = ScanReport::default();
+        let ceiling = *cursor
+            .ceiling
+            .get_or_insert_with(|| self.index.policy_scan_ceiling());
         let mut work = 0;
         while work < limit && out.len() + report.empty.len() < delete_limit {
-            let mut registry = self.shards[cursor.shard].lock().unwrap();
-            let ceiling = *cursor.ceiling.get_or_insert(registry.next);
-            let next = if cursor.block <= ceiling {
-                if tti.is_some() {
-                    registry.ordered.range(cursor.block..=ceiling).next()
-                } else {
-                    let slot = self.work[cursor.shard]
-                        .pending
-                        .lock()
-                        .unwrap()
-                        .range(cursor.block..=ceiling)
-                        .next()
-                        .copied();
-                    slot.and_then(|slot| registry.ordered.get_key_value(&slot))
-                }
-            } else {
-                None
-            };
-            let Some((&slot, block)) = next else {
-                cursor.shard += 1;
-                cursor.block = 0;
-                cursor.page = 0;
-                cursor.ceiling = None;
-                if cursor.shard == SHARDS {
-                    cursor.shard = 0;
-                    report.completed = true;
-                    break;
-                }
-                continue;
-            };
-            if slot != cursor.block {
-                cursor.block = slot;
-                cursor.page = 0;
-            }
-            let id = block.id.clone();
-            if self.index.retire_lifecycle(&id, block) {
-                registry.ordered.remove(&slot);
-                registry.removed(&id);
-                cursor.block = slot + 1;
-                cursor.page = 0;
-                work += 1;
-                continue;
-            }
-            let mut state = block.inner.lock().unwrap();
-            let table = state.pages.clone();
-            let mut pages = table.write().unwrap();
-            if pages.is_empty() && state.cleanup_pending {
-                report.empty.push(block.clone());
-            }
-            if pages.is_empty() && !state.cleanup_pending {
-                cursor.block = slot + 1;
-                cursor.page = 0;
-                work += 1;
-                continue;
-            }
-            let mut exhausted = true;
-            let mut in_block = 0;
-            let start = cursor.page.min(u32::MAX as u64) as u32;
-            let keys: Vec<_> = if tti.is_some() {
-                pages
-                    .range(start..)
-                    .map(|(&page, _)| page)
-                    .take(64)
-                    .collect()
-            } else {
-                state.retries.range(start..).copied().take(64).collect()
-            };
-            for page in keys {
-                if (page as u64) < cursor.page {
-                    continue;
-                }
-                work += 1;
-                in_block += 1;
-                report.checked += 1;
-                cursor.page = u64::from(page) + 1;
-                let flags = pages[&page].handle.state.load(Ordering::Acquire);
-                let retry = PageState::retry(flags);
-                if retry.is_none() {
-                    state.retries.remove(&page);
-                }
-                let entry = pages.get_mut(&page).unwrap();
-                if retry.is_some() {
-                    report.retries += 1;
-                }
-                let tti_expired =
-                    tti.is_some_and(|tti| expired(entry.handle.last_access(), now, tti));
-                let retryable = retry.is_some_and(|reason| reason != 0 || tti.is_some());
-                if flags & (CLOSED | READERS) == 0 && (tti_expired || retryable) {
-                    if let Some(candidate) = block.select(
-                        PageIndex(page),
-                        entry,
-                        if tti_expired { 0 } else { retry.unwrap() },
-                        flags,
-                    ) {
-                        out.push(candidate);
-                    }
-                }
-                if work == limit || in_block == 64 || out.len() + report.empty.len() == delete_limit
-                {
-                    // Release registry and page locks even for a very large block.
-                    exhausted = false;
-                    break;
-                }
-            }
-            if state.work.track_access
-                && !pages.is_empty()
-                && state.retries.is_empty()
-                && !state.cleanup_pending
-            {
-                self.work[cursor.shard]
+            let slot = if tti.is_some() {
+                (cursor.slot < ceiling).then_some(cursor.slot)
+            } else if cursor.slot < ceiling {
+                self.index
+                    .page_work
                     .pending
                     .lock()
                     .unwrap()
-                    .remove(&slot);
-            }
-            if exhausted {
-                cursor.block = slot + 1;
+                    .range(cursor.slot..ceiling)
+                    .next()
+                    .map(|(&slot, _)| slot)
+            } else {
+                None
+            };
+            let Some(slot) = slot else {
+                cursor.slot = 0;
                 cursor.page = 0;
-                work += 1;
+                cursor.ceiling = None;
+                report.completed = true;
+                break;
+            };
+            if slot != cursor.slot {
+                cursor.slot = slot;
+                cursor.page = 0;
+            }
+            let mut examined = 0;
+            let budget = (limit - work).min(64);
+            let more = self
+                .index
+                .with_page_slot(slot, false, |id, rows| {
+                    let (cleanup, retries) = {
+                        let pending = self.index.page_work.pending.lock().unwrap();
+                        pending.get(&slot).map_or((false, Vec::new()), |pending| {
+                            let retries = if tti.is_none() {
+                                u32::try_from(cursor.page).ok().map_or(Vec::new(), |start| {
+                                    pending
+                                        .retries
+                                        .range(start..)
+                                        .copied()
+                                        .take(budget + 1)
+                                        .collect()
+                                })
+                            } else {
+                                Vec::new()
+                            };
+                            (pending.cleanup, retries)
+                        })
+                    };
+                    if cleanup {
+                        report.empty.push(self.mutation(id.clone()));
+                        return false;
+                    }
+                    let Ok(start) = u32::try_from(cursor.page) else {
+                        return false;
+                    };
+                    let inspect = |(page, row): (u32, PageRow<'_>)| {
+                        examined += 1;
+                        cursor.page = u64::from(page) + 1;
+                        report.checked += 1;
+                        let flags = row.state.load(Ordering::Acquire);
+                        let retry = retry(flags);
+                        report.retries += usize::from(retry.is_some());
+                        let idle = tti.is_some_and(|tti| expired(row.age(), now, tti));
+                        let retryable = retry.is_some_and(|reason| reason != 0 || tti.is_some());
+                        if (idle || retryable) && flags & (CLOSED | READERS) == 0 {
+                            let block = self.mutation(id.clone());
+                            if let Some(candidate) = block.select(
+                                page,
+                                row.state,
+                                if idle { 0 } else { retry.unwrap() },
+                                flags,
+                            ) {
+                                out.push(candidate);
+                            }
+                        }
+                        out.len() + report.empty.len() < delete_limit
+                    };
+                    let pages = rows.iter_from(start);
+                    fn scan_pages<'a>(
+                        mut pages: impl Iterator<Item = (u32, PageRow<'a>)>,
+                        budget: usize,
+                        mut inspect: impl FnMut((u32, PageRow<'a>)) -> bool,
+                    ) -> bool {
+                        for _ in 0..budget {
+                            let Some(page) = pages.next() else {
+                                return false;
+                            };
+                            if !inspect(page) {
+                                return true;
+                            }
+                        }
+                        pages.next().is_some()
+                    }
+                    if tti.is_some() {
+                        scan_pages(pages, budget, inspect)
+                    } else {
+                        scan_pages(
+                            retries
+                                .into_iter()
+                                .filter_map(|page| Some((page, rows.get(page)?))),
+                            budget,
+                            inspect,
+                        )
+                    }
+                })
+                .unwrap_or(false);
+            work += examined.max(1);
+            if !more {
+                cursor.slot += 1;
+                cursor.page = 0;
             }
         }
         (out, report)
     }
-    /// Only checkpoint publication and cleanup of shard-level temporary files
-    /// take this gate. Foreground page I/O never waits for a shard checkpoint.
+
     pub fn checkpoint_gate(&self, shard: usize) -> Arc<tokio::sync::Mutex<()>> {
         self.checkpoints[shard].clone()
     }
-    pub fn checkpoint_start(&self, shard: usize) -> (u64, u64, bool) {
-        let g = self.shards[shard].lock().unwrap();
+
+    pub fn checkpoint_start(&self, shard: usize) -> (usize, u64, bool) {
+        let ceiling = self.index.policy_scan_ceiling();
+        let work = self.index.page_work.shard(shard).lock().unwrap();
         (
-            g.next,
-            g.membership,
-            g.membership != g.checkpointed_membership
-                || !self.work[shard].dirty.lock().unwrap().is_empty(),
+            ceiling,
+            work.membership,
+            work.membership != work.checkpointed_membership || !work.dirty.is_empty(),
         )
     }
-    pub fn checkpoint_batch(
+
+    /// Startup groups compact slab indices once, so restoring many shards does
+    /// not rescan the directory 256 times or retain a second set of block keys.
+    pub fn recovery_slots(&self) -> [Vec<usize>; SHARDS] {
+        let mut shards = std::array::from_fn(|_| Vec::new());
+        self.index
+            .visit_paged_slots(|slot, id| shards[disk_shard_key(id)].push(slot));
+        shards
+    }
+
+    pub fn recovery_block(&self, slot: usize) -> Option<PagedMutation> {
+        self.index
+            .with_page_slot(slot, false, |id, _| self.mutation(id.clone()))
+    }
+
+    /// Full checkpoints statically bound the number of slab slots examined per
+    /// call. Deltas jump directly between dirty group bits.
+    pub fn checkpoint_slots(
         &self,
         shard: usize,
-        slot: &mut u64,
-        ceiling: u64,
-    ) -> Vec<Arc<BlockState>> {
-        if *slot > ceiling {
-            return Vec::new();
+        cursor: &mut usize,
+        ceiling: usize,
+        full: bool,
+    ) -> Vec<usize> {
+        if full {
+            let end = (*cursor + 64).min(ceiling);
+            let slots = self
+                .index
+                .paged_slots_in(*cursor..end, |id| disk_shard_key(id) == shard);
+            *cursor = end;
+            return slots;
         }
-        let g = self.shards[shard].lock().unwrap();
-        let batch: Vec<_> = g
-            .ordered
-            .range(*slot..=ceiling)
-            .take(64)
-            .map(|(&n, block)| {
-                *slot = n + 1;
-                block.clone()
-            })
-            .collect();
-        batch
+        let work = self.index.page_work.shard(shard).lock().unwrap();
+        let mut slots = Vec::new();
+        while slots.len() < 64 {
+            let Some(slot) = work.next_dirty(*cursor, ceiling) else {
+                *cursor = ceiling;
+                break;
+            };
+            slots.push(slot);
+            *cursor = slot + 1;
+        }
+        slots
     }
-    /// Look up only notified blocks. Registry slots distinguish recreation of
-    /// the same BlockId; later notifications remain for the next flush.
-    pub fn checkpoint_dirty_batch(
+
+    pub fn checkpoint_snapshot(
         &self,
         shard: usize,
-        slot: &mut u64,
-        ceiling: u64,
-    ) -> Vec<Arc<BlockState>> {
-        if *slot > ceiling {
-            return Vec::new();
-        }
-        let g = self.shards[shard].lock().unwrap();
-        let work = self.work[shard].dirty.lock().unwrap();
-        work.range(*slot..=ceiling)
-            .take(64)
-            .filter_map(|(&n, _)| {
-                *slot = n + 1;
-                g.ordered.get(&n).cloned()
+        slot: usize,
+        full: bool,
+        membership: u64,
+        now: u64,
+        size: &mut usize,
+    ) -> anyhow::Result<Option<PageSnapshot>> {
+        self.index
+            .with_page_slot(slot, true, |id, rows| {
+                if disk_shard_key(id) != shard {
+                    return Ok(None);
+                }
+                let mut work = self.index.page_work.shard(shard).lock().unwrap();
+                let dirty = work.get(slot);
+                if !full && dirty.is_none() {
+                    return Ok(None);
+                }
+                *size += serde_json::to_vec(id)?.len() + rows.count() * 12 + 52;
+                anyhow::ensure!(
+                    *size <= crate::page_access_shard::MAX_BYTES,
+                    "access shard exceeds 64 MiB limit"
+                );
+                // A later tombstone must be followed by the replacement of any
+                // reincarnated block. Leave dirty notifications scheduled when
+                // the deletion wasn't included in this checkpoint's tombstones.
+                let consume = work.membership == membership;
+                let touched = if consume { work.take(slot) } else { None };
+                drop(work);
+                let replace = full || dirty.is_some_and(|(_, replace)| replace);
+                let resident = rows.iter_from(0).next().is_some();
+                let records = rows
+                    .iter_from(0)
+                    .filter_map(|(page, row)| {
+                        let state = if consume {
+                            row.state.fetch_and(!DIRTY, Ordering::Relaxed)
+                        } else {
+                            row.state.load(Ordering::Relaxed)
+                        };
+                        if replace || state & DIRTY != 0 {
+                            return row.age().map(|age| (page, age));
+                        }
+                        None
+                    })
+                    .collect();
+                Ok(Some(PageSnapshot {
+                    block: id.clone(),
+                    resident,
+                    replace,
+                    snapshot: crate::page_access_store::AccessSnapshot {
+                        revision: 0,
+                        sampled_at: now,
+                        records,
+                    },
+                    rollback: touched.map(|(oldest, _)| CheckpointRetry {
+                        index: self.index.clone(),
+                        slot,
+                        oldest,
+                    }),
+                }))
             })
-            .collect()
+            .transpose()
+            .map(Option::flatten)
     }
+
     pub fn checkpoint_journal(
         &self,
         shard: usize,
         membership: u64,
     ) -> (crate::page_access_shard::JournalState, Vec<BlockId>) {
-        let g = self.shards[shard].lock().unwrap();
-        let mut state = g.journal;
-        state.full |= g.removal_overflow != 0;
+        let work = self.index.page_work.shard(shard).lock().unwrap();
+        let mut journal = work.journal;
+        journal.full |= work.removal_overflow != 0;
         (
-            state,
-            g.removed
+            journal,
+            work.removed
                 .range(..=membership)
                 .map(|(_, id)| id.clone())
                 .collect(),
         )
     }
+
     pub fn set_checkpoint_journal(
         &self,
         shard: usize,
-        state: crate::page_access_shard::JournalState,
+        journal: crate::page_access_shard::JournalState,
     ) {
-        self.shards[shard].lock().unwrap().journal = state;
+        self.index.page_work.shard(shard).lock().unwrap().journal = journal;
     }
+
     pub fn checkpoint_finished(&self, shard: usize, membership: u64) {
-        let mut g = self.shards[shard].lock().unwrap();
-        g.checkpointed_membership = membership;
-        g.removed.retain(|&revision, _| revision > membership);
-        g.removed_bytes = g
+        let mut work = self.index.page_work.shard(shard).lock().unwrap();
+        work.checkpointed_membership = membership;
+        work.removed.retain(|&revision, _| revision > membership);
+        work.removed_bytes = work
             .removed
             .values()
             .map(|id| {
                 id.object.bucket.len() + id.object.object_path.len() + id.version.0.len() + 128
             })
             .sum();
-        if g.removal_overflow <= membership {
-            g.removal_overflow = 0;
+        if work.removal_overflow <= membership {
+            work.removal_overflow = 0;
         }
     }
+
     pub fn checkpoint_recovered(&self, shard: usize) {
-        // Also rewrite a recovered snapshot whose last pages disappeared in a
-        // crash. There may be no live BlockState left to carry a dirty bit.
-        self.shards[shard].lock().unwrap().membership += 1;
+        self.index.page_work.shard(shard).lock().unwrap().membership += 1;
     }
-    /// Summaries contain only dirty blocks, never a traversal of resident pages.
+
     pub fn dirty_summary(&self) -> (usize, Option<u64>) {
         let mut count = 0;
         let mut oldest: Option<u64> = None;
-        for shard in &self.work {
-            let dirty = shard.dirty.lock().unwrap();
-            count += dirty.len();
-            if let Some(since) = dirty.values().copied().min() {
-                oldest = Some(oldest.map_or(since, |old| old.min(since)));
+        for shard in self
+            .index
+            .page_work
+            .shards
+            .get()
+            .into_iter()
+            .flat_map(|shards| shards.iter())
+        {
+            for dirty in shard.lock().unwrap().dirty.values() {
+                count += dirty.slots.count_ones() as usize;
+                oldest = Some(oldest.map_or(dirty.oldest, |old| old.min(dirty.oldest)));
             }
         }
         (count, oldest)
     }
 }
 
+pub(crate) struct PageSnapshot {
+    pub block: BlockKey,
+    pub snapshot: crate::page_access_store::AccessSnapshot,
+    pub resident: bool,
+    pub replace: bool,
+    rollback: Option<CheckpointRetry>,
+}
+impl PageSnapshot {
+    pub fn commit(mut self) {
+        self.rollback = None;
+    }
+}
+
+struct CheckpointRetry {
+    index: Arc<crate::BlockIndex>,
+    slot: usize,
+    oldest: u64,
+}
+
+impl Drop for PageSnapshot {
+    fn drop(&mut self) {
+        let Some(retry) = self.rollback.take() else {
+            return;
+        };
+        // A removed identity has its own tombstone. Retry a live identity's
+        // entire block, using its current ages even if it was recreated.
+        retry.index.with_page_slot(retry.slot, false, |id, _| {
+            if id == &self.block {
+                retry
+                    .index
+                    .page_work
+                    .mark(id, retry.slot, retry.oldest, true);
+            }
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Barrier;
     use talon_core::{Backend, ObjectId, Version};
+
+    fn id() -> BlockId {
+        BlockId::new(
+            ObjectId::new(Backend::S3, "bucket", "key"),
+            0,
+            131_072,
+            Version::new("v1"),
+        )
+    }
+
+    fn sample(life: &PageLifecycle, id: &BlockId, membership: u64, full: bool) -> PageSnapshot {
+        let slot = life.recovery_slots()[disk_shard(id)][0];
+        life.checkpoint_snapshot(disk_shard(id), slot, full, membership, 100, &mut 0)
+            .unwrap()
+            .unwrap()
+    }
+
     #[test]
     fn scan_metrics_accumulate_until_the_round_completes() {
         let mut cursor = ScanCursor::default();
@@ -1232,541 +1449,189 @@ mod tests {
         assert_eq!(cursor.record_batch(2.0, 0, true), Some((3.0, 7)));
         assert_eq!(cursor.record_batch(0.5, 0, true), Some((0.5, 0)));
     }
-    pub(super) fn id() -> BlockId {
-        BlockId {
-            object: ObjectId::new(Backend::S3, "bucket", "key"),
-            version: Version("v1".into()),
-            offset: 0,
-            block_size: 64,
+
+    #[test]
+    fn packed_keys_preserve_on_disk_shards() {
+        for offset in [0, 1, u64::MAX] {
+            let mut id = id();
+            id.offset = offset;
+            assert_eq!(disk_shard(&id), disk_shard_key(&BlockKey::new(&id)));
         }
     }
 
     #[test]
     fn read_pin_and_delete_claim_have_one_winner() {
         let life = PageLifecycle::new();
-        let block = life.block(&id());
+        let id = id();
+        let block = life.block(&id);
         for _ in 0..128 {
-            let handle = block.register(PageIndex(0), Some(10), 10, true);
+            block.register_fixture(PageIndex(0), Some(10), 10, true);
             let candidate = block.candidate(PageIndex(0)).unwrap();
-            let barrier = std::sync::Barrier::new(2);
+            let barrier = Barrier::new(2);
             std::thread::scope(|scope| {
-                let reader = scope.spawn(|| {
+                let read = scope.spawn(|| {
                     barrier.wait();
-                    let read = handle.acquire();
-                    // Retain the pin until both contenders have decided.
+                    let held = block.acquire(PageIndex(0));
                     barrier.wait();
-                    read
+                    held
                 });
                 barrier.wait();
-                let claimed = block.claim(&candidate, 100, Some(10));
+                let closed = block.claim(&candidate, 100, Some(10));
                 barrier.wait();
-                let read = reader.join().unwrap();
-                assert_ne!(claimed, read.is_some());
-                drop(read);
-                if !claimed {
+                let held = read.join().unwrap();
+                assert_ne!(closed, held.is_some());
+                drop(held);
+                if !closed {
                     assert!(block.claim(&candidate, 100, Some(10)));
                 }
-                assert!(handle.acquire().is_none());
-                assert!(block.candidate(PageIndex(0)).is_none());
-                block.finish(&candidate, 100);
-                assert!(handle.acquire().is_none());
+                assert!(block.acquire(PageIndex(0)).is_none());
+                assert!(life.index.clear_page(&id, PageIndex(0)));
+                assert!(block.acquire(PageIndex(0)).is_none());
             });
         }
     }
 
     #[test]
-    fn scan_cannot_revive_retry_cancelled_by_a_concurrent_successful_read() {
+    fn sparse_pin_survives_row_moves_and_does_not_touch_reused_slots() {
         let life = PageLifecycle::new();
-        let block = life.block(&id());
-        let handle = block.register(PageIndex(0), Some(10), 10, false);
-        for reason in [1, 2] {
-            let candidate = block.candidate(PageIndex(0)).unwrap();
-            assert!(block.claim(&candidate, 100, None));
-            block.abort(&candidate, reason);
-            let state = block.inner.lock().unwrap();
-            let mut pages = state.pages.write().unwrap();
-            let entry = pages.get_mut(&0).unwrap();
-            let observed = entry.handle.state.load(Ordering::Acquire);
-            assert_eq!(PageState::retry(observed), Some(reason));
-            // Pause selection after inspecting eligibility. Completion through
-            // the stable handle must work even while this block lock is held.
-            handle.acquire().unwrap().record_access_and_release(None);
-            assert!(block
-                .select(PageIndex(0), entry, reason, observed)
-                .is_none());
-            drop(pages);
-            drop(state);
-            let (candidates, _) = life.scan(&mut ScanCursor::default(), 100, 100, None, 10);
-            assert!(candidates.is_empty());
-        }
-    }
-
-    #[test]
-    fn coalesced_access_invalidates_selection_without_changing_block_revision() {
-        let life = PageLifecycle::new();
-        let block = life.block(&id());
-        let handle = block.register(PageIndex(0), Some(10), 10, false);
-        let before = block.inner.lock().unwrap().revision;
-        let old = block.candidate(PageIndex(0)).unwrap();
-        handle
-            .acquire()
-            .unwrap()
-            .record_access_and_release(Some(10));
-        assert!(!block.claim(&old, 100, None));
-        let current = block.candidate(PageIndex(0)).unwrap();
-        assert!(
-            !block.claim(&old, 100, None),
-            "reselection must not revive an old candidate"
-        );
-        // A failed read neither heats the page nor invalidates the selection.
-        drop(handle.acquire().unwrap());
-        assert_eq!(handle.last_access(), Some(10));
-        assert_eq!(handle.dirty_since(), None);
-        assert_eq!(block.inner.lock().unwrap().revision, before);
-        assert!(block.claim(&current, 100, None));
-    }
-
-    #[test]
-    fn checkpoint_commit_retains_new_access_and_failure_restores_old_dirtiness() {
-        let handle = Arc::new(PageState::new(Some(10)));
-        handle
-            .acquire()
-            .unwrap()
-            .record_access_and_release(Some(20));
-        let snapshot = PageCheckpoint::new(0, &handle);
-        assert_eq!(snapshot.access, Some(20));
-        assert!(snapshot.dirty());
-        handle
-            .acquire()
-            .unwrap()
-            .record_access_and_release(Some(30));
-        snapshot.commit();
-        assert_eq!(handle.dirty_since(), Some(30));
-        let failed = PageCheckpoint::new(0, &handle);
-        handle
-            .acquire()
-            .unwrap()
-            .record_access_and_release(Some(40));
-        drop(failed);
-        assert_eq!(handle.dirty_since(), Some(30));
-        let retry = PageCheckpoint::new(0, &handle);
-        assert_eq!(retry.access, Some(40));
-        retry.commit();
-        // Same-millisecond and late readers do not regress the clock or dirty
-        // an already durable timestamp.
-        handle
-            .acquire()
-            .unwrap()
-            .record_access_and_release(Some(40));
-        handle
-            .acquire()
-            .unwrap()
-            .record_access_and_release(Some(35));
-        assert_eq!(handle.last_access(), Some(40));
-        assert_eq!(handle.dirty_since(), None);
-    }
-
-    #[test]
-    fn checkpoint_racing_a_touch_either_captures_it_or_keeps_it_dirty() {
-        for _ in 0..128 {
-            let handle = Arc::new(PageState::new(Some(10)));
-            let barrier = std::sync::Barrier::new(2);
-            std::thread::scope(|scope| {
-                let writer = scope.spawn(|| {
-                    barrier.wait();
-                    handle
-                        .acquire()
-                        .unwrap()
-                        .record_access_and_release(Some(20));
-                });
-                barrier.wait();
-                let snapshot = PageCheckpoint::new(0, &handle);
-                let persisted = snapshot.access;
-                snapshot.commit();
-                writer.join().unwrap();
-                assert!(persisted == Some(20) || handle.dirty_since() == Some(20));
-            });
-        }
-    }
-    #[test]
-    fn consumed_access_releases_once_and_still_invalidates_candidates() {
-        let life = PageLifecycle::new();
-        let block = life.block(&id());
-        block.register(PageIndex(0), Some(10), 10, true);
-        let stale = block.candidate(PageIndex(0)).unwrap();
-        let a = block.acquire(PageIndex(0)).unwrap();
-        let b = block.acquire(PageIndex(0)).unwrap();
-        a.record_access_and_release(Some(20));
-        {
-            let state = block.inner.lock().unwrap();
-            assert_eq!(
-                state.pages.read().unwrap()[&0]
-                    .handle
-                    .state
-                    .load(Ordering::Acquire)
-                    & READERS,
-                1
-            );
-            assert_eq!(
-                state.pages.read().unwrap()[&0].handle.last_access(),
-                Some(20)
-            );
+        let id = id();
+        let block = life.block(&id);
+        let page = PageIndex(100_000);
+        block.register_fixture(page, Some(10), 10, false);
+        let stale = block.candidate(page).unwrap();
+        let old_read = block.acquire(page).unwrap();
+        for index in 0..700 {
+            block.register_fixture(PageIndex(index), Some(10), 10, false);
         }
         assert!(!block.claim(&stale, 100, None));
-        let current = block.candidate(PageIndex(0)).unwrap();
-        assert!(!block.claim(&current, 100, None));
-        drop(b);
-        assert_eq!(
-            block.inner.lock().unwrap().pages.read().unwrap()[&0]
-                .handle
-                .state
-                .load(Ordering::Acquire)
-                & READERS,
-            0
-        );
+        for index in 0..700 {
+            assert!(life.index.clear_page(&id, PageIndex(index)));
+        }
+        assert!(!block.claim(&stale, 100, None));
+        assert!(life.index.clear_page(&id, page));
+        block.register_fixture(page, Some(20), 20, false);
+        let reincarnated = block.acquire(page).unwrap();
+        old_read.record_access_and_release(Some(99));
+        assert_eq!(block.last_access(page.0), Some(20));
+        assert!(block.claim_all_pages().is_none());
+        life.index.remove(&id);
+        block.register_fixture(page, Some(30), 30, false);
+        reincarnated.record_access_and_release(Some(98));
+        assert_eq!(block.last_access(page.0), Some(30));
+        let fresh = block.candidate(page).unwrap();
+        assert!(!block.claim(&stale, 100, None));
+        assert!(block.claim(&fresh, 100, None));
+    }
+
+    #[test]
+    fn same_millisecond_success_invalidates_a_candidate_without_dirtying_ages() {
+        let life = PageLifecycle::new();
+        let id = id();
+        let block = life.block(&id);
+        let page = PageIndex(0);
+        block.register_fixture(page, Some(10), 10, true);
+        sample(&life, &id, 0, true).commit();
+        let stale = block.candidate(page).unwrap();
+        block
+            .acquire(page)
+            .unwrap()
+            .record_access_and_release(Some(10));
+        assert!(!block.claim(&stale, 100, None));
+        assert_eq!(life.dirty_summary(), (0, None));
+        let current = block.candidate(page).unwrap();
+        assert!(!block.claim(&stale, 100, None));
+        drop(block.acquire(page).unwrap());
         assert!(block.claim(&current, 100, None));
     }
 
-    #[tokio::test]
-    async fn directory_stripes_do_not_serialize_foreground_blocks() {
-        let life = PageLifecycle::new();
-        let first = id();
-        let digest = |id: &BlockId| {
-            let mut hash = DefaultHasher::new();
-            id.hash(&mut hash);
-            hash.finish()
-        };
-        let second = (1..10000)
-            .map(|offset| {
-                let mut id = first.clone();
-                id.offset = offset * 64;
-                id
-            })
-            .find(|id| {
-                digest(id) as usize % DIRECTORY_SHARDS == digest(&first) as usize % DIRECTORY_SHARDS
-            })
-            .unwrap();
-        let a = life.block(&first);
-        let b = life.block(&second);
-        let _a = a.lock().await;
-        let _b = tokio::time::timeout(std::time::Duration::from_secs(1), b.lock())
-            .await
-            .unwrap();
-        assert!(life.directory_gate(digest(&first)).try_write().is_err());
-    }
-
-    #[tokio::test]
-    async fn disjoint_fills_overlap_but_exclude_gc_and_whole_commits() {
-        let life = PageLifecycle::new();
-        let state = life.block(&id());
-        let a = state.lock_page_fill().await;
-        let b = tokio::time::timeout(std::time::Duration::from_secs(1), state.lock_page_fill())
-            .await
-            .unwrap();
-        let exclusive = state.lock();
-        tokio::pin!(exclusive);
-        assert!(futures::poll!(&mut exclusive).is_pending());
-        assert!(state.gate().directory.try_write().is_err());
-        drop(a);
-        assert!(futures::poll!(&mut exclusive).is_pending());
-        drop(b);
-        let _exclusive = exclusive.await;
-        assert!(futures::poll!(std::pin::pin!(state.lock_page_fill())).is_pending());
-    }
-
     #[test]
-    fn checkpoint_rollback_cannot_resurrect_retired_dirty_summary() {
-        let life = PageLifecycle::new();
-        let block = life.block(&id());
-        let page = block.register(PageIndex(0), Some(10), 10, true);
-        page.acquire().unwrap().record_access_and_release(Some(20));
-        let summary = block.inner.lock().unwrap().work.checkpoint();
-        let snapshot = PageCheckpoint::new(0, &page);
-        block.claim_all_pages().unwrap().finish(30);
-        drop(block);
-        life.retire_empty(&id());
-        assert!(life.get(&id()).is_none());
-        // Model failed publication dropping its retained guards after retirement.
-        drop(snapshot);
-        drop(summary);
-        assert_eq!(life.dirty_summary(), (0, None));
-    }
-
-    #[test]
-    fn page_and_capacity_selection_keep_independent_flags_without_age_tracking() {
-        let index = Arc::new(crate::BlockIndex::new());
-        index.init_paged(id(), 16, 16);
-        index.mark_page_allocated(&id(), PageIndex(0), 0);
-        let lru = index.restore_lru();
-        let life = PageLifecycle::with_index(index.clone(), false);
-        let block = life.block(&id());
-        let handle = block.register(PageIndex(0), Some(10), 10, true);
-        assert!(
-            handle.access.get().is_none(),
-            "disabled TTI must not allocate ages during fill"
-        );
-        let capacity = lru.block_candidates(&id()).pop().unwrap();
-        let page = block.candidate(PageIndex(0)).unwrap();
-        let (reader, _) = index
-            .page_reads_and_touch(&id(), PageIndex(0), PageIndex(1))
-            .unwrap();
-        assert!(
-            handle.recency.load(Ordering::Relaxed) & 1 != 0,
-            "index reads and capacity share this flag word"
-        );
-        assert!(!block.claim(&page, 10, None));
-        reader.record_access_and_release(None);
-        assert!(!lru.candidate_is_current(&capacity));
-        lru.block_candidates(&id());
-        assert!(handle.recency.load(Ordering::Relaxed) & 1 == 0);
-        assert!(
-            !block.claim(&page, 10, None),
-            "capacity selection must not erase GC access evidence"
-        );
-        lru.touch(&crate::eviction::CacheUnit::Page(id(), PageIndex(0)));
-        let page = block.candidate(PageIndex(0)).unwrap();
-        assert!(
-            handle.recency.load(Ordering::Relaxed) & 1 != 0,
-            "GC selection must not erase capacity recency"
-        );
-        assert!(block.claim(&page, 10, None));
-        assert!(handle.access.get().is_none());
-    }
-
-    #[test]
-    fn cold_pages_keep_read_arbitration_without_maintenance_state() {
-        let index = Arc::new(crate::BlockIndex::new());
-        index.init_paged(id(), 16, 32);
-        index.mark_page_allocated(&id(), PageIndex(0), 4096);
-        let lru = index.restore_lru();
-        let life = PageLifecycle::with_index(index.clone(), false);
-        let (read, tail) = index
-            .page_reads_and_touch(&id(), PageIndex(0), PageIndex(1))
-            .unwrap();
-        assert!(tail.is_empty());
-        assert!(life.get(&id()).is_none());
-        let block = life.block(&id());
-        let handle = block.inner.lock().unwrap().pages.read().unwrap()[&0]
-            .handle
-            .clone();
-        assert!(handle.access.get().is_none());
-        assert!(block.claim_all_pages().is_none());
-        let gate = block.gate();
-        drop(block);
-        life.scan(&mut ScanCursor::default(), 100, 100, None, 10);
-        assert!(
-            life.get(&id()).is_some(),
-            "a retained mutation gate preserves identity"
-        );
-        drop(gate);
-        life.scan(&mut ScanCursor::default(), 100, 100, None, 10);
-        assert!(life.get(&id()).is_none());
-        assert!(!handle.is_bound());
-        assert_eq!(index.page_count(), 1);
-        assert_eq!(lru.total_bytes(), 4096);
-        let block = life.block(&id());
-        assert!(handle.is_bound());
-        assert!(
-            block.claim_all_pages().is_none(),
-            "rebinding must preserve the old reader"
-        );
-        read.record_access_and_release(None);
-        let candidate = block.candidate(PageIndex(0)).unwrap();
-        assert!(block.claim(&candidate, 100, None));
-        block.abort(&candidate, 1);
-        drop(candidate);
-        drop(block);
-        let (retry, _) = life.scan(&mut ScanCursor::default(), 100, 100, None, 10);
-        assert_eq!(retry.len(), 1);
-        assert!(
-            life.get(&id()).is_some(),
-            "unlink retries retain maintenance state"
-        );
-        drop(retry);
-        handle.acquire().unwrap().record_access_and_release(None);
-        for _ in 0..2 {
-            life.scan(&mut ScanCursor::default(), 100, 100, None, 10);
-        }
-        assert!(life.get(&id()).is_none());
-        assert!(index
-            .page_reads_and_touch(&id(), PageIndex(0), PageIndex(1))
-            .is_some());
-    }
-
-    #[test]
-    fn binding_access_tracking_publishes_an_earlier_unbound_touch() {
-        let entry = PageEntry::unbound();
-        entry
-            .handle
-            .acquire()
-            .unwrap()
-            .record_access_and_release(Some(10));
-        let work = Arc::new(BlockWork::default());
-        entry.handle.bind_work(work.clone());
-        assert_eq!(work.shard.dirty.lock().unwrap().get(&0), Some(&10));
-        assert_eq!(entry.handle.last_access(), Some(10));
-    }
-
-    #[test]
-    fn disabled_tti_retires_empty_states_after_external_references_release() {
-        let life = PageLifecycle::new();
-        let block = life.block(&id());
-        // An incomplete fill's empty state stays pending while a caller owns it.
-        life.scan(&mut ScanCursor::default(), 100, 100, None, 10);
-        drop(block);
-        life.scan(&mut ScanCursor::default(), 100, 100, None, 10);
-        assert!(life.get(&id()).is_none());
-
-        let block = life.block(&id());
-        block.register(PageIndex(0), Some(1), 1, true);
-        life.scan(&mut ScanCursor::default(), 100, 100, None, 10);
-        block.claim_all_pages().unwrap().finish(100);
-        life.retire_empty(&id()); // Still protected by this caller's Arc.
-        life.scan(&mut ScanCursor::default(), 100, 100, None, 10);
-        drop(block);
-        life.scan(&mut ScanCursor::default(), 100, 100, None, 10);
-        assert!(life.get(&id()).is_none());
-        assert_eq!(life.dirty_summary(), (0, None));
-    }
-
-    #[test]
-    fn disabled_tti_examines_only_retry_pages() {
-        let life = PageLifecycle::new();
-        let block = life.block(&id());
-        for page in 0..10000 {
-            block.register(PageIndex(page), None, 1, false);
-        }
-        let (_, clean) = life.scan(&mut ScanCursor::default(), 100, 10000, None, 10);
-        assert!(clean.completed);
-        assert_eq!(clean.checked, 0);
-        let retry = block.candidate(PageIndex(9000)).unwrap();
-        block.abort(&retry, 1);
-        let (candidates, retry_scan) = life.scan(&mut ScanCursor::default(), 100, 10000, None, 10);
-        assert_eq!(retry_scan.checked, 1);
-        assert_eq!(candidates.len(), 1);
-        block
-            .acquire(PageIndex(9000))
-            .unwrap()
-            .record_access_and_release(None);
-        let (candidates, _) = life.scan(&mut ScanCursor::default(), 100, 10000, None, 10);
-        assert!(candidates.is_empty());
-        let (_, clean) = life.scan(&mut ScanCursor::default(), 100, 10000, None, 10);
-        assert_eq!(
-            clean.checked, 0,
-            "successful reads retire cancelled retries"
-        );
-    }
-
-    #[test]
-    fn dirty_block_reads_do_not_wait_for_the_shard_summary_lock() {
-        let life = PageLifecycle::new();
-        let block = life.block(&id());
-        let handles: Vec<_> = (0..256)
-            .map(|page| block.register(PageIndex(page), Some(10), 10, false))
-            .collect();
-        handles[0]
-            .acquire()
-            .unwrap()
-            .record_access_and_release(Some(20));
-        let work = block.inner.lock().unwrap().work.clone();
-        let held = work.shard.dirty.lock().unwrap();
-        let completed = std::thread::scope(|scope| {
-            let (tx, rx) = std::sync::mpsc::channel();
-            scope.spawn(move || {
-                for handle in handles {
-                    handle
-                        .acquire()
-                        .unwrap()
-                        .record_access_and_release(Some(30));
-                }
-                tx.send(()).unwrap();
-            });
-            let completed = rx.recv_timeout(std::time::Duration::from_secs(2)).is_ok();
-            // Always release before joining, including a regression's timeout.
-            drop(held);
-            completed
-        });
-        assert!(
-            completed,
-            "other pages of a dirty block waited for the shard lock"
-        );
-        assert_eq!(life.dirty_summary(), (1, Some(20)));
-    }
-
-    #[test]
-    fn failed_checkpoint_restores_older_block_summary_after_a_new_touch() {
-        let life = PageLifecycle::new();
-        let block = life.block(&id());
-        let handle = block.register(PageIndex(0), Some(10), 10, false);
-        let work = block.inner.lock().unwrap().work.clone();
-        handle
-            .acquire()
-            .unwrap()
-            .record_access_and_release(Some(20));
-        let summary = work.checkpoint();
-        let page = PageCheckpoint::new(0, &handle);
-        handle
-            .acquire()
-            .unwrap()
-            .record_access_and_release(Some(30));
-        assert_eq!(life.dirty_summary(), (1, Some(30)));
-        drop(page);
-        drop(summary);
-        assert_eq!(life.dirty_summary(), (1, Some(20)));
-        let summary = work.checkpoint();
-        let page = PageCheckpoint::new(0, &handle);
-        assert_eq!(page.access, Some(30));
-        page.commit();
-        summary.commit();
-        assert_eq!(life.dirty_summary(), (0, None));
-    }
-
-    #[test]
-    fn coalesced_block_touch_racing_checkpoint_is_captured_or_stays_scheduled() {
-        for _ in 0..128 {
+    fn checkpoint_racing_read_and_fill_keeps_the_newest_ages() {
+        for _ in 0..64 {
             let life = PageLifecycle::new();
-            let block = life.block(&id());
-            let first = block.register(PageIndex(0), Some(10), 10, false);
-            let second = block.register(PageIndex(1), Some(10), 10, false);
-            first.acquire().unwrap().record_access_and_release(Some(20));
-            let work = block.inner.lock().unwrap().work.clone();
-            let barrier = std::sync::Barrier::new(2);
+            let id = id();
+            let block = life.block(&id);
+            let first = PageIndex(0);
+            let second = PageIndex(100_000);
+            let shard = disk_shard(&id);
+            block.register_fixture(first, Some(10), 10, true);
+            let (_, generation, _) = life.checkpoint_start(shard);
+            sample(&life, &id, generation, true).commit();
+            block
+                .acquire(first)
+                .unwrap()
+                .record_access_and_release(Some(20));
+            let reader = block.acquire(first).unwrap();
+            let barrier = Barrier::new(2);
             std::thread::scope(|scope| {
-                let reader = scope.spawn(|| {
+                let update = scope.spawn(|| {
                     barrier.wait();
-                    second
-                        .acquire()
-                        .unwrap()
-                        .record_access_and_release(Some(30));
+                    block.register_fixture(second, Some(40), 40, true);
+                    reader.record_access_and_release(Some(30));
                 });
                 barrier.wait();
-                let summary = work.checkpoint();
-                PageCheckpoint::new(0, &first).commit();
-                let page = PageCheckpoint::new(1, &second);
-                let captured = page.access == Some(30);
-                page.commit();
-                summary.commit();
-                reader.join().unwrap();
-                assert!(captured || life.dirty_summary().0 == 1);
+                let snapshot = sample(&life, &id, generation, false);
+                let records = snapshot.snapshot.records.clone();
+                snapshot.commit();
+                update.join().unwrap();
+                let mut persisted: BTreeMap<_, _> = records.into_iter().collect();
+                if life.checkpoint_start(shard).2 {
+                    let retry = sample(&life, &id, generation, false);
+                    persisted.extend(retry.snapshot.records.iter().copied());
+                    retry.commit();
+                }
+                assert_eq!(persisted.get(&first.0), Some(&30));
+                assert_eq!(persisted.get(&second.0), Some(&40));
             });
-            let summary = work.checkpoint();
-            PageCheckpoint::new(0, &first).commit();
-            PageCheckpoint::new(1, &second).commit();
-            summary.commit();
-            assert_eq!(life.dirty_summary(), (0, None));
         }
     }
 
     #[test]
-    fn removal_journal_is_lazy_bounded_and_keeps_concurrent_deletions() {
+    fn failed_snapshot_retries_sampled_ages_without_regressing_a_new_touch() {
         let life = PageLifecycle::new();
-        for _ in 0..100 {
-            drop(life.block(&id()));
-            life.retire_empty(&id());
-        }
-        let shard = disk_shard(&id());
-        let (_, membership, _) = life.checkpoint_start(shard);
-        assert!(life.checkpoint_journal(shard, membership).1.is_empty());
+        let id = id();
+        let block = life.block(&id);
+        let shard = disk_shard(&id);
+        block.register_fixture(PageIndex(0), Some(10), 10, true);
+        let (_, generation, _) = life.checkpoint_start(shard);
+        sample(&life, &id, generation, true).commit();
+        block
+            .acquire(PageIndex(0))
+            .unwrap()
+            .record_access_and_release(Some(20));
+        let failed = sample(&life, &id, generation, false);
+        assert!(!failed.replace);
+        assert_eq!(failed.snapshot.records, vec![(0, 20)]);
+        block
+            .acquire(PageIndex(0))
+            .unwrap()
+            .record_access_and_release(Some(30));
+        drop(failed);
+        assert_eq!(life.dirty_summary(), (1, Some(20)));
+        let retry = sample(&life, &id, generation, false);
+        assert!(retry.replace);
+        assert_eq!(retry.snapshot.records, vec![(0, 30)]);
+        retry.commit();
+        block
+            .acquire(PageIndex(0))
+            .unwrap()
+            .record_access_and_release(Some(25));
+        block
+            .acquire(PageIndex(0))
+            .unwrap()
+            .record_access_and_release(Some(30));
+        assert_eq!(life.dirty_summary(), (0, None));
+    }
+
+    #[test]
+    fn late_tombstone_does_not_erase_a_recreated_blocks_checkpoint() {
+        let life = PageLifecycle::new();
+        let id = id();
+        let shard = disk_shard(&id);
+        let block = life.block(&id);
+        let page = PageIndex(0);
+        block.register_fixture(page, Some(10), 10, true);
+        let (_, old_membership, _) = life.checkpoint_start(shard);
+        sample(&life, &id, old_membership, true).commit();
         life.set_checkpoint_journal(
             shard,
             crate::page_access_shard::JournalState {
@@ -1775,144 +1640,178 @@ mod tests {
                 ..Default::default()
             },
         );
-        for _ in 0..10000 {
-            drop(life.block(&id()));
-            life.retire_empty(&id());
-        }
-        let (_, membership, _) = life.checkpoint_start(shard);
-        assert!(life.checkpoint_journal(shard, membership).0.full);
-        assert!(life.shards[shard].lock().unwrap().removed_bytes <= 1 << 20);
+        life.index.remove(&id);
+        block.register_fixture(page, Some(30), 30, true);
+        let concurrent = sample(&life, &id, old_membership, false);
+        assert_eq!(concurrent.snapshot.records, vec![(0, 30)]);
+        concurrent.commit();
+        life.checkpoint_finished(shard, old_membership);
+        let (_, membership, dirty) = life.checkpoint_start(shard);
+        assert!(dirty);
+        assert_eq!(
+            life.checkpoint_journal(shard, membership).1,
+            vec![id.clone()]
+        );
+        let latest = sample(&life, &id, membership, false);
+        assert!(latest.replace);
+        assert_eq!(latest.snapshot.records, vec![(0, 30)]);
+        latest.commit();
         life.checkpoint_finished(shard, membership);
-        drop(life.block(&id()));
-        life.retire_empty(&id());
-        // Completion of an older snapshot cannot erase later tombstones.
-        life.checkpoint_finished(shard, membership);
-        assert!(life.checkpoint_journal(shard, membership).1.is_empty());
-        let (_, latest, _) = life.checkpoint_start(shard);
-        assert_eq!(life.checkpoint_journal(shard, latest).1, vec![id()]);
-        assert!(!life.checkpoint_journal(shard, latest).0.full);
+        assert!(!life.checkpoint_start(shard).2);
     }
 
     #[test]
-    fn checkpoint_summary_preserves_changes_and_restores_failed_snapshots() {
+    fn failed_empty_snapshot_and_detach_leave_a_tombstone() {
         let life = PageLifecycle::new();
-        let block = life.block(&id());
-        let handle = block.register(PageIndex(0), Some(10), 10, false);
-        let shard = disk_shard(&id());
+        let id = id();
+        let shard = disk_shard(&id);
+        let block = life.block(&id);
+        let page = PageIndex(0);
+        block.register_fixture(page, Some(10), 10, true);
         let (_, membership, _) = life.checkpoint_start(shard);
-        life.checkpoint_finished(shard, membership);
-        assert!(!life.checkpoint_start(shard).2);
-        handle
-            .acquire()
-            .unwrap()
-            .record_access_and_release(Some(20));
-        assert_eq!(life.dirty_summary(), (1, Some(20)));
-        let work = block.inner.lock().unwrap().work.clone();
-        let summary = work.checkpoint();
-        let page = PageCheckpoint::new(0, &handle);
-        handle
-            .acquire()
+        sample(&life, &id, membership, true).commit();
+        life.set_checkpoint_journal(
+            shard,
+            crate::page_access_shard::JournalState {
+                generation: 1,
+                full: false,
+                ..Default::default()
+            },
+        );
+        life.index.clear_page(&id, page);
+        let empty = sample(&life, &id, membership, false);
+        assert!(empty.replace);
+        assert!(!empty.resident);
+        life.index.remove(&id);
+        drop(empty);
+        let (_, next, dirty) = life.checkpoint_start(shard);
+        assert!(dirty);
+        assert_eq!(life.checkpoint_journal(shard, next).1, vec![id]);
+    }
+
+    #[test]
+    fn first_checkpoint_removal_and_bounded_tombstones_preserve_later_changes() {
+        let life = PageLifecycle::new();
+        let id = id();
+        let shard = disk_shard(&id);
+        let block = life.block(&id);
+        let page = PageIndex(0);
+        block.register_fixture(page, None, 1, false);
+        let (_, old, _) = life.checkpoint_start(shard);
+        let in_flight = sample(&life, &id, old, true);
+        life.index.remove(&id);
+        life.set_checkpoint_journal(
+            shard,
+            crate::page_access_shard::JournalState {
+                generation: 1,
+                full: false,
+                ..Default::default()
+            },
+        );
+        in_flight.commit();
+        life.checkpoint_finished(shard, old);
+        let (_, next, dirty) = life.checkpoint_start(shard);
+        assert!(dirty);
+        assert!(life.checkpoint_journal(shard, next).0.full);
+        for _ in 0..9000 {
+            block.register_fixture(page, None, 1, false);
+            life.index.remove(&id);
+        }
+        let (_, flushed, _) = life.checkpoint_start(shard);
+        assert!(life.checkpoint_journal(shard, flushed).0.full);
+        assert!(
+            life.index
+                .page_work
+                .shard(shard)
+                .lock()
+                .unwrap()
+                .removed_bytes
+                <= 1 << 20
+        );
+        life.checkpoint_finished(shard, flushed);
+        block.register_fixture(page, None, 1, false);
+        life.index.remove(&id);
+        life.checkpoint_finished(shard, flushed);
+        let (_, latest, dirty) = life.checkpoint_start(shard);
+        assert!(dirty);
+        let (journal, removed) = life.checkpoint_journal(shard, latest);
+        assert!(!journal.full);
+        assert_eq!(removed, vec![id]);
+    }
+
+    #[test]
+    fn untracked_pages_scan_only_retries_and_pending_cleanup() {
+        let life = PageLifecycle::with_index(Arc::new(crate::BlockIndex::new()), false);
+        let id = id();
+        let block = life.block(&id);
+        for page in (0..10_000).map(PageIndex) {
+            block.register_fixture(page, Some(10), 10, false);
+        }
+        assert!(block.hold_rows().read().unwrap().ages.is_empty());
+        let (_, clean) = life.scan(&mut ScanCursor::default(), 10, 100, None, 10);
+        assert!(clean.completed);
+        assert_eq!(clean.checked, 0);
+        let page = PageIndex(9000);
+        let candidate = block.candidate(page).unwrap();
+        assert!(block.claim(&candidate, 100, None));
+        block.abort(&candidate, 1);
+        let (batch, report) = life.scan(&mut ScanCursor::default(), 10, 100, None, 10);
+        assert_eq!(report.checked, 1);
+        assert_eq!(batch[0].reason, 1);
+        block
+            .acquire(page)
             .unwrap()
             .record_access_and_release(Some(30));
-        page.commit();
-        summary.commit();
-        assert_eq!(life.dirty_summary(), (1, Some(30)));
-        let summary = work.checkpoint();
-        let page = PageCheckpoint::new(0, &handle);
-        drop(page);
-        drop(summary);
-        assert!(life.checkpoint_start(shard).2);
-        assert_eq!(life.dirty_summary(), (1, Some(30)));
-        let summary = work.checkpoint();
-        PageCheckpoint::new(0, &handle).commit();
-        summary.commit();
+        let (batch, clean) = life.scan(&mut ScanCursor::default(), 10, 100, None, 10);
+        assert!(batch.is_empty());
+        assert_eq!(clean.checked, 0);
+        for page in (0..10_000).map(PageIndex) {
+            assert!(life.index.clear_page(&id, page));
+        }
+        let (_, cleanup) = life.scan(&mut ScanCursor::default(), 10, 100, None, 10);
+        assert_eq!(cleanup.empty.len(), 1);
+        life.index.remove(&id);
+        let (_, clean) = life.scan(&mut ScanCursor::default(), 10, 100, None, 10);
+        assert!(clean.empty.is_empty());
         assert_eq!(life.dirty_summary(), (0, None));
-        assert!(!life.checkpoint_start(shard).2);
     }
 
     #[test]
-    fn disabled_tti_keeps_unknown_pages_but_discovers_cleanup_retries() {
+    fn saturated_reader_count_never_produces_an_uncounted_guard() {
         let life = PageLifecycle::new();
         let block = life.block(&id());
-        block.register(PageIndex(0), None, 1, false);
-        block.register(PageIndex(1), None, 1, false);
-        let retry = block.candidate(PageIndex(1)).unwrap();
-        block.abort(&retry, 1);
-        let (candidates, _) = life.scan(&mut ScanCursor::default(), 100, 10000, None, 10);
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].page, PageIndex(1));
-        assert_eq!(candidates[0].reason, 1);
+        let page = PageIndex(0);
+        block.register_fixture(page, None, 0, false);
+        let mut readers: Vec<_> = (0..READERS).map(|_| block.acquire(page).unwrap()).collect();
+        assert!(block.acquire(page).is_none());
+        assert!(block.candidate(page).is_none());
+        drop(readers.pop());
+        readers.push(block.acquire(page).unwrap());
+        drop(readers);
+        assert!(block.candidate(page).is_some());
     }
 
     #[test]
-    fn boundary_pin_touch_and_generation() {
-        let life = PageLifecycle::new();
-        let b = life.block(&id());
-        b.register(PageIndex(0), Some(10), 10, true);
-        let c = b.candidate(PageIndex(0)).unwrap();
-        assert!(!b.claim(&c, 20, Some(10)));
-        let read = b.acquire(PageIndex(0)).unwrap();
-        assert!(!b.claim(&c, 21, Some(10)));
-        read.record_access(21);
-        drop(read);
-        assert!(!b.claim(&c, 40, Some(10)));
-        let c = b.candidate(PageIndex(0)).unwrap();
-        assert!(b.claim(&c, 40, Some(10)));
-        assert!(b.acquire(PageIndex(0)).is_none());
-        b.abort(&c, 0);
-        assert!(b.acquire(PageIndex(0)).is_some());
-        assert!(b.claim(&c, 40, Some(10)));
-        b.finish(&c, 40);
-        b.register(PageIndex(0), Some(50), 50, true);
-        assert!(!b.claim(&c, 100, None));
-    }
-    #[test]
-    fn deletion_budget_resumes_across_empty_cleanup_candidates() {
-        let life = PageLifecycle::new();
-        for offset in 0..8 {
-            let mut id = id();
-            id.offset = offset * 64;
-            let state = life.block(&id);
-            state.register(PageIndex(0), Some(1), 1, false);
-            let candidate = state.candidate(PageIndex(0)).unwrap();
-            assert!(state.claim(&candidate, 100, None));
-            state.finish(&candidate, 100);
+    fn retry_scan_continues_past_a_full_batch_of_pinned_pages() {
+        let life = PageLifecycle::with_index(Arc::new(crate::BlockIndex::new()), false);
+        let block = life.block(&id());
+        for page in (0..65).map(PageIndex) {
+            block.register_fixture(page, None, 0, false);
+            let candidate = block.candidate(page).unwrap();
+            assert!(block.claim(&candidate, 0, None));
+            block.abort(&candidate, 1);
         }
+        let _readers: Vec<_> = (0..64)
+            .map(|page| block.acquire(PageIndex(page)).unwrap())
+            .collect();
         let mut cursor = ScanCursor::default();
-        let mut seen = std::collections::HashSet::new();
-        for _ in 0..16 {
-            let (pages, report) = life.scan(&mut cursor, 100, 100, None, 1);
-            assert!(pages.is_empty());
-            assert!(report.empty.len() <= 1);
-            for block in report.empty {
-                assert!(seen.insert(block.id.clone()));
-            }
-            if report.completed {
-                assert_eq!(seen.len(), 8);
-                return;
-            }
-        }
-        panic!("cleanup candidates prevented scan completion");
-    }
-
-    #[test]
-    fn unknown_is_expired_and_scan_resumes() {
-        let life = PageLifecycle::new();
-        let b = life.block(&id());
-        for p in 0..10 {
-            b.register(PageIndex(p), None, 50, false);
-        }
-        let mut cursor = ScanCursor::default();
-        let mut seen = Vec::new();
-        loop {
-            let (batch, r) = life.scan(&mut cursor, 3, 50, Some(100), usize::MAX);
-            assert!(r.checked <= 3);
-            seen.extend(batch.iter().map(|c| c.page.0));
-            if r.completed {
-                break;
-            }
-        }
-        seen.sort();
-        assert_eq!(seen, (0..10).collect::<Vec<_>>());
+        let (first, report) = life.scan(&mut cursor, 64, 0, None, 64);
+        assert!(first.is_empty());
+        assert_eq!(report.checked, 64);
+        let (second, report) = life.scan(&mut cursor, 64, 0, None, 64);
+        assert_eq!(report.checked, 1);
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].page, PageIndex(64));
+        assert!(report.completed);
     }
 }

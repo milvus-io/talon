@@ -113,13 +113,9 @@ pub struct AccessHandle(Access);
 
 #[derive(Clone)]
 enum Access {
-    Page(
-        Arc<crate::page_lifecycle::PageState>,
-        Option<Arc<AtomicU64>>,
-        u64,
-    ),
+    Page(Arc<OrdinaryReference>, Option<Arc<AtomicU64>>, u64),
     Tracked(
-        Arc<crate::page_lifecycle::PageState>,
+        Arc<OrdinaryReference>,
         Arc<crate::small_store::DirtyAccess>,
         u64,
     ),
@@ -128,6 +124,59 @@ enum Access {
         Option<Arc<AtomicU64>>,
         Option<Arc<crate::small_store::DirtyAccess>>,
     ),
+}
+
+#[derive(Default)]
+pub(crate) struct OrdinaryReference {
+    recency: AtomicU64,
+}
+
+impl OrdinaryReference {
+    pub(crate) fn policy_generation(&self) -> u64 {
+        let old = self
+            .recency
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                Some(
+                    (old & !1)
+                        .checked_add(2)
+                        .expect("policy generation exhausted"),
+                )
+            })
+            .unwrap();
+        (old & !1) + 2
+    }
+    pub(crate) fn retire_policy(&self, generation: u64) {
+        let _ = self
+            .recency
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                (current & !1 == generation).then(|| {
+                    generation
+                        .checked_add(2)
+                        .expect("policy generation exhausted")
+                })
+            });
+    }
+    pub(crate) fn referenced(&self, generation: u64) -> bool {
+        self.recency.load(Ordering::Relaxed) == generation | 1
+    }
+    pub(crate) fn reference(&self, generation: u64) {
+        let _ = self.recency.compare_exchange(
+            generation,
+            generation | 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
+    pub(crate) fn take_reference(&self, generation: u64) -> bool {
+        self.recency
+            .compare_exchange(
+                generation | 1,
+                generation,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+    }
 }
 
 /// Anchored wall time: monotonic within a process and portable across restarts.
@@ -145,31 +194,18 @@ impl Default for AccessHandle {
 }
 
 impl AccessHandle {
-    pub(crate) fn with_state(
-        state: Arc<crate::page_lifecycle::PageState>,
-        clock: Option<Arc<AtomicU64>>,
-    ) -> Self {
+    pub(crate) fn with_state(state: Arc<OrdinaryReference>, clock: Option<Arc<AtomicU64>>) -> Self {
         let generation = state.policy_generation();
         Self(Access::Page(state, clock, generation))
     }
-    pub(crate) fn bind_state(mut self, state: Arc<crate::page_lifecycle::PageState>) -> Self {
-        match &mut self.0 {
-            Access::Page(old, _, generation) | Access::Tracked(old, _, generation) => {
-                if !Arc::ptr_eq(old, &state) {
-                    *generation = state.policy_generation();
-                    *old = state;
-                }
-            }
-            Access::Small(..) => unreachable!("small-object token cannot bind a page"),
-        }
-        self
-    }
-    pub(crate) fn page_state(&self) -> &Arc<crate::page_lifecycle::PageState> {
+    #[cfg(test)]
+    fn page_state(&self) -> &Arc<OrdinaryReference> {
         match &self.0 {
             Access::Page(state, ..) | Access::Tracked(state, ..) => state,
             Access::Small(..) => unreachable!("small-object token has no page state"),
         }
     }
+
     pub(crate) fn small(&self) -> Option<&Arc<crate::small_store::policy::SmallAccess>> {
         match &self.0 {
             Access::Small(small, ..) => Some(small),
@@ -366,7 +402,7 @@ pub(crate) struct PolicyEntry {
 
 #[derive(Default)]
 pub(crate) struct PageAccessSlot {
-    state: Option<Arc<crate::page_lifecycle::PageState>>,
+    state: Option<Arc<OrdinaryReference>>,
     clock: Option<Arc<AtomicU64>>,
     // Policy generations are even; the low bit records residency independently.
     generation_and_resident: u64,

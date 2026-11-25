@@ -19,14 +19,14 @@ use crate::small_store::key::{SmallIdentity, SmallRef};
 mod catalog;
 mod directory;
 pub(crate) use directory::Directory;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, RwLockReadGuard};
 
 use crate::eviction::{
     AccessHandle, BlockActivity, BlockPolicy, CacheUnit, PolicyEntry, PolicyState, SharedUnit,
     UnitKey, UnitKind,
 };
-use crate::page_lifecycle::{BlockState, PageEntry, PageReadGuard, PageTable};
+use crate::page_lifecycle::{PageEntry, PageReadGuard, PageRows, PageSet, PageTable, PageWork};
 
 use talon_core::{BlockForm, BlockId, BlockMeta, PageIndex, PresentBitmap};
 
@@ -52,12 +52,12 @@ pub struct BlockIndex {
     resident_blocks: AtomicU64,
     resident_bytes: AtomicU64,
     resident_pages: AtomicU64,
+    pub(crate) page_work: Arc<PageWork>,
 }
 
 #[derive(Default)]
 pub(crate) struct DirectoryEntry {
     resident: Option<Arc<Entry>>,
-    lifecycle: Option<Arc<BlockState>>,
     policy: PolicyUnits,
     activity: BlockPolicy,
 }
@@ -66,29 +66,89 @@ pub(crate) struct DirectoryEntry {
 struct PolicyUnits {
     whole: Option<Arc<RwLock<UnitSlot>>>,
     exact: Option<Box<PolicyEntry>>,
-    pages: Option<PageTable>,
+    pages: Option<PolicyPages>,
     len: usize,
     legacy: u8,
 }
 
+// The current eviction API needs this compatibility storage for journaled
+// pages. It carries policy only. Presence and reader state live in Geometry.
+enum PolicyPages {
+    Legacy(PageTable),
+    Catalog(Box<RwLock<crate::page_table::PageMap<PolicyEntry>>>),
+}
+
+impl PolicyPages {
+    fn next(&self, start: u32) -> Option<(u32, bool, bool)> {
+        match self {
+            Self::Legacy(pages) => {
+                let pages = pages.read().unwrap();
+                let (&page, entry) = pages.range(start..).next()?;
+                Some((
+                    page,
+                    entry.unit.policy.is_some(),
+                    pages.last_key_value().unwrap().0 == &page,
+                ))
+            }
+            Self::Catalog(pages) => {
+                let pages = pages.read().unwrap();
+                let (&page, _) = pages.range(start..).next()?;
+                Some((page, true, pages.last_key_value().unwrap().0 == &page))
+            }
+        }
+    }
+
+    fn update<T>(&self, page: u32, update: impl FnOnce(&mut PolicyState) -> T) -> Option<T> {
+        match self {
+            Self::Legacy(pages) => Some(update(
+                pages
+                    .write()
+                    .unwrap()
+                    .get_mut(&page)?
+                    .unit
+                    .policy
+                    .as_mut()?,
+            )),
+            Self::Catalog(pages) => Some(update(&mut pages.write().unwrap().get_mut(&page)?.state)),
+        }
+    }
+}
+
+impl PolicyUnits {
+    fn touch_catalog_page(&self, page: u32) {
+        if let Some(PolicyPages::Catalog(pages)) = &self.pages {
+            if let Some(entry) = pages.read().unwrap().get(&page) {
+                entry.access.touch();
+            }
+        }
+    }
+}
+
 impl DirectoryEntry {
+    fn has_paged_resident(&self) -> bool {
+        self.resident.as_ref().is_some_and(|entry| entry.paged)
+    }
+
     fn is_empty(&self) -> bool {
-        self.resident.is_none()
-            && self.lifecycle.is_none()
-            && self.policy.len == 0
-            && self.activity.access.is_none()
+        self.resident.is_none() && self.policy.len == 0 && self.activity.access.is_none()
     }
 }
 
 struct Entry {
     // None means retired: retained Arcs must never mutate or charge it again.
     block: RwLock<Option<IndexedBlock>>,
+    paged: bool,
+    // Directory detachment precedes retirement. Only the attached occupant
+    // can publish slot-indexed maintenance updates.
+    attached: AtomicBool,
 }
 
 impl Entry {
     fn new(block: IndexedBlock) -> Self {
         Self {
+            paged: matches!(block.units, IndexedUnits::Paged(_)),
             block: RwLock::new(Some(block)),
+            attached: AtomicBool::new(true),
         }
     }
 }
@@ -165,6 +225,12 @@ pub(crate) struct PageUnit {
     policy: Option<PolicyState>,
 }
 
+impl PageUnit {
+    pub(crate) fn resident(&self) -> bool {
+        self.access.resident()
+    }
+}
+
 impl IndexedUnits {
     fn resident(&self, page: PageIndex) -> bool {
         match self {
@@ -187,12 +253,6 @@ impl IndexedUnits {
                 .sum(),
         }
     }
-    fn page_table(&self) -> Option<PageTable> {
-        match self {
-            Self::Paged(pages) => Some(pages.clone()),
-            _ => None,
-        }
-    }
 }
 
 impl From<StoredMeta> for IndexedBlock {
@@ -211,10 +271,10 @@ impl From<StoredMeta> for IndexedBlock {
                 }))),
             ),
             BlockForm::Paged { page_size, present } => {
-                let mut pages = crate::page_table::PageMap::default();
+                let mut pages = PageRows::default();
                 for page in 0..present.len() {
                     if present.is_present(PageIndex(page)) {
-                        let mut entry = PageEntry::unbound();
+                        let mut entry = PageEntry::default();
                         entry.unit.access.set_resident(true);
                         pages.insert(page, entry);
                     }
@@ -267,7 +327,7 @@ impl IndexedBlock {
                     slots
                         .write()
                         .unwrap()
-                        .get_or_insert_with(page.0, PageEntry::unbound)
+                        .get_or_insert_with(page.0, PageEntry::default)
                         .unit
                         .allocated = allocated;
                 }
@@ -306,14 +366,58 @@ impl IndexedBlock {
     }
 }
 
+fn with_catalog_pages<T>(
+    entries: &Directory,
+    slot: usize,
+    f: impl FnOnce(&BlockKey, PageSet<'_>) -> T,
+) -> Option<T> {
+    let (key, geometry, _) = entries.resident_at(slot)?;
+    (geometry.kind() == Some(StoreKind::Paged)).then(|| f(key, PageSet::Catalog(geometry)))
+}
+
+fn with_legacy_pages<T>(
+    entry: &DirectoryEntry,
+    exclusive: bool,
+    f: impl FnOnce(PageSet<'_>) -> T,
+) -> Option<T> {
+    let block = entry.resident.as_ref()?.block.read().unwrap();
+    let IndexedUnits::Paged(table) = &block.as_ref()?.units else {
+        return None;
+    };
+    if exclusive {
+        let rows = table.write().unwrap();
+        Some(f(PageSet::Legacy(&rows)))
+    } else {
+        let rows = table.read().unwrap();
+        Some(f(PageSet::Legacy(&rows)))
+    }
+}
+
+fn paged_key_at(entries: &Directory, catalog: bool, slot: usize) -> Option<&BlockKey> {
+    if catalog {
+        let (key, geometry, _) = entries.resident_at(slot)?;
+        (geometry.kind() == Some(StoreKind::Paged)).then_some(key)
+    } else {
+        let (key, entry) = entries.at(slot)?;
+        entry.has_paged_resident().then_some(key)
+    }
+}
+
 impl BlockIndex {
     /// Startup only, before serving. Reusing a recovered index starts a new
     /// runtime generation without retaining the previous policy or lifecycle.
     pub(crate) fn prepare_runtime_recovery(&self) {
         self.small.write().unwrap().clear();
         let mut entries = self.entries.write().unwrap();
+        let tracked = self.page_work.tracking();
+        self.page_work.reset();
+        if self.catalog {
+            entries
+                .rows
+                .for_each_paged_mut(crate::catalog::Geometry::reset_page_states);
+        }
         entries.retain(|_, directory| {
-            if directory.lifecycle.is_none()
+            if (self.catalog || !tracked)
                 && directory.policy.len == 0
                 && directory.activity.access.is_none()
             {
@@ -340,7 +444,6 @@ impl BlockIndex {
                 };
                 *block = IndexedBlock::allocated(block.metadata(), allocated);
             }
-            directory.lifecycle = None;
             directory.policy = PolicyUnits::default();
             directory.activity = BlockPolicy::default();
             directory.resident.is_some()
@@ -404,22 +507,14 @@ impl BlockIndex {
             }
         }
         if let (Some(pages), Ok(start)) = (&slots.pages, u32::try_from(cursor.1 - 2)) {
-            let pages = pages.read().unwrap();
-            if let Some((&page, entry)) = pages.range(start..).next() {
-                if pages
-                    .last_key_value()
-                    .is_some_and(|(&last, _)| last == page)
-                {
+            if let Some((page, active, last)) = pages.next(start) {
+                if last {
                     advance_slot(cursor);
                 } else {
                     cursor.1 = u64::from(page) + 3;
                 }
-                return entry
-                    .unit
-                    .policy
-                    .is_some()
-                    .then(|| unit(UnitKind::Page(PageIndex(page))));
-            };
+                return active.then(|| unit(UnitKind::Page(PageIndex(page))));
+            }
         }
         advance_slot(cursor);
         None
@@ -468,14 +563,17 @@ impl BlockIndex {
         match unit.kind() {
             UnitKind::Whole => read(&policy.whole.as_ref()?.read().unwrap()),
             UnitKind::ExactRange => policy.exact.as_deref().cloned(),
-            UnitKind::Page(page) => {
-                let pages = policy.pages.as_ref()?.read().unwrap();
-                let slot = &pages.get(&page.0)?.unit;
-                Some(PolicyEntry {
-                    state: slot.policy?,
-                    access: slot.access.get()?,
-                })
-            }
+            UnitKind::Page(page) => match policy.pages.as_ref()? {
+                PolicyPages::Catalog(pages) => pages.read().unwrap().get(&page.0).cloned(),
+                PolicyPages::Legacy(pages) => {
+                    let pages = pages.read().unwrap();
+                    let slot = &pages.get(&page.0)?.unit;
+                    Some(PolicyEntry {
+                        state: slot.policy?,
+                        access: slot.access.get()?,
+                    })
+                }
+            },
         }
     }
 
@@ -503,12 +601,25 @@ impl BlockIndex {
                 units.push((UnitKind::Whole, policy));
             }
         }
-        if let Some(pages) = &entry.policy.pages {
-            for (&page, slot) in pages.read().unwrap().iter() {
-                if let Some(policy) = slot.unit.policy {
-                    units.push((UnitKind::Page(PageIndex(page)), policy));
-                }
+        match &entry.policy.pages {
+            Some(PolicyPages::Catalog(pages)) => {
+                units.extend(
+                    pages
+                        .read()
+                        .unwrap()
+                        .iter()
+                        .map(|(&page, entry)| (UnitKind::Page(PageIndex(page)), entry.state)),
+                );
             }
+            Some(PolicyPages::Legacy(pages)) => {
+                units.extend(pages.read().unwrap().iter().filter_map(|(&page, entry)| {
+                    entry
+                        .unit
+                        .policy
+                        .map(|state| (UnitKind::Page(PageIndex(page)), state))
+                }));
+            }
+            None => {}
         }
         units
     }
@@ -610,22 +721,30 @@ impl BlockIndex {
                 put(&mut slot.write().unwrap(), entry.access)
             }
             UnitKind::Page(page) => {
-                let pages = directory.policy.pages.get_or_insert_with(|| {
+                let storage = directory.policy.pages.get_or_insert_with(|| {
                     if self.catalog {
-                        if let Some(life) = &directory.lifecycle {
-                            return life.inner.lock().unwrap().pages.clone();
-                        }
+                        PolicyPages::Catalog(Box::default())
+                    } else {
+                        PolicyPages::Legacy(pages.unwrap_or_default())
                     }
-                    pages.unwrap_or_default()
                 });
-                let mut pages = pages.write().unwrap();
-                let page = pages.get_or_insert_with(page.0, || {
-                    PageEntry::with_handle(entry.access.page_state().clone())
-                });
-                let access = entry.access.bind_state(page.handle.clone());
-                let fresh = page.unit.policy.replace(entry.state).is_none();
-                page.unit.access.set(access.clone());
-                (fresh, access)
+                match storage {
+                    PolicyPages::Catalog(pages) => {
+                        let access = entry.access.clone();
+                        (
+                            pages.write().unwrap().insert(page.0, entry).is_none(),
+                            access,
+                        )
+                    }
+                    PolicyPages::Legacy(pages) => {
+                        let mut pages = pages.write().unwrap();
+                        let page = pages.get_or_insert_with(page.0, PageEntry::default);
+                        let access = entry.access;
+                        let fresh = page.unit.policy.replace(entry.state).is_none();
+                        page.unit.access.set(access.clone());
+                        (fresh, access)
+                    }
+                }
             }
         };
         directory.policy.len += usize::from(fresh);
@@ -660,17 +779,7 @@ impl BlockIndex {
         let result = match unit.kind() {
             UnitKind::ExactRange => unreachable!(),
             UnitKind::Whole => update(policy.whole.as_ref()?.write().unwrap().policy.as_mut()?),
-            UnitKind::Page(page) => update(
-                policy
-                    .pages
-                    .as_ref()?
-                    .write()
-                    .unwrap()
-                    .get_mut(&page.0)?
-                    .unit
-                    .policy
-                    .as_mut()?,
-            ),
+            UnitKind::Page(page) => policy.pages.as_ref()?.update(page.0, update)?,
         };
         Some((result, true))
     }
@@ -704,16 +813,6 @@ impl BlockIndex {
             }
         }
         let mut entries = self.entries.write().unwrap();
-        let catalog_present = if let UnitKind::Page(page) = unit.kind() {
-            entries
-                .resident(unit.block())
-                .is_some_and(|(_, geometry, _)| {
-                    geometry.kind() == Some(StoreKind::Paged)
-                        && geometry.allocation(page.0).is_some()
-                })
-        } else {
-            false
-        };
         let directory = entries.get_mut(unit.block())?;
         let take = |slot: &mut UnitSlot| {
             Some(PolicyEntry {
@@ -724,30 +823,29 @@ impl BlockIndex {
         let removed = match unit.kind() {
             UnitKind::ExactRange => *directory.policy.exact.take()?,
             UnitKind::Whole => take(&mut directory.policy.whole.as_ref()?.write().unwrap())?,
-            UnitKind::Page(page) => {
-                let resident = directory
-                    .resident
-                    .as_ref()
-                    .map(|entry| entry.block.read().unwrap());
-                let present = resident
-                    .as_ref()
-                    .and_then(|entry| entry.as_ref())
-                    .is_some_and(|entry| entry.units.resident(page));
-                let mut pages = directory.policy.pages.as_ref()?.write().unwrap();
-                let entry = pages.get_mut(&page.0)?;
-                let removed = PolicyEntry {
-                    state: entry.unit.policy.take()?,
-                    access: entry.unit.access.get().expect("policy access token"),
-                };
-                if !catalog_present
-                    && !present
-                    && entry.unit.allocated == 0
-                    && !entry.handle.is_bound()
-                {
-                    pages.remove(&page.0);
+            UnitKind::Page(page) => match directory.policy.pages.as_mut()? {
+                PolicyPages::Catalog(pages) => pages.write().unwrap().remove(&page.0)?,
+                PolicyPages::Legacy(pages) => {
+                    let resident = directory
+                        .resident
+                        .as_ref()
+                        .map(|entry| entry.block.read().unwrap());
+                    let present = resident
+                        .as_ref()
+                        .and_then(|entry| entry.as_ref())
+                        .is_some_and(|entry| entry.units.resident(page));
+                    let mut pages = pages.write().unwrap();
+                    let entry = pages.get_mut(&page.0)?;
+                    let removed = PolicyEntry {
+                        state: entry.unit.policy.take()?,
+                        access: entry.unit.access.get().expect("policy access token"),
+                    };
+                    if !present && entry.unit.allocated == 0 {
+                        pages.remove(&page.0);
+                    }
+                    removed
                 }
-                removed
-            }
+            },
         };
         removed.access.retire();
         directory.policy.len -= 1;
@@ -884,73 +982,101 @@ impl BlockIndex {
         Ok(())
     }
 
-    pub(crate) fn lifecycle(&self, id: &BlockId) -> Option<Arc<BlockState>> {
-        self.entries.read().unwrap().get(id)?.lifecycle.clone()
-    }
-
-    pub(crate) fn lifecycle_or_insert(
-        &self,
-        id: &BlockId,
-        create: impl FnOnce(BlockKey, Option<PageTable>) -> Arc<BlockState>,
-    ) -> Arc<BlockState> {
-        if let Some(block) = self.lifecycle(id) {
-            return block;
-        }
-        let mut entries = self.entries.write().unwrap();
-        let key = entries
+    pub(crate) fn canonical_key(&self, id: &BlockId) -> Option<BlockKey> {
+        self.entries
+            .read()
+            .unwrap()
             .get_key_value(id)
             .map(|(id, _)| id.clone())
-            .unwrap_or_else(|| BlockKey::new(id));
-        let (_, slot) = entries.get_or_insert(key.clone());
-        if let Some(block) = &slot.lifecycle {
-            return block.clone();
-        }
-        let pages = slot
-            .policy
-            .pages
-            .clone()
-            .filter(|_| self.catalog)
-            .or_else(|| {
-                slot.resident.as_ref().and_then(|entry| {
-                    entry
-                        .block
-                        .read()
-                        .unwrap()
-                        .as_ref()
-                        .and_then(|block| block.units.page_table())
-                })
-            });
-        let block = create(key, pages);
-        slot.lifecycle = Some(block.clone());
-        block
     }
 
-    // Caller owns the lifecycle registry. Retirement checks maintenance work
-    // while the directory and registry are the only remaining owners.
-    pub(crate) fn retire_lifecycle(&self, id: &dyn BlockIdentity, block: &Arc<BlockState>) -> bool {
-        if Arc::strong_count(block) != 2 || !block.retirement_candidate() {
-            return false;
-        }
-        // The precheck releases local locks before the directory write lock.
-        // Recheck identity, owners and work before detaching the lifecycle.
+    pub(crate) fn enable_page_ages(&self) {
         let mut entries = self.entries.write().unwrap();
-        let Some(slot) = entries.get_mut(id) else {
-            return false;
+        if self.page_work.tracking() {
+            return;
+        }
+        if self.catalog {
+            entries
+                .rows
+                .for_each_paged_mut(crate::catalog::Geometry::enable_page_ages);
+        } else {
+            for entry in entries.values().filter_map(|entry| entry.resident.as_ref()) {
+                let block = entry.block.read().unwrap();
+                if let IndexedUnits::Paged(table) = &block.as_ref().unwrap().units {
+                    table.write().unwrap().track_resident_ages();
+                }
+            }
+        }
+        self.page_work.enable_tracking();
+    }
+
+    /// Keep directory membership stable across all accesses to a page row.
+    pub(crate) fn with_page_slot<T>(
+        &self,
+        slot: usize,
+        exclusive: bool,
+        f: impl FnOnce(&BlockKey, PageSet<'_>) -> T,
+    ) -> Option<T> {
+        if self.catalog && exclusive {
+            return with_catalog_pages(&self.entries.write().unwrap(), slot, f);
+        }
+        let entries = self.entries.read().unwrap();
+        if self.catalog {
+            with_catalog_pages(&entries, slot, f)
+        } else {
+            let (key, entry) = entries.at(slot)?;
+            with_legacy_pages(entry, exclusive, |rows| f(key, rows))
+        }
+    }
+
+    pub(crate) fn with_pages<T>(
+        &self,
+        id: &dyn BlockIdentity,
+        exclusive: bool,
+        f: impl FnOnce(usize, PageSet<'_>) -> T,
+    ) -> Option<T> {
+        if self.catalog && exclusive {
+            let entries = self.entries.write().unwrap();
+            let slot = entries.slot(id)?;
+            return with_catalog_pages(&entries, slot, |_, rows| f(slot, rows));
+        }
+        let entries = self.entries.read().unwrap();
+        let slot = entries.slot(id)?;
+        if self.catalog {
+            with_catalog_pages(&entries, slot, |_, rows| f(slot, rows))
+        } else {
+            with_legacy_pages(entries.get(id)?, exclusive, |rows| f(slot, rows))
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn legacy_pages(&self, id: &dyn BlockIdentity) -> Option<PageTable> {
+        let entries = self.entries.read().unwrap();
+        let block = entries.get(id)?.resident.as_ref()?.block.read().unwrap();
+        let IndexedUnits::Paged(table) = &block.as_ref()?.units else {
+            return None;
         };
-        if !slot
-            .lifecycle
-            .as_ref()
-            .is_some_and(|old| Arc::ptr_eq(old, block))
-            || Arc::strong_count(block) != 2
-            || !block.retire_if_idle()
-        {
-            return false;
+        Some(table.clone())
+    }
+
+    pub(crate) fn visit_paged_slots(&self, mut visit: impl FnMut(usize, &BlockKey)) {
+        let entries = self.entries.read().unwrap();
+        for slot in 0..entries.slot_count() {
+            if let Some(id) = paged_key_at(&entries, self.catalog, slot) {
+                visit(slot, id);
+            }
         }
-        slot.lifecycle = None;
-        if slot.is_empty() {
-            entries.remove(id);
-        }
-        true
+    }
+
+    pub(crate) fn paged_slots_in(
+        &self,
+        slots: std::ops::Range<usize>,
+        matches_shard: impl Fn(&BlockKey) -> bool,
+    ) -> Vec<usize> {
+        let entries = self.entries.read().unwrap();
+        slots
+            .filter(|&slot| paged_key_at(&entries, self.catalog, slot).is_some_and(&matches_shard))
+            .collect()
     }
 
     fn entry(&self, id: &BlockId) -> Option<Arc<Entry>> {
@@ -975,6 +1101,27 @@ impl BlockIndex {
             let mut guard = entry.block.write().unwrap();
             if let Some(block) = guard.as_mut() {
                 return Some(write(block));
+            }
+        }
+    }
+
+    fn write_paged_entry<T>(
+        &self,
+        id: &BlockId,
+        write: impl FnOnce(&mut IndexedBlock, usize, &AtomicBool) -> T,
+    ) -> Option<T> {
+        loop {
+            let (cursor, entry) = {
+                let entries = self.entries.read().unwrap();
+                let cursor = entries.slot(id)?;
+                let entry = entries.at(cursor)?.1.resident.clone()?;
+                (cursor, entry)
+            };
+            let mut block = entry.block.write().unwrap();
+            if let Some(block) = block.as_mut() {
+                if entry.attached.load(Ordering::Acquire) {
+                    return Some(write(block, cursor, &entry.attached));
+                }
             }
         }
     }
@@ -1010,7 +1157,7 @@ impl BlockIndex {
     /// No block lifecycle lock or second page-table lookup is needed. The single
     /// page case keeps its guard inline and does not allocate a vector buffer.
     pub(crate) fn page_reads_and_touch(
-        &self,
+        self: &Arc<Self>,
         id: &BlockId,
         start: PageIndex,
         end: PageIndex,
@@ -1020,7 +1167,7 @@ impl BlockIndex {
     }
 
     pub(crate) fn page_reads_and_touch_at(
-        &self,
+        self: &Arc<Self>,
         id: &BlockId,
         start: PageIndex,
         end: PageIndex,
@@ -1031,24 +1178,36 @@ impl BlockIndex {
         if self.catalog {
             return self.catalog_read_pages(id, start, end);
         }
-        self.read_entry(id, |entry| {
-            let IndexedUnits::Paged(pages) = &entry.units else {
+        // On a partial range miss, release acquired guards only after all
+        // directory, entry and page locks have gone out of scope.
+        let first;
+        let mut tail = Vec::new();
+        let disk_id = {
+            let entries = self.entries.read().unwrap();
+            let slot = entries.slot(id)?;
+            let (_, directory) = entries.at(slot)?;
+            let block = directory.resident.as_ref()?.block.read().unwrap();
+            let block = block.as_ref()?;
+            let IndexedUnits::Paged(pages) = &block.units else {
                 return None;
             };
             let pages = pages.read().unwrap();
             let acquire = |page| {
-                let state = pages.get(&page)?;
-                if !state.unit.access.resident() || state.unit.access.is_none() {
+                let row = pages.get(&page)?;
+                if !row.unit.access.resident() || row.unit.access.is_none() {
                     return None;
                 }
-                let guard = state.handle.acquire()?;
-                state.unit.access.touch()?;
+                let guard = PageReadGuard::acquire(self, slot, page, &row.state)?;
+                let _ = row.unit.access.touch();
                 Some(guard)
             };
-            let first = acquire(start.0)?;
-            let tail: Option<Vec<_>> = (start.0 + 1..end.0).map(acquire).collect();
-            Some((entry.meta.disk_id, first, tail?))
-        })?
+            first = acquire(start.0)?;
+            for page in start.0 + 1..end.0 {
+                tail.push(acquire(page)?);
+            }
+            block.meta.disk_id
+        };
+        Some((disk_id, first, tail))
     }
 
     /// Startup only, before serving or starting maintenance. Attach policy
@@ -1101,8 +1260,7 @@ impl BlockIndex {
                 IndexedUnits::Paged(pages) => {
                     for (&page, state) in pages.write().unwrap().iter_mut() {
                         if state.unit.access.resident() {
-                            let access =
-                                AccessHandle::with_state(state.handle.clone(), clock.clone());
+                            let access = AccessHandle::with_state(Arc::default(), clock.clone());
                             state.unit.access.set(access.clone());
                             add(Some(PageIndex(page)), state.unit.allocated, access);
                         }
@@ -1117,47 +1275,6 @@ impl BlockIndex {
             "ordinary cache policy token recovery"
         );
         units
-    }
-
-    /// Startup only. Whole blocks have no page lifecycle: skip them without
-    /// allocating or cloning their identities into a second full snapshot.
-    pub(crate) fn restore_page_states(&self, lifecycle: &crate::page_lifecycle::PageLifecycle) {
-        if self.catalog {
-            let ids: Vec<_> = self
-                .entries
-                .read()
-                .unwrap()
-                .residents()
-                .filter(|(_, geometry)| geometry.kind() == Some(StoreKind::Paged))
-                .map(|(key, _)| key.clone())
-                .collect();
-            for key in ids {
-                lifecycle.block(&key.materialize());
-            }
-            return;
-        }
-        let entries: Vec<_> = self
-            .entries
-            .read()
-            .unwrap()
-            .iter()
-            .filter_map(|(id, entry)| {
-                entry
-                    .resident
-                    .as_ref()
-                    .map(|entry| (id.clone(), entry.clone()))
-            })
-            .collect();
-        for (id, entry) in entries {
-            let paged = {
-                let guard = entry.block.read().unwrap();
-                let entry = guard.as_ref().expect("live directory entry");
-                entry.materialized_pages() > 0
-            };
-            if paged {
-                lifecycle.block(&id.materialize());
-            }
-        }
     }
 
     /// Create an empty index.
@@ -1411,6 +1528,12 @@ impl BlockIndex {
         let mut entry = IndexedBlock::allocated(meta, allocated);
         let pages = entry.materialized_pages();
         let added = entry.charged_bytes;
+        if self.page_work.tracking() {
+            if let IndexedUnits::Paged(table) = &mut entry.units {
+                let rows = Arc::get_mut(table).unwrap().get_mut().unwrap();
+                rows.track_resident_ages();
+            }
+        }
         let mut entries = self.entries.write().unwrap();
         // Structural mutations take directory -> entry. Ordinary operations
         // never reacquire the directory while holding an entry lock.
@@ -1433,15 +1556,17 @@ impl BlockIndex {
             self.resident_pages
                 .fetch_sub(old_pages - pages, Ordering::Relaxed);
         }
-        if let (Some(life), IndexedUnits::Paged(pages)) = (&slot.lifecycle, &mut entry.units) {
-            let mut state = life.inner.lock().unwrap();
-            for page in pages.read().unwrap().values() {
-                page.handle.bind_work(state.work.clone());
-            }
-            state.pages = pages.clone();
-        }
-        if slot.resident.replace(Arc::new(Entry::new(entry))).is_none() {
+        let key = entry.meta.id.clone();
+        let replaced = slot.resident.replace(Arc::new(Entry::new(entry)));
+        if replaced.is_none() {
             self.resident_blocks.fetch_add(1, Ordering::Relaxed);
+        }
+        let cursor = entries.slot(&key).unwrap();
+        if let Some(old) = replaced.filter(|old| old.paged) {
+            self.page_work.detached(&key, cursor, Some(&old.attached));
+        }
+        if pages != 0 {
+            self.page_work.mark_structural(&key, cursor);
         }
         drop(entries);
         // Potentially large page tables and bitmaps are freed outside directory locks.
@@ -1496,17 +1621,6 @@ impl BlockIndex {
         if slot.resident.is_some() {
             return false;
         }
-        if let Some(life) = &slot.lifecycle {
-            life.inner.lock().unwrap().pages = entry
-                .block
-                .get_mut()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .units
-                .page_table()
-                .unwrap();
-        }
         slot.resident = Some(Arc::new(entry));
         self.resident_blocks.fetch_add(1, Ordering::Relaxed);
         // A fresh paged entry has no present pages, so it adds no resident bytes.
@@ -1529,7 +1643,7 @@ impl BlockIndex {
         allocated: u64,
         disk_id: Option<DiskId>,
     ) -> bool {
-        self.write_entry(id, |entry| {
+        self.write_paged_entry(id, |entry, cursor, attached| {
             let IndexedUnits::Paged(pages) = &mut entry.units else {
                 return false;
             };
@@ -1544,9 +1658,15 @@ impl BlockIndex {
                 return false;
             }
             let mut pages = pages.write().unwrap();
-            let slot = pages.get_or_insert_with(page.0, PageEntry::unbound);
+            let slot = pages.get_or_insert_with(page.0, PageEntry::default);
             let fresh = !slot.unit.access.set_resident(true);
             let old = std::mem::replace(&mut slot.unit.allocated, allocated);
+            if fresh {
+                if self.page_work.tracking() {
+                    pages.track_age(page.0);
+                }
+                self.page_work.added_page(&entry.meta.id, cursor, attached);
+            }
             entry.charged_bytes = entry
                 .charged_bytes
                 .saturating_sub(old)
@@ -1571,7 +1691,7 @@ impl BlockIndex {
     /// Used by page-level eviction: the block entry (and its other pages) stays
     /// intact. Returns `true` if the page was present and is now cleared.
     pub fn clear_page(&self, id: &BlockId, page: PageIndex) -> bool {
-        self.write_entry(id, |entry| {
+        self.write_paged_entry(id, |entry, cursor, attached| {
             let IndexedUnits::Paged(pages) = &mut entry.units else {
                 return false;
             };
@@ -1591,9 +1711,19 @@ impl BlockIndex {
             if slot.unit.policy.is_none() {
                 slot.unit.access.clear();
             }
-            if !slot.handle.is_bound() && slot.unit.policy.is_none() {
+            let remove = slot.unit.policy.is_none();
+            let retry = pages.forget_page(page.0);
+            if remove {
                 pages.remove(&page.0);
             }
+            self.page_work.removed_page(
+                &entry.meta.id,
+                cursor,
+                page.0,
+                entry.charged_pages == 0,
+                retry,
+                attached,
+            );
             self.replace_bytes(bytes, 0);
             self.resident_pages.fetch_sub(1, Ordering::Relaxed);
             true
@@ -1648,8 +1778,15 @@ impl BlockIndex {
     /// accounting finish; retained operations may complete in that interval.
     pub fn remove(&self, id: &BlockId) -> Option<BlockMeta> {
         let mut entries = self.entries.write().unwrap();
+        let cursor = entries.slot(id)?;
+        let key = entries.at(cursor)?.0.clone();
         let slot = entries.get_mut(id)?;
         let entry = slot.resident.take()?;
+        if entry.paged {
+            self.page_work.detached(&key, cursor, Some(&entry.attached));
+        } else {
+            entry.attached.store(false, Ordering::Release);
+        }
         if slot.is_empty() {
             entries.remove(id);
         }
@@ -1787,7 +1924,9 @@ mod tests {
         let index = Arc::new(BlockIndex::new());
         let life = crate::page_lifecycle::PageLifecycle::with_index(index.clone(), false);
         let id = block(1);
-        life.block(&id).inner.lock().unwrap().cleanup_pending = true;
+        index.init_paged(id.clone(), 4096, 4096);
+        index.mark_page_allocated(&id, PageIndex(0), 4096);
+        index.clear_page(&id, PageIndex(0));
 
         with_directory_reader(&index, || {
             let (_, report) = life.scan(
@@ -1801,8 +1940,8 @@ mod tests {
             assert_eq!(report.empty.len(), 1);
         });
         assert!(life.get(&id).is_some());
-        life.block(&id).inner.lock().unwrap().cleanup_pending = false;
-        life.retire_empty(&id);
+        life.block(&id).cleanup_finished();
+        index.remove(&id);
         assert!(life.get(&id).is_none());
     }
 
@@ -1842,36 +1981,27 @@ mod tests {
         });
     }
 
-    #[test]
-    fn lifecycle_directory_preserves_gates_across_residency_changes() {
+    #[tokio::test]
+    async fn mutation_gate_survives_residency_changes_without_an_index_row() {
         let index = Arc::new(BlockIndex::new());
         let life = crate::page_lifecycle::PageLifecycle::with_index(index.clone(), true);
         let id = block(1);
         let pending = life.block(&id);
-        assert_eq!(index.len(), 0);
-        assert!(index.snapshot_lens().is_empty());
-        assert!(index.get(&id).is_none());
-
+        let held = pending.lock().await;
+        assert!(index.entries.read().unwrap().is_empty());
         index.init_paged(id.clone(), 4096, 4096);
         index.mark_page_allocated(&id, PageIndex(0), 4096);
-        assert!(Arc::ptr_eq(&pending, &life.block(&id)));
-        pending.register(PageIndex(0), None, 0, false);
-        let candidate = pending.candidate(PageIndex(0)).unwrap();
-        assert!(pending.claim(&candidate, 0, None));
-        index.clear_page(&id, PageIndex(0));
-        pending.finish(&candidate, 0);
-        pending.inner.lock().unwrap().cleanup_pending = false;
-        drop(candidate);
         index.remove(&id).unwrap();
-        assert_eq!(index.len(), 0);
-        life.retire_empty(&id);
-        assert!(Arc::ptr_eq(&pending, &life.block(&id)));
+        assert!(index.entries.read().unwrap().is_empty());
         index.commit(whole_meta(id.clone(), 4096));
-        assert!(Arc::ptr_eq(&pending, &life.block(&id)));
-        drop(pending);
-        life.retire_empty(&id);
-        assert!(life.get(&id).is_none());
-        assert_eq!(index.len(), 1);
+        let current = life.block(&id);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), current.lock())
+                .await
+                .is_err()
+        );
+        drop(held);
+        let _held = current.lock().await;
         assert_eq!(index.resident_bytes(), 4096);
         index.remove(&id).unwrap();
         assert!(index.entries.read().unwrap().is_empty());
@@ -1904,32 +2034,30 @@ mod tests {
         index.init_paged(id.clone(), 4096, 8192);
         let block = life.block(&id);
         let p0 = PageIndex(0);
-        let old = block.register(p0, Some(10), 10, false);
         index.mark_page_allocated(&id, p0, 4096);
-        let read = old.acquire().unwrap();
+        block.register(p0, Some(10), 10, false);
         let candidate = block.candidate(p0).unwrap();
+        let read = block.acquire(p0).unwrap();
         assert!(!block.claim(&candidate, 100, None));
 
-        block.register(PageIndex(1), Some(10), 10, false);
         index.mark_page_allocated(&id, PageIndex(1), 8192);
+        block.register(PageIndex(1), Some(10), 10, false);
         drop(read);
         assert!(block.claim(&candidate, 100, None));
         block.abort(&candidate, 1);
         assert_eq!(index.resident_bytes(), 12288);
-        assert!(old.acquire().is_some());
+        assert!(block.acquire(p0).is_some());
         let candidate = block.candidate(p0).unwrap();
         assert!(block.claim(&candidate, 100, None));
         assert!(index.clear_page(&id, p0));
-        block.finish(&candidate, 100);
         assert_eq!(index.resident_bytes(), 8192);
-        assert!(old.acquire().is_none());
+        assert!(block.acquire(p0).is_none());
 
-        let fresh = block.register(p0, Some(101), 101, false);
         index.mark_page_allocated(&id, p0, 16384);
+        block.register(p0, Some(101), 101, false);
         assert!(!block.claim(&candidate, 102, None));
         block.abort(&candidate, 1);
-        block.finish(&candidate, 102);
-        assert!(fresh.acquire().is_some());
+        assert!(block.acquire(p0).is_some());
         assert_eq!(index.resident_bytes(), 24576);
         assert_eq!(index.page_count(), 2);
     }
@@ -2318,7 +2446,11 @@ mod tests {
             index.mark_page_allocated(&paged, PageIndex(pages - 1), 8192);
             let lru = index.restore_lru();
             let lifecycle = crate::page_lifecycle::PageLifecycle::with_index(index.clone(), true);
-            index.restore_page_states(&lifecycle);
+            for page in [0, pages - 1] {
+                lifecycle
+                    .block(&paged)
+                    .register(PageIndex(page), None, 0, false);
+            }
             assert_eq!(lru.len(), 3);
             assert_eq!(lru.total_bytes(), index.resident_bytes());
             assert_eq!(index.page_count(), 2);
@@ -2386,7 +2518,7 @@ mod tests {
     }
 
     #[test]
-    fn page_lookup_does_not_lock_block_and_partial_pin_failure_releases_readers() {
+    fn page_lookup_partial_pin_failure_releases_readers() {
         use crate::eviction::Lru;
         let idx = Arc::new(BlockIndex::new());
         let lru = Lru::new();
@@ -2401,21 +2533,9 @@ mod tests {
             idx.set_access(&unit, lru.insert(unit.clone(), 4096));
             block.register(page, Some(10), 10, false);
         }
-        let locked = block.inner.lock().unwrap();
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::scope(|scope| {
-            scope.spawn(|| {
-                tx.send(
-                    idx.page_reads_and_touch(&id, PageIndex(0), PageIndex(2))
-                        .is_some(),
-                )
-                .unwrap();
-            });
-            let result = rx.recv_timeout(std::time::Duration::from_secs(5));
-            // Release before asserting so a regression cannot strand the thread.
-            drop(locked);
-            assert!(result.unwrap());
-        });
+        assert!(idx
+            .page_reads_and_touch(&id, PageIndex(0), PageIndex(2))
+            .is_some());
         let second = block.candidate(PageIndex(1)).unwrap();
         assert!(block.claim(&second, 100, None));
         assert!(idx
@@ -2594,11 +2714,10 @@ mod tests {
         let other = block(2);
         index.init_paged(busy.clone(), 4096, 8192);
         index.init_paged(other.clone(), 4096, 8192);
+        let lifecycle = crate::page_lifecycle::PageLifecycle::with_index(index.clone(), true);
         let busy_entry = index.entry(&busy).unwrap();
         let busy_guard = busy_entry.block.write().unwrap();
         // A directory reader must not prevent mutations to existing entries.
-        let lifecycle = crate::page_lifecycle::PageLifecycle::with_index(index.clone(), true);
-        let _other_lifecycle = lifecycle.block(&other);
         let directory_guard = index.entries.read().unwrap();
         let (tx, rx) = mpsc::channel();
         std::thread::scope(|scope| {
@@ -2710,7 +2829,7 @@ mod tests {
             index.mark_page_allocated(&id, PageIndex(0), allocated);
             let lru = index.restore_lru();
             let life = crate::page_lifecycle::PageLifecycle::with_index(index.clone(), false);
-            let candidate = bind.then(|| {
+            let _candidate = bind.then(|| {
                 let state = life.block(&id);
                 let candidate = state.candidate(PageIndex(0)).unwrap();
                 assert!(state.claim(&candidate, 0, None));
@@ -2727,9 +2846,6 @@ mod tests {
                 let detached = index.entry(&id).is_none();
                 if detached {
                     lru.remove(&CacheUnit::Page(id.clone(), PageIndex(0)));
-                    if let Some(candidate) = &candidate {
-                        candidate.block.finish(candidate, 0);
-                    }
                 }
                 drop(held);
                 assert!(detached);
@@ -2749,6 +2865,7 @@ mod tests {
 
         let index = Arc::new(BlockIndex::new());
         let id = block(1);
+        let lifecycle = crate::page_lifecycle::PageLifecycle::with_index(index.clone(), true);
         index.init_paged(id.clone(), 4096, 8192);
         index.mark_page_allocated(&id, PageIndex(0), 4096);
         let lru = index.restore_lru();
@@ -2759,6 +2876,12 @@ mod tests {
         let (removed_tx, removed_rx) = mpsc::channel();
         let (inserted_tx, inserted_rx) = mpsc::channel();
         std::thread::scope(|scope| {
+            let writer = scope.spawn(|| index.mark_page_allocated(&id, PageIndex(1), 4096));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Arc::strong_count(&old) < 3 && Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            let writer_waiting = Arc::strong_count(&old) >= 3;
             scope.spawn(|| removed_tx.send(index.remove(&id)).unwrap());
             let deadline = Instant::now() + Duration::from_secs(5);
             let detached = loop {
@@ -2793,10 +2916,12 @@ mod tests {
             // Release the entry before assertions: on failure the remover must
             // still be able to finish so scope can join its threads.
             drop(read_guard);
+            assert!(writer_waiting, "page writer did not retain the old entry");
             assert!(
                 detached,
                 "removal held the directory while waiting for an entry"
             );
+            assert!(!writer.join().unwrap());
             let (meta, bytes, pages) = inserted.unwrap().expect("same-key insertion was blocked");
             assert!(matches!(meta.form, BlockForm::Whole));
             // The detached old page is still charged until retirement finishes.
@@ -2807,6 +2932,7 @@ mod tests {
                 .unwrap();
             assert!(matches!(removed.form, BlockForm::Paged { .. }));
         });
+        assert_eq!(lifecycle.dirty_summary(), (0, None));
         assert_eq!(lru.total_bytes(), 4096);
         assert!(lru.evict_to_fit(0).is_empty());
         lru.unpin(&unit);
@@ -2841,13 +2967,8 @@ mod tests {
         lru.unpin(&unit);
         assert_eq!(lru.remove(&unit), Some(4096));
         assert!(index
-            .read_entry(&id, |entry| entry
-                .units
-                .page_table()
-                .unwrap()
-                .read()
-                .unwrap()
-                .is_empty())
+            .legacy_pages(&id)
+            .map(|pages| pages.read().unwrap().is_empty())
             .unwrap());
         index.remove(&id);
         assert!(index.entries.read().unwrap().is_empty());
@@ -2881,7 +3002,7 @@ mod tests {
             index.prepare_runtime_recovery();
             let lru = index.restore_lru();
             let life = crate::page_lifecycle::PageLifecycle::with_index(index.clone(), true);
-            index.restore_page_states(&life);
+            life.block(&id).register(PageIndex(0), Some(10), 10, false);
             let access = index.policy_get(&unit).unwrap().access;
             if let Some(previous) = previous_clock {
                 assert!(!Arc::ptr_eq(&previous, access.clock()));
@@ -2897,7 +3018,7 @@ mod tests {
         }
         index.prepare_runtime_recovery();
         assert!(index.policy_get(&CacheUnit::Whole(block(2))).is_none());
-        assert!(index.lifecycle(&id).is_none());
+        assert!(!index.page_work.tracking());
         assert_eq!(index.len(), 1);
     }
 
@@ -2913,17 +3034,12 @@ mod tests {
             assert_eq!(lru.remove(&unit), Some(4096));
         }
         assert_eq!(lru.len(), 1);
-        assert_eq!(
-            index.entries.read().unwrap()[&id]
-                .policy
-                .pages
-                .as_ref()
-                .unwrap()
-                .read()
-                .unwrap()
-                .len(),
-            1
-        );
+        let entries = index.entries.read().unwrap();
+        let Some(PolicyPages::Legacy(rows)) = &entries[&id].policy.pages else {
+            panic!("expected policy-only page table");
+        };
+        assert_eq!(rows.read().unwrap().len(), 1);
+        drop(entries);
         lru.remove_block(&id);
         assert!(index.entries.read().unwrap().is_empty());
     }

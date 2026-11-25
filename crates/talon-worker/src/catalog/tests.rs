@@ -659,6 +659,78 @@ async fn pending_put_is_cleaned_by_exact_path_including_replaced_page() {
 }
 
 #[tokio::test]
+async fn catalog_page_pins_survive_row_moves_and_ignore_reused_slots() {
+    use crate::page_lifecycle::{disk_shard, PageLifecycle};
+
+    let root = tempfile::tempdir().unwrap();
+    let catalog = open(root.path());
+    let paged = store(&catalog);
+    let index = Arc::new(catalog.index(4));
+    let lifecycle = PageLifecycle::with_index(index.clone(), true);
+    let id = block(0);
+    let body = Bytes::from_static(b"data");
+    paged
+        .commit_page(&id, PageIndex(2), 16, body.clone())
+        .await
+        .unwrap();
+    let state = lifecycle.block(&id);
+    let shard = disk_shard(&id);
+    // An existing access base requires a delta tombstone.
+    lifecycle.set_checkpoint_journal(
+        shard,
+        crate::page_access_shard::JournalState {
+            generation: 1,
+            ..Default::default()
+        },
+    );
+    let [slot]: [usize; 1] = lifecycle.recovery_slots()[shard]
+        .as_slice()
+        .try_into()
+        .unwrap();
+    let (_, old, _) = index
+        .page_reads_and_touch_at(&id, PageIndex(2), PageIndex(3))
+        .unwrap();
+
+    paged
+        .commit_page(&id, PageIndex(0), 16, body.clone())
+        .await
+        .unwrap();
+    assert!(state.candidate(PageIndex(2)).is_none());
+    assert!(index
+        .page_reads_and_touch_at(&id, PageIndex(0), PageIndex(3))
+        .is_none());
+    assert!(
+        state.candidate(PageIndex(0)).is_some(),
+        "partial-range read leaked a pin"
+    );
+    paged.evict_page_async(&id, PageIndex(0)).await.unwrap();
+    assert!(state.candidate(PageIndex(2)).is_none());
+
+    // Simulate retirement outside normal GC while an old guard still exists.
+    paged.delete_block_async(&id).await.unwrap();
+    assert_eq!(lifecycle.dirty_summary(), (0, None));
+    let (_, membership, changed) = lifecycle.checkpoint_start(shard);
+    assert!(changed);
+    assert_eq!(
+        lifecycle.checkpoint_journal(shard, membership).1,
+        vec![id.clone()]
+    );
+    paged
+        .commit_page(&id, PageIndex(2), 16, body)
+        .await
+        .unwrap();
+    assert_eq!(lifecycle.recovery_slots()[shard], vec![slot]);
+
+    let new = state.acquire(PageIndex(2)).unwrap();
+    old.record_access_and_release(Some(100));
+    assert_eq!(state.last_access(2), None);
+    assert!(state.candidate(PageIndex(2)).is_none());
+    new.record_access_and_release(Some(200));
+    assert_eq!(state.last_access(2), Some(200));
+    assert!(state.candidate(PageIndex(2)).is_some());
+}
+
+#[tokio::test]
 async fn pending_deletes_survive_checkpoint_and_recreation() {
     for operation in [Operation::DeletePage { page: 0 }, Operation::DeleteBlock] {
         let root = tempfile::tempdir().unwrap();

@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     eviction::Lru,
-    page_lifecycle::{PageEntry, PageLifecycle},
+    page_lifecycle::PageLifecycle,
 };
 use std::{
     alloc::{GlobalAlloc, Layout, System},
@@ -103,9 +103,9 @@ fn identity(n: usize) -> BlockId {
     )
 }
 
-fn scenario(count: usize, pages: u32, tracked: bool, tti: bool) {
+fn scenario(count: usize, pages: u32, tracked: bool, checkpoint: bool) {
     let label = format!(
-        "{}-p{pages}-tracked{tracked}-tti{tti}",
+        "{}-p{pages}-tracked{tracked}-checkpoint{checkpoint}",
         if pages == 0 { "whole" } else { "paged" }
     );
     eprintln!("SCENARIO|{label}|blocks={count}|pages={pages}|text=144");
@@ -153,6 +153,7 @@ fn scenario(count: usize, pages: u32, tracked: bool, tti: bool) {
     });
     let before_owner = Snapshot::now();
     let index = Arc::new(index);
+    assert!(index.uses_catalog());
     let after_owner = Snapshot::now();
     after_owner.report("fixed_index_owner_per_scope", 1, before_owner);
     let lru = measure("capacity_policy", count, || {
@@ -161,13 +162,11 @@ fn scenario(count: usize, pages: u32, tracked: bool, tti: bool) {
     });
     let before_lifecycle = Snapshot::now();
     let lifecycle = measure("fixed_lifecycle_per_scope", 1, || {
-        PageLifecycle::with_index(index.clone(), tti)
+        PageLifecycle::with_index(index.clone(), false)
     });
     let after_lifecycle = Snapshot::now();
-    if pages != 0 && tti {
-        measure("lifecycle_binding", count, || {
-            index.restore_page_states(&lifecycle);
-        });
+    if pages != 0 && checkpoint {
+        measure("checkpoint_age_storage", count, || lifecycle.enable_access_tracking());
     }
     drop(keys);
     let end = Snapshot::now();
@@ -191,16 +190,15 @@ fn scenario(count: usize, pages: u32, tracked: bool, tti: bool) {
         lru.total_bytes(),
         count as u64 * u64::from(pages.max(1)) * (1 << 20)
     );
-    if !tti {
-        measure("on_demand_lifecycle_binding", count, || {
-            if pages == 0 {
-                for (id, _) in index.snapshot_lens() {
-                    lifecycle.block(&id);
-                }
-            } else {
-                index.restore_page_states(&lifecycle);
-            }
-        });
+    if pages != 0 {
+        let id = identity(0);
+        let (_, first, tail) = index
+            .page_reads_and_touch_at(&id, talon_core::PageIndex(0), talon_core::PageIndex(pages))
+            .unwrap();
+        assert_eq!(tail.len(), (pages - 1) as usize);
+        first.record_access_and_release(checkpoint.then_some(100));
+        drop(tail);
+        assert_eq!(lifecycle.block(&id).last_access(0), checkpoint.then_some(100));
     }
     std::hint::black_box((&catalog, &index, &lru, &lifecycle));
 }
@@ -229,19 +227,13 @@ fn store_memory_breakdown() {
         scenario(1, 0, tracked, false);
         scenario(1, 1, tracked, false);
     }
-    for (tracked, tti) in [(false, false), (true, false), (true, true)] {
+    for (tracked, checkpoint) in [(false, false), (true, false), (true, true)] {
         for pages in [0, 1, 2, 4, 16, 64, 256] {
-            if pages == 0 && tti {
+            if pages == 0 && checkpoint {
                 continue;
             }
             let count = if pages <= 4 { 16_384 } else { 1024 };
-            scenario(count, pages, tracked, tti);
+            scenario(count, pages, tracked, checkpoint);
         }
-    }
-    for n in [1_usize, 2, 4, 16, 64, 256, 16_384] {
-        let map: PageMap = measure("page_table_nodes_and_states", n, || {
-            (0..n).map(|p| (p as u32, PageEntry::unbound())).collect()
-        });
-        drop(map);
     }
 }

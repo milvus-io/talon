@@ -922,7 +922,6 @@ impl WorkerRuntime {
                         let _pin = runtime.lru.pin_guard(unit.clone());
                         drop(gate);
                         drop(state);
-                        runtime.page_lifecycle.retire_empty(&block);
                         runtime.enforce_capacity().await;
                         return Ok(ServeOutcome::Bytes(bytes));
                     }
@@ -1729,10 +1728,11 @@ impl WorkerRuntime {
         Ok(out.freeze())
     }
 
-    /// TTI-disabled hits need only read/delete arbitration, not timestamps or
-    /// checkpoint dirtiness. Configuration is immutable while serving.
+    /// Checkpoint-enabled runtimes track ages even while TTI collection is off.
     fn page_access_time(&self) -> Option<u64> {
-        Some(self.page_clock.now())
+        self.page_lifecycle
+            .tracks_access()
+            .then(|| self.page_clock.now())
     }
 
     /// Return a page from L1 or the on-disk page file, promoting L2 hits to L1.
@@ -2008,18 +2008,12 @@ impl WorkerRuntime {
                             runtime
                                 .index
                                 .init_paged(id.clone(), paged.page_size(), block_len);
-                        }
-                        state.register(
-                            page,
-                            Some(runtime.page_clock.now()),
-                            runtime.page_clock.now(),
-                            true,
-                        );
-                        if !runtime.index.uses_catalog() {
                             runtime
                                 .index
                                 .mark_page_allocated_at(&id, page, allocated, disk_id);
                         }
+                        let now = runtime.page_access_time();
+                        state.register(page, now, now.unwrap_or_default(), true);
                         let unit = CacheUnit::Page(id.clone(), page);
                         let access = runtime.lru.insert(unit.clone(), allocated);
                         if !runtime.index.uses_catalog() {
@@ -2314,7 +2308,6 @@ impl WorkerRuntime {
                 }
                 drop(gate);
                 drop(state);
-                runtime.page_lifecycle.retire_empty(&id);
                 removed.map(|_| ())
             })
             .await
@@ -2525,7 +2518,7 @@ impl WorkerRuntime {
                         }
                         // Keep same-version paged residency and complete the admission
                         // even when the original requester stops waiting.
-                        let paged = !state.inner.lock().unwrap().pages.read().unwrap().is_empty();
+                        let paged = state.has_pages();
                         if paged {
                             drop(gate);
                             let size = runtime.paged_page_size().expect("paged state");
@@ -2577,7 +2570,6 @@ impl WorkerRuntime {
                         let _pin = runtime.lru.pin_guard(unit);
                         drop(gate);
                         drop(state);
-                        runtime.page_lifecycle.retire_empty(&id);
                         let superseded = runtime.lru.superseded_candidates(&id);
                         runtime.unlink_units(superseded, 2).await;
                         runtime.enforce_capacity().await;
@@ -3107,7 +3099,10 @@ fn disk_unit() -> u64 {
     use std::{io::Write, os::unix::fs::MetadataExt, sync::OnceLock};
     static UNIT: OnceLock<u64> = OnceLock::new();
     *UNIT.get_or_init(|| {
-        let mut file = tempfile::tempfile().unwrap();
+        // Keep the name until allocation is measured. Some mounted test
+        // filesystems cannot stat a file descriptor after unlink.
+        let mut temp = tempfile::NamedTempFile::new().unwrap();
+        let file = temp.as_file_mut();
         file.write_all(&[0; 16]).unwrap();
         file.sync_all().unwrap();
         file.metadata().unwrap().blocks() * 512

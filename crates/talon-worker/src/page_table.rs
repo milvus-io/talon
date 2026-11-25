@@ -59,9 +59,6 @@ impl<V> PageMap<V> {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
-    pub fn clear(&mut self) {
-        *self = Self::default();
-    }
     pub fn get(&self, key: &u32) -> Option<&V> {
         match self {
             Self::One(one) => one.as_ref().filter(|(k, _)| k == key).map(|(_, v)| v),

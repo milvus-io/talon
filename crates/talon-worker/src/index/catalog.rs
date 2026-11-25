@@ -21,8 +21,10 @@ pub(super) fn metadata(key: &BlockKey, geometry: &Geometry, page_size: u32) -> B
 
 impl BlockIndex {
     pub(crate) fn from_catalog(entries: Arc<RwLock<Directory>>) -> Self {
+        let page_work = entries.read().unwrap().page_work.clone();
         Self {
             entries,
+            page_work,
             catalog: true,
             ..Self::default()
         }
@@ -33,30 +35,35 @@ impl BlockIndex {
     }
 
     pub(super) fn catalog_read_pages(
-        &self,
+        self: &Arc<Self>,
         id: &BlockId,
         start: PageIndex,
         end: PageIndex,
     ) -> Option<(Option<DiskId>, PageReadGuard, Vec<PageReadGuard>)> {
-        let entries = self.entries.read().unwrap();
-        let (_, geometry, runtime) = entries.resident(id)?;
-        if geometry.kind() != Some(StoreKind::Paged) {
-            return None;
-        }
-        let pages = runtime.policy.pages.as_ref()?.read().unwrap();
-        let mut geometry_pages = geometry.pages_after(start.0.checked_sub(1));
-        let mut acquire = |page| {
-            if geometry_pages.next()?.0 != page {
-                return None;
+        // Drop any partially acquired range after releasing the directory lock.
+        let first;
+        let mut tail = Vec::new();
+        let disk_id = {
+            let entries = self.entries.read().unwrap();
+            let slot = entries.slot(id)?;
+            let (_, geometry, runtime) = entries.resident_at(slot)?;
+            let mut rows = geometry.page_rows_from(start.0);
+            let mut acquire = |page| {
+                let (found, row) = rows.next()?;
+                if found != page {
+                    return None;
+                }
+                let guard = PageReadGuard::acquire(self, slot, page, row.state)?;
+                runtime.policy.touch_catalog_page(page);
+                Some(guard)
+            };
+            first = acquire(start.0)?;
+            for page in start.0 + 1..end.0 {
+                tail.push(acquire(page)?);
             }
-            let state = pages.get(&page)?;
-            let guard = state.handle.acquire()?;
-            state.unit.access.touch()?;
-            Some(guard)
+            geometry.disk_id
         };
-        let first = acquire(start.0)?;
-        let tail: Option<Vec<_>> = (start.0 + 1..end.0).map(acquire).collect();
-        Some((geometry.disk_id, first, tail?))
+        Some((disk_id, first, tail))
     }
 
     pub(super) fn catalog_recover_policy(

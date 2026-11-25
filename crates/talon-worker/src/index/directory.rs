@@ -1,7 +1,8 @@
 use super::DirectoryEntry;
 use crate::block_key::{BlockIdentity, BlockKey};
 use crate::catalog::{BlockRow, BlockRows, Geometry, Operation, StoreKind};
-use std::sync::LazyLock;
+use crate::page_lifecycle::PageWork;
+use std::sync::{Arc, LazyLock};
 #[cfg(test)]
 use talon_core::BlockId;
 
@@ -14,6 +15,7 @@ pub(crate) struct Directory {
     pub(crate) rows: BlockRows,
     runtime: Vec<DirectoryEntry>,
     page_size: Option<u32>,
+    pub(super) page_work: Arc<PageWork>,
     blocks: u64,
     pages: u64,
     bytes: u128,
@@ -44,7 +46,7 @@ impl Directory {
     }
 
     pub fn get_key_value(&self, id: &dyn BlockIdentity) -> Option<(&BlockKey, &DirectoryEntry)> {
-        self.at(self.rows.handle(id)? as usize - 1)
+        self.at(self.slot(id)?)
     }
 
     pub fn get_or_insert(&mut self, id: BlockKey) -> (BlockKey, &mut DirectoryEntry) {
@@ -65,6 +67,10 @@ impl Directory {
             .unwrap_or_default();
         self.rows.release(id);
         Some(runtime)
+    }
+
+    pub fn slot(&self, id: &dyn BlockIdentity) -> Option<usize> {
+        Some(self.rows.handle(id)? as usize - 1)
     }
 
     pub fn slot_count(&self) -> usize {
@@ -157,10 +163,19 @@ impl Directory {
         &self,
         id: &dyn BlockIdentity,
     ) -> Option<(&BlockKey, &Geometry, &DirectoryEntry)> {
-        let handle = self.rows.handle(id)?;
-        let slot = handle as usize - 1;
-        let row = self.rows.at(slot).unwrap();
-        Some((&row.id, self.visible(handle, row)?, self.runtime_at(slot)))
+        self.resident_at(self.slot(id)?)
+    }
+
+    pub(super) fn resident_at(
+        &self,
+        slot: usize,
+    ) -> Option<(&BlockKey, &Geometry, &DirectoryEntry)> {
+        let row = self.rows.at(slot)?;
+        Some((
+            &row.id,
+            self.visible(slot as u32 + 1, row)?,
+            self.runtime_at(slot),
+        ))
     }
 
     pub fn residents(&self) -> impl Iterator<Item = (&BlockKey, &Geometry)> {
@@ -230,6 +245,9 @@ impl Directory {
             _ => None,
         };
         let before = self.usage(handle, page);
+        let slot = handle as usize - 1;
+        let live_paged = kind == StoreKind::Paged && self.page_size.is_some_and(|size| size != 0);
+        let key = live_paged.then(|| self.rows.at(slot).unwrap().id.clone());
         match (operation, allocated) {
             (Operation::PutWhole { len }, Some(bytes)) => {
                 self.rows
@@ -240,11 +258,40 @@ impl Directory {
                     debug_assert_eq!(row.disk_id, disk_id);
                     row.put(*len, *page, bytes);
                 } else {
-                    self.rows
-                        .put(handle, Geometry::new(kind, disk_id, *len, *page, bytes));
+                    let mut geometry = Geometry::new(kind, disk_id, *len, *page, bytes);
+                    if live_paged && self.page_work.tracking() {
+                        geometry.enable_page_ages();
+                    }
+                    self.rows.put(handle, geometry);
+                }
+                if let Some(key) = &key {
+                    if self.rows.geometry(handle, kind).unwrap().page_count() as u64 > before.pages
+                    {
+                        self.page_work.mark_structural(key, slot);
+                    }
                 }
             }
             _ => {
+                if let Some(key) = &key {
+                    if let Some(row) = self.rows.geometry(handle, kind) {
+                        match page {
+                            None => self.page_work.detached(key, slot, None),
+                            Some(page) => {
+                                if let Some(state) = row.page_row(page) {
+                                    if row.page_count() == 1 {
+                                        // The final unlink also retires the disk directory.
+                                        self.page_work.detached(key, slot, None);
+                                    } else {
+                                        if state.retry_pending() {
+                                            self.page_work.cancel_retry(slot, page);
+                                        }
+                                        self.page_work.mark_structural(key, slot);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 if let Some(page) = page {
                     if self
                         .rows
@@ -256,7 +303,7 @@ impl Directory {
                 } else {
                     self.rows.clear(handle, kind);
                 }
-                if self.runtime_at(handle as usize - 1).is_empty() {
+                if self.runtime_at(slot).is_empty() {
                     self.rows.release(id);
                 }
             }
