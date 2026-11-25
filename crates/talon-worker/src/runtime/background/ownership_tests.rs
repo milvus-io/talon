@@ -19,8 +19,8 @@ impl BackendStore for UnusedOrigin {
     }
 }
 
-fn worker_fixture(root: &std::path::Path) -> (Arc<WorkerRuntime>, WorkerConfig) {
-    let config = WorkerConfig {
+fn fixture_config() -> WorkerConfig {
+    WorkerConfig {
         node_id: Some("a".into()),
         backend: Some("s3".into()),
         block_size: 32,
@@ -31,16 +31,19 @@ fn worker_fixture(root: &std::path::Path) -> (Arc<WorkerRuntime>, WorkerConfig) 
         page_tti_hours: 0,
         stale_gc_enabled: false,
         ..Default::default()
-    };
+    }
+}
+
+fn open_worker(root: &std::path::Path, config: &WorkerConfig) -> Arc<WorkerRuntime> {
     let lock = Arc::new(crate::page_access_store::CacheRootLock::acquire(root).unwrap());
     let worker = WorkerRuntime::open_namespaces(
-        &config,
+        config,
         lock,
         Arc::new(UnusedOrigin),
         crate::WorkerMetrics::new(0),
     )
     .unwrap();
-    (Arc::new(worker), config)
+    Arc::new(worker)
 }
 
 fn publish(worker: &WorkerRuntime, b_zone: Option<&str>) {
@@ -105,7 +108,8 @@ fn completed_slices(worker: &WorkerRuntime) -> talon_core::Counter {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_protected_namespaces_respect_retry_deadlines() {
     let root = tempfile::tempdir().unwrap();
-    let (worker, config) = worker_fixture(root.path());
+    let config = fixture_config();
+    let worker = open_worker(root.path(), &config);
     let other = worker
         .for_namespace(&NamespaceId::named("analytics"))
         .await
@@ -169,7 +173,13 @@ async fn drive_scheduler_until(done: impl Fn() -> bool) {
 #[tokio::test]
 async fn ownership_wakes_for_membership_changes_and_validity_restoration() {
     let root = tempfile::tempdir().unwrap();
-    let (worker, config) = worker_fixture(root.path());
+    // Keep wall-clock rate-limit deadlines out of this paused-clock wakeup test.
+    let config = WorkerConfig {
+        background_delete_max_per_sec: 0,
+        background_io_max_mb_per_sec: 0,
+        ..fixture_config()
+    };
+    let worker = open_worker(root.path(), &config);
     let mut misplaced = packed_blocks("b");
     let protected = misplaced.next().unwrap();
     let late = misplaced.next().unwrap();
