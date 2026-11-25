@@ -1728,6 +1728,11 @@ impl PageLifecycle {
     pub fn checkpoint_finished(&self, shard: usize, membership: u64) {
         let mut work = self.index.page_work.shard(shard).lock().unwrap();
         work.checkpointed_membership = membership;
+        // Taking the last dirty group can leave an empty B-tree root. Release
+        // its allocation once the checkpoint owns no dirty work to retry.
+        if work.dirty.is_empty() {
+            work.dirty.clear();
+        }
         work.removed.retain(|&revision, _| revision > membership);
         work.removed_bytes = work
             .removed
