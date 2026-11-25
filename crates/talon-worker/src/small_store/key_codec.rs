@@ -16,6 +16,17 @@ fn field(out: &mut Vec<u8>, bytes: &[u8]) {
 
 fn unfield(input: &mut &[u8]) -> String {
     let mut out = Vec::new();
+    object_field(input, &mut out).to_owned()
+}
+
+fn object_field<'a, 'b: 'a>(input: &mut &'b [u8], scratch: &'a mut Vec<u8>) -> &'a str {
+    let end = input.iter().position(|&byte| byte == 0).unwrap();
+    if input[end + 1] == 0 {
+        let (field, rest) = input.split_at(end);
+        *input = &rest[2..];
+        return std::str::from_utf8(field).expect("encoded small-object UTF-8");
+    }
+    scratch.clear();
     while let Some((&b, tail)) = input.split_first() {
         *input = tail;
         if b == 0 {
@@ -25,9 +36,32 @@ fn unfield(input: &mut &[u8]) -> String {
                 break;
             }
         }
-        out.push(b);
+        scratch.push(b);
     }
-    String::from_utf8(out).expect("encoded small-object UTF-8")
+    std::str::from_utf8(scratch).expect("encoded small-object UTF-8")
+}
+
+fn backend(tag: u8) -> Backend {
+    match tag & 0x1f {
+        0 => Backend::S3,
+        1 => Backend::Gcs,
+        2 => Backend::Azure,
+        _ => unreachable!("encoded small-object backend"),
+    }
+}
+
+pub(super) fn object<'a>(
+    mut input: &'a [u8],
+    bucket: &'a mut Vec<u8>,
+    path: &'a mut Vec<u8>,
+) -> ObjectRef<'a> {
+    let bucket = object_field(&mut input, bucket);
+    let object_path = object_field(&mut input, path);
+    ObjectRef {
+        backend: backend(input[0]),
+        bucket,
+        object_path,
+    }
 }
 
 pub(super) fn encode(id: &dyn SmallIdentity) -> Vec<u8> {
@@ -78,12 +112,7 @@ pub(super) fn decode(mut input: &[u8]) -> SmallKey {
     } else {
         UnitKind::Whole
     };
-    let backend = match tag & 0x1f {
-        0 => Backend::S3,
-        1 => Backend::Gcs,
-        2 => Backend::Azure,
-        _ => unreachable!("encoded small-object backend"),
-    };
+    let backend = backend(tag);
     let block_size = u32::from_le_bytes(input[1..5].try_into().unwrap());
     input = &input[5..];
     let offset = if tag & 0x40 != 0 {

@@ -1,6 +1,7 @@
 use super::catalog::{Address, Catalog};
 use super::lookup::{POLICY, REFERENCED, VISIBLE};
 use crate::eviction::{AccessHandle, PolicyEntry, PolicyState};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
@@ -180,15 +181,23 @@ impl Catalog {
             .unwrap_or_else(|| AccessHandle::for_small(ticket))
     }
 
-    pub(super) fn enable_compact(&mut self, stream: usize) {
-        if !self.compact_streams.insert(stream) {
+    pub(super) fn enable_compact(&mut self, streams: impl IntoIterator<Item = usize>) {
+        let mut recovered = HashSet::new();
+        for stream in streams {
+            if self.compact_streams.insert(stream) {
+                self.compact_totals.insert(stream, (0, 0));
+                if self.live.get(&stream).copied().unwrap_or(0) != 0 {
+                    recovered.insert(stream);
+                }
+            }
+        }
+        if recovered.is_empty() {
             return;
         }
-        if self.live.get(&stream).copied().unwrap_or(0) == 0 {
-            self.compact_totals.insert(stream, (0, 0));
-            return;
+        #[cfg(test)]
+        {
+            self.compact_recovery_slots += self.lookup.capacity();
         }
-        let mut total = (0_u64, 0_usize);
         for slot in 0..self.lookup.capacity() {
             let Some((handle, flags)) = self.lookup.entry(slot) else {
                 continue;
@@ -197,18 +206,19 @@ impl Catalog {
                 continue;
             }
             let (address, record) = self.metadata(handle).unwrap();
-            if self.segment(address.0).unwrap().slot != stream {
+            let stream = self.segment(address.0).unwrap().slot;
+            if !recovered.contains(&stream) {
                 continue;
             }
             assert!(
                 !self.policy.contains_key(&address),
                 "generic policy already installed"
             );
+            let total = self.compact_totals.get_mut(&stream).unwrap();
             total.0 += record.stored_len();
             total.1 += 1;
             self.lookup.set_flags(slot, flags | POLICY);
         }
-        self.compact_totals.insert(stream, total);
     }
 
     pub(super) fn compact_admit(&mut self, slot: usize, bytes: u64, clock: bool) -> AccessHandle {

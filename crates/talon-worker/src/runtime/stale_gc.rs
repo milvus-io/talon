@@ -1,11 +1,14 @@
 //! Reclaim cold local cache entries only after an authoritative backend NotFound.
 use super::WorkerRuntime;
+use crate::block_key::ObjectRef;
 use crate::eviction::{access_millis, StaleBlockCandidate};
-use crate::small_store::{IdleRecencyCursor, SmallGcCandidate};
+use crate::small_store::{SmallGcCandidate, SmallStaleCursor};
 use futures::StreamExt;
 use std::{
+    borrow::Borrow,
     collections::{HashMap, VecDeque},
-    sync::Arc,
+    hash::{Hash, Hasher},
+    sync::{Arc, RwLock},
     time::Duration,
 };
 use talon_core::{Error, ObjectId, WorkerConfig};
@@ -41,28 +44,74 @@ impl Candidate {
     }
 }
 
+trait ObjectIdentity {
+    fn view(&self) -> ObjectRef<'_>;
+}
+
+impl ObjectIdentity for ObjectId {
+    fn view(&self) -> ObjectRef<'_> {
+        ObjectRef {
+            backend: self.backend,
+            bucket: &self.bucket,
+            object_path: &self.object_path,
+        }
+    }
+}
+
+impl ObjectIdentity for ObjectRef<'_> {
+    fn view(&self) -> ObjectRef<'_> {
+        *self
+    }
+}
+
+impl Hash for dyn ObjectIdentity + '_ {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.view().hash(state);
+    }
+}
+
+impl PartialEq for dyn ObjectIdentity + '_ {
+    fn eq(&self, other: &Self) -> bool {
+        self.view() == other.view()
+    }
+}
+
+impl Eq for dyn ObjectIdentity + '_ {}
+
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct CheckedObject(Arc<ObjectId>);
+
+impl<'a> Borrow<dyn ObjectIdentity + 'a> for CheckedObject {
+    fn borrow(&self) -> &(dyn ObjectIdentity + 'a) {
+        self.0.as_ref()
+    }
+}
+
+type HeadTimes = HashMap<CheckedObject, u64>;
+
 #[derive(Default)]
 struct PositiveHeads {
-    checked: HashMap<Arc<ObjectId>, u64>,
-    expiry: VecDeque<(u64, Arc<ObjectId>)>,
+    checked: Arc<RwLock<HeadTimes>>,
+    expiry: VecDeque<(u64, CheckedObject)>,
+}
+
+fn head_due(checked: &HeadTimes, object: ObjectRef<'_>, now: u64) -> bool {
+    checked
+        .get(&object as &dyn ObjectIdentity)
+        .map_or(true, |at| now.saturating_sub(*at) >= DAY_MS)
 }
 
 impl PositiveHeads {
-    fn due(&self, object: &ObjectId, now: u64) -> bool {
-        self.checked
-            .get(object)
-            .map_or(true, |at| now.saturating_sub(*at) >= DAY_MS)
-    }
-
     fn record(&mut self, object: ObjectId, now: u64) {
-        let object = Arc::new(object);
-        self.checked.insert(object.clone(), now);
+        let object = CheckedObject(Arc::new(object));
+        self.checked.write().unwrap().insert(object.clone(), now);
         self.expiry.push_back((now, object));
     }
 
     /// Returns true when the next slice has more expired records to release.
     fn prune(&mut self, now: u64) -> bool {
         let mut budget = 256;
+        let mut checked = self.checked.write().unwrap();
         while let Some((at, _)) = self.expiry.front() {
             if now.saturating_sub(*at) < DAY_MS {
                 return false;
@@ -72,10 +121,11 @@ impl PositiveHeads {
             }
             budget -= 1;
             let (at, object) = self.expiry.pop_front().unwrap();
-            if self.checked.get(&object) == Some(&at) {
-                self.checked.remove(&object);
+            if checked.get(&object) == Some(&at) {
+                checked.remove(&object);
             }
         }
+        drop(checked);
         if self.expiry.capacity() != 0 {
             *self = Self::default();
         }
@@ -86,9 +136,11 @@ impl PositiveHeads {
 pub(super) struct StaleGc {
     cursor: (u64, u64),
     blocks_done: bool,
-    small_cursor: IdleRecencyCursor,
+    small_cursor: SmallStaleCursor,
     small_done: bool,
     pending: VecDeque<Candidate>,
+    small_pending: VecDeque<Candidate>,
+    prefer_small: bool,
     round_now: Option<u64>,
     missing: VecDeque<(Candidate, u64)>,
     positive_heads: PositiveHeads,
@@ -118,10 +170,12 @@ impl StaleGc {
         Self {
             cursor: (0, 0),
             blocks_done: false,
-            small_cursor: IdleRecencyCursor::default(),
+            small_cursor: SmallStaleCursor::default(),
             small_done: false,
             positive_heads: PositiveHeads::default(),
             pending: VecDeque::new(),
+            small_pending: VecDeque::new(),
+            prefer_small: false,
             round_now: None,
             missing: VecDeque::new(),
             heads,
@@ -170,12 +224,14 @@ impl StaleGc {
         let done = self.blocks_done
             && self.small_done
             && self.pending.is_empty()
+            && self.small_pending.is_empty()
             && self.missing.is_empty();
         if done {
             self.round_now = None;
             self.blocks_done = false;
             self.small_done = false;
-            self.small_cursor = IdleRecencyCursor::default();
+            self.small_cursor = SmallStaleCursor::default();
+            self.prefer_small = false;
         }
         done
     }
@@ -239,16 +295,62 @@ impl StaleGc {
         if compact.is_none() {
             self.small_done = true;
         }
-        if self.pending.is_empty() {
-            let (scan, deletes) = worker.maintenance_batch_limits();
-            let scan = scan.min(4096);
-            let deletes = deletes.min(256);
-            if !self.blocks_done {
+        let has_blocks = !self.blocks_done || !self.pending.is_empty();
+        let has_small = !self.small_done || !self.small_pending.is_empty();
+        if !has_blocks && !has_small {
+            return;
+        }
+        let scan_small = has_small && (self.prefer_small || !has_blocks);
+        self.prefer_small = !scan_small;
+
+        let (scan, deletes) = worker.maintenance_batch_limits();
+        let scan = scan.min(4096);
+        let deletes = deletes.min(256);
+        // Keep the round's idle cutoff, but evaluate positive HEAD expiry in
+        // real time, both before materializing candidates and before using them.
+        let now = clock();
+        let checked = self.positive_heads.checked.clone();
+        let pending = if scan_small {
+            if self.small_pending.is_empty() {
+                let small = compact.expect("compact small store").clone();
+                let mut cursor = self.small_cursor;
+                let (cursor, done, candidates) = tokio::task::spawn_blocking(move || {
+                    let checked = checked.read().unwrap();
+                    let (done, candidates) = small.stale_candidates(
+                        &mut cursor,
+                        round_now,
+                        DAY_MS,
+                        scan,
+                        deletes,
+                        |object| head_due(&checked, object, now),
+                    );
+                    (cursor, done, candidates)
+                })
+                .await
+                .expect("stale small GC scan panicked");
+                self.small_cursor = cursor;
+                self.small_done = done;
+                self.small_pending.extend(
+                    candidates
+                        .into_iter()
+                        .map(|(candidate, revision)| Candidate::Small(candidate, revision)),
+                );
+            }
+            &mut self.small_pending
+        } else {
+            if self.pending.is_empty() {
                 let lru = worker.lru.clone();
                 let mut cursor = self.cursor;
                 let (cursor, candidates) = tokio::task::spawn_blocking(move || {
-                    let candidates =
-                        lru.idle_candidates(&mut cursor, round_now, DAY_MS, scan, deletes);
+                    let checked = checked.read().unwrap();
+                    let candidates = lru.filtered_idle_candidates(
+                        &mut cursor,
+                        round_now,
+                        DAY_MS,
+                        scan,
+                        deletes,
+                        |object| head_due(&checked, object, now),
+                    );
                     (cursor, candidates)
                 })
                 .await
@@ -257,39 +359,26 @@ impl StaleGc {
                 self.blocks_done = cursor.0 >= cursor.1;
                 self.pending
                     .extend(candidates.into_iter().map(Candidate::Block));
-            } else if !self.small_done {
-                let small = compact.expect("compact small store").clone();
-                let mut cursor = self.small_cursor;
-                let (cursor, done, candidates) = tokio::task::spawn_blocking(move || {
-                    let (done, candidates) =
-                        small.stale_candidates(&mut cursor, round_now, DAY_MS, scan, deletes);
-                    (cursor, done, candidates)
-                })
-                .await
-                .expect("stale small GC scan panicked");
-                self.small_cursor = cursor;
-                self.small_done = done;
-                self.pending.extend(
-                    candidates
-                        .into_iter()
-                        .map(|(candidate, revision)| Candidate::Small(candidate, revision)),
-                );
             }
-        }
-        // The idle cutoff belongs to the round. Successful HEADs expire in
-        // real time, even while a long round is still scanning its prefix.
+            &mut self.pending
+        };
         let now = clock();
         let mut groups: HashMap<ObjectId, Vec<Candidate>> = HashMap::new();
-        while let Some(candidate) = self.pending.front() {
-            if !groups.contains_key(candidate.object()) && groups.len() == self.head_batch {
-                break;
-            }
-            let candidate = self.pending.pop_front().unwrap();
-            if self.positive_heads.due(candidate.object(), now) && candidate.is_current(worker) {
-                groups
-                    .entry(candidate.object().clone())
-                    .or_default()
-                    .push(candidate);
+        {
+            let checked = self.positive_heads.checked.read().unwrap();
+            while let Some(candidate) = pending.front() {
+                if !groups.contains_key(candidate.object()) && groups.len() == self.head_batch {
+                    break;
+                }
+                let candidate = pending.pop_front().unwrap();
+                if head_due(&checked, candidate.object().view(), now)
+                    && candidate.is_current(worker)
+                {
+                    groups
+                        .entry(candidate.object().clone())
+                        .or_default()
+                        .push(candidate);
+                }
             }
         }
         let heads = &self.heads;
@@ -337,6 +426,7 @@ mod tests {
     #[derive(Default)]
     struct Origin {
         calls: AtomicUsize,
+        objects: std::sync::Mutex<Vec<ObjectId>>,
         mode: AtomicUsize, // 0 missing, 1 exists, 2 forbidden, 3 timeout
         hold: AtomicBool,
         entered: tokio::sync::Notify,
@@ -348,6 +438,7 @@ mod tests {
             panic!("GC must not fetch data")
         }
         async fn head(&self, object: &ObjectId) -> talon_core::Result<ObjectStat> {
+            self.objects.lock().unwrap().push(object.clone());
             self.calls.fetch_add(1, Ordering::Relaxed);
             self.entered.notify_one();
             if self.hold.load(Ordering::Relaxed) {
@@ -457,7 +548,7 @@ mod tests {
             .unwrap()
             .assert_no_resident_policy_allocations();
         let gc = StaleGc::default();
-        assert_eq!(gc.positive_heads.checked.capacity(), 0);
+        assert_eq!(gc.positive_heads.checked.read().unwrap().capacity(), 0);
         assert_eq!(gc.positive_heads.expiry.capacity(), 0);
     }
 
@@ -531,10 +622,10 @@ mod tests {
             .unwrap();
         let mut gc = StaleGc::default();
         let now = cold_now();
-        assert!(gc.positive_heads.checked.is_empty());
+        assert!(gc.positive_heads.checked.read().unwrap().is_empty());
         gc.run_round_at(&worker, now).await;
         assert_eq!(origin.calls.load(Ordering::Relaxed), 1);
-        assert_eq!(gc.positive_heads.checked.len(), 1);
+        assert_eq!(gc.positive_heads.checked.read().unwrap().len(), 1);
         origin.mode.store(0, Ordering::Relaxed);
         gc.run_round_at(&worker, now + DAY_MS - 1).await;
         assert_eq!(origin.calls.load(Ordering::Relaxed), 1);
@@ -546,7 +637,7 @@ mod tests {
         gc.run_round_at(&worker, now + DAY_MS).await;
         assert_eq!(origin.calls.load(Ordering::Relaxed), 2);
         assert!(!small.contains(&exact));
-        assert!(gc.positive_heads.checked.is_empty());
+        assert!(gc.positive_heads.checked.read().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -607,11 +698,11 @@ mod tests {
                     gc.run_slice_with_clock(&worker, || DAY_MS + 1).await,
                     Some(Duration::ZERO)
                 );
-                assert_eq!(gc.positive_heads.checked.len(), left);
+                assert_eq!(gc.positive_heads.checked.read().unwrap().len(), left);
                 assert!(gc.round_now.is_none());
             }
             let delay = gc.run_slice_with_clock(&worker, || DAY_MS + 1).await;
-            assert_eq!(gc.positive_heads.checked.capacity(), 0);
+            assert_eq!(gc.positive_heads.checked.read().unwrap().capacity(), 0);
             assert_eq!(gc.positive_heads.expiry.capacity(), 0);
             if backend_ready {
                 assert_eq!(delay, Some(Duration::ZERO));
@@ -624,6 +715,88 @@ mod tests {
             }
             assert_eq!(origin.calls.load(Ordering::Relaxed), 0);
         }
+    }
+
+    #[tokio::test]
+    async fn stale_gc_alternates_mixed_queues_while_ordinary_heads_remain_pending() {
+        let root = tempfile::tempdir().unwrap();
+        let origin = Arc::new(Origin::default());
+        origin.mode.store(2, Ordering::Relaxed);
+        let worker = compact_runtime(root.path(), false, origin.clone());
+        let mut packed = block(0);
+        packed.object.object_path = "earlier-packed".into();
+        worker
+            .small
+            .as_ref()
+            .unwrap()
+            .put(&packed, Bytes::from_static(b"packed"))
+            .await
+            .unwrap();
+        for n in 0..12 {
+            let mut ordinary = block(0);
+            ordinary.object.object_path = format!("ordinary-{n}");
+            fill(&worker, &ordinary, false).await;
+        }
+        let start = cold_now() + 1000;
+        let mut gc = StaleGc::new(&WorkerConfig {
+            stale_gc_head_concurrency: 1,
+            ..Default::default()
+        });
+        assert!(!gc.tick_at(&worker, start).await);
+        assert!(!gc.tick_at(&worker, start).await);
+        {
+            let heads = origin.objects.lock().unwrap();
+            assert_eq!(heads.len(), 2);
+            assert_eq!(heads[0].object_path, "ordinary-0");
+            assert_eq!(heads[1], packed.object);
+        }
+        gc.run_round_at(&worker, start).await;
+        assert_eq!(origin.calls.load(Ordering::Relaxed), 13);
+    }
+
+    #[tokio::test]
+    async fn cached_positive_heads_do_not_consume_candidate_caps_or_arm_packed_watches() {
+        let root = tempfile::tempdir().unwrap();
+        let origin = Arc::new(Origin::default());
+        origin.mode.store(2, Ordering::Relaxed);
+        let mut worker = compact_runtime(root.path(), false, origin.clone());
+        worker.page_gc_config.delete_batch_size = 1;
+        let small = worker.small.as_ref().unwrap();
+        let cooled = ObjectId::new(Backend::S3, "bucket", "cooled\0☃");
+        for n in 0..8 {
+            let mut id = block(n);
+            id.object = cooled.clone();
+            fill(&worker, &id, false).await;
+            small
+                .put(&CacheUnit::ExactRange(id), Bytes::from_static(&[2; 32]))
+                .await
+                .unwrap();
+        }
+        let mut due_block = block(0);
+        due_block.object.object_path = "ordinary-due".into();
+        fill(&worker, &due_block, false).await;
+        let mut due_small = block(0);
+        due_small.object.object_path = "packed-due".into();
+        small
+            .put(&due_small, Bytes::from_static(b"packed"))
+            .await
+            .unwrap();
+
+        let now = cold_now() + 1000;
+        let mut gc = StaleGc::default();
+        gc.positive_heads.record(cooled, now - 1);
+        let revision = small.catalog_revision();
+        assert!(!gc.tick_at(&worker, now).await);
+        gc.tick_at(&worker, now).await;
+        assert_eq!(
+            *origin.objects.lock().unwrap(),
+            [due_block.object, due_small.object],
+        );
+        assert_eq!(
+            small.catalog_revision() - revision,
+            2,
+            "one ticket and one watch"
+        );
     }
 
     #[tokio::test]
@@ -660,7 +833,7 @@ mod tests {
             Some(Duration::ZERO)
         );
         assert_eq!(origin.calls.load(Ordering::Relaxed), 1);
-        assert_eq!(gc.positive_heads.checked.len(), 1);
+        assert_eq!(gc.positive_heads.checked.read().unwrap().len(), 1);
 
         origin.mode.store(0, Ordering::Relaxed);
         let later = start + DAY_MS + 1;
@@ -669,9 +842,10 @@ mod tests {
             Some(Duration::ZERO)
         );
         assert_eq!(gc.round_now, Some(start));
-        assert!(gc.positive_heads.checked.is_empty());
+        assert!(gc.positive_heads.checked.read().unwrap().is_empty());
         assert!(gc.positive_heads.expiry.is_empty());
-        assert_eq!(origin.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(origin.calls.load(Ordering::Relaxed), 2);
+        assert!(!small.contains(&exact));
 
         for _ in 0..8 {
             if gc.run_slice_with_clock(&worker, || later).await != Some(Duration::ZERO) {

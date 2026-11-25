@@ -14,7 +14,7 @@ pub(crate) mod directory;
 mod disk_io;
 mod flush;
 mod gc;
-pub(crate) use gc::{GcCheck, OwnershipCursor, OwnershipLimit, SmallGcCandidate};
+pub(crate) use gc::{GcCheck, OwnershipCursor, OwnershipLimit, SmallGcCandidate, SmallStaleCursor};
 mod format;
 mod journal;
 mod key_codec;
@@ -274,6 +274,10 @@ struct SegmentStore {
     append_pause: Mutex<Option<Arc<tests::AppendPause>>>,
     #[cfg(test)]
     flush_pause: Mutex<Option<Arc<tests::AppendPause>>>,
+    #[cfg(test)]
+    relocation_pause: Mutex<Option<Arc<tests::AppendPause>>>,
+    #[cfg(test)]
+    fail_delete_after_journal: std::sync::atomic::AtomicBool,
     slot: usize,
     journal: Arc<journal::Journal>,
     threshold: u64,
@@ -366,6 +370,10 @@ impl SegmentStore {
             append_pause: Mutex::new(None),
             #[cfg(test)]
             flush_pause: Mutex::new(None),
+            #[cfg(test)]
+            relocation_pause: Mutex::new(None),
+            #[cfg(test)]
+            fail_delete_after_journal: std::sync::atomic::AtomicBool::new(false),
             slot,
             journal: journal.clone(),
             threshold,
@@ -655,6 +663,15 @@ impl SegmentStore {
     }
 
     #[cfg(test)]
+    async fn pause_relocation(&self) {
+        let pause = self.relocation_pause.lock().unwrap().take();
+        if let Some(pause) = pause {
+            pause.entered.notify_one();
+            pause.resume.notified().await;
+        }
+    }
+
+    #[cfg(test)]
     pub async fn delete(self: &Arc<Self>, id: &(impl SmallStoreKey + ?Sized)) -> io::Result<()> {
         let store = self.clone();
         let id = id.cache_unit();
@@ -697,7 +714,15 @@ impl SegmentStore {
                 .await?;
             segment.metadata += 21;
             #[cfg(test)]
-            tests::crash("delete_sync");
+            {
+                tests::crash("delete_sync");
+                if self
+                    .fail_delete_after_journal
+                    .swap(false, std::sync::atomic::Ordering::Relaxed)
+                {
+                    return Err(io::Error::other("injected failure after journal Delete"));
+                }
+            }
             let removed = charge(&id.view(), loc.len);
             segment.live -= removed;
             segment.live_data_bytes -= loc.stored_len();
@@ -854,10 +879,9 @@ impl SegmentStore {
                     let bytes = loc.clone().retain().await?.read_stored().await?;
                     // Keep the storage weight and checksum format of an existing
                     // admission when relocating it.
-                    let mut replacement = self
+                    let replacement = self
                         .append(&mut state, new, key, bytes, loc.checksum)
                         .await?;
-                    replacement.access = loc.access.clone();
                     moved.push((key.clone(), replacement));
                 }
                 let s = state.segments.get_mut(&new).unwrap();
@@ -887,24 +911,21 @@ impl SegmentStore {
                 )
                 .await?;
             #[cfg(test)]
-            tests::crash("compact_manifest");
+            {
+                tests::crash("compact_manifest");
+                self.pause_relocation().await;
+            }
             if let Some(budget) = &budget {
                 budget.delete().await;
             }
             let readers = self.readers.write().await;
-            {
-                let mut directory = self.entries.write().unwrap();
-                for (key, loc) in moved {
-                    directory.insert(key, loc);
-                }
-                if let Some(new) = replacement {
-                    directory.replace_ownership_segment(old, new);
-                }
-            }
+            self.entries
+                .write()
+                .unwrap()
+                .replace_segment(old, replacement, moved);
             if state.active == Some(old) {
                 state.active = None;
             }
-            self.entries.write().unwrap().retire_segment(old);
             drop(readers);
             drop(access_relocation);
             let segment = state.segments.remove(&old).unwrap();

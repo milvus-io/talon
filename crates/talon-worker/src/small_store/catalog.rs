@@ -34,12 +34,18 @@ pub(super) struct Catalog {
     pub live: HashMap<usize, usize>,
     pub compact_streams: HashSet<usize>,
     pub compact_totals: HashMap<usize, (u64, usize)>,
+    #[cfg(test)]
+    pub compact_recovery_slots: usize,
     pub tickets: Arc<super::tickets::Tickets>,
     pub pins: HashMap<Address, Arc<super::policy::SmallAccess>>,
     pub charges: HashMap<Address, u64>,
     pub revision: AtomicU64,
     pub retired: HashMap<SmallKey, Retired>,
+    pub retired_addresses: BTreeMap<Address, SmallKey>,
     retired_segments: BTreeMap<u64, Arc<SegmentMeta>>,
+    // A sealed replacement inherits its source's place in policy scans.
+    pub published: BTreeMap<u64, u64>,
+    relocated: HashMap<u64, u64>,
     active: bool,
 }
 
@@ -221,14 +227,22 @@ impl Catalog {
     }
 
     pub fn location(&self, slot: usize) -> Option<Location> {
+        let resolved = self.resolve_record(slot)?;
+        self.resolve_location(slot, resolved)
+    }
+
+    pub fn location_for_move(&self, slot: usize) -> Option<Location> {
+        self.payload_location(self.resolve_record(slot)?, None)
+    }
+
+    fn resolve_record(&self, slot: usize) -> Option<ResolvedRecord> {
         let (address, record) = self.metadata(self.lookup.handle(slot))?;
-        let resolved = ResolvedRecord {
+        Some(ResolvedRecord {
             address,
             len: record.len,
             checksum: record.checksum,
             stream: self.segment(address.0)?.slot,
-        };
-        self.resolve_location(slot, resolved)
+        })
     }
 
     fn compact_policy(&self, slot: usize, stream: usize) -> bool {
@@ -381,6 +395,10 @@ impl Catalog {
         self.unindex_rows(segment, 0, usize::MAX);
         self.retired_segments.remove(&segment);
         self.files.remove(&segment);
+        let logical = self.relocated.remove(&segment).unwrap_or(segment);
+        if self.published.get(&logical) == Some(&segment) {
+            self.published.remove(&logical);
+        }
         if let Some(ownership) = &mut self.ownership {
             ownership.remove_segment(segment);
         }
@@ -391,6 +409,18 @@ impl Catalog {
             self.free_chunks.extend(chunks);
         }
         self.trim_index();
+    }
+
+    pub fn replace_published_segment(&mut self, old: u64, new: u64) {
+        let logical = self.relocated.remove(&old).unwrap_or(old);
+        self.published.insert(logical, new);
+        self.relocated.insert(new, logical);
+    }
+
+    pub fn publish_segment(&mut self, segment: u64) {
+        if !self.relocated.contains_key(&segment) {
+            self.published.insert(segment, segment);
+        }
     }
 
     fn trim_index(&mut self) {
@@ -426,6 +456,10 @@ impl Catalog {
                 if let Some(slot) = self.at(address) {
                     if let Some(location) = self.location(slot) {
                         let key = self.record(self.lookup.handle(slot)).unwrap().1.key;
+                        let live = self.lookup.flags(slot) & VISIBLE != 0;
+                        if live && self.ownership.is_some() {
+                            self.retired_addresses.insert(address, key.clone());
+                        }
                         let policy = self.policy.remove(&address).or_else(|| {
                             let access = location.access.as_ref()?;
                             let state = *access.small()?.state.lock().unwrap();
@@ -440,7 +474,7 @@ impl Catalog {
                                 slot: self.segment(address.0).unwrap().slot,
                                 key,
                                 location,
-                                live: self.lookup.flags(slot) & VISIBLE != 0,
+                                live,
                                 policy,
                             },
                         );

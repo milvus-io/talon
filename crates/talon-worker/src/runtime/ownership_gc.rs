@@ -46,7 +46,7 @@ struct SmallPass {
     cursor: OwnershipCursor,
     scan_done: bool,
     pending: VecDeque<SmallGcCandidate>,
-    retries: VecDeque<SmallGcCandidate>,
+    retry_cursor: Option<u64>,
     attempt: Option<(SmallGcCandidate, u64, bool)>,
 }
 
@@ -58,7 +58,7 @@ impl SmallPass {
             cursor: OwnershipCursor::default(),
             scan_done: false,
             pending: VecDeque::new(),
-            retries: VecDeque::new(),
+            retry_cursor: None,
             attempt: None,
         }
     }
@@ -185,13 +185,14 @@ impl OwnershipGc {
                 block_round_done: false,
                 small,
             });
+            self.round_ended = false;
         }
         if self.round_ended {
             let pass = self.pass.as_mut().unwrap();
             pass.retry_cursor = pass.range.start;
             pass.block_round_done = false;
             if let Some(small) = &mut pass.small {
-                small.pending = std::mem::take(&mut small.retries);
+                small.retry_cursor = Some(0);
             }
         }
         self.round_ended = false;
@@ -281,7 +282,7 @@ impl OwnershipGc {
         let pass = self.pass.as_mut().unwrap();
         pass.block_round_done = true;
         if pass.small.is_none() {
-            self.finish_round(view);
+            self.finish_round(view, false);
         }
     }
 
@@ -290,25 +291,25 @@ impl OwnershipGc {
         let pass = self.pass.as_mut().unwrap().small.as_mut().unwrap();
         let started = Instant::now();
         let epochs = pass.first_epoch..pass.limit.epoch;
-        if pass.attempt.is_none() && pass.pending.is_empty() && !pass.scan_done {
+        if pass.attempt.is_none() && pass.pending.is_empty() {
             let mut cursor = pass.cursor;
-            // Move the cursor only after selection completes; cancellation of
-            // the publication-lock wait must leave the prior cursor intact.
             let first_epoch = pass.first_epoch;
             let limit = pass.limit;
-            let scan = small.ownership_candidates(&mut cursor, first_epoch, limit, 64, |block| {
-                worker.page_gc_metrics.ownership_checked.inc();
-                self.owns(block)
-            });
-            let Ok((done, candidates)) =
-                tokio::time::timeout_at(view.valid_until.into(), scan).await
-            else {
-                return;
-            };
-            let pass = self.pass.as_mut().unwrap().small.as_mut().unwrap();
-            pass.cursor = cursor;
-            pass.scan_done = done;
-            pass.pending = candidates.into();
+            if let Some(retry_cursor) = &mut pass.retry_cursor {
+                let (done, candidates) = small.ownership_retry_candidates(retry_cursor, limit, 64);
+                pass.pending = candidates.into();
+                pass.scan_done = done;
+            } else if !pass.scan_done {
+                let (done, candidates) =
+                    small.ownership_candidates(&mut cursor, first_epoch, limit, 64, |block| {
+                        worker.page_gc_metrics.ownership_checked.inc();
+                        self.owns(block)
+                    });
+                let pass = self.pass.as_mut().unwrap().small.as_mut().unwrap();
+                pass.cursor = cursor;
+                pass.scan_done = done;
+                pass.pending = candidates.into();
+            }
         }
         let pass = self.pass.as_mut().unwrap().small.as_mut().unwrap();
         for _ in 0..64 {
@@ -318,16 +319,15 @@ impl OwnershipGc {
             if pass.attempt.is_none() {
                 let Some(candidate) = pass.pending.pop_front() else {
                     if pass.scan_done {
-                        self.finish_round(view);
+                        let retries = small.has_ownership_retries(pass.limit);
+                        self.finish_round(view, retries);
                     }
                     return;
                 };
                 match candidate.ticket.observe_gc(GcCheck::Ownership(&epochs)) {
                     Some(revision) => pass.attempt = Some((candidate, revision, false)),
                     None => {
-                        if candidate.ticket.admitted_in(&candidate.unit, &epochs) {
-                            pass.retries.push_back(candidate);
-                        }
+                        small.defer_ownership(&candidate, &epochs);
                         continue;
                     }
                 }
@@ -336,9 +336,7 @@ impl OwnershipGc {
             if !*paid {
                 if !candidate.ticket.gc_is_current(*revision) {
                     let (candidate, _, _) = pass.attempt.take().unwrap();
-                    if candidate.ticket.admitted_in(&candidate.unit, &epochs) {
-                        pass.retries.push_back(candidate);
-                    }
+                    small.defer_ownership(&candidate, &epochs);
                     continue;
                 }
                 if let Some(budget) = &worker.background_budget {
@@ -357,24 +355,17 @@ impl OwnershipGc {
                 .unlink_small_gc(candidate.clone(), *revision, Some(renewed))
                 .await;
             let (candidate, _, _) = pass.attempt.take().unwrap();
-            if candidate.ticket.admitted_in(&candidate.unit, &epochs) {
-                pass.retries.push_back(candidate);
-            }
+            small.defer_ownership(&candidate, &epochs);
             if started.elapsed() >= Duration::from_millis(10) {
                 return;
             }
         }
     }
 
-    fn finish_round(&mut self, view: &MembershipSnapshot) {
+    fn finish_round(&mut self, view: &MembershipSnapshot, small_retries: bool) {
         let pass = self.pass.as_ref().unwrap();
         self.round_ended = true;
-        if pass.retries.is_empty()
-            && pass
-                .small
-                .as_ref()
-                .map_or(true, |small| small.retries.is_empty())
-        {
+        if pass.retries.is_empty() && !small_retries {
             self.completed_generation = view.generation;
             self.completed_limit = pass.range.end;
             if let Some(small) = &pass.small {
@@ -729,6 +720,201 @@ mod tests {
         assert!(!small.contains(&renewed));
         assert!(!small.contains(&exact));
         assert_eq!(worker.lru.total_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn ownership_discovers_unaccounted_journal_deletes_before_and_after_selection() {
+        for selected in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let (worker, fixture) = namespace_runtime(root.path(), false);
+            let foreign = packed_placed("b", 0);
+            let small = worker.small.as_ref().unwrap();
+            let payload = Bytes::from_static(b"packed");
+            small.put(&foreign, payload.clone()).await.unwrap();
+            small.maintain(true).await.unwrap();
+            let mut collector = OwnershipGc::new(&fixture.config);
+            if selected {
+                let pin = worker
+                    .lru
+                    .pin_guard(CacheUnit::Whole(foreign.clone()))
+                    .unwrap();
+                fixture.publish(&worker);
+                collector.run_round(&worker).await;
+                assert_eq!(small.ownership_retry_count(), 1);
+                drop(pin);
+            }
+            let live = worker.lru.total_bytes();
+            let store_charge = small.stats().unwrap().live_bytes;
+            small.fail_next_delete_after_journal(&foreign);
+            assert_eq!(
+                small.delete(&foreign).await.unwrap_err().to_string(),
+                "injected failure after journal Delete"
+            );
+            assert_eq!(small.read(&foreign).await.unwrap(), Some(payload.clone()));
+            if !selected {
+                fixture.publish(&worker);
+            }
+            let generation = worker.membership_snapshot().unwrap().generation;
+            for _ in 0..2 {
+                collector.run_round(&worker).await;
+                assert_eq!(small.ownership_retry_count(), 1);
+                assert_ne!(collector.completed_generation, generation);
+                assert_eq!(collector.next_delay(&worker), Some(Duration::from_secs(1)));
+                assert_eq!(worker.lru.total_bytes(), live);
+                assert_eq!(small.stats().unwrap().live_bytes, store_charge);
+                assert!(small.contains(&foreign));
+            }
+            drop(worker);
+            let (reopened, _) = namespace_runtime(root.path(), false);
+            assert!(!reopened.contains_block(&foreign));
+        }
+    }
+
+    #[tokio::test]
+    async fn ownership_defers_poisoned_stream_with_bounded_tickets() {
+        let root = tempfile::tempdir().unwrap();
+        let (worker, fixture) = namespace_runtime(root.path(), false);
+        let small = worker.small.as_ref().unwrap();
+        let ids: Vec<_> = (0..140).map(|n| packed_placed("b", n)).collect();
+        for id in &ids {
+            small.put(id, Bytes::from_static(b"packed")).await.unwrap();
+        }
+        small.fail_next_delete_after_journal(&ids[0]);
+        assert!(small.delete(&ids[0]).await.is_err());
+        let charge = worker.logical_resident_bytes();
+        let mut collector = fixture.gc(&worker);
+        for _ in 0..2 {
+            collector.run_round(&worker).await;
+            assert_eq!(small.ownership_retry_count(), ids.len());
+            // The failed tombstone itself is still charged. All remaining
+            // retries must release their temporary tickets between slices.
+            assert_eq!(small.live_ticket_count(), 1);
+            assert_eq!(collector.next_delay(&worker), Some(Duration::from_secs(1)));
+            assert_eq!(worker.logical_resident_bytes(), charge);
+            assert!(ids.iter().all(|id| small.contains(id)));
+        }
+    }
+
+    async fn remove_large_packed_row(worker: &WorkerRuntime) {
+        let small = worker.small.as_ref().unwrap();
+        let garbage = BlockId::new(
+            ObjectId::new(Backend::S3, "bucket", "garbage"),
+            0,
+            128 << 10,
+            Version::new("v1"),
+        );
+        small
+            .put(&garbage, Bytes::from(vec![1; 64 << 10]))
+            .await
+            .unwrap();
+        small.delete(&garbage).await.unwrap();
+        worker.lru.remove(&CacheUnit::Whole(garbage));
+    }
+
+    #[tokio::test]
+    async fn ownership_deduplicates_protected_rows_after_mid_scan_relocation() {
+        let root = tempfile::tempdir().unwrap();
+        let (worker, fixture) = namespace_runtime(root.path(), false);
+        let small = worker.small.as_ref().unwrap();
+        let protected: Vec<_> = (0..4).map(|n| packed_placed("b", n)).collect();
+        let owned: Vec<_> = (0..70).map(|n| packed_placed("a", n)).collect();
+        let tail = packed_placed("b", 4);
+        remove_large_packed_row(&worker).await;
+        for id in protected.iter().chain(&owned).chain([&tail]) {
+            small.put(id, Bytes::from_static(b"packed")).await.unwrap();
+        }
+        let mut pins: Vec<_> = protected
+            .iter()
+            .map(|id| worker.lru.pin_guard(CacheUnit::Whole(id.clone())).unwrap())
+            .collect();
+        let mut collector = fixture.gc(&worker);
+        collector.run_slice(&worker).await;
+        collector.run_slice(&worker).await;
+        assert_eq!(small.ownership_retry_count(), protected.len());
+        assert!(small.contains(&tail));
+        let source = small
+            .lookup_entry(&protected[0])
+            .unwrap()
+            .unwrap()
+            .segment();
+        assert!(small.maintain(true).await.unwrap());
+        assert_ne!(
+            small
+                .lookup_entry(&protected[0])
+                .unwrap()
+                .unwrap()
+                .segment(),
+            source
+        );
+        collector.run_round(&worker).await;
+        assert_eq!(small.ownership_retry_count(), protected.len());
+        assert!(!small.contains(&tail));
+
+        // Re-admission at a moved offset belongs to the next epoch.
+        small
+            .put(&protected[0], Bytes::from_static(b"packed"))
+            .await
+            .unwrap();
+        drop(pins.remove(1));
+        small.delete(&protected[1]).await.unwrap();
+        worker.lru.remove(&CacheUnit::Whole(protected[1].clone()));
+        small
+            .put(&protected[1], Bytes::from_static(b"refill"))
+            .await
+            .unwrap();
+        assert_eq!(small.ownership_retry_count(), protected.len() - 2);
+        drop(pins);
+        collector.run_round(&worker).await;
+        assert!(small.contains(&protected[0]));
+        assert_eq!(
+            small.read(&protected[1]).await.unwrap(),
+            Some(Bytes::from_static(b"refill"))
+        );
+        assert!(protected[2..].iter().all(|id| !small.contains(id)));
+        assert!(owned.iter().all(|id| small.contains(id)));
+        assert_eq!(small.ownership_retry_count(), 0);
+        collector.next_supplement = tokio::time::Instant::now();
+        collector.run_round(&worker).await;
+        assert!(!small.contains(&protected[0]));
+        assert!(!small.contains(&protected[1]));
+    }
+
+    #[tokio::test]
+    async fn ownership_event_extent_excludes_late_appends_even_after_relocation() {
+        for relocate in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let (worker, fixture) = namespace_runtime(root.path(), false);
+            let small = worker.small.as_ref().unwrap();
+            let first = packed_placed("b", 0);
+            let late: Vec<_> = (1..=66).map(|n| packed_placed("b", n)).collect();
+            // The retired garbage shifts the physical offset of every survivor.
+            remove_large_packed_row(&worker).await;
+            small
+                .put(&first, Bytes::from_static(b"packed"))
+                .await
+                .unwrap();
+            let source = small.lookup_entry(&first).unwrap().unwrap().segment();
+            let mut collector = fixture.gc(&worker);
+            for id in &late {
+                small.put(id, Bytes::from_static(b"late")).await.unwrap();
+                assert_eq!(small.lookup_entry(id).unwrap().unwrap().segment(), source);
+            }
+            if relocate {
+                assert!(small.maintain(true).await.unwrap());
+                assert_ne!(
+                    small.lookup_entry(&first).unwrap().unwrap().segment(),
+                    source
+                );
+            }
+            collector.run_slice(&worker).await;
+            collector.run_slice(&worker).await;
+            assert!(
+                collector.pass.is_none(),
+                "late rows consumed the event scan budget"
+            );
+            assert!(!small.contains(&first));
+            assert!(late.iter().all(|id| small.contains(id)));
+        }
     }
 
     #[tokio::test]

@@ -181,12 +181,15 @@ of the ordinary block index and a bounded extent of the compact catalog, using
 independent cursors. A batch spends at most 4096 scan steps and retains at most
 256 candidates, subject to the configured scan and deletion limits. Each ordinary
 block or packed row costs one step. Passing a compact segment without visiting
-any rows also costs one step.
+any rows also costs one step. The packed cursor follows logical segment positions.
+It sees the readable source until the replacement locators are published.
 
 Each scheduler slice issues at most one concurrent wave of HEAD requests,
 bounded by the configured concurrency, 32 distinct objects, and one second of
 HEAD rate credits. Each request has a five-second backend timeout. Unprocessed
 candidates carry over to the next slice, which immediately becomes eligible.
+When both stores have work, successive waves alternate between them even when
+the previous wave left candidates queued.
 The scheduler slot is released between slices; task metrics count slices.
 The existing disk concurrency and deletion rate budgets apply to unlinks, not
 HEAD traffic. A whole-block removal charges deletion work for all resident pages,
@@ -195,6 +198,8 @@ even though they are removed together as a directory.
 A successful HEAD suppresses further GC verification for 24 hours across every
 cached offset and version of the same `(backend, bucket, key)` in the namespace.
 One table covers ordinary and packed entries and retains only positive results.
+Discovery checks the cooled object identity before materializing a candidate
+or acquiring a packed ticket. Pending candidates recheck the same table.
 Cooldowns survive local eviction and expire 24 hours after the HEAD completes,
 including during an ongoing sweep. The sweep keeps its original idle cutoff.
 Positive HEADs leave recency unchanged. A changed version still counts as an

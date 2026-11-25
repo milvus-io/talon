@@ -43,7 +43,7 @@ impl CacheUnit {
     }
 }
 
-use crate::block_key::{BlockIdentity, BlockKey};
+use crate::block_key::{BlockIdentity, BlockKey, ObjectRef};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum UnitKind {
@@ -1046,6 +1046,18 @@ impl Lru {
         scan_budget: usize,
         delete_budget: usize,
     ) -> Vec<StaleBlockCandidate> {
+        self.filtered_idle_candidates(cursor, now, age, scan_budget, delete_budget, |_| true)
+    }
+
+    pub(crate) fn filtered_idle_candidates(
+        &self,
+        cursor: &mut (u64, u64),
+        now: u64,
+        age: u64,
+        scan_budget: usize,
+        delete_budget: usize,
+        due: impl Fn(ObjectRef<'_>) -> bool,
+    ) -> Vec<StaleBlockCandidate> {
         let mut out = Vec::new();
         if cursor.0 >= cursor.1 {
             *cursor = (0, self.inner.lock().unwrap().clock);
@@ -1057,6 +1069,9 @@ impl Lru {
                 break;
             };
             cursor.0 = position + 1;
+            if !due(block.view().object) {
+                continue;
+            }
             let activity = g.index.policy_block_get(block).expect("tracked block");
             let access = activity.access.load(Ordering::Relaxed);
             if activity.pins != 0 || now.saturating_sub(access) <= age {

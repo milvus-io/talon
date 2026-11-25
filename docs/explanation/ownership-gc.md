@@ -59,15 +59,21 @@ recovered blocks. GC scans only that fixed prefix for ownership. It also exclude
 blocks whose admission revision is at or beyond the limit: a post-event replacement
 or page fill conservatively excludes the entire block. Reads do not change the
 admission revision. New data never expands an event's scan, including data written
-between publication and delayed GC startup.
+between publication and delayed GC startup. A packed segment freezes its published
+offset extent on the first later admission. When compaction moves the segment,
+the replacement keeps its logical scan position and the extent follows the
+surviving rows of the original prefix.
 
 A complete pass marks the generation converged once all selected misplaced entries
 have been reclaimed or superseded by a later admission and the generation remains
 valid. Reader and pin protection, activity races and unlink failure leave the event
 pending. After one second, the sweep retries protected or failed ordinary entries by
-queue position and packed entries by their retained locator tickets. The cursor and selected candidate survive cancellation; already checked
-owned blocks are not rescanned. Once converged, new writes do not immediately wake
-ownership; the supplemental check handles them later.
+queue position. Packed retries keep deduplicated admission addresses that move with
+the locator. Each retry batch obtains fresh tickets, and a later admission removes
+the old retry. A journaled deletion that still has a readable, charged locator
+remains discoverable until accounting completes or recovery applies the tombstone.
+The cursor and current candidate survive cancellation. Once converged, ownership
+waits for the next event or supplemental check.
 
 A newer event supersedes the old generation, including A -> B -> A changes observed
 by the publisher between GC invocations. Missing, expired or self-excluding membership
@@ -155,7 +161,8 @@ received during active work. Once converged, ownership waits for a membership
 event or its hourly admission check without occupying a task slot.
 
 Independent `stale_gc` retains its hourly round delay, one-second batch pacing,
-24-hour idle filter and positive HEAD cooldown. Only authoritative `NotFound`
+24-hour idle filter and positive HEAD cooldown. In a mixed namespace it alternates
+ordinary and packed HEAD waves while both have pending work. Only authoritative `NotFound`
 authorizes backend-deletion reclamation. Each batch permits at most 32 distinct
 HEADs within a five-second backend work deadline. Neither ownership activity nor
 membership failure changes this schedule or policy.

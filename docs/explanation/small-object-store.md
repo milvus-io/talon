@@ -226,7 +226,8 @@ not constant-time startup or a disk-only index.
 
 Before serving, the worker attaches access tokens to ordinary index entries and
 bulk-builds their shared LRU membership and block indexes. Packed rows contribute
-their resident charges through the compact catalog. Recovery restores persisted
+their resident charges through one shared lookup traversal that accumulates the
+totals for each append stream. Recovery restores persisted
 Small Store ages directly to those rows. Large ordinary caches use at most
 three CPU threads (including the initializing thread), and small namespaces stay
 serial. Paged lifecycle initialization skips whole objects.
@@ -478,6 +479,8 @@ times and TTI eligibility unchanged.
 [Ownership GC](ownership-gc.md) scans the compact catalog within the membership
 event's admission boundary. A segment normally shares one admission epoch, with
 per-offset exceptions for appends and re-admissions across an epoch boundary.
-Relocation preserves the epoch, recency, and any active access token. Both GC tasks
+Relocation copies payloads from their stored locations and preserves the epoch,
+recency, and any active access token. Compaction publishes the replacement
+locators and their scan position together. Both GC tasks
 revalidate the exact packed unit before deleting it. The key and persisted record
 formats are unchanged.

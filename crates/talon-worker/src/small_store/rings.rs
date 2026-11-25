@@ -331,36 +331,25 @@ impl SmallObjectStore {
             .await
     }
 
+    #[cfg(test)]
+    pub(crate) fn fail_next_delete_after_journal(&self, id: &BlockId) {
+        self.owner(id)
+            .unwrap()
+            .fail_delete_after_journal
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub(crate) async fn delete_idle(
         self: &Arc<Self>,
         id: CacheUnit,
         ticket: Arc<super::policy::SmallAccess>,
         expiry: impl FnOnce() -> (u64, u64) + Send + 'static,
     ) -> io::Result<bool> {
-        let store = self.clone();
-        self.tasks
-            .run(async move {
-                let _guard = store.mutation(&id).await;
-                let Some(stream) = store.owner(&id) else {
-                    return Ok(false);
-                };
-                let removed = stream
-                    .delete_inner_if(&id, |loc| {
-                        let (now, age) = expiry();
-                        loc.access
-                            .as_ref()
-                            .and_then(AccessHandle::small)
-                            .is_some_and(|current| {
-                                Arc::ptr_eq(current, &ticket) && current.is_idle_at(now, age)
-                            })
-                    })
-                    .await?;
-                if removed {
-                    store.policy().expect("compact small policy").remove(&id);
-                }
-                Ok(removed)
-            })
-            .await
+        self.delete_if_current(id, ticket, move |current| {
+            let (now, age) = expiry();
+            current.is_idle_at(now, age)
+        })
+        .await
     }
 
     pub(crate) async fn delete_gc(
@@ -369,10 +358,21 @@ impl SmallObjectStore {
         revision: u64,
         authorized: impl FnOnce() -> bool + Send + 'static,
     ) -> io::Result<bool> {
+        self.delete_if_current(candidate.unit, candidate.ticket, move |current| {
+            current.gc_is_current(revision) && authorized()
+        })
+        .await
+    }
+
+    async fn delete_if_current(
+        self: &Arc<Self>,
+        id: CacheUnit,
+        ticket: Arc<super::policy::SmallAccess>,
+        eligible: impl FnOnce(&super::policy::SmallAccess) -> bool + Send + 'static,
+    ) -> io::Result<bool> {
         let store = self.clone();
         self.tasks
             .run(async move {
-                let id = candidate.unit;
                 let _guard = store.mutation(&id).await;
                 let Some(stream) = store.owner(&id) else {
                     return Ok(false);
@@ -383,9 +383,7 @@ impl SmallObjectStore {
                             .as_ref()
                             .and_then(AccessHandle::small)
                             .is_some_and(|current| {
-                                Arc::ptr_eq(current, &candidate.ticket)
-                                    && current.gc_is_current(revision)
-                                    && authorized()
+                                Arc::ptr_eq(current, &ticket) && eligible(current)
                             })
                     })
                     .await?;
@@ -421,11 +419,13 @@ impl SmallObjectStore {
         track_clock: bool,
     ) {
         self.bind_index(index);
-        let streams = self.streams();
         if !track_clock {
-            for stream in streams {
-                stream.entries.write().unwrap().enable_compact();
-            }
+            let streams = self.streams.read().unwrap();
+            self.journal.model.0.write().unwrap().enable_compact(
+                streams
+                    .iter()
+                    .filter_map(|(&slot, stream)| stream.get().map(|_| slot)),
+            );
             return;
         }
         let shared_access = units
@@ -436,7 +436,7 @@ impl SmallObjectStore {
             })
             .map(|unit| (unit.unit.block.materialize(), unit.access.clone()))
             .collect();
-        for stream in streams {
+        for stream in self.streams() {
             stream
                 .restore_policy_units(units, &shared_access, track_clock)
                 .expect("validated small object identity");
@@ -672,6 +672,52 @@ mod tests {
                 assert_eq!(budget.charged_bytes(), payload_io + log_bytes() - before);
             }
         });
+    }
+
+    #[tokio::test]
+    async fn compact_recovery_classifies_all_streams_in_one_lookup_pass() {
+        let root = tempfile::tempdir().unwrap();
+        let mut fixtures = Vec::new();
+        {
+            let store = open(root.path());
+            for slot in 0..4 {
+                let stream = store.writer(slot).await.unwrap();
+                let mut expected = (0, 0);
+                for n in 0..=slot {
+                    let block = id(&format!("stream-{slot}-row-{n}"));
+                    let payload = Bytes::from(vec![slot as u8; 17 + n]);
+                    stream
+                        .put_inner(&block, payload.clone(), None)
+                        .await
+                        .unwrap();
+                    expected.0 += payload.len() as u64 + CHECKSUM_BYTES;
+                    expected.1 += 1;
+                    fixtures.push((slot, block, payload, expected));
+                }
+            }
+            store.maintain(true).await.unwrap();
+        }
+        let reopened = open(root.path());
+        let index = Arc::new(crate::BlockIndex::new());
+        let mut generic = Vec::new();
+        reopened.restore_policy_units(&index, &mut generic, false);
+        assert!(generic.is_empty());
+        reopened.assert_no_resident_policy_allocations();
+        {
+            let catalog = reopened.journal.model.0.read().unwrap();
+            assert_eq!(catalog.compact_recovery_slots, catalog.lookup.capacity());
+            for slot in 0..4 {
+                let expected = fixtures
+                    .iter()
+                    .rfind(|(stream, ..)| *stream == slot)
+                    .unwrap()
+                    .3;
+                assert_eq!(catalog.compact_totals[&slot], expected);
+            }
+        }
+        for (_, block, payload, _) in fixtures {
+            assert_eq!(reopened.read(&block).await.unwrap(), Some(payload));
+        }
     }
 
     #[test]
