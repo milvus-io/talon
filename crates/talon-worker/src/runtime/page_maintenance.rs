@@ -1103,6 +1103,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_capacity_rechecks_ticket_after_waiting_for_mutation_gate() {
+        use futures::FutureExt;
+        let root = tempfile::tempdir().unwrap();
+        let (worker, _, _) = runtime(root.path());
+        let id = block();
+        let page = PageIndex(0);
+        worker
+            .commit_fetched_page(&id, page, 16, Bytes::from_static(b"data"))
+            .await
+            .unwrap();
+        let bytes = worker.lru.total_bytes();
+        assert!(bytes > 0);
+        let state = worker.page_lifecycle.block(&id);
+        let guard = state.lock_page_fill().await;
+        let tickets = worker.lru.block_candidates(&id);
+        assert_eq!(tickets.len(), 1);
+        let unlink = tokio::spawn({
+            let worker = worker.clone();
+            async move { worker.unlink_units_to_target(tickets, 1, 0).await }
+        });
+
+        // Tokio queues later readers behind a pending writer. Once a shared
+        // acquisition stalls, the unlink has selected the page and reached its gate.
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while state.lock_page_fill().now_or_never().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("capacity unlink did not queue at the page gate");
+        let replacement = worker.lru.block_candidates(&id);
+        assert_eq!(replacement.len(), 1);
+        drop(guard);
+        unlink.await.unwrap();
+
+        assert_eq!(worker.lru.total_bytes(), bytes);
+        assert_eq!(worker.resident_bytes(), bytes);
+        assert_eq!(
+            worker.cached_page(&id, page, 16).await.unwrap(),
+            Some(Bytes::from_static(b"data"))
+        );
+    }
+
+    #[tokio::test]
     async fn paged_eviction_retains_catalog_failure_accounting() {
         for stale in [false, true] {
             for poisoned in [false, true] {
