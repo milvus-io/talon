@@ -150,6 +150,7 @@ pub struct WorkerRuntime {
     page_lifecycle: Arc<PageLifecycle>,
     page_clock: Arc<AccessClock>,
     page_gc_config: PageGcConfig,
+    page_gc_configured: bool,
     page_gc_metrics: PageGcMetrics,
     page_mutations: Arc<Mutations>,
     page_gc_io: Arc<tokio::sync::Semaphore>,
@@ -331,6 +332,7 @@ impl WorkerRuntime {
             page_lifecycle,
             page_clock: Arc::new(AccessClock::new()),
             page_gc_config: PageGcConfig::default(),
+            page_gc_configured: false,
             page_mutations: Arc::new(Mutations::default()),
             page_gc_io: Arc::new(tokio::sync::Semaphore::new(4)),
             background_budget: None,
@@ -500,6 +502,9 @@ impl WorkerRuntime {
         self.page_cleanup = Arc::new(tokio::sync::Mutex::new(
             crate::page_cleanup::CleanupCursor::new(paged.root().to_owned()),
         ));
+        if self.page_gc_configured {
+            self.restore_paged_access(&paged);
+        }
         self.paged = Some(Arc::new(paged));
         self
     }

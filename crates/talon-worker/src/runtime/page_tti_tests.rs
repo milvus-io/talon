@@ -56,13 +56,29 @@ fn request(offset: u64, len: u64) -> RangeRequest {
     }
 }
 fn runtime(root: &Path, l1: bool, capacity: u64, tti: u64) -> WorkerRuntime {
+    let (worker, paged) = runtime_before_paged_setup(root, l1, capacity);
+    worker
+        .with_paged_store(paged)
+        .with_page_gc(PageGcConfig {
+            tti_ms: tti,
+            checkpoint_interval_ms: 10,
+            ..Default::default()
+        })
+        .unwrap()
+}
+
+fn runtime_before_paged_setup(
+    root: &Path,
+    l1: bool,
+    capacity: u64,
+) -> (WorkerRuntime, PagedBlockStore) {
     let capacity = capacity.div_ceil(16) * disk_unit();
     let paged = PagedBlockStore::open(root.join("paged"), 16).unwrap();
     let index = Arc::new(BlockIndex::new());
     for entry in paged.scan_allocated().unwrap() {
         index.commit_stored(entry);
     }
-    WorkerRuntime::new_with_l1(
+    let worker = WorkerRuntime::new_with_l1(
         WholeBlockStore::open(root.join("whole")).unwrap(),
         index,
         Arc::new(InFlightLoads::new()),
@@ -72,14 +88,8 @@ fn runtime(root: &Path, l1: bool, capacity: u64, tti: u64) -> WorkerRuntime {
         if l1 { 256 } else { 0 },
         16,
         WorkerMetrics::new(capacity),
-    )
-    .with_paged_store(paged)
-    .with_page_gc(PageGcConfig {
-        tti_ms: tti,
-        checkpoint_interval_ms: 10,
-        ..Default::default()
-    })
-    .unwrap()
+    );
+    (worker, paged)
 }
 async fn collect_all(r: &WorkerRuntime) -> u64 {
     let report = r.gc_once().await;
@@ -1584,4 +1594,39 @@ async fn disabled_tti_restores_checkpointed_access_after_restart() {
     let state = r.page_lifecycle.get(&id()).unwrap();
     assert_eq!(state.last_access(0), Some(10_000));
     assert_eq!(r.gc_once().await.reclaimed, 0);
+}
+
+#[tokio::test]
+async fn page_gc_configured_before_paged_store_checkpoints_and_restores_access() {
+    let root = tempfile::tempdir().unwrap();
+    let open = || {
+        let (worker, paged) = runtime_before_paged_setup(root.path(), false, 0);
+        worker
+            .with_page_gc(PageGcConfig {
+                tti_ms: 0,
+                checkpoint_interval_ms: 10,
+                ..Default::default()
+            })
+            .unwrap()
+            .with_paged_store(paged)
+    };
+    let worker = open();
+    worker.page_clock.set(10_000);
+    worker.serve_range(&request(0, 16)).await.unwrap();
+    let checkpoint = worker.checkpoint_access_times().await;
+    assert_eq!(checkpoint.failures, 0);
+    assert_eq!(checkpoint.blocks, 1);
+    drop(worker);
+
+    let worker = open();
+    let page = worker.page_lifecycle.get(&id()).unwrap();
+    assert_eq!(page.last_access(0), Some(10_000));
+    worker.page_clock.set(10_001);
+    let mut dynamic = crate::dynamic_config::DynamicConfig::default();
+    assert!(dynamic.apply_runtime(
+        "page_tti_hours = 1\nrate_limits = { enabled = false }\n",
+        &worker,
+    ));
+    assert_eq!(worker.current_tti_ms(), 3_600_000);
+    assert_eq!(worker.gc_once().await.reclaimed, 0);
 }

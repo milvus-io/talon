@@ -68,47 +68,7 @@ impl WorkerRuntime {
             small.enable_access_tracking()?;
         }
         if let Some(paged) = self.paged.as_ref() {
-            // Checkpoints run even with TTI disabled. Keep ages for
-            // recovery and for enabling TTI through live namespace settings.
-            self.page_lifecycle.enable_access_tracking();
-            let now = self.page_clock.now();
-            let slots = self.page_lifecycle.recovery_slots();
-            for (shard, slots) in slots.into_iter().enumerate() {
-                let dir = paged.root().join(format!("{shard:02x}"));
-                let mut recovered_shard =
-                    crate::page_access_shard::load(&dir, shard, paged.page_size(), now);
-                if let Some(recovered) = &recovered_shard {
-                    self.page_lifecycle
-                        .set_checkpoint_journal(shard, recovered.journal);
-                }
-                if recovered_shard.is_some() || !slots.is_empty() {
-                    self.page_lifecycle.checkpoint_recovered(shard);
-                }
-                for slot in slots {
-                    let Some(state) = self.page_lifecycle.recovery_block(slot) else {
-                        continue;
-                    };
-                    let id = state.id.materialize();
-                    let recovered = match &mut recovered_shard {
-                        Some(shard) => shard.records.remove(&id).unwrap_or_else(|| {
-                            crate::page_access_store::AccessRecovery {
-                                corrupt: shard.corrupt,
-                                ..Default::default()
-                            }
-                        }),
-                        None if paged.journaled() => Default::default(),
-                        None => {
-                            PageAccessStore::load(&paged.dir_for(&id), &id, paged.page_size(), now)
-                        }
-                    };
-                    let (resident, missing) = state.restore_ages(&recovered.records);
-                    if recovered.corrupt {
-                        self.page_gc_metrics.corrupt.add(resident);
-                    }
-                    self.page_gc_metrics.future.add(recovered.future as u64);
-                    self.page_gc_metrics.missing.add(missing);
-                }
-            }
+            self.restore_paged_access(paged);
         }
         self.page_gc_metrics
             .tti_seconds
@@ -118,7 +78,49 @@ impl WorkerRuntime {
             .set(config.checkpoint_interval_ms as f64 / 1000.0);
         self.page_gc_io = Arc::new(tokio::sync::Semaphore::new(config.io_concurrency));
         self.page_gc_config = config;
+        self.page_gc_configured = true;
         Ok(self)
+    }
+
+    pub(super) fn restore_paged_access(&self, paged: &PagedBlockStore) {
+        // Checkpoints also provide ages for enabling TTI through live settings.
+        self.page_lifecycle.enable_access_tracking();
+        let now = self.page_clock.now();
+        let slots = self.page_lifecycle.recovery_slots();
+        for (shard, slots) in slots.into_iter().enumerate() {
+            let dir = paged.root().join(format!("{shard:02x}"));
+            let mut recovered_shard =
+                crate::page_access_shard::load(&dir, shard, paged.page_size(), now);
+            if let Some(recovered) = &recovered_shard {
+                self.page_lifecycle
+                    .set_checkpoint_journal(shard, recovered.journal);
+            }
+            if recovered_shard.is_some() || !slots.is_empty() {
+                self.page_lifecycle.checkpoint_recovered(shard);
+            }
+            for slot in slots {
+                let Some(state) = self.page_lifecycle.recovery_block(slot) else {
+                    continue;
+                };
+                let id = state.id.materialize();
+                let recovered = match &mut recovered_shard {
+                    Some(shard) => shard.records.remove(&id).unwrap_or_else(|| {
+                        crate::page_access_store::AccessRecovery {
+                            corrupt: shard.corrupt,
+                            ..Default::default()
+                        }
+                    }),
+                    None if paged.journaled() => Default::default(),
+                    None => PageAccessStore::load(&paged.dir_for(&id), &id, paged.page_size(), now),
+                };
+                let (resident, missing) = state.restore_ages(&recovered.records);
+                if recovered.corrupt {
+                    self.page_gc_metrics.corrupt.add(resident);
+                }
+                self.page_gc_metrics.future.add(recovered.future as u64);
+                self.page_gc_metrics.missing.add(missing);
+            }
+        }
     }
 
     pub(crate) async fn drain_page_mutations(&self) {
