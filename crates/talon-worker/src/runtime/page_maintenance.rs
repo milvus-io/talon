@@ -330,10 +330,14 @@ impl WorkerRuntime {
             runtime.l1.remove_page(id, page);
             #[cfg(test)]
             crate::page_access_store::crash_barrier("last_page_unlink").unwrap();
-            runtime.index.clear_page(id, page);
+            if !paged.journaled() {
+                runtime.index.clear_page(id, page);
+            }
             runtime.metrics.record_eviction(); runtime.refresh_l1_metrics();
             runtime.page_gc_metrics.deleted[reason].inc(); runtime.page_gc_metrics.bytes[reason].add(bytes);
-            if !block.has_pages() {
+            // A durable catalog completion already retires the page and
+            // removes the block row when its last page is gone.
+            if !paged.journaled() && !block.has_pages() {
                 match paged.delete_block_async(id).await {
                     Ok(()) => { block.cleanup_finished(); if runtime.index.get(id).is_some_and(|m| matches!(m.form, BlockForm::Paged {..})) {runtime.index.remove(id);} }
                     Err(error) => {runtime.page_gc_metrics.delete_errors.inc(); tracing::warn!(block = %id, %error, "empty page directory cleanup failed");}
