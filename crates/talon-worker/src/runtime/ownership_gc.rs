@@ -1386,7 +1386,7 @@ mod tests {
             let mut gc = fixture.gc(&r);
             // Old-route traffic after publication excludes the entire old block.
             if paged {
-                r.commit_fetched_page(&rewritten, PageIndex(2), 64, Bytes::from_static(&[1; 16]))
+                r.commit_fetched_page(&rewritten, PageIndex(1), 32, Bytes::from_static(&[1; 16]))
                     .await
                     .unwrap();
             } else {
@@ -1540,7 +1540,7 @@ mod tests {
             }).await.unwrap();
         }
         let bounds = gc.supplement.clone().unwrap();
-        r.commit_fetched_page(&rewritten, PageIndex(2), 64, Bytes::from_static(&[1; 16]))
+        r.commit_fetched_page(&rewritten, PageIndex(1), 32, Bytes::from_static(&[1; 16]))
             .await
             .unwrap();
         drop(gate);
@@ -1570,7 +1570,7 @@ mod tests {
             // The boundary belongs to publication, even if GC starts much later.
             fill(&r, &new, paged).await;
             if paged {
-                r.commit_fetched_page(&rewritten, PageIndex(2), 64, Bytes::from_static(&[1; 16]))
+                r.commit_fetched_page(&rewritten, PageIndex(1), 32, Bytes::from_static(&[1; 16]))
                     .await
                     .unwrap();
             } else {

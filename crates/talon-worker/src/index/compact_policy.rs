@@ -58,6 +58,16 @@ impl BlockIndex {
         self.compact_enabled.store(true, Ordering::Relaxed);
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_policy_clock(&self, id: &BlockId, last_access: u64) {
+        let entries = self.entries.read().unwrap();
+        let slot = entries.position(id).expect("tracked block slot");
+        entries
+            .clock(slot)
+            .expect("tracked block clock")
+            .store(last_access, Ordering::Relaxed);
+    }
+
     pub(super) fn admit_block(&self, block: &mut IndexedBlock, clock: Option<&AtomicU64>) {
         let mut units = 0;
         let mut bytes = 0;

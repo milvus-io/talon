@@ -824,13 +824,7 @@ mod tests {
         warm.object.object_path = "warm".into();
         fill(&worker, &warm, false).await;
         let start = cold_now();
-        worker
-            .index
-            .policy_get(&CacheUnit::Whole(warm.clone()))
-            .unwrap()
-            .access
-            .clock()
-            .store(start - DAY_MS, Ordering::Relaxed);
+        worker.index.set_policy_clock(&warm, start - DAY_MS);
 
         let mut gc = StaleGc::default();
         assert_eq!(
