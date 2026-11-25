@@ -1,41 +1,27 @@
 use super::DirectoryEntry;
 use crate::block_key::{BlockIdentity, BlockKey};
-use crate::small_store::lookup::Lookup;
-use std::hash::{BuildHasher, RandomState};
+use crate::catalog::{BlockRow, BlockRows, Geometry, Operation, StoreKind};
+use std::sync::LazyLock;
 #[cfg(test)]
 use talon_core::BlockId;
 
-#[derive(Default)]
-struct Slot {
-    key: Option<BlockKey>,
-    entry: DirectoryEntry,
-}
+static EMPTY_RUNTIME_ROW: LazyLock<DirectoryEntry> = LazyLock::new(DirectoryEntry::default);
 
-/// The lookup stores only stable slab handles. Hashing omits the source
-/// version so exact lookups and superseded-version walks share one probe chain.
+/// The journal and the index share these rows. Runtime policy and lifecycle
+/// are attached by slot, and may keep an identity alive without any files.
 #[derive(Default)]
-pub(super) struct Directory {
-    lookup: Lookup,
-    hash: RandomState,
-    slots: Vec<Slot>,
-    free: Vec<u32>,
+pub(crate) struct Directory {
+    pub(crate) rows: BlockRows,
+    runtime: Vec<DirectoryEntry>,
+    page_size: Option<u32>,
+    blocks: u64,
+    pages: u64,
+    bytes: u128,
 }
 
 impl Directory {
-    fn hash(&self, id: &dyn BlockIdentity) -> u32 {
-        let id = id.view();
-        self.hash.hash_one((id.object, id.offset, id.block_size)) as u32
-    }
-
-    fn find(&self, id: &dyn BlockIdentity) -> Option<usize> {
-        let view = id.view();
-        self.lookup.find(self.hash(id), |handle, _| {
-            self.slots[handle as usize - 1].key.as_ref().unwrap().view() == view
-        })
-    }
-
     pub fn len(&self) -> usize {
-        self.lookup.len()
+        self.rows.len()
     }
 
     #[cfg(test)]
@@ -43,16 +29,10 @@ impl Directory {
         self.len() == 0
     }
 
+    #[cfg(test)]
     pub fn reserve(&mut self, additional: usize) {
-        if self.lookup.needs_reserve(additional) {
-            let growth = additional.max(self.lookup.len() / 8);
-            self.lookup.rebuild(growth, |handle| {
-                let id = self.slots[handle as usize - 1].key.as_ref().unwrap().view();
-                self.hash.hash_one((id.object, id.offset, id.block_size)) as u32
-            });
-        }
-        self.slots
-            .reserve(additional.saturating_sub(self.free.len()));
+        self.rows.reserve(additional);
+        self.runtime.reserve(additional);
     }
 
     pub fn get(&self, id: &dyn BlockIdentity) -> Option<&DirectoryEntry> {
@@ -60,50 +40,44 @@ impl Directory {
     }
 
     pub fn get_mut(&mut self, id: &dyn BlockIdentity) -> Option<&mut DirectoryEntry> {
-        let handle = self.lookup.handle(self.find(id)?);
-        Some(&mut self.slots[handle as usize - 1].entry)
+        self.runtime.get_mut(self.rows.handle(id)? as usize - 1)
     }
 
     pub fn get_key_value(&self, id: &dyn BlockIdentity) -> Option<(&BlockKey, &DirectoryEntry)> {
-        self.at(self.lookup.handle(self.find(id)?) as usize - 1)
+        self.at(self.rows.handle(id)? as usize - 1)
     }
 
     pub fn get_or_insert(&mut self, id: BlockKey) -> (BlockKey, &mut DirectoryEntry) {
-        let handle = match self.find(&id) {
-            Some(i) => self.lookup.handle(i),
-            None => {
-                self.reserve(1);
-                let handle = self.free.pop().unwrap_or_else(|| {
-                    let handle = u32::try_from(self.slots.len() + 1)
-                        .expect("block directory handle exhausted");
-                    assert!(handle < u32::MAX);
-                    self.slots.push(Slot::default());
-                    handle
-                });
-                self.lookup.insert(self.hash(&id), handle, 0);
-                self.slots[handle as usize - 1].key = Some(id);
-                handle
-            }
-        };
-        let slot = &mut self.slots[handle as usize - 1];
-        (slot.key.as_ref().unwrap().clone(), &mut slot.entry)
+        let slot = self.rows.get_or_insert(id) as usize - 1;
+        if slot >= self.runtime.len() {
+            self.runtime.resize_with(slot + 1, DirectoryEntry::default);
+        }
+        let key = self.rows.at(slot).unwrap().id.clone();
+        (key, &mut self.runtime[slot])
     }
 
     pub fn remove(&mut self, id: &dyn BlockIdentity) -> Option<DirectoryEntry> {
-        let i = self.find(id)?;
-        let handle = self.lookup.handle(i);
-        self.lookup.remove(i);
-        self.free.push(handle);
-        Some(std::mem::take(&mut self.slots[handle as usize - 1]).entry)
+        let slot = self.rows.handle(id)? as usize - 1;
+        let runtime = self
+            .runtime
+            .get_mut(slot)
+            .map(std::mem::take)
+            .unwrap_or_default();
+        self.rows.release(id);
+        Some(runtime)
     }
 
     pub fn slot_count(&self) -> usize {
-        self.slots.len()
+        self.rows.slot_count()
     }
 
     pub fn at(&self, cursor: usize) -> Option<(&BlockKey, &DirectoryEntry)> {
-        let slot = self.slots.get(cursor)?;
-        Some((slot.key.as_ref()?, &slot.entry))
+        let row = self.rows.at(cursor)?;
+        Some((&row.id, self.runtime_at(cursor)))
+    }
+
+    fn runtime_at(&self, slot: usize) -> &DirectoryEntry {
+        self.runtime.get(slot).unwrap_or(&EMPTY_RUNTIME_ROW)
     }
 
     pub fn versions(
@@ -111,23 +85,15 @@ impl Directory {
         id: &dyn BlockIdentity,
         mut visit: impl FnMut(&BlockKey, &DirectoryEntry),
     ) {
-        let view = id.view();
-        self.lookup.find_all(self.hash(id), |_, handle| {
-            let (key, entry) = self.at(handle as usize - 1).unwrap();
-            let candidate = key.view();
-            if (candidate.object, candidate.offset, candidate.block_size)
-                == (view.object, view.offset, view.block_size)
-            {
-                visit(key, entry);
-            }
-            false
+        self.rows.versions(id, |handle, row| {
+            visit(&row.id, self.runtime_at(handle as usize - 1))
         });
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&BlockKey, &DirectoryEntry)> {
-        self.slots
+        self.rows
             .iter()
-            .filter_map(|slot| Some((slot.key.as_ref()?, &slot.entry)))
+            .map(|(handle, row)| (&row.id, self.runtime_at(handle as usize - 1)))
     }
 
     pub fn values(&self) -> impl Iterator<Item = &DirectoryEntry> {
@@ -135,16 +101,178 @@ impl Directory {
     }
 
     pub fn retain(&mut self, mut keep: impl FnMut(&BlockKey, &mut DirectoryEntry) -> bool) {
-        for cursor in 0..self.slots.len() {
-            let slot = &mut self.slots[cursor];
-            if let Some(key) = &slot.key {
-                if !keep(key, &mut slot.entry) {
-                    let id = key.clone();
-                    self.remove(&id);
+        for (cursor, entry) in self.runtime.iter_mut().enumerate() {
+            if let Some(row) = self.rows.at(cursor) {
+                if !keep(&row.id, entry) {
+                    let id = row.id.clone();
+                    *entry = DirectoryEntry::default();
+                    self.rows.release(&id);
                 }
             }
         }
     }
+
+    pub(crate) fn attach(&mut self, page_size: u32) {
+        if let Some(current) = self.page_size {
+            assert_eq!(current, page_size, "shared catalog page geometry changed");
+            return;
+        }
+        self.rows.restore_shadows();
+        self.page_size = Some(page_size);
+        let total = self
+            .rows
+            .iter()
+            .fold(Usage::default(), |mut total, (handle, _)| {
+                let usage = self.usage(handle, None);
+                total.blocks += usage.blocks;
+                total.pages += usage.pages;
+                total.bytes += usage.bytes;
+                total
+            });
+        self.blocks = total.blocks;
+        self.pages = total.pages;
+        self.bytes = total.bytes;
+    }
+
+    pub fn page_size(&self) -> u32 {
+        self.page_size.unwrap_or_default()
+    }
+
+    pub fn totals(&self) -> (u64, u64, u64) {
+        (
+            self.blocks,
+            self.pages,
+            u64::try_from(self.bytes).unwrap_or(u64::MAX),
+        )
+    }
+
+    fn visible<'a>(&'a self, handle: u32, row: &'a BlockRow) -> Option<&'a Geometry> {
+        if self.page_size? == 0 {
+            return self.rows.geometry(handle, StoreKind::Whole);
+        }
+        row.geometry.kind().map(|_| &row.geometry)
+    }
+
+    pub fn resident(
+        &self,
+        id: &dyn BlockIdentity,
+    ) -> Option<(&BlockKey, &Geometry, &DirectoryEntry)> {
+        let handle = self.rows.handle(id)?;
+        let slot = handle as usize - 1;
+        let row = self.rows.at(slot).unwrap();
+        Some((&row.id, self.visible(handle, row)?, self.runtime_at(slot)))
+    }
+
+    pub fn residents(&self) -> impl Iterator<Item = (&BlockKey, &Geometry)> {
+        self.rows
+            .iter()
+            .filter_map(|(handle, row)| Some((&row.id, self.visible(handle, row)?)))
+    }
+
+    pub(crate) fn store_geometry(
+        &self,
+        kind: StoreKind,
+        id: &dyn BlockIdentity,
+    ) -> Option<&Geometry> {
+        self.rows.geometry(self.rows.handle(id)?, kind)
+    }
+
+    fn usage(&self, handle: u32, page: Option<u32>) -> Usage {
+        let Some(geometry) = self
+            .rows
+            .at(handle as usize - 1)
+            .and_then(|r| self.visible(handle, r))
+        else {
+            return Usage::default();
+        };
+        let paged = geometry.kind() == Some(StoreKind::Paged);
+        let bytes = if let Some(page) = page.filter(|_| paged) {
+            u128::from(geometry.allocation(page).unwrap_or(0))
+        } else {
+            geometry
+                .pages_after(None)
+                .map(|(_, bytes)| u128::from(bytes))
+                .sum()
+        };
+        Usage {
+            blocks: 1,
+            pages: if paged {
+                geometry.page_count() as u64
+            } else {
+                0
+            },
+            bytes,
+        }
+    }
+
+    pub(crate) fn apply(
+        &mut self,
+        id: &talon_core::BlockId,
+        kind: StoreKind,
+        operation: &Operation,
+        disk_id: Option<crate::catalog::DiskId>,
+        allocated: Option<u64>,
+    ) {
+        let handle = match self.rows.handle(id) {
+            Some(handle) => handle,
+            None if allocated.is_some()
+                && matches!(
+                    operation,
+                    Operation::Put { .. } | Operation::PutWhole { .. }
+                ) =>
+            {
+                self.rows.get_or_insert(BlockKey::new(id))
+            }
+            None => return,
+        };
+        let page = match operation {
+            Operation::Put { page, .. } | Operation::DeletePage { page } => Some(*page),
+            _ => None,
+        };
+        let before = self.usage(handle, page);
+        match (operation, allocated) {
+            (Operation::PutWhole { len }, Some(bytes)) => {
+                self.rows
+                    .put(handle, Geometry::new(kind, disk_id, *len, 0, bytes));
+            }
+            (Operation::Put { page, len }, Some(bytes)) => {
+                if let Some(row) = self.rows.geometry_mut(handle, kind) {
+                    debug_assert_eq!(row.disk_id, disk_id);
+                    row.put(*len, *page, bytes);
+                } else {
+                    self.rows
+                        .put(handle, Geometry::new(kind, disk_id, *len, *page, bytes));
+                }
+            }
+            _ => {
+                if let Some(page) = page {
+                    if self
+                        .rows
+                        .geometry_mut(handle, kind)
+                        .is_some_and(|row| row.remove_page(page))
+                    {
+                        self.rows.clear(handle, kind);
+                    }
+                } else {
+                    self.rows.clear(handle, kind);
+                }
+                if self.runtime_at(handle as usize - 1).is_empty() {
+                    self.rows.release(id);
+                }
+            }
+        }
+        let after = self.usage(handle, page);
+        self.blocks = self.blocks - before.blocks + after.blocks;
+        self.pages = self.pages - before.pages + after.pages;
+        self.bytes = self.bytes - before.bytes + after.bytes;
+    }
+}
+
+#[derive(Default)]
+struct Usage {
+    blocks: u64,
+    pages: u64,
+    bytes: u128,
 }
 
 #[cfg(test)]
@@ -185,7 +313,7 @@ mod tests {
             .iter()
             .map(|(id, entry)| (id.clone(), entry.policy.len))
             .collect();
-        let free = directory.slots.len() - directory.len();
+        let free = directory.slot_count() - directory.len();
         for n in 100..100 + free {
             let entry = directory.get_or_insert(id(n)).1;
             assert!(
@@ -194,12 +322,12 @@ mod tests {
             );
             entry.policy.len = n;
         }
-        assert_eq!(directory.slots.len(), 100);
+        assert_eq!(directory.slot_count(), 100);
         for (id, value) in retained {
             assert_eq!(directory.get(&id).unwrap().policy.len, value);
         }
         directory.retain(|_, _| false);
         assert!(directory.is_empty());
-        assert_eq!(directory.slots.len() - directory.len(), 100);
+        assert_eq!(directory.slot_count() - directory.len(), 100);
     }
 }

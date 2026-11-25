@@ -187,7 +187,6 @@ impl NamespaceRuntimes {
         let store =
             WholeBlockStore::open_with_catalog(&root, self.whole_fds.clone(), catalog.clone())?;
         let store = store.with_uring(self.uring)?;
-        let mut index = Arc::new(BlockIndex::new());
         let paged = if config.l2_page_size_bytes > 0 {
             let path = catalog.store_path(&root.join("paged"))?;
             let registered = catalog.registered(&path, config.l2_page_size_bytes as u32)?;
@@ -213,19 +212,7 @@ impl NamespaceRuntimes {
             None
         };
         let recovery_started = Instant::now();
-        store.restore_index_exclusive(
-            Arc::get_mut(&mut index).expect("unpublished startup index"),
-        )?;
-        let whole_ms = recovery_started.elapsed().as_secs_f64() * 1000.0;
-        let paged_started = Instant::now();
-        if let Some(paged) = &paged {
-            paged.restore_index_exclusive(
-                Arc::get_mut(&mut index).expect("unpublished startup index"),
-            )?;
-        }
-        tracing::info!(root = %root.display(), whole_ms,
-            paged_ms = paged_started.elapsed().as_secs_f64() * 1000.0,
-            "cache index recovery phases");
+        let index = Arc::new(catalog.index(config.l2_page_size_bytes as u32));
         tracing::info!(root = %root.display(), blocks = index.len(),
             elapsed_ms = recovery_started.elapsed().as_millis() as u64,
             "cache index restored");

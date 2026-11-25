@@ -976,7 +976,7 @@ mod tests {
                 catalog.clone(),
             )
             .unwrap(),
-            Arc::new(BlockIndex::new()),
+            Arc::new(catalog.index(config.l2_page_size_bytes as u32)),
             Arc::new(InFlightLoads::new()),
             Arc::new(UnusedOrigin),
             config.block_size,
@@ -1099,6 +1099,29 @@ mod tests {
             Bytes::from_static(&[2; 16])
         );
         assert_eq!(worker.lru.block_candidates(&id).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn missing_whole_file_retires_shared_catalog_and_policy() {
+        let root = tempfile::tempdir().unwrap();
+        let (worker, catalog, _) = runtime(root.path());
+        let id = block();
+        worker
+            .commit_cached_block(&id, Bytes::from_static(&[1; 16]))
+            .await
+            .unwrap();
+
+        let disk_id = catalog.disk_id("whole", &id).unwrap().unwrap();
+        std::fs::remove_file(disk_id.path(&worker.store.root().join("whole"), "blk")).unwrap();
+
+        assert!(worker
+            .cached_block_range(&id, 0, 16)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(catalog.recover("whole").unwrap().unwrap().is_empty());
+        assert!(worker.index.is_empty());
+        assert_eq!(worker.lru.total_bytes(), 0);
     }
 
     #[tokio::test]

@@ -30,17 +30,7 @@ fn restart_replay_and_index() {
         let catalog =
             Catalog::with_service(&service, service.root(), transaction_budget(), None).unwrap();
         let replay_seconds = started.elapsed().as_secs_f64();
-        let entries = catalog
-            .journal
-            .query_blocking(move |state| {
-                state
-                    .entries_with_threads("paged", threads)
-                    .map_err(std::io::Error::other)
-            })
-            .unwrap()
-            .unwrap();
-        let mut index = crate::BlockIndex::new();
-        index.restore_allocated(entries, threads);
+        let index = catalog.index(131072);
         assert_eq!(index.page_count(), index.len() as u64 * 32);
         let seconds = started.elapsed().as_secs_f64();
         let after = usage();

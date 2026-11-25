@@ -6,17 +6,19 @@
 //! decisions), the miss/loader path (commit on completion), and eviction
 //! (byte accounting).
 //!
-//! The directory lock protects membership; each block has its own [`RwLock`]
-//! for metadata and page updates. Readers borrow the entry while holding the
+//! Journal-backed blocks use the catalog directory for membership, geometry,
+//! and allocation. Standalone entries keep an individual [`RwLock`] for
+//! metadata and page updates. Readers borrow the entry while holding the
 //! directory read lock. Writers retain an Arc and release the directory before
 //! locking the entry. Removal/replacement retires the old entry under its write
 //! lock, so writers racing with retirement retry their lookup.
 use crate::block_key::{BlockIdentity, BlockKey};
-use crate::catalog::DiskId;
+use crate::catalog::{DiskId, StoreKind};
 use crate::small_store::key::{SmallIdentity, SmallRef};
 
+mod catalog;
 mod directory;
-use directory::Directory;
+pub(crate) use directory::Directory;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, RwLockReadGuard};
 
@@ -44,7 +46,8 @@ pub enum Presence {
 /// A thread-safe index of resident blocks.
 #[derive(Default)]
 pub struct BlockIndex {
-    entries: RwLock<Directory>,
+    entries: Arc<RwLock<Directory>>,
+    catalog: bool,
     small: RwLock<Vec<Arc<RwLock<crate::small_store::directory::Directory>>>>,
     resident_blocks: AtomicU64,
     resident_bytes: AtomicU64,
@@ -52,7 +55,7 @@ pub struct BlockIndex {
 }
 
 #[derive(Default)]
-struct DirectoryEntry {
+pub(crate) struct DirectoryEntry {
     resident: Option<Arc<Entry>>,
     lifecycle: Option<Arc<BlockState>>,
     policy: PolicyUnits,
@@ -581,7 +584,7 @@ impl BlockIndex {
             directory.policy.len += usize::from(fresh);
             return access;
         }
-        let resident = directory
+        let (whole, pages) = directory
             .resident
             .as_ref()
             .and_then(|resident| {
@@ -603,14 +606,18 @@ impl BlockIndex {
                 let slot = directory
                     .policy
                     .whole
-                    .get_or_insert_with(|| resident.0.unwrap_or_default());
+                    .get_or_insert_with(|| whole.unwrap_or_default());
                 put(&mut slot.write().unwrap(), entry.access)
             }
             UnitKind::Page(page) => {
-                let pages = directory
-                    .policy
-                    .pages
-                    .get_or_insert_with(|| resident.1.unwrap_or_default());
+                let pages = directory.policy.pages.get_or_insert_with(|| {
+                    if self.catalog {
+                        if let Some(life) = &directory.lifecycle {
+                            return life.inner.lock().unwrap().pages.clone();
+                        }
+                    }
+                    pages.unwrap_or_default()
+                });
                 let mut pages = pages.write().unwrap();
                 let page = pages.get_or_insert_with(page.0, || {
                     PageEntry::with_handle(entry.access.page_state().clone())
@@ -697,6 +704,16 @@ impl BlockIndex {
             }
         }
         let mut entries = self.entries.write().unwrap();
+        let catalog_present = if let UnitKind::Page(page) = unit.kind() {
+            entries
+                .resident(unit.block())
+                .is_some_and(|(_, geometry, _)| {
+                    geometry.kind() == Some(StoreKind::Paged)
+                        && geometry.allocation(page.0).is_some()
+                })
+        } else {
+            false
+        };
         let directory = entries.get_mut(unit.block())?;
         let take = |slot: &mut UnitSlot| {
             Some(PolicyEntry {
@@ -722,7 +739,11 @@ impl BlockIndex {
                     state: entry.unit.policy.take()?,
                     access: entry.unit.access.get().expect("policy access token"),
                 };
-                if !present && entry.unit.allocated == 0 && !entry.handle.is_bound() {
+                if !catalog_present
+                    && !present
+                    && entry.unit.allocated == 0
+                    && !entry.handle.is_bound()
+                {
                     pages.remove(&page.0);
                 }
                 removed
@@ -799,6 +820,7 @@ impl BlockIndex {
     }
     /// Startup-only bulk restoration. Exclusive ownership prevents publication
     /// to readers while workers build page tables without the directory lock.
+    #[cfg(test)]
     pub(crate) fn restore_allocated(&mut self, blocks: Vec<StoredBlock>, threads: usize) {
         self.try_restore_allocated(blocks, threads, |block| {
             Ok::<_, std::convert::Infallible>((block.meta, block.allocated))
@@ -809,6 +831,7 @@ impl BlockIndex {
     /// Decode and construct entries in parallel, then publish with exclusive
     /// ownership. A decode error leaves the existing index unchanged. Small
     /// whole objects can supply inline allocations instead of a Vec per object.
+    #[cfg(test)]
     pub(crate) fn try_restore_allocated<T: Send, A, E: Send>(
         &mut self,
         input: Vec<T>,
@@ -828,7 +851,7 @@ impl BlockIndex {
         })
         .into_iter()
         .collect::<Result<Vec<_>, E>>()?;
-        let entries = self.entries.get_mut().unwrap();
+        let entries = Arc::get_mut(&mut self.entries).unwrap().get_mut().unwrap();
         entries.reserve(built.len());
         let bytes = self.resident_bytes.get_mut();
         let pages = self.resident_pages.get_mut();
@@ -882,14 +905,21 @@ impl BlockIndex {
         if let Some(block) = &slot.lifecycle {
             return block.clone();
         }
-        let pages = slot.resident.as_ref().and_then(|entry| {
-            entry
-                .block
-                .read()
-                .unwrap()
-                .as_ref()
-                .and_then(|block| block.units.page_table())
-        });
+        let pages = slot
+            .policy
+            .pages
+            .clone()
+            .filter(|_| self.catalog)
+            .or_else(|| {
+                slot.resident.as_ref().and_then(|entry| {
+                    entry
+                        .block
+                        .read()
+                        .unwrap()
+                        .as_ref()
+                        .and_then(|block| block.units.page_table())
+                })
+            });
         let block = create(key, pages);
         slot.lifecycle = Some(block.clone());
         block
@@ -998,6 +1028,9 @@ impl BlockIndex {
         if start.0 >= end.0 {
             return None;
         }
+        if self.catalog {
+            return self.catalog_read_pages(id, start, end);
+        }
         self.read_entry(id, |entry| {
             let IndexedUnits::Paged(pages) = &entry.units else {
                 return None;
@@ -1035,6 +1068,9 @@ impl BlockIndex {
         &self,
         track_clock: bool,
     ) -> Vec<crate::eviction::RecoveredUnit> {
+        if self.catalog {
+            return self.catalog_recover_policy(track_clock);
+        }
         use crate::eviction::RecoveredUnit;
         let started = std::time::Instant::now();
         let entries = self.entries.read().unwrap();
@@ -1086,6 +1122,20 @@ impl BlockIndex {
     /// Startup only. Whole blocks have no page lifecycle: skip them without
     /// allocating or cloning their identities into a second full snapshot.
     pub(crate) fn restore_page_states(&self, lifecycle: &crate::page_lifecycle::PageLifecycle) {
+        if self.catalog {
+            let ids: Vec<_> = self
+                .entries
+                .read()
+                .unwrap()
+                .residents()
+                .filter(|(_, geometry)| geometry.kind() == Some(StoreKind::Paged))
+                .map(|(key, _)| key.clone())
+                .collect();
+            for key in ids {
+                lifecycle.block(&key.materialize());
+            }
+            return;
+        }
         let entries: Vec<_> = self
             .entries
             .read()
@@ -1117,6 +1167,9 @@ impl BlockIndex {
 
     /// Number of blocks currently tracked.
     pub fn len(&self) -> usize {
+        if self.catalog {
+            return self.entries.read().unwrap().totals().0 as usize;
+        }
         self.resident_blocks.load(Ordering::Relaxed) as usize
     }
 
@@ -1127,11 +1180,23 @@ impl BlockIndex {
 
     /// Allocated disk bytes of indexed data files, also charged to eviction.
     pub fn resident_bytes(&self) -> u64 {
+        if self.catalog {
+            return self.entries.read().unwrap().totals().2;
+        }
         self.resident_bytes.load(Ordering::Relaxed)
     }
 
     #[cfg(test)]
     pub(crate) fn logical_resident_bytes(&self) -> u64 {
+        if self.catalog {
+            let entries = self.entries.read().unwrap();
+            return entries
+                .residents()
+                .map(|(key, geometry)| {
+                    catalog::metadata(key, geometry, entries.page_size()).resident_bytes()
+                })
+                .sum();
+        }
         self.with_snapshot(|entries| {
             entries
                 .iter()
@@ -1145,11 +1210,19 @@ impl BlockIndex {
 
     /// Number of materialized pages across all paged blocks.
     pub fn page_count(&self) -> u64 {
+        if self.catalog {
+            return self.entries.read().unwrap().totals().1;
+        }
         self.resident_pages.load(Ordering::Relaxed)
     }
 
     /// Look up a copy of a block's metadata.
     pub fn get(&self, id: &BlockId) -> Option<BlockMeta> {
+        if self.catalog {
+            let entries = self.entries.read().unwrap();
+            let (key, geometry, _) = entries.resident(id)?;
+            return Some(catalog::metadata(key, geometry, entries.page_size()));
+        }
         self.read_entry(id, |entry| entry.metadata().into())
     }
 
@@ -1159,6 +1232,17 @@ impl BlockIndex {
     }
 
     pub(crate) fn get_and_touch_at(&self, id: &BlockId) -> Option<(BlockMeta, Option<DiskId>)> {
+        if self.catalog {
+            let entries = self.entries.read().unwrap();
+            let (key, geometry, runtime) = entries.resident(id)?;
+            if geometry.kind() == Some(StoreKind::Whole) {
+                catalog::touch_whole(runtime);
+            }
+            return Some((
+                catalog::metadata(key, geometry, entries.page_size()),
+                geometry.disk_id,
+            ));
+        }
         self.read_entry(id, |entry| {
             if let IndexedUnits::Whole(slot) = &entry.units {
                 if let Some(access) = &slot.read().unwrap().access {
@@ -1175,6 +1259,15 @@ impl BlockIndex {
     }
 
     pub(crate) fn whole_and_touch(&self, id: &BlockId) -> Option<Option<DiskId>> {
+        if self.catalog {
+            let entries = self.entries.read().unwrap();
+            let (_, geometry, runtime) = entries.resident(id)?;
+            if geometry.kind() != Some(StoreKind::Whole) {
+                return None;
+            }
+            catalog::touch_whole(runtime);
+            return Some(geometry.disk_id);
+        }
         self.read_entry(id, |entry| {
             let IndexedUnits::Whole(slot) = &entry.units else {
                 return None;
@@ -1218,6 +1311,15 @@ impl BlockIndex {
     /// on-disk cache, so already-resident blocks count against capacity from the
     /// first request (issue #159).
     pub fn snapshot_lens(&self) -> Vec<(BlockId, u64)> {
+        if self.catalog {
+            return self
+                .entries
+                .read()
+                .unwrap()
+                .residents()
+                .map(|(key, geometry)| (key.materialize(), geometry.len()))
+                .collect();
+        }
         self.with_snapshot(|entries| {
             entries
                 .iter()
@@ -1235,6 +1337,17 @@ impl BlockIndex {
     /// Seeds the eviction tracker at startup so a rebuilt paged block charges
     /// capacity per resident page rather than for its full logical length.
     pub fn snapshot_units(&self) -> Vec<(BlockId, Option<PageIndex>, u64)> {
+        if self.catalog {
+            let entries = self.entries.read().unwrap();
+            let mut units = Vec::new();
+            for (key, geometry) in entries.residents() {
+                let paged = geometry.kind() == Some(StoreKind::Paged);
+                units.extend(geometry.pages_after(None).map(|(page, bytes)| {
+                    (key.materialize(), paged.then_some(PageIndex(page)), bytes)
+                }));
+            }
+            return units;
+        }
         self.with_snapshot(|entries| {
             let mut out = Vec::new();
             for guard in entries {
@@ -1493,6 +1606,23 @@ impl BlockIndex {
     /// `start_page`/`end_page` are only consulted for paged blocks; for a whole
     /// block the answer is always [`Presence::Whole`].
     pub fn presence(&self, id: &BlockId, start_page: PageIndex, end_page: PageIndex) -> Presence {
+        if self.catalog {
+            let entries = self.entries.read().unwrap();
+            let Some((_, geometry, _)) = entries.resident(id) else {
+                return Presence::Miss;
+            };
+            if geometry.kind() == Some(StoreKind::Whole) {
+                return Presence::Whole;
+            }
+            let mut present = geometry.pages_after(start_page.0.checked_sub(1));
+            return if (start_page.0..end_page.0)
+                .all(|expected| present.next().is_some_and(|(page, _)| page == expected))
+            {
+                Presence::PageHit
+            } else {
+                Presence::PageMiss
+            };
+        }
         self.read_entry(id, |entry| match &entry.units {
             IndexedUnits::Whole(_) => Presence::Whole,
             IndexedUnits::Paged(pages) => {

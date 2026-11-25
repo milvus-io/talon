@@ -43,7 +43,7 @@ async fn pending_whole_mutations_reconcile_snapshot_and_tail() {
                 .put(&block(0), Bytes::from_static(b"new!"))
                 .await
                 .unwrap();
-            assert_ne!(store.read_path(&block(0), None).await.unwrap(), path);
+            assert_ne!(store.read_path(&block(0), None).unwrap(), path);
             drop(store);
             let store = WholeBlockStore::open(root.path()).unwrap();
             assert_eq!(store.scan().unwrap().len(), 1);
@@ -109,7 +109,7 @@ async fn failed_whole_rewrite_hides_only_pending_block() {
     let (a, b) = (block(0), block(1));
     store.put(&a, Bytes::from_static(b"kept")).await.unwrap();
     store.put(&b, Bytes::from_static(b"old!")).await.unwrap();
-    let path = store.read_path(&b, None).await.unwrap();
+    let path = store.read_path(&b, None).unwrap();
     let pinned = store.get_block(&b).await.unwrap();
 
     crate::page_access_store::FAIL_CHECKPOINT.with(|f| f.set(Some("whole_published")));

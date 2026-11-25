@@ -42,8 +42,10 @@ fn repeated_whole_put_preserves_canonical_identity() {
                 },
             )
             .unwrap();
-        let row = state.stores["whole"].blocks.get(&block(0)).unwrap();
-        assert_eq!(row.disk_id, DiskId::new(2, 0).ok());
+        let directory = state.live.directory.read().unwrap();
+        let handle = directory.rows.handle(&block(0)).unwrap();
+        let row = directory.rows.at(handle as usize - 1).unwrap();
+        assert_eq!(row.geometry.disk_id, DiskId::new(2, 0).ok());
         if let Some(old) = previous {
             assert!(BlockKey::ptr_eq(&old, &row.id));
         }
@@ -104,11 +106,14 @@ fn frozen_snapshot_preserves_pages_and_pending_transaction_ids() {
     let entries = restored.entries("paged").unwrap().unwrap();
     assert_eq!(entries[0].allocated, vec![(Some(PageIndex(0)), 4096)]);
     assert_eq!(entries[0].meta.disk_id, DiskId::new(2, 0).ok());
-    assert_eq!(restored.pending[&4].disk_id, DiskId::new(2, 0).ok());
+    assert_eq!(
+        restored.live.pending.read().unwrap()[&4].disk_id,
+        DiskId::new(2, 0).ok()
+    );
     restored
         .apply(6, Record::Resolve { transaction: 4 })
         .unwrap();
-    assert!(restored.pending.is_empty());
+    assert!(restored.live.pending.read().unwrap().is_empty());
     assert!(restored.entries("paged").unwrap().unwrap().is_empty());
     assert_eq!(
         state.entries("paged").unwrap().unwrap()[0].allocated,
@@ -239,7 +244,8 @@ async fn large_block_checkpoint_reopens_without_an_oversized_frame() {
     catalog
         .journal
         .query(move |state| {
-            let restored = state.stores[path].blocks.get(&id).unwrap();
+            let directory = state.live.directory.read().unwrap();
+            let restored = directory.store_geometry(StoreKind::Paged, &id).unwrap();
             assert_eq!(restored.page_count(), count as usize - 1);
             assert_eq!(restored.len(), u64::from(id.block_size));
             assert!(restored
@@ -289,9 +295,12 @@ fn snapshot_page_chunks_validate_identity_order_and_legacy_records() {
     state.restore(chunk(2, 16, true)).unwrap();
     assert!(state.restore(chunk(1, 16, true)).is_err());
     assert_eq!(
-        state.stores[path]
-            .blocks
-            .get(&block(0))
+        state
+            .live
+            .directory
+            .read()
+            .unwrap()
+            .store_geometry(StoreKind::Paged, &block(0))
             .unwrap()
             .pages_after(None)
             .collect::<Vec<_>>(),
@@ -378,7 +387,7 @@ fn many_pending_intents_reconcile_inside_tokio_startup() {
                 let catalog = open(root.path());
                 assert!(catalog
                     .journal
-                    .query_blocking(|state| Ok(state.pending.is_empty()))
+                    .query_blocking(|state| Ok(state.live.pending.read().unwrap().is_empty()))
                     .unwrap());
                 assert!(catalog.recover(path).unwrap().unwrap().is_empty());
             });
@@ -458,14 +467,24 @@ async fn replay_restores_exact_residency_and_allocation_without_listing_data() {
     let root = tempfile::tempdir().unwrap();
     let catalog = open(root.path());
     let paged = store(&catalog);
-    paged
-        .commit_page(&block(0), PageIndex(0), 16, Bytes::from_static(b"aaaa"))
-        .await
-        .unwrap();
-    paged
-        .commit_page(&block(0), PageIndex(2), 16, Bytes::from_static(b"bbbb"))
-        .await
-        .unwrap();
+    let index = catalog.index(4);
+    let id = block(0);
+    let (first, sibling) = tokio::join!(
+        paged.commit_page(&id, PageIndex(0), 16, Bytes::from_static(b"aaaa")),
+        paged.commit_page(&id, PageIndex(2), 16, Bytes::from_static(b"bbbb")),
+    );
+    first.unwrap();
+    sibling.unwrap();
+    assert_eq!(index.len(), 1);
+    assert_eq!(index.page_count(), 2);
+    assert_eq!(
+        index.presence(&id, PageIndex(0), PageIndex(1)),
+        crate::Presence::PageHit
+    );
+    assert_eq!(
+        index.presence(&id, PageIndex(0), PageIndex(3)),
+        crate::Presence::PageMiss
+    );
     paged
         .commit_page(&block(1), PageIndex(1), 12, Bytes::from_static(b"cccc"))
         .await
@@ -482,6 +501,13 @@ async fn replay_restores_exact_residency_and_allocation_without_listing_data() {
     assert_eq!(before.len(), 1);
     assert_eq!(before[0].allocated.len(), 1);
     let expected = before[0].allocated.clone();
+    assert_eq!(index.resident_bytes(), expected[0].1);
+    assert_eq!(
+        index.snapshot_units(),
+        [(id.clone(), expected[0].0, expected[0].1)]
+    );
+    assert_eq!(index.page_count(), 1);
+    drop(index);
     drop(paged);
     drop(catalog);
     // If recovery enumerates or stats data, this replacement makes it fail.
@@ -489,11 +515,105 @@ async fn replay_restores_exact_residency_and_allocation_without_listing_data() {
     std::fs::rename(&data, root.path().join("hidden-data")).unwrap();
     std::fs::write(&data, b"not a directory").unwrap();
     let catalog = open(root.path());
+    let index = catalog.index(4);
+    assert_eq!(index.snapshot_units(), [(id, expected[0].0, expected[0].1)]);
     let recovered = catalog.recover("paged").unwrap().unwrap();
     assert_eq!(recovered.len(), 1);
     assert_eq!(recovered[0].allocated, expected);
     assert_eq!(recovered[0].meta.id.materialize(), block(0));
     assert_eq!(recovered[0].meta.len, 16);
+}
+
+#[tokio::test]
+async fn shared_slots_keep_store_addresses_and_reused_generations_distinct() {
+    use crate::WholeBlockStore;
+    use talon_core::ObjectStore;
+
+    let root = tempfile::tempdir().unwrap();
+    let catalog = open(root.path());
+    let whole = WholeBlockStore::open_with_catalog(
+        root.path(),
+        Arc::new(crate::fd_cache::FdCache::new(8)),
+        catalog.clone(),
+    )
+    .unwrap();
+    let paged = store(&catalog);
+    let index = catalog.index(4);
+    let id = block(0);
+    whole.put(&id, Bytes::from_static(b"abcd")).await.unwrap();
+    let whole_disk = catalog.disk_id("whole", &id).unwrap().unwrap();
+    let key = index.shared_identity(&id).unwrap();
+    assert_eq!(index.whole_and_touch(&id), Some(Some(whole_disk)));
+
+    paged
+        .commit_page(&id, PageIndex(1), 16, Bytes::from_static(b"efgh"))
+        .await
+        .unwrap();
+    let page_disk = catalog.disk_id("paged", &id).unwrap().unwrap();
+    assert_ne!(whole_disk, page_disk);
+    assert!(key.ptr_eq(&index.shared_identity(&id).unwrap()));
+    assert_eq!(index.len(), 1);
+    assert_eq!(index.page_count(), 1);
+    assert_eq!(
+        whole.get_bytes(&id).await.unwrap(),
+        Bytes::from_static(b"abcd")
+    );
+    assert_eq!(
+        paged.get_page_bytes(&id, PageIndex(1), 4).await.unwrap(),
+        Bytes::from_static(b"efgh")
+    );
+
+    catalog.checkpoint().await.unwrap();
+    drop((paged, whole, index, catalog));
+
+    let catalog = open(root.path());
+    let index = catalog.index(4);
+    assert_eq!(catalog.disk_id("whole", &id).unwrap(), Some(whole_disk));
+    assert_eq!(catalog.disk_id("paged", &id).unwrap(), Some(page_disk));
+    assert_eq!(index.page_count(), 1);
+    let recovered_handle = catalog
+        .live
+        .directory
+        .read()
+        .unwrap()
+        .rows
+        .handle(&id)
+        .unwrap();
+    let paged = store(&catalog);
+    paged.delete_block_async(&id).await.unwrap();
+    assert!(index.is_empty());
+    assert_eq!(index.resident_bytes(), 0);
+    let whole = WholeBlockStore::open_with_catalog(
+        root.path(),
+        Arc::new(crate::fd_cache::FdCache::new(8)),
+        catalog.clone(),
+    )
+    .unwrap();
+    whole.delete(&id).await.unwrap();
+    assert!(index.shared_identity(&id).is_none());
+    whole.put(&id, Bytes::from_static(b"ijkl")).await.unwrap();
+    assert_eq!(
+        catalog.live.directory.read().unwrap().rows.handle(&id),
+        Some(recovered_handle)
+    );
+    let replacement = index.whole_and_touch(&id).flatten().unwrap();
+    assert_ne!(replacement, whole_disk);
+    assert_eq!(
+        whole.get_bytes(&id).await.unwrap(),
+        Bytes::from_static(b"ijkl")
+    );
+
+    let mut other_version = id.clone();
+    other_version.version = Version::new("v2");
+    whole
+        .put(&other_version, Bytes::from_static(b"mnop"))
+        .await
+        .unwrap();
+    let index = Arc::new(index);
+    let policy = index.restore_lru();
+    assert_eq!(policy.len(), 2);
+    assert_eq!(index.policy_version_blocks(&id).len(), 2);
+    assert_eq!(index.get(&other_version).unwrap().id, other_version);
 }
 
 #[tokio::test]

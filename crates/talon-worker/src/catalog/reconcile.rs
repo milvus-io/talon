@@ -19,9 +19,7 @@ fn sync_dir(path: &Path) -> io::Result<()> {
 
 impl Catalog {
     pub(super) fn reconcile(&self) -> anyhow::Result<()> {
-        let pending = self
-            .journal
-            .query_blocking(|state| Ok(state.pending.clone()))?;
+        let pending = self.live.pending.read().unwrap().clone();
         if pending.is_empty() {
             return Ok(());
         }

@@ -13,8 +13,8 @@ TYPES = {
     "index.rs": ["DirectoryEntry", "PolicyUnits", "Entry", "IndexedBlock", "ResidentMeta", "IndexedUnits", "UnitSlot", "PageUnit", "Option<PolicyState>", "Option<AccessHandle>", "RwLock<UnitSlot>"],
     "eviction.rs": ["SharedUnit", "AccessHandle", "PageAccessSlot", "Access", "PolicyState", "BlockPolicy", "Inner"],
     "page_lifecycle.rs": ["PageState", "PageAccess", "PageEntry", "BlockState", "BlockPages", "PageMutationGate", "BlockWork", "ShardWork", "Registry", "crate::page_table::PageMap", "RwLock<crate::page_table::PageMap>", "talon_core::BlockId", "talon_core::ObjectId"],
-    "catalog/rows.rs": ["BlockRow", "Option<BlockRow>", "BlockRows", "CompactPage", "PageRows"],
-    "index/directory.rs": ["Directory", "Slot", "Lookup"],
+    "catalog/rows.rs": ["BlockRow", "Option<BlockRow>", "BlockRows", "Geometry", "CompactPage", "PageRows"],
+    "index/directory.rs": ["Directory"],
     "fd_cache.rs": ["CachedFd", "Shard", "(PathBuf, CachedFd)", "OwnedFd"],
     "runtime.rs": ["CachedVersion", "(ObjectId, CachedVersion)", "crate::WholeBlockStore", "crate::PagedBlockStore"],
 }

@@ -1,7 +1,6 @@
 use super::*;
 use crate::{
     eviction::Lru,
-    index::BlockIndex,
     page_lifecycle::{PageEntry, PageLifecycle},
 };
 use std::{
@@ -110,7 +109,6 @@ fn scenario(count: usize, pages: u32, tracked: bool, tti: bool) {
         if pages == 0 { "whole" } else { "paged" }
     );
     eprintln!("SCENARIO|{label}|blocks={count}|pages={pages}|text=144");
-    let mut index = BlockIndex::new();
     let baseline = Snapshot::now();
     let mut keys = Vec::with_capacity(count);
     let before_keys = Snapshot::now();
@@ -150,33 +148,8 @@ fn scenario(count: usize, pages: u32, tracked: bool, tti: bool) {
         }
         catalog
     });
-    measure("resident_index_excluding_identity", count, || {
-        let blocks = keys
-            .iter()
-            .enumerate()
-            .map(|(n, key)| StoredBlock {
-                meta: StoredMeta {
-                    id: key.clone(),
-                    disk_id: DiskId::new(n as u64 + 1, 0).ok(),
-                    form: if pages == 0 {
-                        BlockForm::Whole
-                    } else {
-                        BlockForm::Paged {
-                            page_size: 1 << 20,
-                            present: (0..pages).fold(PresentBitmap::new(256), |mut b, p| {
-                                b.set(PageIndex(p));
-                                b
-                            }),
-                        }
-                    },
-                    len: u64::from(pages.max(1)) << 20,
-                },
-                allocated: (0..pages.max(1))
-                    .map(|p| ((pages != 0).then_some(PageIndex(p)), 1 << 20))
-                    .collect(),
-            })
-            .collect();
-        index.restore_allocated(blocks, 1);
+    let index = measure("resident_index_excluding_identity", count, || {
+        catalog.live.index(if pages == 0 { 0 } else { 1 << 20 })
     });
     let before_owner = Snapshot::now();
     let index = Arc::new(index);
@@ -221,8 +194,8 @@ fn scenario(count: usize, pages: u32, tracked: bool, tti: bool) {
     if !tti {
         measure("on_demand_lifecycle_binding", count, || {
             if pages == 0 {
-                for row in catalog.stores["whole"].blocks.values() {
-                    lifecycle.block(&row.id.materialize());
+                for (id, _) in index.snapshot_lens() {
+                    lifecycle.block(&id);
                 }
             } else {
                 index.restore_page_states(&lifecycle);

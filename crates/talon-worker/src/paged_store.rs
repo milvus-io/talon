@@ -536,25 +536,6 @@ impl PagedBlockStore {
         self.restore_index_with_workers(index, 16)
     }
 
-    /// Startup has exclusive ownership of the index, including whole entries
-    /// recovered earlier. Build page tables on CPU workers before merging them.
-    pub(crate) fn restore_index_exclusive(&self, index: &mut crate::BlockIndex) -> Result<()> {
-        if self.catalog.is_none() {
-            return self.restore_index(index);
-        }
-        let entries = self.scan_allocated()?;
-        for entry in &entries {
-            if !matches!(entry.meta.form, BlockForm::Paged { page_size, .. } if page_size == self.page_size)
-            {
-                return Err(
-                    crate::cache_reset::incompatible("catalog page geometry mismatch").into(),
-                );
-            }
-        }
-        index.restore_allocated(entries, crate::recovery::workers());
-        Ok(())
-    }
-
     pub(crate) fn restore_index_with_workers(
         &self,
         index: &crate::BlockIndex,

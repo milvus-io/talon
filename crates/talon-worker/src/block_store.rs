@@ -17,8 +17,7 @@
 #[cfg(test)]
 mod journal_tests;
 
-use crate::block_key::BlockIdentity;
-use crate::catalog::{DiskId, Transaction, WholeLocations};
+use crate::catalog::DiskId;
 use crate::fd_cache::FdCache;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -89,7 +88,7 @@ pub struct WholeBlockStore {
     fd_cache: Arc<FdCache>,
     catalog: Arc<crate::catalog::Catalog>,
     catalog_path: String,
-    standalone_locations: Option<WholeLocations>,
+    standalone: bool,
     mutations: Arc<crate::page_gc::Mutations>,
     gates: Arc<[tokio::sync::RwLock<()>; 64]>,
 }
@@ -133,7 +132,6 @@ impl WholeBlockStore {
                     )
                     .await
                     .map_err(catalog_error)?;
-                store.hide_pending(&id);
                 #[cfg(test)]
                 crate::page_access_store::crash_barrier("whole_begin")?;
                 let disk_id = transaction.disk_id;
@@ -181,7 +179,11 @@ impl WholeBlockStore {
                         if crate::page_access_store::checkpoint_fault("whole_published").is_err() {
                             store.catalog.poison();
                         }
-                        store.complete(transaction, allocated, id).await?;
+                        store
+                            .catalog
+                            .complete(transaction, allocated)
+                            .await
+                            .map_err(catalog_error)?;
                         #[cfg(test)]
                         crate::page_access_store::crash_barrier("whole_complete")?;
                         Ok((allocated, disk_id))
@@ -201,18 +203,13 @@ impl WholeBlockStore {
         &self.gates[hasher.finish() as usize % self.gates.len()]
     }
 
-    fn hide_pending(&self, id: &BlockId) {
-        if let Some(locations) = &self.standalone_locations {
-            locations.write().unwrap().remove(id as &dyn BlockIdentity);
-        }
-    }
-
     // A rewrite reuses the path. Hold the shared gate from location lookup
     // until the file is open or the path-based read finishes.
     async fn read_gate(&self, id: &BlockId) -> Option<tokio::sync::RwLockReadGuard<'_, ()>> {
-        match &self.standalone_locations {
-            Some(_) => Some(self.gate(id).read().await),
-            None => None,
+        if self.standalone {
+            Some(self.gate(id).read().await)
+        } else {
+            None
         }
     }
 
@@ -252,7 +249,7 @@ impl WholeBlockStore {
             )),
             catalog,
         )?;
-        store.standalone_locations = Some(store.catalog.recover_whole_locations()?);
+        store.standalone = true;
         Ok(store)
     }
 
@@ -299,7 +296,7 @@ impl WholeBlockStore {
             fd_cache,
             catalog,
             catalog_path,
-            standalone_locations: None,
+            standalone: false,
             mutations: Arc::new(crate::page_gc::Mutations::new(true)),
             gates: Arc::new(std::array::from_fn(|_| tokio::sync::RwLock::new(()))),
         })
@@ -318,29 +315,12 @@ impl WholeBlockStore {
         disk_id.path(&self.root.join("whole"), "blk")
     }
 
-    async fn complete(&self, transaction: Transaction, allocated: u64, id: BlockId) -> Result<()> {
-        match &self.standalone_locations {
-            Some(locations) => {
-                self.catalog
-                    .complete_whole(transaction, allocated, id, locations.clone())
-                    .await
-            }
-            None => self.catalog.complete(transaction, allocated).await,
-        }
-        .map_err(catalog_error)
-    }
-
-    async fn read_path(&self, id: &BlockId, indexed: Option<DiskId>) -> Result<PathBuf> {
-        let disk_id = match (&self.standalone_locations, indexed) {
-            // Public callers can combine a standalone store with an index
-            // populated by another catalog. Its IDs are local to that catalog.
-            (Some(locations), _) => locations
-                .read()
-                .unwrap()
-                .get(id as &dyn BlockIdentity)
-                .copied(),
-            (None, Some(disk_id)) => Some(disk_id),
-            (None, None) => self.catalog.lookup_disk_id(&self.catalog_path, id).await?,
+    fn read_path(&self, id: &BlockId, indexed: Option<DiskId>) -> Result<PathBuf> {
+        let disk_id = match (self.standalone, indexed) {
+            // A standalone store may receive a DiskId from an unrelated index.
+            (true, _) => self.catalog.standalone_whole_disk_id(id),
+            (false, Some(disk_id)) => Some(disk_id),
+            (false, None) => self.catalog.disk_id(&self.catalog_path, id)?,
         }
         .ok_or_else(|| Error::NotFound(id.to_string()))?;
         Ok(self.path_for(disk_id))
@@ -362,11 +342,6 @@ impl WholeBlockStore {
         Ok(())
     }
 
-    pub(crate) fn restore_index_exclusive(&self, index: &mut crate::BlockIndex) -> Result<()> {
-        index.restore_allocated(self.scan_allocated()?, crate::recovery::workers());
-        Ok(())
-    }
-
     pub(crate) fn scan_allocated(&self) -> Result<Vec<crate::index::StoredBlock>> {
         self.catalog
             .recover(&self.catalog_path)
@@ -384,7 +359,7 @@ impl WholeBlockStore {
     /// dentry), and measured ~50x the cost of the data access it guards.
     async fn open_ro(&self, id: &BlockId, disk_id: Option<DiskId>) -> Result<(Arc<OwnedFd>, u64)> {
         let _gate = self.read_gate(id).await;
-        let path = self.read_path(id, disk_id).await?;
+        let path = self.read_path(id, disk_id)?;
         if self.uring {
             talon_uring::require_ring()?;
             return self
@@ -422,7 +397,7 @@ impl WholeBlockStore {
         len: u64,
     ) -> Result<Bytes> {
         let _gate = self.read_gate(id).await;
-        let path = self.read_path(id, disk_id).await?;
+        let path = self.read_path(id, disk_id)?;
         let id = id.clone();
         if self.uring {
             talon_uring::require_ring()?;
@@ -493,7 +468,7 @@ impl ObjectStore for WholeBlockStore {
 
     async fn get_bytes(&self, id: &BlockId) -> Result<Bytes> {
         let _gate = self.read_gate(id).await;
-        let path = self.read_path(id, None).await?;
+        let path = self.read_path(id, None)?;
         let id = id.clone();
         if self.uring {
             talon_uring::require_ring()?;
@@ -541,7 +516,6 @@ impl ObjectStore for WholeBlockStore {
                     )
                     .await
                     .map_err(catalog_error)?;
-                store.hide_pending(&id);
                 #[cfg(test)]
                 crate::page_access_store::crash_barrier("whole_delete_begin")?;
                 let path = store.path_for(transaction.disk_id);
@@ -563,7 +537,11 @@ impl ObjectStore for WholeBlockStore {
                     Ok(()) => {
                         #[cfg(test)]
                         crate::page_access_store::crash_barrier("whole_deleted")?;
-                        store.complete(transaction, 0, id).await
+                        store
+                            .catalog
+                            .complete(transaction, 0)
+                            .await
+                            .map_err(catalog_error)
                     }
                     Err(error) => {
                         store.catalog.poison();
@@ -575,7 +553,7 @@ impl ObjectStore for WholeBlockStore {
     }
     async fn contains(&self, id: &BlockId) -> Result<bool> {
         let _gate = self.read_gate(id).await;
-        let path = match self.read_path(id, None).await {
+        let path = match self.read_path(id, None) {
             Ok(path) => path,
             Err(Error::NotFound(_)) => return Ok(false),
             Err(error) => return Err(error),
@@ -632,7 +610,7 @@ mod tests {
         let store = WholeBlockStore::open(root.path()).unwrap();
         let id = block(0);
         store.put(&id, Bytes::from(vec![0; 6000])).await.unwrap();
-        let path = store.read_path(&id, None).await.unwrap();
+        let path = store.read_path(&id, None).unwrap();
         let allocated = std::fs::metadata(&path).unwrap().blocks() * 512;
         let shard = path.parent().unwrap().to_owned();
         store.catalog.checkpoint().await.unwrap();
@@ -701,7 +679,6 @@ mod tests {
         // No staging temp files leaked.
         let shard = store
             .read_path(&id, None)
-            .await
             .unwrap()
             .parent()
             .unwrap()
@@ -750,7 +727,7 @@ mod tests {
 
         let mut paths = Vec::new();
         for (id, _) in &committed {
-            let path = store.read_path(id, None).await.unwrap();
+            let path = store.read_path(id, None).unwrap();
             assert!(!path.with_extension("meta").exists());
             assert!(!paths.contains(&path));
             paths.push(path);
@@ -760,7 +737,7 @@ mod tests {
         let reopened = WholeBlockStore::open(&root).unwrap();
         assert_eq!(reopened.scan().unwrap().len(), 3);
         for ((id, bytes), path) in committed.iter().zip(paths) {
-            assert_eq!(reopened.read_path(id, None).await.unwrap(), path);
+            assert_eq!(reopened.read_path(id, None).unwrap(), path);
             assert_eq!(reopened.get_bytes(id).await.unwrap(), *bytes);
         }
         let index = crate::BlockIndex::new();

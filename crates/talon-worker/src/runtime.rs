@@ -2004,21 +2004,27 @@ impl WorkerRuntime {
                         let (allocated, disk_id) = paged
                             .commit_page_payload(&id, page, block_len, value)
                             .await?;
-                        runtime
-                            .index
-                            .init_paged(id.clone(), paged.page_size(), block_len);
+                        if !runtime.index.uses_catalog() {
+                            runtime
+                                .index
+                                .init_paged(id.clone(), paged.page_size(), block_len);
+                        }
                         state.register(
                             page,
                             Some(runtime.page_clock.now()),
                             runtime.page_clock.now(),
                             true,
                         );
-                        runtime
-                            .index
-                            .mark_page_allocated_at(&id, page, allocated, disk_id);
+                        if !runtime.index.uses_catalog() {
+                            runtime
+                                .index
+                                .mark_page_allocated_at(&id, page, allocated, disk_id);
+                        }
                         let unit = CacheUnit::Page(id.clone(), page);
                         let access = runtime.lru.insert(unit.clone(), allocated);
-                        runtime.index.set_access(&unit, access);
+                        if !runtime.index.uses_catalog() {
+                            runtime.index.set_access(&unit, access);
+                        }
                         if !warm_only && runtime.l1.is_enabled() {
                             runtime.admit_l1_page(&id, page, bytes.into_bytes());
                         }
@@ -2279,17 +2285,33 @@ impl WorkerRuntime {
 
     /// Drop stale metadata after an index-hit/file-miss eviction race.
     async fn forget_missing_l2_parent(&self, block: &BlockId, disk_id: Option<DiskId>) {
-        let state = self.page_lifecycle.block(block);
-        let gate = state.lock().await;
-        if self.index.whole_and_touch(block) == Some(disk_id) {
-            self.invalidate_l1(block);
-            self.index.remove(block);
-            self.lru.remove(&CacheUnit::Whole(block.clone()));
-            tracing::debug!(%block, "discarded stale L2 index entry after file miss");
-        }
-        drop(gate);
-        drop(state);
-        self.page_lifecycle.retire_empty(block);
+        let runtime = self.clone();
+        let id = block.clone();
+        self.page_mutations.run(async move {
+            let state = runtime.page_lifecycle.block(&id);
+            let gate = state.lock().await;
+            if runtime.index.whole_and_touch(&id) == Some(disk_id) {
+                let result = if runtime.index.uses_catalog() {
+                    runtime.store.delete(&id).await
+                } else {
+                    runtime.index.remove(&id);
+                    Ok(())
+                };
+                match result {
+                    Ok(()) => {
+                        runtime.invalidate_l1(&id);
+                        runtime.lru.remove(&CacheUnit::Whole(id.clone()));
+                        tracing::debug!(block = %id, "discarded stale L2 index entry after file miss");
+                    }
+                    Err(error) => {
+                        tracing::warn!(block = %id, %error, "failed to remove missing whole block from catalog");
+                    }
+                }
+            }
+            drop(gate);
+            drop(state);
+            runtime.page_lifecycle.retire_empty(&id);
+        }).await;
     }
 
     /// Record an L2 hit. The preceding index lookup already marks recency.
@@ -2528,17 +2550,21 @@ impl WorkerRuntime {
                         } else {
                             let (allocated, disk_id) =
                                 runtime.store.put_payload(&id, bytes).await?;
-                            runtime.index.commit_allocated_at(
-                                BlockMeta {
-                                    id: id.clone(),
-                                    form: BlockForm::Whole,
-                                    len,
-                                },
-                                Some(disk_id),
-                                [(None, allocated)],
-                            );
+                            if !runtime.index.uses_catalog() {
+                                runtime.index.commit_allocated_at(
+                                    BlockMeta {
+                                        id: id.clone(),
+                                        form: BlockForm::Whole,
+                                        len,
+                                    },
+                                    Some(disk_id),
+                                    [(None, allocated)],
+                                );
+                            }
                             let access = runtime.lru.insert(unit.clone(), allocated);
-                            runtime.index.set_access(&unit, access);
+                            if !runtime.index.uses_catalog() {
+                                runtime.index.set_access(&unit, access);
+                            }
                         }
                         talon_telemetry::record("talon.cache.committed_bytes", len);
                         // Pin before releasing the gate used by candidate validation.
