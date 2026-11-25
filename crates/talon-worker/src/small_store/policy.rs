@@ -194,11 +194,11 @@ impl Catalog {
         if recovered.is_empty() {
             return;
         }
-        #[cfg(test)]
-        {
-            self.compact_recovery_slots += self.lookup.capacity();
-        }
         for slot in 0..self.lookup.capacity() {
+            #[cfg(test)]
+            {
+                self.compact_recovery_slots += 1;
+            }
             let Some((handle, flags)) = self.lookup.entry(slot) else {
                 continue;
             };

@@ -54,7 +54,9 @@ impl Directory {
         let slot = self
             .pending(&catalog, id)
             .or_else(|| self.find(&catalog, id, VISIBLE))?;
-        catalog.enable_compact([self.slot]);
+        if !catalog.compact_streams.contains(&self.slot) {
+            catalog.enable_compact([self.slot]);
+        }
         Some(catalog.compact_admit(slot, bytes, clock))
     }
 
