@@ -2195,7 +2195,7 @@ impl WorkerRuntime {
             {
                 Ok(bytes) => bytes,
                 Err(Error::NotFound(_)) => {
-                    self.forget_missing_l2_parent(block, disk_id).await;
+                    self.forget_missing_l2_parent(block, disk_id).await?;
                     return Ok(None);
                 }
                 Err(error) => {
@@ -2213,7 +2213,7 @@ impl WorkerRuntime {
         {
             Ok(bytes) => bytes,
             Err(Error::NotFound(_)) => {
-                self.forget_missing_l2_parent(block, disk_id).await;
+                self.forget_missing_l2_parent(block, disk_id).await?;
                 return Ok(None);
             }
             Err(error) => return Err(anyhow::anyhow!("read committed L2 pages: {error}")),
@@ -2284,34 +2284,40 @@ impl WorkerRuntime {
     }
 
     /// Drop stale metadata after an index-hit/file-miss eviction race.
-    async fn forget_missing_l2_parent(&self, block: &BlockId, disk_id: Option<DiskId>) {
+    async fn forget_missing_l2_parent(
+        &self,
+        block: &BlockId,
+        disk_id: Option<DiskId>,
+    ) -> talon_core::Result<()> {
         let runtime = self.clone();
         let id = block.clone();
-        self.page_mutations.run(async move {
-            let state = runtime.page_lifecycle.block(&id);
-            let gate = state.lock().await;
-            if runtime.index.whole_and_touch(&id) == Some(disk_id) {
-                let result = if runtime.index.uses_catalog() {
-                    runtime.store.delete(&id).await
+        self.page_mutations
+            .run(async move {
+                let state = runtime.page_lifecycle.block(&id);
+                let gate = state.lock().await;
+                let removed = if runtime.index.whole_and_touch(&id) != Some(disk_id) {
+                    Ok(false)
+                } else if runtime.index.uses_catalog() {
+                    runtime.store.retire_if_missing(&id, disk_id).await
                 } else {
-                    runtime.index.remove(&id);
-                    Ok(())
+                    runtime.store.contains(&id).await.map(|present| {
+                        if !present {
+                            runtime.index.remove(&id);
+                        }
+                        !present
+                    })
                 };
-                match result {
-                    Ok(()) => {
-                        runtime.invalidate_l1(&id);
-                        runtime.lru.remove(&CacheUnit::Whole(id.clone()));
-                        tracing::debug!(block = %id, "discarded stale L2 index entry after file miss");
-                    }
-                    Err(error) => {
-                        tracing::warn!(block = %id, %error, "failed to remove missing whole block from catalog");
-                    }
+                if let Ok(true) = removed {
+                    runtime.invalidate_l1(&id);
+                    runtime.lru.remove(&CacheUnit::Whole(id.clone()));
+                    tracing::debug!(block = %id, "discarded stale L2 index entry after file miss");
                 }
-            }
-            drop(gate);
-            drop(state);
-            runtime.page_lifecycle.retire_empty(&id);
-        }).await;
+                drop(gate);
+                drop(state);
+                runtime.page_lifecycle.retire_empty(&id);
+                removed.map(|_| ())
+            })
+            .await
     }
 
     /// Record an L2 hit. The preceding index lookup already marks recency.

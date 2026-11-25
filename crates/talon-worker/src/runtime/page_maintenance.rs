@@ -1089,7 +1089,10 @@ mod tests {
             worker.store.get_range_bytes_at(&id, Some(old), 0, 16).await,
             Err(talon_core::Error::NotFound(_))
         ));
-        worker.forget_missing_l2_parent(&id, Some(old)).await;
+        worker
+            .forget_missing_l2_parent(&id, Some(old))
+            .await
+            .unwrap();
         assert_eq!(
             worker
                 .cached_block_range(&id, 0, 16)
@@ -1098,6 +1101,80 @@ mod tests {
                 .unwrap(),
             Bytes::from_static(&[2; 16])
         );
+        assert_eq!(worker.lru.block_candidates(&id).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn delayed_whole_miss_keeps_same_address_repair_after_reopen() {
+        let root = tempfile::tempdir().unwrap();
+        let id = block();
+        let repaired = Bytes::from_static(&[2; 16]);
+        let (worker, catalog, _) = runtime(root.path());
+        let request = CachedBlockPutRequest {
+            block: id.clone(),
+            object_len: 16,
+            body_len: 16,
+        };
+        worker
+            .admit_cached_block(&request, Bytes::from_static(&[1; 16]))
+            .await
+            .unwrap();
+        let address = catalog.disk_id("whole", &id).unwrap().unwrap();
+        std::fs::remove_file(address.path(&worker.store.root().join("whole"), "blk")).unwrap();
+        assert!(matches!(
+            worker
+                .store
+                .get_range_bytes_at(&id, Some(address), 0, 16)
+                .await,
+            Err(talon_core::Error::NotFound(_))
+        ));
+
+        // Run the repair between the observed miss and its delayed cleanup.
+        worker
+            .admit_cached_block(&request, repaired.clone())
+            .await
+            .unwrap();
+        assert_eq!(catalog.disk_id("whole", &id).unwrap(), Some(address));
+        worker
+            .forget_missing_l2_parent(&id, Some(address))
+            .await
+            .unwrap();
+        assert_eq!(catalog.disk_id("whole", &id).unwrap(), Some(address));
+        assert_eq!(
+            worker.cached_block_range(&id, 0, 16).await.unwrap(),
+            Some(repaired.clone())
+        );
+        drop(worker);
+        drop(catalog);
+
+        let (worker, catalog, _) = runtime(root.path());
+        assert_eq!(catalog.disk_id("whole", &id).unwrap(), Some(address));
+        assert_eq!(
+            worker.cached_block_range(&id, 0, 16).await.unwrap(),
+            Some(repaired)
+        );
+    }
+
+    #[tokio::test]
+    async fn whole_miss_recheck_propagates_lookup_error() {
+        let root = tempfile::tempdir().unwrap();
+        let (worker, catalog, _) = runtime(root.path());
+        let id = block();
+        worker
+            .commit_cached_block(&id, Bytes::from_static(&[1; 16]))
+            .await
+            .unwrap();
+        let address = catalog.disk_id("whole", &id).unwrap().unwrap();
+        let path = address.path(&worker.store.root().join("whole"), "blk");
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&path, &path).unwrap();
+
+        let error = worker
+            .forget_missing_l2_parent(&id, Some(address))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, talon_core::Error::Io(e) if e.raw_os_error() == Some(libc::ELOOP)));
+        assert_eq!(catalog.disk_id("whole", &id).unwrap(), Some(address));
         assert_eq!(worker.lru.block_candidates(&id).len(), 1);
     }
 

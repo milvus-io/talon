@@ -302,6 +302,76 @@ impl WholeBlockStore {
         })
     }
 
+    /// Revalidate a read miss under the same gate as replacement and deletion.
+    /// A same-key rewrite can keep its DiskId while replacing the file.
+    pub(crate) async fn retire_if_missing(
+        &self,
+        id: &BlockId,
+        expected: Option<DiskId>,
+    ) -> Result<bool> {
+        let store = self.clone();
+        let id = id.clone();
+        self.mutations
+            .run(async move {
+                let _gate = store.gate(&id).write().await;
+                if store.catalog.disk_id(&store.catalog_path, &id)? != expected {
+                    return Ok(false);
+                }
+                if let Some(address) = expected {
+                    let path = store.path_for(address);
+                    if spawn_blocking_io(move || Ok(path.try_exists()?)).await? {
+                        return Ok(false);
+                    }
+                }
+                store.delete_locked(&id).await?;
+                Ok(true)
+            })
+            .await
+    }
+
+    async fn delete_locked(&self, id: &BlockId) -> Result<()> {
+        let transaction = self
+            .catalog
+            .begin(
+                &self.catalog_path,
+                id,
+                crate::catalog::Operation::DeleteBlock,
+            )
+            .await
+            .map_err(catalog_error)?;
+        #[cfg(test)]
+        crate::page_access_store::crash_barrier("whole_delete_begin")?;
+        let path = self.path_for(transaction.disk_id);
+        let invalidate = path.clone();
+        let result = spawn_blocking_io(move || {
+            match std::fs::remove_file(&path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                result => result?,
+            }
+            match std::fs::File::open(path.parent().unwrap()) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                file => file?.sync_all()?,
+            }
+            Ok(())
+        })
+        .await;
+        self.fd_cache.invalidate(&invalidate);
+        match result {
+            Ok(()) => {
+                #[cfg(test)]
+                crate::page_access_store::crash_barrier("whole_deleted")?;
+                self.catalog
+                    .complete(transaction, 0)
+                    .await
+                    .map_err(catalog_error)
+            }
+            Err(error) => {
+                self.catalog.poison();
+                Err(error)
+            }
+        }
+    }
+
     /// The cache root directory.
     pub fn root(&self) -> &Path {
         &self.root
@@ -507,47 +577,7 @@ impl ObjectStore for WholeBlockStore {
         self.mutations
             .run(async move {
                 let _gate = store.gate(&id).write().await;
-                let transaction = store
-                    .catalog
-                    .begin(
-                        &store.catalog_path,
-                        &id,
-                        crate::catalog::Operation::DeleteBlock,
-                    )
-                    .await
-                    .map_err(catalog_error)?;
-                #[cfg(test)]
-                crate::page_access_store::crash_barrier("whole_delete_begin")?;
-                let path = store.path_for(transaction.disk_id);
-                let invalidate = path.clone();
-                let result = spawn_blocking_io(move || {
-                    match std::fs::remove_file(&path) {
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                        result => result?,
-                    }
-                    match std::fs::File::open(path.parent().unwrap()) {
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                        file => file?.sync_all()?,
-                    }
-                    Ok(())
-                })
-                .await;
-                store.fd_cache.invalidate(&invalidate);
-                match result {
-                    Ok(()) => {
-                        #[cfg(test)]
-                        crate::page_access_store::crash_barrier("whole_deleted")?;
-                        store
-                            .catalog
-                            .complete(transaction, 0)
-                            .await
-                            .map_err(catalog_error)
-                    }
-                    Err(error) => {
-                        store.catalog.poison();
-                        Err(error)
-                    }
-                }
+                store.delete_locked(&id).await
             })
             .await
     }
@@ -558,7 +588,7 @@ impl ObjectStore for WholeBlockStore {
             Err(Error::NotFound(_)) => return Ok(false),
             Err(error) => return Err(error),
         };
-        spawn_blocking_io(move || Ok(path.exists())).await
+        spawn_blocking_io(move || Ok(path.try_exists()?)).await
     }
 }
 
