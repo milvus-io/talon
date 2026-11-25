@@ -3,7 +3,7 @@ use super::*;
 use crate::block_key::BlockIdentity;
 use crate::page_access_store::{AccessSnapshot, PageAccessStore};
 use crate::page_gc::{CheckpointReport, GcReport};
-use crate::page_lifecycle::{GcCandidate, PagedMutation};
+use crate::page_lifecycle::{CheckpointRound, GcCandidate, PageSnapshot, PagedMutation, SHARDS};
 
 impl WorkerRuntime {
     pub(super) async fn background_io(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
@@ -694,11 +694,12 @@ impl WorkerRuntime {
         // Retain serialization and dirty-state ownership even if the caller is cancelled.
         self.page_mutations.run(async move {
             let mut report = CheckpointReport::default();
-            for _ in 0..if all { crate::page_lifecycle::SHARDS } else { 1 } {
+            let slots = Arc::new(CheckpointRound::new((!all).then_some(*cursor)));
+            for _ in 0..if all { SHARDS } else { 1 } {
                 let shard = *cursor;
-                *cursor = (shard + 1) % crate::page_lifecycle::SHARDS;
+                *cursor = (shard + 1) % SHARDS;
                 let _background_io = runtime.background_io().await;
-                let result = runtime.checkpoint_shard(shard).await;
+                let result = runtime.checkpoint_shard(shard, slots.clone()).await;
                 match result {
                     Ok((blocks, bytes)) => {
                         report.blocks += blocks;
@@ -720,7 +721,11 @@ impl WorkerRuntime {
         }).await
     }
 
-    async fn checkpoint_shard(&self, shard: usize) -> anyhow::Result<(usize, usize)> {
+    async fn checkpoint_shard(
+        &self,
+        shard: usize,
+        slots: Arc<CheckpointRound>,
+    ) -> anyhow::Result<(usize, usize)> {
         let paged = self.paged.as_ref().expect("paged TTI");
         let gate = self.page_lifecycle.checkpoint_gate(shard);
         let _guard = gate.lock().await;
@@ -735,23 +740,35 @@ impl WorkerRuntime {
             let mut retry = journal;
             retry.full = true;
             worker.page_lifecycle.set_checkpoint_journal(shard, retry);
-            let mut slot = 0;
             let mut snapshots = Vec::new();
             let mut size = 24;
-            while slot < ceiling {
-                for sampled in worker
-                    .page_lifecycle
-                    .checkpoint_slots(shard, &mut slot, ceiling, full)
-                {
-                    if let Some(snapshot) = worker.page_lifecycle.checkpoint_snapshot(
-                        shard,
-                        sampled,
-                        full,
-                        membership,
-                        &worker.page_clock,
-                        &mut size,
-                    )? {
-                        snapshots.push(snapshot);
+            let mut sample_slot = |slot| -> anyhow::Result<()> {
+                if let Some(snapshot) = worker.page_lifecycle.checkpoint_snapshot(
+                    shard,
+                    slot,
+                    full,
+                    membership,
+                    &worker.page_clock,
+                    &mut size,
+                )? {
+                    snapshots.push(snapshot);
+                }
+                Ok(())
+            };
+            if full {
+                for &slot in slots.full_slots(&worker.page_lifecycle, shard) {
+                    sample_slot(slot as usize)?;
+                }
+                PageSnapshot::keep_latest(&mut snapshots);
+            } else {
+                let mut cursor = 0;
+                while cursor < ceiling {
+                    for slot in
+                        worker
+                            .page_lifecycle
+                            .checkpoint_dirty_slots(shard, &mut cursor, ceiling)
+                    {
+                        sample_slot(slot)?;
                     }
                 }
             }

@@ -1,7 +1,7 @@
 //! Page residency and idle age. Disk operations never run under these locks.
 use crate::block_key::{BlockIdentity, BlockKey};
-use crate::catalog::Geometry;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use crate::catalog::{DiskId, Geometry};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
@@ -245,14 +245,14 @@ impl PageRow<'_> {
 
 pub(crate) enum PageSet<'a> {
     Catalog(&'a Geometry, Option<&'a PageAge>),
-    Legacy(&'a PageRows),
+    Legacy(&'a PageRows, &'a PageTable),
 }
 
 impl PageSet<'_> {
     fn get(&self, page: u32) -> Option<PageRow<'_>> {
         match self {
             Self::Catalog(geometry, age) => geometry.page_row(page, *age),
-            Self::Legacy(rows) => {
+            Self::Legacy(rows, _) => {
                 let row = rows.get(&page)?;
                 row.unit.resident().then_some(PageRow {
                     state: &row.state,
@@ -262,17 +262,10 @@ impl PageSet<'_> {
         }
     }
 
-    fn count(&self) -> usize {
-        match self {
-            Self::Catalog(geometry, _) => geometry.page_count(),
-            Self::Legacy(rows) => rows.len(),
-        }
-    }
-
     fn iter_from(&self, start: u32) -> impl Iterator<Item = (u32, PageRow<'_>)> {
         let (catalog, legacy) = match self {
             Self::Catalog(geometry, age) => (Some(geometry.page_rows_from(start, *age)), None),
-            Self::Legacy(rows) => (
+            Self::Legacy(rows, _) => (
                 None,
                 Some(rows.range(start..).filter_map(|(&page, row)| {
                     row.unit.resident().then_some((
@@ -293,6 +286,30 @@ impl PageSet<'_> {
 }
 
 pub(crate) type PageTable = Arc<RwLock<PageRows>>;
+
+// A slot can be reused between batches. The catalog's durable address and
+// the standalone table allocation identify an incarnation without pinning it.
+enum PageIncarnation {
+    Catalog(Option<DiskId>),
+    Legacy(Weak<RwLock<PageRows>>),
+}
+
+impl PageIncarnation {
+    fn of(rows: &PageSet<'_>) -> Self {
+        match rows {
+            PageSet::Catalog(geometry, _) => Self::Catalog(geometry.disk_id),
+            PageSet::Legacy(_, table) => Self::Legacy(Arc::downgrade(table)),
+        }
+    }
+
+    fn matches(&self, rows: &PageSet<'_>) -> bool {
+        match (self, rows) {
+            (Self::Catalog(disk), PageSet::Catalog(geometry, _)) => *disk == geometry.disk_id,
+            (Self::Legacy(old), PageSet::Legacy(_, table)) => old.as_ptr() == Arc::as_ptr(table),
+            _ => false,
+        }
+    }
+}
 
 pub(crate) struct PageReadGuard {
     index: Arc<crate::BlockIndex>,
@@ -1320,7 +1337,9 @@ impl PageLifecycle {
     pub fn recovery_slots(&self) -> [Vec<usize>; SHARDS] {
         let mut shards = std::array::from_fn(|_| Vec::new());
         self.index
-            .visit_paged_slots(|slot, id| shards[disk_shard_key(id)].push(slot));
+            .visit_paged_slots(0..self.index.policy_scan_ceiling(), |slot, id| {
+                shards[disk_shard_key(id)].push(slot);
+            });
         shards
     }
 
@@ -1329,23 +1348,13 @@ impl PageLifecycle {
             .with_page_slot(slot, false, |id, _| self.mutation(id.clone()))
     }
 
-    /// Full checkpoints statically bound the number of slab slots examined per
-    /// call. Deltas jump directly between dirty group bits.
-    pub fn checkpoint_slots(
+    /// Delta checkpoints jump directly between dirty group bits.
+    pub fn checkpoint_dirty_slots(
         &self,
         shard: usize,
         cursor: &mut usize,
         ceiling: usize,
-        full: bool,
     ) -> Vec<usize> {
-        if full {
-            let end = (*cursor + 64).min(ceiling);
-            let slots = self
-                .index
-                .paged_slots_in(*cursor..end, |id| disk_shard_key(id) == shard);
-            *cursor = end;
-            return slots;
-        }
         let work = self.index.page_work.shard(shard).lock().unwrap();
         let mut slots = Vec::new();
         while slots.len() < 64 {
@@ -1368,21 +1377,30 @@ impl PageLifecycle {
         clock: &AccessClock,
         size: &mut usize,
     ) -> anyhow::Result<Option<PageSnapshot>> {
-        self.index
+        self.sample_checkpoint((shard, membership), slot, full, clock, size, || {})
+    }
+
+    fn sample_checkpoint(
+        &self,
+        (shard, membership): (usize, u64),
+        slot: usize,
+        full: bool,
+        clock: &AccessClock,
+        size: &mut usize,
+        mut between_batches: impl FnMut(),
+    ) -> anyhow::Result<Option<PageSnapshot>> {
+        let mut batch = CheckpointBatch::default();
+        let Some((mut sample, incarnation, consume, mut next_page)) = self
+            .index
             .with_page_slot(slot, true, |id, rows| {
                 if disk_shard_key(id) != shard {
-                    return Ok(None);
+                    return None;
                 }
                 let mut work = self.index.page_work.shard(shard).lock().unwrap();
                 let dirty = work.get(slot);
                 if !full && dirty.is_none() {
-                    return Ok(None);
+                    return None;
                 }
-                *size += serde_json::to_vec(id)?.len() + rows.count() * 12 + 52;
-                anyhow::ensure!(
-                    *size <= crate::page_access_shard::MAX_BYTES,
-                    "access shard exceeds 64 MiB limit"
-                );
                 // A later tombstone must be followed by the replacement of any
                 // reincarnated block. Leave dirty notifications scheduled when
                 // the deletion wasn't included in this checkpoint's tombstones.
@@ -1390,40 +1408,60 @@ impl PageLifecycle {
                 let touched = if consume { work.take(slot) } else { None };
                 drop(work);
                 let replace = full || dirty.is_some_and(|(_, replace)| replace);
-                let resident = rows.iter_from(0).next().is_some();
-                let records = rows
-                    .iter_from(0)
-                    .filter_map(|(page, row)| {
-                        let state = if consume {
-                            row.state.fetch_and(!DIRTY, Ordering::Relaxed)
-                        } else {
-                            row.state.load(Ordering::Relaxed)
-                        };
-                        if replace || state & DIRTY != 0 {
-                            return row.age().map(|age| (page, age));
-                        }
-                        None
-                    })
-                    .collect();
-                Ok(Some(PageSnapshot {
+                let incarnation = PageIncarnation::of(&rows);
+                let next_page = batch.read(&rows, 0, replace, consume);
+                let snapshot = PageSnapshot {
                     block: id.clone(),
-                    resident,
+                    resident: batch.visited != 0,
                     replace,
                     snapshot: crate::page_access_store::AccessSnapshot {
                         revision: 0,
-                        // Recovery rejects ages later than the sample timestamp.
-                        sampled_at: clock.now(),
-                        records,
+                        sampled_at: 0,
+                        records: Vec::new(),
                     },
                     rollback: touched.map(|(oldest, _)| CheckpointRetry {
                         index: self.index.clone(),
                         slot,
                         oldest,
                     }),
-                }))
+                };
+                Some((snapshot, incarnation, consume, next_page))
             })
-            .transpose()
-            .map(Option::flatten)
+            .flatten()
+        else {
+            return Ok(None);
+        };
+
+        // Budget for identity, record header, and the largest frame header.
+        // The encoder also checks the limit, including any tombstones.
+        let overhead = if full { 52 } else { 61 };
+        let mut bytes = *size + serde_json::to_vec(&sample.block)?.len() + overhead;
+        loop {
+            bytes += batch.len * 12;
+            anyhow::ensure!(
+                bytes <= crate::page_access_shard::MAX_BYTES,
+                "access shard exceeds 64 MiB limit"
+            );
+            sample
+                .snapshot
+                .records
+                .extend_from_slice(&batch.records[..batch.len]);
+            let Some(page) = next_page else { break };
+            between_batches();
+            // A late detach has its own tombstone. Never clear the dirty bits
+            // of a replacement or combine ages from two incarnations.
+            let Some(Some(next)) = self.index.with_page_slot(slot, true, |id, rows| {
+                (id == &sample.block && incarnation.matches(&rows))
+                    .then(|| batch.read(&rows, page, sample.replace, consume))
+            }) else {
+                return Ok(None);
+            };
+            next_page = next;
+        }
+        // Recovery rejects ages later than the sample timestamp.
+        sample.snapshot.sampled_at = clock.now();
+        *size = bytes;
+        Ok(Some(sample))
     }
 
     pub fn checkpoint_journal(
@@ -1491,6 +1529,93 @@ impl PageLifecycle {
     }
 }
 
+const CHECKPOINT_BATCH: usize = 64;
+
+/// The first compaction in a round groups the physical slab once. Keep only
+/// compact slot numbers and revalidate membership when sampling each slot.
+pub(crate) struct CheckpointRound {
+    only_shard: Option<usize>,
+    full: OnceLock<Box<[Vec<u32>; SHARDS]>>,
+    #[cfg(test)]
+    visited_slots: std::sync::atomic::AtomicUsize,
+}
+
+impl CheckpointRound {
+    pub fn new(only_shard: Option<usize>) -> Self {
+        Self {
+            only_shard,
+            full: OnceLock::new(),
+            #[cfg(test)]
+            visited_slots: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    pub fn full_slots(&self, life: &PageLifecycle, shard: usize) -> &[u32] {
+        &self.full.get_or_init(|| {
+            let mut groups = Box::new(std::array::from_fn(|_| Vec::new()));
+            let ceiling = life.index.policy_scan_ceiling();
+            for start in (0..ceiling).step_by(CHECKPOINT_BATCH) {
+                let end = (start + CHECKPOINT_BATCH).min(ceiling);
+                #[cfg(test)]
+                self.visited_slots.fetch_add(end - start, Ordering::Relaxed);
+                life.index.visit_paged_slots(start..end, |slot, id| {
+                    let shard = disk_shard_key(id);
+                    if self.only_shard.map_or(true, |only| only == shard) {
+                        groups[shard]
+                            .push(u32::try_from(slot).expect("directory slot fits in u32"));
+                    }
+                });
+            }
+            groups
+        })[shard]
+    }
+}
+
+struct CheckpointBatch {
+    records: [(u32, u64); CHECKPOINT_BATCH],
+    len: usize,
+    visited: usize,
+}
+
+impl Default for CheckpointBatch {
+    fn default() -> Self {
+        Self {
+            records: [(0, 0); CHECKPOINT_BATCH],
+            len: 0,
+            visited: 0,
+        }
+    }
+}
+
+impl CheckpointBatch {
+    fn read(
+        &mut self,
+        rows: &PageSet<'_>,
+        start: u32,
+        replace: bool,
+        consume: bool,
+    ) -> Option<u32> {
+        self.len = 0;
+        self.visited = 0;
+        let mut pages = rows.iter_from(start);
+        for (page, row) in pages.by_ref().take(CHECKPOINT_BATCH) {
+            self.visited += 1;
+            let state = if consume {
+                row.state.fetch_and(!DIRTY, Ordering::Relaxed)
+            } else {
+                row.state.load(Ordering::Relaxed)
+            };
+            if replace || state & DIRTY != 0 {
+                if let Some(age) = row.age() {
+                    self.records[self.len] = (page, age);
+                    self.len += 1;
+                }
+            }
+        }
+        pages.next().map(|(page, _)| page)
+    }
+}
+
 pub(crate) struct PageSnapshot {
     pub block: BlockKey,
     pub snapshot: crate::page_access_store::AccessSnapshot,
@@ -1499,6 +1624,15 @@ pub(crate) struct PageSnapshot {
     rollback: Option<CheckpointRetry>,
 }
 impl PageSnapshot {
+    /// An earlier slot and a later reused slot may both have sampled the
+    /// same logical block. Keep the last sample, including empty replacements.
+    pub fn keep_latest(samples: &mut Vec<Self>) {
+        let mut seen = HashSet::new();
+        samples.reverse();
+        samples.retain(|sample| seen.insert(sample.block.clone()));
+        samples.reverse();
+    }
+
     pub fn commit(mut self) {
         self.rollback = None;
     }
@@ -1674,7 +1808,11 @@ mod tests {
                 .unwrap()
                 .record_access_and_release(Some(clock.now()));
             let (ceiling, membership, _) = life.checkpoint_start(shard);
-            let slot = life.checkpoint_slots(shard, &mut 0, ceiling, full)[0];
+            let slot = if full {
+                CheckpointRound::new(Some(shard)).full_slots(&life, shard)[0] as usize
+            } else {
+                life.checkpoint_dirty_slots(shard, &mut 0, ceiling)[0]
+            };
 
             // A reader completes after the checkpointer selects the slot but
             // before it acquires the row lock and consumes the dirty age.
@@ -1695,6 +1833,236 @@ mod tests {
             assert_eq!(restored.records.get(&page.0), Some(&101));
             assert_eq!(restored.future, 0);
         }
+    }
+
+    #[tokio::test]
+    async fn full_checkpoint_replays_after_a_block_moves_into_a_later_slot() {
+        use crate::page_access_shard::{self, JournalState};
+
+        let life = PageLifecycle::new();
+        let first = id();
+        let shard = disk_shard(&first);
+        let mut siblings = (1..).map(|offset| BlockId { offset, ..id() });
+        let removed = siblings.find(|id| disk_shard(id) == shard).unwrap();
+        let neighbor = siblings.find(|id| disk_shard(id) == shard).unwrap();
+        let page = PageIndex(0);
+        let block = life.block(&first);
+        for (id, age) in [(&first, 10), (&removed, 11), (&neighbor, 12)] {
+            life.block(id).register_fixture(page, Some(age), age, true);
+        }
+        let (_, membership, _) = life.checkpoint_start(shard);
+        let round = CheckpointRound::new(None);
+        let slots = round.full_slots(&life, shard);
+        assert_eq!(slots, &[0, 1, 2]);
+        let clock = AccessClock::new();
+        clock.set(100);
+        let mut size = 24;
+        let mut sample = |slot| {
+            life.checkpoint_snapshot(shard, slot as usize, true, membership, &clock, &mut size)
+                .unwrap()
+                .unwrap()
+        };
+        let before = sample(slots[0]);
+        life.index.remove(&first).unwrap();
+        life.index.remove(&removed).unwrap();
+        block.register_fixture(page, Some(30), 30, true);
+        let after = sample(slots[1]);
+        assert_eq!(after.block, before.block);
+        let mut samples = vec![before, after, sample(slots[2])];
+        let encode = |samples: &[PageSnapshot]| {
+            page_access_shard::encode(
+                16,
+                samples
+                    .iter()
+                    .map(|sample| (sample.block.view(), &sample.snapshot)),
+            )
+            .unwrap()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let replay = || page_access_shard::load(dir.path(), shard, 16, clock.now()).unwrap();
+        // Reproduce the old traversal's output, including both incarnations.
+        page_access_shard::publish(dir.path(), encode(&samples), None)
+            .await
+            .unwrap();
+        assert!(replay().corrupt);
+
+        PageSnapshot::keep_latest(&mut samples);
+        let (journal, _) = page_access_shard::flush(
+            dir.path(),
+            JournalState::default(),
+            true,
+            encode(&samples),
+            None,
+        )
+        .await
+        .unwrap();
+        life.set_checkpoint_journal(shard, journal);
+        for sample in samples {
+            sample.commit();
+        }
+        life.checkpoint_finished(shard, membership);
+        let recovered = replay();
+        assert!(!recovered.corrupt);
+        assert_eq!(recovered.records.len(), 2);
+        assert_eq!(recovered.records[&first].records[&0], 30);
+        assert_eq!(recovered.records[&neighbor].records[&0], 12);
+        assert!(
+            life.checkpoint_start(shard).2,
+            "late changes must stay dirty"
+        );
+    }
+
+    #[test]
+    fn full_checkpoint_round_visits_the_directory_once() {
+        const SLOT_COUNT: usize = 16_384;
+        let life = PageLifecycle::new();
+        for offset in 0..SLOT_COUNT {
+            let id = BlockId {
+                offset: offset as u64,
+                block_size: 1,
+                ..id()
+            };
+            life.block(&id)
+                .register_fixture(PageIndex(0), Some(10), 10, true);
+        }
+        let round = CheckpointRound::new(None);
+        assert_eq!(round.visited_slots.load(Ordering::Relaxed), 0);
+        let mut slots = BTreeSet::new();
+        for shard in 0..SHARDS {
+            for &slot in round.full_slots(&life, shard) {
+                let block = life.recovery_block(slot as usize).unwrap();
+                assert_eq!(disk_shard_key(&block.id), shard);
+                assert!(slots.insert(slot));
+            }
+        }
+        assert_eq!(slots.len(), SLOT_COUNT);
+        let visits = round.visited_slots.load(Ordering::Relaxed);
+        assert_eq!(visits, SLOT_COUNT);
+        eprintln!(
+            "full-round directory visits: old={}, current={visits}",
+            SLOT_COUNT * SHARDS
+        );
+    }
+
+    #[test]
+    fn catalog_delta_sampling_allows_independent_reads_between_batches() {
+        use crate::catalog::{Operation, StoreKind};
+
+        const PAGES: u32 = 65_536;
+        const PAGE_SIZE: u32 = 16;
+        let mut id = id();
+        id.block_size = PAGES * PAGE_SIZE;
+        let neighbor = BlockId {
+            offset: 1,
+            ..id.clone()
+        };
+        let directory = Arc::new(RwLock::new(crate::index::Directory::default()));
+        directory.write().unwrap().attach(PAGE_SIZE);
+        let life = PageLifecycle::with_index(
+            Arc::new(crate::BlockIndex::from_catalog(directory.clone())),
+            true,
+        );
+        let block = life.block(&id);
+        let cold = life.block(&neighbor);
+        let shard = disk_shard(&id);
+        {
+            let mut directory = directory.write().unwrap();
+            for (id, count) in [(&id, PAGES), (&neighbor, 1)] {
+                let len = u64::from(id.block_size);
+                for page in 0..count {
+                    directory.apply(
+                        id,
+                        StoreKind::Paged,
+                        &Operation::Put { page, len },
+                        None,
+                        Some(512),
+                    );
+                }
+            }
+        }
+        let (ceiling, membership, _) = life.checkpoint_start(shard);
+        let slot = life.checkpoint_dirty_slots(shard, &mut 0, ceiling)[0];
+        let clock = AccessClock::new();
+        clock.set(10);
+        let sample =
+            |full| life.checkpoint_snapshot(shard, slot, full, membership, &clock, &mut 24);
+        sample(true).unwrap().unwrap().commit();
+        block
+            .acquire(PageIndex(0))
+            .unwrap()
+            .record_access_and_release(Some(10));
+
+        let mut boundaries = 0;
+        let delta = std::thread::scope(|scope| {
+            let (start, wait) = std::sync::mpsc::channel();
+            let (done, completed) = std::sync::mpsc::channel();
+            scope.spawn(move || {
+                wait.recv().unwrap();
+                cold.acquire(PageIndex(0))
+                    .unwrap()
+                    .record_access_and_release(Some(11));
+                done.send(()).unwrap();
+            });
+            life.sample_checkpoint((shard, membership), slot, false, &clock, &mut 24, || {
+                boundaries += 1;
+                if boundaries == 1 {
+                    start.send(()).unwrap();
+                    completed
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                    clock.set(12);
+                    block
+                        .acquire(PageIndex(PAGES - 1))
+                        .unwrap()
+                        .record_access_and_release(Some(12));
+                    clock.set(13);
+                    block
+                        .acquire(PageIndex(0))
+                        .unwrap()
+                        .record_access_and_release(Some(13));
+                }
+            })
+            .unwrap()
+            .unwrap()
+        });
+        assert_eq!(boundaries, PAGES as usize / CHECKPOINT_BATCH - 1);
+        assert!(!delta.replace);
+        assert_eq!(delta.snapshot.records, vec![(0, 10), (PAGES - 1, 12)]);
+        assert_eq!(delta.snapshot.sampled_at, 13);
+        delta.commit();
+        let next = sample(false).unwrap().unwrap();
+        assert_eq!(next.snapshot.records, vec![(0, 13)]);
+        next.commit();
+        eprintln!("{PAGES}-page delta: reader completed at first of {boundaries} lock boundaries");
+    }
+
+    #[test]
+    fn checkpoint_never_combines_pages_from_reused_slot_incarnations() {
+        let life = PageLifecycle::new();
+        let id = id();
+        let block = life.block(&id);
+        let shard = disk_shard(&id);
+        let last = PageIndex(CHECKPOINT_BATCH as u32);
+        for page in 0..=last.0 {
+            block.register_fixture(PageIndex(page), Some(10), 10, true);
+        }
+        let (ceiling, membership, _) = life.checkpoint_start(shard);
+        let slot = life.checkpoint_dirty_slots(shard, &mut 0, ceiling)[0];
+        let clock = AccessClock::new();
+        clock.set(100);
+        let sampled = life
+            .sample_checkpoint((shard, membership), slot, true, &clock, &mut 24, || {
+                life.index.remove(&id).unwrap();
+                block.register_fixture(last, Some(30), 30, true);
+            })
+            .unwrap();
+        assert!(sampled.is_none());
+        let (_, next, dirty) = life.checkpoint_start(shard);
+        assert!(dirty);
+        let replacement = sample(&life, &id, next, false);
+        assert!(replacement.replace);
+        assert_eq!(replacement.snapshot.records, vec![(last.0, 30)]);
+        replacement.commit();
     }
 
     #[test]
@@ -1773,6 +2141,28 @@ mod tests {
             .unwrap()
             .record_access_and_release(Some(30));
         assert_eq!(life.dirty_summary(), (0, None));
+
+        block
+            .acquire(PageIndex(0))
+            .unwrap()
+            .record_access_and_release(Some(40));
+        let slot = life.recovery_slots()[shard][0];
+        let mut size = crate::page_access_shard::MAX_BYTES;
+        assert!(life
+            .checkpoint_snapshot(
+                shard,
+                slot,
+                false,
+                generation,
+                &AccessClock::new(),
+                &mut size
+            )
+            .is_err());
+        assert_eq!(life.dirty_summary(), (1, Some(40)));
+        let retry = sample(&life, &id, generation, false);
+        assert!(retry.replace);
+        assert_eq!(retry.snapshot.records, vec![(0, 40)]);
+        retry.commit();
     }
 
     #[test]

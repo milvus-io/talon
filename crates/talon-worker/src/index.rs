@@ -370,10 +370,10 @@ fn with_legacy_pages<T>(
     };
     if exclusive {
         let rows = table.write().unwrap();
-        Some(f(PageSet::Legacy(&rows)))
+        Some(f(PageSet::Legacy(&rows, table)))
     } else {
         let rows = table.read().unwrap();
-        Some(f(PageSet::Legacy(&rows)))
+        Some(f(PageSet::Legacy(&rows, table)))
     }
 }
 
@@ -1003,24 +1003,17 @@ impl BlockIndex {
         Some(table.clone())
     }
 
-    pub(crate) fn visit_paged_slots(&self, mut visit: impl FnMut(usize, &BlockKey)) {
+    pub(crate) fn visit_paged_slots(
+        &self,
+        slots: std::ops::Range<usize>,
+        mut visit: impl FnMut(usize, &BlockKey),
+    ) {
         let entries = self.entries.read().unwrap();
-        for slot in 0..entries.slot_count() {
+        for slot in slots {
             if let Some(id) = paged_key_at(&entries, self.catalog, slot) {
                 visit(slot, id);
             }
         }
-    }
-
-    pub(crate) fn paged_slots_in(
-        &self,
-        slots: std::ops::Range<usize>,
-        matches_shard: impl Fn(&BlockKey) -> bool,
-    ) -> Vec<usize> {
-        let entries = self.entries.read().unwrap();
-        slots
-            .filter(|&slot| paged_key_at(&entries, self.catalog, slot).is_some_and(&matches_shard))
-            .collect()
     }
 
     fn entry(&self, id: &BlockId) -> Option<Arc<Entry>> {
