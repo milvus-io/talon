@@ -972,8 +972,7 @@ impl Lru {
                             {
                                 return out;
                             }
-                            scan_budget -= 1;
-                            let next = g.index.policy_unit_at(&mut cursor, end);
+                            let next = g.index.policy_scan_step(&mut cursor, end, &mut scan_budget);
                             g.capacity_hand = cursor;
                             let Some(next) = next else {
                                 continue;
@@ -1723,6 +1722,70 @@ mod tests {
         for i in 0..8 {
             assert!(lru.index().policy_get(&whole(i)).is_none());
         }
+    }
+
+    #[test]
+    fn sparse_clock_spends_visit_budget_on_occupied_slots_and_wraps() {
+        let lru = Lru::new();
+        let first = whole(63);
+        let paged_slot = 3074;
+        let low = CacheUnit::Page(blk(paged_slot), PageIndex(0));
+        let high = CacheUnit::Page(blk(paged_slot), PageIndex(3));
+        for n in 0..4096 {
+            lru.insert(whole(n), 10);
+        }
+        lru.insert(low.clone(), 10);
+        lru.insert(high.clone(), 10);
+        for n in (0..4096).filter(|&n| n != 63) {
+            lru.remove(&whole(n));
+        }
+        let ceiling = lru.block_scan_ceiling();
+        assert_eq!(ceiling, 4096);
+        let index = lru.index();
+        let end = (ceiling, 0);
+        let mut cursor = (0, 0);
+        let mut credits = 4;
+        let units: Vec<_> = (0..4)
+            .filter_map(|_| index.policy_scan_step(&mut cursor, end, &mut credits))
+            .map(|unit| unit.materialize())
+            .collect();
+        assert_eq!(units, [first.clone(), low.clone(), high.clone()]);
+        assert_eq!(cursor, end);
+        assert_eq!(credits, 1, "only the three live units consume visits");
+
+        let next = || {
+            let candidates = lru.candidates_to_fit_bounded(0, &HashSet::new(), 1, 1);
+            assert_eq!(candidates.len(), 1);
+            candidates.into_iter().next().unwrap().unit
+        };
+        for unit in [&first, &low, &high, &first] {
+            assert_eq!(&next(), unit);
+        }
+
+        let reused = whole(4096);
+        lru.insert(reused.clone(), 10);
+        assert_eq!(lru.block_scan_ceiling(), ceiling);
+        for unit in [&low, &high, &reused] {
+            assert_eq!(&next(), unit);
+        }
+        let units: Vec<_> = lru
+            .candidates_to_fit(0, &HashSet::new())
+            .into_iter()
+            .map(|candidate| candidate.unit)
+            .collect();
+        assert_eq!(units, [first, low.clone(), high.clone(), reused.clone()]);
+
+        // A cursor saved between pages can outlive its entire block.
+        lru.remove(&low);
+        lru.remove(&high);
+        let mut cursor = (paged_slot as usize, 3);
+        let mut credits = 1;
+        let unit = index
+            .policy_scan_step(&mut cursor, end, &mut credits)
+            .unwrap();
+        assert_eq!(unit.materialize(), reused);
+        assert_eq!(cursor, end);
+        assert_eq!(credits, 0);
     }
 
     #[test]

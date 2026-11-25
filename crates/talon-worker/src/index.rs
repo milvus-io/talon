@@ -489,77 +489,85 @@ impl BlockIndex {
         }
     }
 
-    /// Advance by stable directory slot and then by unit key within the block.
-    pub(crate) fn policy_unit_at(
+    /// Advance by occupied directory slot and then by unit key within the block.
+    /// The caller supplies at least one visit credit. A gap consumes no credit.
+    pub(crate) fn policy_scan_step(
         &self,
         cursor: &mut (usize, u64),
         end: (usize, u64),
+        remaining: &mut usize,
     ) -> Option<SharedUnit> {
         let entries = self.entries.read().unwrap();
-        let (position, start) = *cursor;
+        let Some((position, block, entry)) = entries
+            .at_or_after(cursor.0)
+            .filter(|(position, _, _)| (*position, 0) < end)
+        else {
+            *cursor = end;
+            return None;
+        };
+        *remaining -= 1;
+        let start = if position == cursor.0 { cursor.1 } else { 0 };
         let mut next = None;
         let mut last = None;
-        if let Some((block, entry)) = entries.at(position) {
-            let mut consider = |first, final_key| {
-                next = next.into_iter().chain(first).min();
-                last = last.into_iter().chain(final_key).max();
+        let mut consider = |first, final_key| {
+            next = next.into_iter().chain(first).min();
+            last = last.into_iter().chain(final_key).max();
+        };
+        if let Some(legacy) = &entry.legacy {
+            consider(
+                legacy.units.range(start..).next().map(|(&key, _)| key),
+                legacy.units.last_key_value().map(|(&key, _)| key),
+            );
+            for key in 0..=1 {
+                if legacy.small & (1 << key) != 0 {
+                    consider((start <= key).then_some(key), Some(key));
+                }
+            }
+        }
+        if let Some((_, geometry, _)) = entries.resident_at(position) {
+            let first = geometry
+                .policy_units_from(start)
+                .next()
+                .map(|(kind, _)| kind.order());
+            let last = match geometry.kind().unwrap() {
+                StoreKind::Whole => 0,
+                StoreKind::Paged => u64::from(geometry.last_page()) + 2,
             };
-            if let Some(legacy) = &entry.legacy {
-                consider(
-                    legacy.units.range(start..).next().map(|(&key, _)| key),
-                    legacy.units.last_key_value().map(|(&key, _)| key),
-                );
-                for key in 0..=1 {
-                    if legacy.small & (1 << key) != 0 {
-                        consider((start <= key).then_some(key), Some(key));
+            consider(first, Some(last));
+        }
+        if let Some(entry) = &entry.resident {
+            let entry = entry.block.read().unwrap();
+            if let Some(block) = entry.as_ref().filter(|block| block.policy_units != 0) {
+                match &block.units {
+                    IndexedUnits::Whole(unit) if unit.access.admitted() => {
+                        consider((start == 0).then_some(0), Some(0));
                     }
+                    IndexedUnits::Paged(pages) => {
+                        if let Ok(page) = u32::try_from(start.saturating_sub(2)) {
+                            let pages = pages.read().unwrap();
+                            consider(
+                                pages
+                                    .range(page..)
+                                    .next()
+                                    .map(|(&page, _)| u64::from(page) + 2),
+                                pages.last_key_value().map(|(&page, _)| u64::from(page) + 2),
+                            );
+                        }
+                    }
+                    IndexedUnits::Whole(_) => {}
                 }
             }
-            if let Some((_, geometry, _)) = entries.resident_at(position) {
-                let first = geometry
-                    .policy_units_from(start)
-                    .next()
-                    .map(|(kind, _)| kind.order());
-                let last = match geometry.kind().unwrap() {
-                    StoreKind::Whole => 0,
-                    StoreKind::Paged => u64::from(geometry.last_page()) + 2,
-                };
-                consider(first, Some(last));
-            }
-            if let Some(entry) = &entry.resident {
-                let entry = entry.block.read().unwrap();
-                if let Some(block) = entry.as_ref().filter(|block| block.policy_units != 0) {
-                    match &block.units {
-                        IndexedUnits::Whole(unit) if unit.access.admitted() => {
-                            consider((start == 0).then_some(0), Some(0));
-                        }
-                        IndexedUnits::Paged(pages) => {
-                            if let Ok(page) = u32::try_from(start.saturating_sub(2)) {
-                                let pages = pages.read().unwrap();
-                                consider(
-                                    pages
-                                        .range(page..)
-                                        .next()
-                                        .map(|(&page, _)| u64::from(page) + 2),
-                                    pages.last_key_value().map(|(&page, _)| u64::from(page) + 2),
-                                );
-                            }
-                        }
-                        IndexedUnits::Whole(_) => {}
-                    }
-                }
-            }
-            if let Some(key) = next.filter(|&key| (position, key) < end) {
-                *cursor = if Some(key) == last {
-                    (position + 1, 0)
-                } else {
-                    (position, key + 1)
-                };
-                return Some(SharedUnit {
-                    block: block.clone(),
-                    kind: UnitKind::from_order(key),
-                });
-            }
+        }
+        if let Some(key) = next.filter(|&key| (position, key) < end) {
+            *cursor = if Some(key) == last {
+                (position + 1, 0).min(end)
+            } else {
+                (position, key + 1)
+            };
+            return Some(SharedUnit {
+                block: block.clone(),
+                kind: UnitKind::from_order(key),
+            });
         }
         *cursor = (position + 1, 0).min(end);
         None

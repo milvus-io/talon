@@ -186,12 +186,17 @@ impl OwnershipGc {
                         .take_superseded_retries(pass.limit),
                 );
             }
+            let ceiling = if range.is_empty() {
+                0
+            } else {
+                worker.lru.block_scan_ceiling()
+            };
             self.pass = Some(OwnershipPass {
                 generation: view.generation,
-                cursor: 0..worker.lru.block_scan_ceiling(),
+                cursor: 0..ceiling,
                 retry_cursor: range.start,
+                scanning: !range.is_empty(),
                 range,
-                scanning: true,
                 retries: BTreeMap::new(),
                 attempt: None,
                 block_round_done: false,
@@ -208,8 +213,13 @@ impl OwnershipGc {
             }
         }
         self.round_ended = false;
-        if self.pass.as_ref().unwrap().block_round_done {
-            self.run_small_slice(worker, &view).await;
+        let pass = self.pass.as_ref().unwrap();
+        // A Small-only supplement, including its retry rounds, has no
+        // ordinary admission revisions to examine.
+        if pass.block_round_done || (self.supplement.is_some() && pass.range.is_empty()) {
+            if worker.membership_is_current(&view) {
+                self.run_small_slice(worker, &view).await;
+            }
             return;
         }
         let started = Instant::now();
@@ -1133,6 +1143,54 @@ mod tests {
         gc.run_round(&worker).await;
         assert!(worker.small.as_ref().unwrap().contains(&foreign));
         assert!(gc.pass.is_none());
+    }
+
+    #[tokio::test]
+    async fn small_only_supplement_visits_no_ordinary_slots_even_during_retries() {
+        let root = tempfile::tempdir().unwrap();
+        let (worker, fixture) = namespace_runtime(root.path(), true);
+        let ordinary = [placed("a", 0), placed("a", 1)];
+        for id in &ordinary {
+            fill(&worker, id, true).await;
+        }
+        let mut gc = fixture.gc(&worker);
+        gc.run_round(&worker).await;
+        assert!(gc.pass.is_none());
+        assert_eq!(worker.lru.block_scan_ceiling(), ordinary.len());
+        assert_eq!(worker.page_gc_metrics.ownership_checked.get(), 2);
+        let limit = gc.completed_limit;
+
+        let late = packed_placed("b", 0);
+        worker
+            .commit_cached_block(&late, Bytes::from_static(b"packed"))
+            .await
+            .unwrap();
+        let small = worker.small.as_ref().unwrap();
+        let pin = worker
+            .lru
+            .pin_guard(CacheUnit::Whole(late.clone()))
+            .unwrap();
+        assert_eq!(worker.lru.ownership_admission_ceiling(), limit);
+        gc.next_supplement = tokio::time::Instant::now();
+        for _ in 0..2 {
+            gc.run_slice(&worker).await;
+            let pass = gc.pass.as_ref().unwrap();
+            assert_eq!(pass.range, limit..limit);
+            assert_eq!(pass.cursor, 0..0, "no ordinary slot visits");
+            assert!(
+                gc.round_ended,
+                "the Small retry round finished in one slice"
+            );
+            assert_eq!(small.ownership_retry_count(), 1);
+        }
+        assert_eq!(worker.page_gc_metrics.ownership_checked.get(), 3);
+
+        drop(pin);
+        gc.run_round(&worker).await;
+        assert!(!small.contains(&late));
+        assert!(gc.pass.is_none());
+        assert_eq!(gc.completed_limit, limit);
+        assert!(ordinary.iter().all(|id| worker.contains_block(id)));
     }
 
     #[tokio::test]

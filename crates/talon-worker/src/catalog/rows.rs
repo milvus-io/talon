@@ -4,12 +4,13 @@ use crate::block_key::{BlockIdentity, BlockKey};
 use crate::eviction::UnitKind;
 use crate::page_lifecycle::{PageAge, PageRow, PageWord};
 use crate::small_store::lookup::Lookup;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::hash::{BuildHasher, RandomState};
 use std::sync::Arc;
 use talon_core::PageIndex;
 
 const SLAB_ROWS: usize = 256;
+const OCCUPANCY_WORDS: usize = SLAB_ROWS / u64::BITS as usize;
 const SECTOR: u64 = 512;
 
 #[derive(Clone)]
@@ -485,6 +486,8 @@ pub(crate) struct BlockRows {
     lookup: Lookup,
     hash: RandomState,
     slabs: Vec<Slab>,
+    // Only occupied slabs need a bitmap. Keep it outside the snapshot slabs.
+    occupied: BTreeMap<usize, [u64; OCCUPANCY_WORDS]>,
     slots: usize,
     free: Vec<u32>,
     // A logical block normally has only one address. Retain both file families
@@ -503,6 +506,43 @@ impl BlockRows {
             .get(slot / SLAB_ROWS)?
             .get(slot % SLAB_ROWS)?
             .as_ref()
+    }
+
+    pub fn at_or_after(&self, start: usize) -> Option<(usize, &BlockRow)> {
+        if let Some(row) = self.at(start) {
+            return Some((start, row));
+        }
+        let start_slab = start / SLAB_ROWS;
+        let word_bits = u64::BITS as usize;
+        // At most the starting slab needs a partial search. Later slabs in
+        // this map are nonempty, even after a long run of retired slabs.
+        for (&slab, words) in self.occupied.range(start_slab..) {
+            let offset = if slab == start_slab {
+                start % SLAB_ROWS
+            } else {
+                0
+            };
+            for (word, &bits) in words.iter().enumerate().skip(offset / word_bits) {
+                let base = word * word_bits;
+                let bits = bits & (u64::MAX << offset.saturating_sub(base));
+                if bits != 0 {
+                    let slot = slab * SLAB_ROWS + base + bits.trailing_zeros() as usize;
+                    return Some((slot, self.at(slot).expect("occupied catalog slot")));
+                }
+            }
+        }
+        None
+    }
+
+    fn occupancy_address(handle: u32) -> (usize, usize, u64) {
+        let slot = handle as usize - 1;
+        let offset = slot % SLAB_ROWS;
+        let word_bits = u64::BITS as usize;
+        (
+            slot / SLAB_ROWS,
+            offset / word_bits,
+            1 << (offset % word_bits),
+        )
     }
 
     fn at_mut(&mut self, handle: u32) -> &mut Option<BlockRow> {
@@ -559,6 +599,8 @@ impl BlockRows {
             id,
             geometry: Geometry::empty(),
         });
+        let (slab, word, bit) = Self::occupancy_address(handle);
+        self.occupied.entry(slab).or_default()[word] |= bit;
         handle
     }
 
@@ -646,6 +688,12 @@ impl BlockRows {
                 self.lookup.remove(slot);
                 self.free.push(handle);
                 *self.at_mut(handle) = None;
+                let (slab, word, bit) = Self::occupancy_address(handle);
+                let words = self.occupied.get_mut(&slab).unwrap();
+                words[word] &= !bit;
+                if words.iter().all(|&bits| bits == 0) {
+                    self.occupied.remove(&slab);
+                }
             }
         }
     }

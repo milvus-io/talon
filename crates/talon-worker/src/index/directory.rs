@@ -86,6 +86,11 @@ impl Directory {
         Some((&row.id, self.runtime_at(cursor)))
     }
 
+    pub(super) fn at_or_after(&self, start: usize) -> Option<(usize, &BlockKey, &DirectoryEntry)> {
+        let (slot, row) = self.rows.at_or_after(start)?;
+        Some((slot, &row.id, self.runtime_at(slot)))
+    }
+
     fn runtime_at(&self, slot: usize) -> &DirectoryEntry {
         self.runtime.get(&slot).unwrap_or(&EMPTY_RUNTIME_ROW)
     }
