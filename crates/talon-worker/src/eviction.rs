@@ -1050,7 +1050,7 @@ impl Lru {
             .collect()
     }
 
-    /// Visit each slab slot once in bounded slices, independent of the CLOCK hand.
+    /// Visit occupied slots in bounded slices, independent of the CLOCK hand.
     pub(crate) fn idle_candidates(
         &self,
         cursor: &mut (usize, usize),
@@ -1078,12 +1078,13 @@ impl Lru {
         if delete_budget == 0 {
             return out;
         }
-        let count = (cursor.1 - cursor.0).min(scan_budget);
-        for _ in 0..count {
-            let slot = cursor.0;
-            cursor.0 += 1;
+        let mut slots = cursor.0..cursor.1;
+        for _ in 0..scan_budget {
             let g = self.inner.lock().unwrap();
-            let Some((block, activity)) = g.index.policy_block_at(slot) else {
+            let Some(activity) = g.index.policy_block_step(&mut slots) else {
+                break;
+            };
+            let Some((block, activity)) = activity else {
                 continue;
             };
             let access = activity.last_access;
@@ -1099,21 +1100,27 @@ impl Lru {
                 break;
             }
         }
+        cursor.0 = slots.start;
         out
     }
 
-    /// Examine one slot. The admission range may exclude a block updated
+    /// Examine one occupied slot. The admission range may exclude a block updated
     /// after the boundary; a supplemental pass will see the newer revision.
-    pub(crate) fn ownership_block_at(
+    pub(crate) fn ownership_block_step(
         &self,
-        slot: usize,
+        cursor: &mut std::ops::Range<usize>,
         range: &std::ops::Range<u64>,
-    ) -> Option<StaleBlockCandidate> {
+    ) -> Option<Option<StaleBlockCandidate>> {
         let g = self.inner.lock().unwrap();
-        let (block, activity) = g.index.policy_block_at(slot)?;
-        range
-            .contains(&activity.revision)
-            .then(|| activity.candidate(block.materialize()))
+        Some(
+            g.index
+                .policy_block_step(cursor)?
+                .and_then(|(block, activity)| {
+                    range
+                        .contains(&activity.revision)
+                        .then(|| activity.candidate(block.materialize()))
+                }),
+        )
     }
 
     pub(crate) fn refresh_ownership_candidate(
@@ -1131,7 +1138,10 @@ impl Lru {
         &self,
         range: std::ops::Range<u64>,
     ) -> Option<StaleBlockCandidate> {
-        (0..self.block_scan_ceiling()).find_map(|slot| self.ownership_block_at(slot, &range))
+        let mut cursor = 0..self.block_scan_ceiling();
+        std::iter::from_fn(|| self.ownership_block_step(&mut cursor, &range))
+            .flatten()
+            .next()
     }
 
     pub(crate) fn block_scan_ceiling(&self) -> usize {

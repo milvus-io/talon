@@ -230,12 +230,15 @@ impl OwnershipGc {
             let pass = self.pass.as_mut().unwrap();
             if pass.attempt.is_none() {
                 let candidate = if pass.scanning {
-                    let Some(slot) = pass.cursor.next() else {
+                    let Some(candidate) = worker
+                        .lru
+                        .ownership_block_step(&mut pass.cursor, &pass.range)
+                    else {
                         pass.scanning = false;
                         self.finish_block_round(&view);
                         return;
                     };
-                    let Some(candidate) = worker.lru.ownership_block_at(slot, &pass.range) else {
+                    let Some(candidate) = candidate else {
                         continue;
                     };
                     candidate
@@ -500,6 +503,132 @@ mod tests {
             Version::new("v1"),
         )
     }
+
+    async fn check_sparse_maintenance(historical: u64) {
+        use crate::{
+            catalog::{Operation, StoreKind},
+            index::Directory,
+            page_lifecycle::ScanCursor,
+        };
+        let directory = Arc::new(std::sync::RwLock::new(Directory::default()));
+        directory.write().unwrap().attach(16);
+        let index = Arc::new(BlockIndex::from_catalog(directory.clone()));
+        let root = tempfile::tempdir().unwrap();
+        let worker = WorkerRuntime::new(
+            WholeBlockStore::open(root.path().join("whole")).unwrap(),
+            index,
+            Arc::new(InFlightLoads::new()),
+            Arc::new(Origin::default()),
+            32,
+            0,
+            WorkerMetrics::new(0),
+        );
+        worker.page_lifecycle.enable_access_tracking();
+        let first = block(63);
+        let tail = block(historical - 1);
+        let reused = block(historical);
+        let late = block(historical + 1);
+        let put = |rows: &mut Directory, id: &BlockId, page| {
+            rows.apply(
+                id,
+                StoreKind::Paged,
+                &Operation::Put { page, len: 32 },
+                None,
+                Some(16),
+            );
+        };
+        {
+            let mut rows = directory.write().unwrap();
+            for n in 0..historical {
+                put(&mut rows, &block(n), 0);
+            }
+            for n in (0..historical - 1).rev().filter(|&n| n != 63) {
+                rows.apply(
+                    &block(n),
+                    StoreKind::Paged,
+                    &Operation::DeleteBlock,
+                    None,
+                    Some(0),
+                );
+            }
+            put(&mut rows, &reused, 0);
+            put(&mut rows, &first, 1);
+            assert_eq!(rows.slot(&reused), Some(0));
+            assert_eq!(rows.slot(&tail), Some(historical as usize - 1));
+        }
+        let ceiling = worker.lru.block_scan_ceiling();
+        assert_eq!(ceiling, historical as usize);
+
+        let mut page_cursor = ScanCursor::default();
+        let mut pages = Vec::new();
+        for (id, page) in [(&reused, 0), (&first, 0), (&first, 1), (&tail, 0)] {
+            let (batch, report) = worker
+                .page_lifecycle
+                .scan(&mut page_cursor, 1, 100, Some(1), 10);
+            assert_eq!(report.checked, 1);
+            let candidate = &batch[0];
+            assert_eq!(candidate.block.id.materialize(), *id);
+            assert_eq!(candidate.page, PageIndex(page));
+            pages.extend(batch);
+        }
+        let (_, report) = worker
+            .page_lifecycle
+            .scan(&mut page_cursor, 1, 100, Some(1), 10);
+        assert!(report.completed);
+        assert_eq!(report.checked, 0);
+        drop(pages);
+        let (pages, report) =
+            worker
+                .page_lifecycle
+                .scan(&mut page_cursor, 4096, 100, Some(1), 4096);
+        assert!(report.completed);
+        assert_eq!((pages.len(), report.checked), (4, 4));
+
+        let mut stale = (0, 0);
+        for id in [&reused, &first, &tail, &reused] {
+            let batch = worker.lru.idle_candidates(&mut stale, u64::MAX, 0, 1, 1);
+            assert_eq!(batch.len(), 1);
+            assert_eq!(batch[0].block, *id);
+        }
+        let mut stale = (0, 0);
+        let batch = worker
+            .lru
+            .idle_candidates(&mut stale, u64::MAX, 0, 4096, 4096);
+        assert_eq!((batch.len(), stale), (3, (ceiling, ceiling)));
+
+        let fixture = MembershipFixture::new();
+        *fixture.members.lock().unwrap() = Some(vec!["a"]);
+        let mut gc = fixture.gc(&worker);
+        let limit = worker.lru.ownership_admission_ceiling();
+        put(&mut directory.write().unwrap(), &late, 0);
+        let mut slots = 0..ceiling;
+        let visits: Vec<_> =
+            std::iter::from_fn(|| worker.lru.ownership_block_step(&mut slots, &(0..limit)))
+                .map(|candidate| candidate.map(|candidate| candidate.block))
+                .collect();
+        assert_eq!(visits, [Some(reused), None, Some(first), Some(tail)]);
+        gc.run_slice(&worker).await;
+        assert!(gc.pass.is_none());
+        assert_eq!(gc.completed_limit, limit);
+        assert_eq!(worker.page_gc_metrics.ownership_checked.get(), 3);
+        gc.next_supplement = tokio::time::Instant::now();
+        gc.run_slice(&worker).await;
+        assert!(gc.pass.is_none());
+        assert_eq!(worker.page_gc_metrics.ownership_checked.get(), 4);
+        println!("historical_slots={ceiling} live_slots=3 reused_slot=0 final_live_slot={} tti_pages={} tti_batches=1 stale_visits={} stale_batches=1 ownership_event_visits={} ownership_event_checks=3 ownership_event_slices=1 ownership_supplement_checks=1", ceiling - 1, report.checked, batch.len(), visits.len());
+    }
+
+    #[tokio::test]
+    async fn sparse_maintenance_skips_retired_slots_and_preserves_bounds() {
+        check_sparse_maintenance(16_384).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "million-slot maintenance work-count probe"]
+    async fn sparse_maintenance_million_slot_probe() {
+        check_sparse_maintenance(1_000_000).await;
+    }
+
     fn runtime(root: &std::path::Path, paged: bool, origin: Arc<Origin>) -> WorkerRuntime {
         let store = WholeBlockStore::open(root.join("whole")).unwrap();
         let index = Arc::new(BlockIndex::new());

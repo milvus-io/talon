@@ -544,7 +544,7 @@ impl WorkerRuntime {
                 if idle_at.is_some_and(|now| !candidate.is_idle(now.max(crate::eviction::access_millis()), runtime.current_tti_ms())) { return; }
                 if !runtime.lru.stale_candidate_is_current(&candidate) { return; }
                 let Some(claim) = state.claim_all_pages() else { return; };
-                // A reader may have completed while the pages were being closed.
+                // A reader may have completed before the block claim.
                 if !runtime.lru.stale_candidate_is_current(&candidate) { return; }
                 if membership.as_ref().is_some_and(|view|
                     Instant::now() >= view.valid_until || !runtime.membership_is_current(view)) { return; }
@@ -578,7 +578,7 @@ impl WorkerRuntime {
                 runtime.invalidate_l1(id);
                 runtime.index.remove(id);
                 runtime.lru.remove_tracked_block(id);
-                claim.finish();
+                drop(claim);
                 runtime.metrics.record_eviction();
                 if pages > 0 {
                     runtime.page_gc_metrics.deleted[reason].add(pages as u64);

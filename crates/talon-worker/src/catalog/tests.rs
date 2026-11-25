@@ -189,6 +189,152 @@ fn range_pins_survive_chunk_promotion_and_exclude_page_deletion() {
     assert!(block.candidate(PageIndex(256)).is_some());
 }
 
+#[tokio::test]
+async fn wide_catalog_block_claim_allows_unrelated_reads_and_durable_publication() {
+    use crate::page_lifecycle::PageLifecycle;
+    use futures::FutureExt;
+    use std::time::Duration;
+
+    const PAGES: u32 = 65_536;
+    let root = tempfile::tempdir().unwrap();
+    let catalog = open(root.path());
+    let paged = store(&catalog);
+    let index = Arc::new(catalog.index(4));
+    let life = PageLifecycle::with_index(index.clone(), false);
+    let mut wide = block(0);
+    wide.block_size = PAGES * 4;
+    let slot = {
+        let mut directory = catalog.live.directory.write().unwrap();
+        // Seed wide geometry directly so the fixture requires only two durable writes.
+        for page in 0..PAGES {
+            directory.apply(
+                &wide,
+                StoreKind::Paged,
+                &Operation::Put {
+                    page,
+                    len: u64::from(wide.block_size),
+                },
+                None,
+                Some(4),
+            );
+        }
+        directory.slot(&wide).unwrap()
+    };
+    let other = block(1);
+    let body = Bytes::from_static(b"data");
+    paged
+        .commit_page(&other, PageIndex(0), 8, body.clone())
+        .await
+        .unwrap();
+
+    let state = life.block(&wide);
+    let reader = index
+        .page_reads_and_touch(&wide, PageIndex(PAGES - 2), PageIndex(PAGES))
+        .unwrap();
+    let gate = state.lock().await;
+    assert!(state.claim_all_pages().is_none());
+    drop(reader);
+
+    let claim = state.claim_all_pages().unwrap();
+    assert_eq!(claim.len(), PAGES as usize);
+    assert_eq!(index.page_work.operation_counts(slot), (1, 0));
+    assert!(state.acquire(PageIndex(0)).is_none());
+    assert!(index
+        .page_reads_and_touch(&wide, PageIndex(0), PageIndex(PAGES))
+        .is_none());
+    assert!(state.candidate(PageIndex(PAGES - 1)).is_none());
+    assert!(
+        state.lock().now_or_never().is_none(),
+        "single-page eviction uses this same exclusive gate"
+    );
+    assert!(state.lock_page_fill().now_or_never().is_none());
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let read = index
+            .page_reads_and_touch(&other, PageIndex(0), PageIndex(1))
+            .unwrap();
+        paged
+            .commit_page(&other, PageIndex(1), 8, body.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            paged.get_page_bytes(&other, PageIndex(1), 4).await.unwrap(),
+            body
+        );
+        drop(read);
+    })
+    .await
+    .unwrap();
+
+    // Abort touches only its operation stripe, even while directory access is blocked.
+    let directory = catalog.live.directory.write().unwrap();
+    std::thread::scope(|scope| {
+        let (sent, received) = std::sync::mpsc::channel();
+        scope.spawn(move || {
+            drop(claim);
+            sent.send(()).unwrap();
+        });
+        let aborted = received.recv_timeout(Duration::from_secs(5));
+        drop(directory);
+        aborted.unwrap();
+    });
+    assert_eq!(index.page_work.operation_counts(slot), (0, 0));
+    assert!(state.acquire(PageIndex(PAGES - 1)).is_some());
+    drop(gate);
+    println!(
+        "wide_pages={PAGES} active_block_claims=1 active_page_claims=0 unrelated_durable_puts=1"
+    );
+}
+
+#[tokio::test]
+async fn catalog_block_claim_abort_preserves_pending_page_operations_and_reuse() {
+    use crate::page_lifecycle::PageLifecycle;
+
+    let root = tempfile::tempdir().unwrap();
+    let catalog = open(root.path());
+    let paged = store(&catalog);
+    let index = Arc::new(catalog.index(4));
+    let life = PageLifecycle::with_index(index.clone(), false);
+    let id = block(0);
+    let page = PageIndex(0);
+    let body = Bytes::from_static(b"data");
+    paged.commit_page(&id, page, 4, body.clone()).await.unwrap();
+    let state = life.block(&id);
+    let slot = catalog.live.directory.read().unwrap().slot(&id).unwrap();
+    let _gate = state.lock().await;
+
+    let selected = state.candidate(page).unwrap();
+    assert!(state.claim(&selected, 0, None));
+    assert!(state.claim_all_pages().is_none());
+    state.abort(&selected, 1);
+    let old = state.claim_all_pages().unwrap();
+    assert!(!state.claim(&selected, 0, None));
+
+    // Retire and refill while obsolete handles survive, as a forced replacement.
+    paged.delete_block_async(&id).await.unwrap();
+    paged.commit_page(&id, page, 4, body).await.unwrap();
+    assert_eq!(catalog.live.directory.read().unwrap().slot(&id), Some(slot));
+    let pending = state.candidate(page).unwrap();
+    let new = state.claim_all_pages().unwrap();
+    drop(old);
+    assert!(!state.claim(&selected, 0, None));
+    assert!(!state.claim(&pending, 0, None));
+    assert!(state.acquire(page).is_none());
+
+    // The first unlink fails before removing any resident file.
+    let path = paged.catalog_dir_for(&id).unwrap().join("0.page");
+    std::fs::rename(&path, path.with_extension("saved")).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    assert!(paged.delete_block_async(&id).await.is_err());
+    assert!(state.acquire(page).is_none());
+    drop(new);
+    assert_eq!(index.page_work.operation_counts(slot), (0, 1));
+    drop(state.acquire(page).unwrap());
+    assert!(state.claim(&pending, 0, None));
+    state.abort(&pending, 1);
+    assert!(state.acquire(page).is_some());
+}
+
 #[test]
 fn frozen_snapshot_preserves_pages_and_pending_transaction_ids() {
     let mut state = State::default();

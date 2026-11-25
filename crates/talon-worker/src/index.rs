@@ -365,15 +365,17 @@ fn with_legacy_pages<T>(
     f: impl FnOnce(PageSet<'_>) -> T,
 ) -> Option<T> {
     let block = entry.resident.as_ref()?.block.read().unwrap();
-    let IndexedUnits::Paged(table) = &block.as_ref()?.units else {
+    let block = block.as_ref()?;
+    let IndexedUnits::Paged(table) = &block.units else {
         return None;
     };
+    let count = block.materialized_pages() as usize;
     if exclusive {
         let rows = table.write().unwrap();
-        Some(f(PageSet::Legacy(&rows, table)))
+        Some(f(PageSet::Legacy(&rows, table, count)))
     } else {
         let rows = table.read().unwrap();
-        Some(f(PageSet::Legacy(&rows, table)))
+        Some(f(PageSet::Legacy(&rows, table, count)))
     }
 }
 
@@ -463,10 +465,25 @@ impl BlockIndex {
         capture(entries.slot_count())
     }
 
-    pub(crate) fn policy_block_at(&self, slot: usize) -> Option<(BlockKey, BlockActivity)> {
+    /// Advance one occupied row. An occupied row without ordinary policy
+    /// still consumes a visit, so callers can bound work before yielding.
+    pub(crate) fn policy_block_step(
+        &self,
+        cursor: &mut std::ops::Range<usize>,
+    ) -> Option<Option<(BlockKey, BlockActivity)>> {
         let entries = self.entries.read().unwrap();
-        let (id, _) = entries.at(slot)?;
-        Some((id.clone(), self.block_activity(&entries, slot)?))
+        let Some((slot, id, _)) = entries
+            .at_or_after(cursor.start)
+            .filter(|(slot, _, _)| *slot < cursor.end)
+        else {
+            cursor.start = cursor.end;
+            return None;
+        };
+        cursor.start = slot + 1;
+        Some(
+            self.block_activity(&entries, slot)
+                .map(|activity| (id.clone(), activity)),
+        )
     }
 
     fn block_activity(&self, entries: &Directory, slot: usize) -> Option<BlockActivity> {
@@ -998,6 +1015,25 @@ impl BlockIndex {
             let (key, entry) = entries.at(slot)?;
             with_legacy_pages(entry, exclusive, |rows| f(key, rows))
         }
+    }
+
+    /// Locate and inspect the next occupied slot under the same directory lock.
+    pub(crate) fn scan_page_slot<T>(
+        &self,
+        slots: std::ops::Range<usize>,
+        f: impl FnOnce(usize, &BlockKey, PageSet<'_>) -> T,
+    ) -> Option<(usize, Option<T>)> {
+        let entries = self.entries.read().unwrap();
+        let (slot, key, entry) = entries.at_or_after(slots.start)?;
+        if slot >= slots.end {
+            return None;
+        }
+        let pages = if self.catalog {
+            with_catalog_pages(&entries, slot, |key, rows| f(slot, key, rows))
+        } else {
+            with_legacy_pages(entry, false, |rows| f(slot, key, rows))
+        };
+        Some((slot, pages))
     }
 
     pub(crate) fn with_pages<T>(

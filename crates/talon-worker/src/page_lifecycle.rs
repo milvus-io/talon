@@ -250,14 +250,21 @@ impl PageRow<'_> {
 
 pub(crate) enum PageSet<'a> {
     Catalog(&'a Geometry, Option<&'a PageAge>),
-    Legacy(&'a PageRows, &'a PageTable),
+    Legacy(&'a PageRows, &'a PageTable, usize),
 }
 
 impl PageSet<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Catalog(geometry, _) => geometry.page_count(),
+            Self::Legacy(_, _, count) => *count,
+        }
+    }
+
     fn get(&self, page: u32) -> Option<PageRow<'_>> {
         match self {
             Self::Catalog(geometry, age) => geometry.page_row(page, *age),
-            Self::Legacy(rows, _) => {
+            Self::Legacy(rows, _, _) => {
                 let row = rows.get(&page)?;
                 row.unit.resident().then_some(PageRow {
                     state: &row.state,
@@ -270,7 +277,7 @@ impl PageSet<'_> {
     fn iter_from(&self, start: u32) -> impl Iterator<Item = (u32, PageRow<'_>)> {
         let (catalog, legacy) = match self {
             Self::Catalog(geometry, age) => (Some(geometry.page_rows_from(start, *age)), None),
-            Self::Legacy(rows, _) => (
+            Self::Legacy(rows, _, _) => (
                 None,
                 Some(rows.range(start..).filter_map(|(&page, row)| {
                     row.unit.resident().then_some((
@@ -303,14 +310,14 @@ impl PageIncarnation {
     fn of(rows: &PageSet<'_>) -> Self {
         match rows {
             PageSet::Catalog(geometry, _) => Self::Catalog(geometry.disk_id),
-            PageSet::Legacy(_, table) => Self::Legacy(Arc::downgrade(table)),
+            PageSet::Legacy(_, table, _) => Self::Legacy(Arc::downgrade(table)),
         }
     }
 
     fn matches(&self, rows: &PageSet<'_>) -> bool {
         match (self, rows) {
             (Self::Catalog(disk), PageSet::Catalog(geometry, _)) => *disk == geometry.disk_id,
-            (Self::Legacy(old), PageSet::Legacy(_, table)) => old.as_ptr() == Arc::as_ptr(table),
+            (Self::Legacy(old), PageSet::Legacy(_, table, _)) => old.as_ptr() == Arc::as_ptr(table),
             _ => false,
         }
     }
@@ -326,40 +333,55 @@ pub(crate) struct PageReadGuard {
 }
 
 impl PageReadGuard {
+    fn pin(page: u32, state: &PageWord) -> Option<()> {
+        match state.fetch_update(Ordering::AcqRel, Ordering::Relaxed, |flags| {
+            (flags & CLOSED == 0 && flags & PINNED != PINNED).then(|| flags + ONE_READER)
+        }) {
+            Ok(_) => Some(()),
+            Err(flags) => {
+                if flags & PINNED == PINNED {
+                    static REPORTED: AtomicBool = AtomicBool::new(false);
+                    if !REPORTED.swap(true, Ordering::Relaxed) {
+                        tracing::warn!(page, "resident page reader limit reached");
+                    }
+                }
+                None
+            }
+        }
+    }
+
     /// Pin the resident prefix while the caller holds the directory and page
     /// rows stable. The caller drops a partial guard outside those locks.
     pub(crate) fn acquire<'a, T>(
         index: &Arc<crate::BlockIndex>,
         slot: usize,
         start: u32,
-        rows: impl Iterator<Item = (&'a PageWord, T)>,
+        mut rows: impl Iterator<Item = (&'a PageWord, T)>,
         mut touch: impl FnMut(&PageWord, T),
     ) -> Option<Self> {
-        let mut len = 0;
+        let (first, access) = rows.next()?;
+        let work = &index.page_work;
+        let ticket = {
+            let mut active = work.operations(slot).lock().unwrap();
+            if active.get((slot, BLOCK_CLAIM)).is_some() {
+                return None;
+            }
+            Self::pin(start, first)?;
+            let ticket = work.next_identity();
+            active.insert((slot, ticket), u64::from(start));
+            ticket
+        };
+        // The directory (or standalone page table) remains borrowed until
+        // the range is pinned. Other slots can use this operation stripe.
+        touch(first, access);
+        let mut len = 1;
         for (state, access) in rows {
-            if let Err(flags) = state.fetch_update(Ordering::AcqRel, Ordering::Relaxed, |flags| {
-                (flags & CLOSED == 0 && flags & PINNED != PINNED).then(|| flags + ONE_READER)
-            }) {
-                if flags & PINNED == PINNED {
-                    static REPORTED: AtomicBool = AtomicBool::new(false);
-                    if !REPORTED.swap(true, Ordering::Relaxed) {
-                        tracing::warn!(page = start + len, "resident page reader limit reached");
-                    }
-                }
+            if Self::pin(start + len, state).is_none() {
                 break;
             }
             touch(state, access);
             len += 1;
         }
-        if len == 0 {
-            return None;
-        }
-        let work = &index.page_work;
-        let ticket = work.next_identity();
-        work.operations(slot)
-            .lock()
-            .unwrap()
-            .insert_read(slot, ticket, start, len);
         Some(Self {
             index: index.clone(),
             slot,
@@ -381,10 +403,14 @@ impl PageReadGuard {
 
     #[cfg(test)]
     pub fn record_access(&self, now: u64) {
+        assert_eq!(self.len, 1);
         self.index.with_page_slot(self.slot, false, |id, rows| {
             let work = &self.index.page_work;
             let active = work.operations(self.slot).lock().unwrap();
-            let Some(page) = active.single_page(self.slot, self.ticket) else {
+            let Some(page) = active
+                .get((self.slot, self.ticket))
+                .map(|start| start as u32)
+            else {
                 return;
             };
             drop(active);
@@ -411,12 +437,12 @@ impl Drop for PageReadGuard {
     fn drop(&mut self) {
         self.index.with_page_slot(self.slot, false, |id, rows| {
             let work = &self.index.page_work;
-            let range = work
+            let start = work
                 .operations(self.slot)
                 .lock()
                 .unwrap()
-                .remove_read(self.slot, self.ticket);
-            let Some(range) = range else {
+                .remove((self.slot, self.ticket));
+            let Some(start) = start.map(|start| start as u32) else {
                 // A detached block may already have reused this slot.
                 return;
             };
@@ -439,13 +465,13 @@ impl Drop for PageReadGuard {
                     debug_assert!(flags & PINNED != 0);
                 }
             };
-            if range.len == 1 {
-                if let Some(row) = rows.get(range.start) {
-                    release(range.start, row);
+            if self.len == 1 {
+                if let Some(row) = rows.get(start) {
+                    release(start, row);
                 }
             } else {
-                for (page, row) in rows.iter_from(range.start) {
-                    if page - range.start >= range.len {
+                for (page, row) in rows.iter_from(start) {
+                    if page - start >= self.len {
                         break;
                     }
                     release(page, row);
@@ -609,6 +635,9 @@ impl PagedMutation {
         }
         let work = &self.index.page_work;
         let mut active = work.operations(slot).lock().unwrap();
+        if active.get((slot, BLOCK_CLAIM)).is_some() {
+            return None;
+        }
         state
             .compare_exchange(
                 flags,
@@ -618,7 +647,7 @@ impl PagedMutation {
             )
             .ok()?;
         let identity = work.next_identity();
-        active.select(slot, page, identity);
+        active.insert((slot, u64::from(page)), identity);
         Some(GcCandidate {
             block: self.clone(),
             page: PageIndex(page),
@@ -642,17 +671,28 @@ impl PagedMutation {
                 let Some(row) = rows.get(c.page.0) else {
                     return false;
                 };
-                let active = work.operations(slot).lock().unwrap();
+                let mut active = work.operations(slot).lock().unwrap();
                 let flags = row.state.load(Ordering::Acquire);
-                if !c.lease.current(&active, slot)
+                if active.get((slot, BLOCK_CLAIM)).is_some()
+                    || !c.lease.current(&active, slot)
                     || flags & (CLOSED | PINNED | ACCESSED) != 0
                     || tti.is_some_and(|tti| !expired(row.age(), now, tti))
                 {
                     return false;
                 }
-                row.state
+                if row
+                    .state
                     .compare_exchange(flags, flags | CLOSED, Ordering::AcqRel, Ordering::Relaxed)
-                    .is_ok()
+                    .is_err()
+                {
+                    return false;
+                }
+                active.remove((slot, u64::from(c.page.0)));
+                active.insert(
+                    (slot, FIRST_CLOSED_PAGE + u64::from(c.page.0)),
+                    c.lease.identity,
+                );
+                true
             })
             .unwrap_or(false)
     }
@@ -666,14 +706,16 @@ impl PagedMutation {
             let Some(row) = rows.get(c.page.0) else {
                 return;
             };
-            let active = work.operations(slot).lock().unwrap();
-            let old = row.state.load(Ordering::Relaxed);
-            if c.lease.current(&active, slot) && old & CLOSED != 0 {
+            let mut active = work.operations(slot).lock().unwrap();
+            let key = (slot, FIRST_CLOSED_PAGE + u64::from(c.page.0));
+            if slot == c.lease.slot && active.get(key) == Some(c.lease.identity) {
                 row.state
                     .fetch_update(Ordering::Release, Ordering::Relaxed, |flags| {
                         Some((flags & !(CLOSED | RETRY)) | ((reason as u32 + 1) << RETRY_SHIFT))
                     })
                     .unwrap();
+                active.remove(key);
+                active.insert((slot, u64::from(c.page.0)), c.lease.identity);
                 drop(active);
                 work.schedule_retry(slot, c.page.0);
             }
@@ -681,27 +723,24 @@ impl PagedMutation {
     }
 
     pub fn claim_all_pages(&self) -> Option<BlockPageClaim> {
+        let work = &self.index.page_work;
         let mut claim = BlockPageClaim {
-            block: self.clone(),
-            identity: 0,
+            work: work.clone(),
+            operation: None,
             len: 0,
-            committed: false,
         };
+        // The exclusive directory (standalone: page table) borrow serializes
+        // this check with complete range pin and release, while the stripe
+        // separates pending GC selections from reads and claimed deletions.
         let valid = self.index.with_pages(&self.id, true, |slot, rows| {
-            let work = &self.index.page_work;
             let mut active = work.operations(slot).lock().unwrap();
-            if rows
-                .iter_from(0)
-                .any(|(_, row)| row.state.load(Ordering::Relaxed) & (CLOSED | PINNED) != 0)
-            {
+            if active.blocks_claim(slot) {
                 return false;
             }
-            claim.identity = work.next_identity();
-            for (page, row) in rows.iter_from(0) {
-                row.state.fetch_or(CLOSED, Ordering::Release);
-                active.select(slot, page, claim.identity);
-                claim.len += 1;
-            }
+            let identity = work.next_identity();
+            active.insert((slot, BLOCK_CLAIM), identity);
+            claim.operation = Some((slot, identity));
+            claim.len = rows.len();
             true
         });
         valid.unwrap_or(true).then_some(claim)
@@ -732,35 +771,22 @@ impl PagedMutation {
 }
 
 pub(crate) struct BlockPageClaim {
-    block: PagedMutation,
-    identity: u64,
+    work: Arc<PageWork>,
+    operation: Option<(usize, u64)>,
     len: usize,
-    committed: bool,
 }
 impl BlockPageClaim {
     pub fn len(&self) -> usize {
         self.len
     }
-
-    /// The caller already removed the exact claimed residency from the index.
-    pub fn finish(mut self) {
-        self.committed = true;
-    }
 }
 impl Drop for BlockPageClaim {
     fn drop(&mut self) {
-        if !self.committed && self.len != 0 {
-            self.block
-                .index
-                .with_pages(&self.block.id, true, |slot, rows| {
-                    let mut active = self.block.index.page_work.operations(slot).lock().unwrap();
-                    for (page, row) in rows.iter_from(0) {
-                        if active.selection(slot, page) == Some(self.identity) {
-                            row.state.fetch_and(!CLOSED, Ordering::Release);
-                            active.remove_selection(slot, page);
-                        }
-                    }
-                });
+        if let Some((slot, identity)) = self.operation {
+            let mut active = self.work.operations(slot).lock().unwrap();
+            if active.get((slot, BLOCK_CLAIM)) == Some(identity) {
+                active.remove((slot, BLOCK_CLAIM));
+            }
         }
     }
 }
@@ -774,159 +800,77 @@ pub(crate) struct GcCandidate {
 }
 
 const OPERATION_SHARDS: usize = 64;
-// The low keys name GC selections by page. High keys name read tickets.
-const FIRST_READ_TICKET: u64 = u32::MAX as u64 + 1;
-type OperationTree = BTreeMap<(usize, u64), ActivePage>;
+// Each slot orders pending selections before operations that block a whole
+// claim. Page keys store a selection identity, read tickets store their start
+// page, and the last key stores the whole-block claim's identity.
+const FIRST_CLOSED_PAGE: u64 = 1 << 32;
+const FIRST_READ_TICKET: u64 = 2 << 32;
+const BLOCK_CLAIM: u64 = u64::MAX;
+type OperationKey = (usize, u64);
 
 // One operation fits in a stripe without allocating a tree.
 #[derive(Default)]
 enum ActivePages {
     #[default]
     Empty,
-    Read {
-        slot: usize,
-        ticket: u64,
-        start: u32,
-        len: u32,
-    },
-    Selected {
-        slot: usize,
-        page: u32,
-        identity: u64,
-    },
-    Tree(OperationTree),
+    One(OperationKey, u64),
+    Tree(BTreeMap<OperationKey, u64>),
 }
 
 impl ActivePages {
-    fn tree_mut(&mut self) -> &mut OperationTree {
-        if !matches!(self, Self::Tree(_)) {
-            let mut tree = BTreeMap::new();
-            match std::mem::take(self) {
-                Self::Read {
-                    slot,
-                    ticket,
-                    start,
-                    len,
-                } => {
-                    tree.insert((slot, ticket), ActivePage::Read(ReadRange { start, len }));
-                }
-                Self::Selected {
-                    slot,
-                    page,
-                    identity,
-                } => {
-                    tree.insert((slot, u64::from(page)), ActivePage::Selected(identity));
-                }
-                _ => {}
-            }
-            *self = Self::Tree(tree);
-        }
-        let Self::Tree(tree) = self else {
-            unreachable!()
-        };
-        tree
-    }
-
-    fn insert_read(&mut self, slot: usize, ticket: u64, start: u32, len: u32) {
-        if matches!(self, Self::Empty) {
-            *self = Self::Read {
-                slot,
-                ticket,
-                start,
-                len,
-            };
-        } else {
-            self.tree_mut()
-                .insert((slot, ticket), ActivePage::Read(ReadRange { start, len }));
-        }
-    }
-
-    fn remove_read(&mut self, slot: usize, ticket: u64) -> Option<ReadRange> {
+    fn insert(&mut self, key: OperationKey, value: u64) {
         match self {
-            &mut Self::Read {
-                slot: current,
-                ticket: id,
-                start,
-                len,
-            } if (current, id) == (slot, ticket) => {
+            Self::Empty => *self = Self::One(key, value),
+            Self::One(current, old) if *current == key => *old = value,
+            Self::One(current, old) => {
+                *self = Self::Tree(BTreeMap::from([(*current, *old), (key, value)]));
+            }
+            Self::Tree(tree) => {
+                tree.insert(key, value);
+            }
+        }
+    }
+
+    fn get(&self, key: OperationKey) -> Option<u64> {
+        match self {
+            Self::One(current, value) if *current == key => Some(*value),
+            Self::Tree(tree) => tree.get(&key).copied(),
+            _ => None,
+        }
+    }
+
+    fn remove(&mut self, key: OperationKey) -> Option<u64> {
+        match self {
+            Self::One(current, value) if *current == key => {
+                let value = *value;
                 *self = Self::Empty;
-                Some(ReadRange { start, len })
+                Some(value)
             }
-            Self::Tree(_) => match self.remove((slot, ticket))? {
-                ActivePage::Read(range) => Some(range),
-                _ => unreachable!(),
-            },
+            Self::Tree(tree) => {
+                let removed = tree.remove(&key);
+                if tree.is_empty() {
+                    *self = Self::Empty;
+                }
+                removed
+            }
             _ => None,
         }
     }
 
-    #[cfg(test)]
-    fn single_page(&self, slot: usize, ticket: u64) -> Option<u32> {
+    fn blocks_claim(&self, slot: usize) -> bool {
         match self {
-            &Self::Read {
-                slot: current,
-                ticket: id,
-                start,
-                len: 1,
-            } if (current, id) == (slot, ticket) => Some(start),
-            Self::Tree(tree) => match tree.get(&(slot, ticket)) {
-                Some(ActivePage::Read(ReadRange { start, len: 1 })) => Some(*start),
-                _ => None,
-            },
-            _ => None,
-        }
-    }
-
-    fn remove(&mut self, key: (usize, u64)) -> Option<ActivePage> {
-        let Self::Tree(tree) = self else { return None };
-        let removed = tree.remove(&key);
-        if tree.is_empty() {
-            *self = Self::Empty;
-        }
-        removed
-    }
-
-    fn select(&mut self, slot: usize, page: u32, identity: u64) {
-        if matches!(self, Self::Empty)
-            || matches!(self, Self::Selected { slot: current, page: selected, .. } if (*current, *selected) == (slot, page))
-        {
-            *self = Self::Selected {
-                slot,
-                page,
-                identity,
-            };
-        } else {
-            self.tree_mut()
-                .insert((slot, u64::from(page)), ActivePage::Selected(identity));
-        }
-    }
-
-    fn selection(&self, slot: usize, page: u32) -> Option<u64> {
-        match self {
-            &Self::Selected {
-                slot: current,
-                page: selected,
-                identity,
-            } if (current, selected) == (slot, page) => Some(identity),
-            Self::Tree(tree) => match tree.get(&(slot, u64::from(page))) {
-                Some(ActivePage::Selected(identity)) => Some(*identity),
-                _ => None,
-            },
-            _ => None,
+            Self::One((current, key), _) => *current == slot && *key >= FIRST_CLOSED_PAGE,
+            Self::Tree(tree) => tree
+                .range((slot, FIRST_CLOSED_PAGE)..=(slot, BLOCK_CLAIM))
+                .next()
+                .is_some(),
+            Self::Empty => false,
         }
     }
 
     fn remove_selection(&mut self, slot: usize, page: u32) {
-        match self {
-            &mut Self::Selected {
-                slot: current,
-                page: selected,
-                ..
-            } if (current, selected) == (slot, page) => *self = Self::Empty,
-            Self::Tree(_) => {
-                self.remove((slot, u64::from(page)));
-            }
-            _ => {}
+        if self.remove((slot, u64::from(page))).is_none() {
+            self.remove((slot, FIRST_CLOSED_PAGE + u64::from(page)));
         }
     }
 
@@ -935,20 +879,17 @@ impl ActivePages {
         if !pinned {
             return;
         }
+        // Standalone readers use one ticket per page because public
+        // clear_page may forcibly retire that page while others stay pinned.
+        let retired = |&(current, key): &OperationKey, &start: &u64| {
+            current == slot
+                && (FIRST_READ_TICKET..BLOCK_CLAIM).contains(&key)
+                && start == u64::from(page)
+        };
         match self {
-            Self::Read {
-                slot: current,
-                start,
-                len: 1,
-                ..
-            } if (*current, *start) == (slot, page) => {
-                *self = Self::Empty;
-            }
+            Self::One(key, start) if retired(key, start) => *self = Self::Empty,
             Self::Tree(tree) => {
-                tree.retain(|&(current, _), op| {
-                    current != slot
-                        || !matches!(op, ActivePage::Read(ReadRange { start, len: 1 }) if *start == page)
-                });
+                tree.retain(|key, start| !retired(key, start));
                 if tree.is_empty() {
                     *self = Self::Empty;
                 }
@@ -959,13 +900,9 @@ impl ActivePages {
 
     fn invalidate_block(&mut self, slot: usize) {
         match self {
-            Self::Read { slot: current, .. } | Self::Selected { slot: current, .. }
-                if *current == slot =>
-            {
-                *self = Self::Empty
-            }
+            Self::One((current, _), _) if *current == slot => *self = Self::Empty,
             Self::Tree(tree) => {
-                while let Some((&key, _)) = tree.range((slot, 0)..=(slot, u64::MAX)).next() {
+                while let Some((&key, _)) = tree.range((slot, 0)..=(slot, BLOCK_CLAIM)).next() {
                     tree.remove(&key);
                 }
                 if tree.is_empty() {
@@ -977,16 +914,6 @@ impl ActivePages {
     }
 }
 
-enum ActivePage {
-    Selected(u64),
-    Read(ReadRange),
-}
-
-struct ReadRange {
-    start: u32,
-    len: u32,
-}
-
 struct PageSelection {
     work: Arc<PageWork>,
     slot: usize,
@@ -996,7 +923,7 @@ struct PageSelection {
 
 impl PageSelection {
     fn current(&self, active: &ActivePages, slot: usize) -> bool {
-        self.slot == slot && active.selection(slot, self.page) == Some(self.identity)
+        self.slot == slot && active.get((slot, u64::from(self.page))) == Some(self.identity)
     }
 }
 
@@ -1004,7 +931,7 @@ impl Drop for PageSelection {
     fn drop(&mut self) {
         let mut active = self.work.operations(self.slot).lock().unwrap();
         if self.current(&active, self.slot) {
-            active.remove_selection(self.slot, self.page);
+            active.remove((self.slot, u64::from(self.page)));
         }
     }
 }
@@ -1156,6 +1083,29 @@ impl PageWork {
             .active
             .get_or_init(|| Box::new(std::array::from_fn(|_| Mutex::default())))
             [slot % OPERATION_SHARDS]
+    }
+
+    #[cfg(test)]
+    pub(crate) fn operation_counts(&self, slot: usize) -> (usize, usize) {
+        let mut pages = 0;
+        let mut blocks = 0;
+        let mut count = |key| {
+            if key == BLOCK_CLAIM {
+                blocks += 1;
+            } else if key < FIRST_READ_TICKET {
+                pages += 1;
+            }
+        };
+        match &*self.operations(slot).lock().unwrap() {
+            ActivePages::One((current, key), _) if *current == slot => count(*key),
+            ActivePages::Tree(tree) => {
+                for (&(_, key), _) in tree.range((slot, 0)..=(slot, BLOCK_CLAIM)) {
+                    count(key);
+                }
+            }
+            _ => {}
+        }
+        (blocks, pages)
     }
 
     pub(crate) fn remove_selection(&self, slot: usize, page: u32) {
@@ -1442,115 +1392,120 @@ impl PageLifecycle {
             .get_or_insert_with(|| self.index.policy_scan_ceiling());
         let mut work = 0;
         while work < limit && out.len() + report.empty.len() < delete_limit {
-            let slot = if tti.is_some() {
-                (cursor.slot < ceiling).then_some(cursor.slot)
-            } else if cursor.slot < ceiling {
-                self.index
+            let start_slot = cursor.slot;
+            let mut examined = 0;
+            let budget = (limit - work).min(64);
+            let mut inspect_slot = |slot, id: &BlockKey, rows: PageSet<'_>| {
+                if slot != start_slot {
+                    cursor.page = 0;
+                }
+                let (cleanup, retries) = {
+                    let pending = self.index.page_work.pending.lock().unwrap();
+                    pending.get(&slot).map_or((false, Vec::new()), |pending| {
+                        let retries = if tti.is_none() {
+                            u32::try_from(cursor.page).ok().map_or(Vec::new(), |start| {
+                                pending
+                                    .retries
+                                    .range(start..)
+                                    .copied()
+                                    .take(budget + 1)
+                                    .collect()
+                            })
+                        } else {
+                            Vec::new()
+                        };
+                        (pending.cleanup, retries)
+                    })
+                };
+                if cleanup {
+                    report.empty.push(self.mutation(id.clone()));
+                    return false;
+                }
+                let Ok(start) = u32::try_from(cursor.page) else {
+                    return false;
+                };
+                let inspect = |(page, row): (u32, PageRow<'_>)| {
+                    examined += 1;
+                    cursor.page = u64::from(page) + 1;
+                    report.checked += 1;
+                    let flags = row.state.load(Ordering::Acquire);
+                    let retry = retry(flags);
+                    report.retries += usize::from(retry.is_some());
+                    let idle = tti.is_some_and(|tti| expired(row.age(), now, tti));
+                    let retryable = retry.is_some_and(|reason| reason != 0 || tti.is_some());
+                    if (idle || retryable) && flags & (CLOSED | PINNED) == 0 {
+                        let block = self.mutation(id.clone());
+                        if let Some(candidate) = block.select(
+                            slot,
+                            page,
+                            row.state,
+                            if idle { 0 } else { retry.unwrap() },
+                            flags,
+                        ) {
+                            out.push(candidate);
+                        }
+                    }
+                    out.len() + report.empty.len() < delete_limit
+                };
+                let pages = rows.iter_from(start);
+                fn scan_pages<'a>(
+                    mut pages: impl Iterator<Item = (u32, PageRow<'a>)>,
+                    budget: usize,
+                    mut inspect: impl FnMut((u32, PageRow<'a>)) -> bool,
+                ) -> bool {
+                    for _ in 0..budget {
+                        let Some(page) = pages.next() else {
+                            return false;
+                        };
+                        if !inspect(page) {
+                            return true;
+                        }
+                    }
+                    pages.next().is_some()
+                }
+                if tti.is_some() {
+                    scan_pages(pages, budget, inspect)
+                } else {
+                    scan_pages(
+                        retries
+                            .into_iter()
+                            .filter_map(|page| Some((page, rows.get(page)?))),
+                        budget,
+                        inspect,
+                    )
+                }
+            };
+            let scanned = if tti.is_some() {
+                self.index.scan_page_slot(start_slot..ceiling, inspect_slot)
+            } else if start_slot < ceiling {
+                let slot = self
+                    .index
                     .page_work
                     .pending
                     .lock()
                     .unwrap()
-                    .range(cursor.slot..ceiling)
+                    .range(start_slot..ceiling)
                     .next()
-                    .map(|(&slot, _)| slot)
+                    .map(|(&slot, _)| slot);
+                slot.map(|slot| {
+                    let more = self
+                        .index
+                        .with_page_slot(slot, false, |id, rows| inspect_slot(slot, id, rows));
+                    (slot, more)
+                })
             } else {
                 None
             };
-            let Some(slot) = slot else {
+            let Some((slot, more)) = scanned else {
                 cursor.slot = 0;
                 cursor.page = 0;
                 cursor.ceiling = None;
                 report.completed = true;
                 break;
             };
-            if slot != cursor.slot {
-                cursor.slot = slot;
-                cursor.page = 0;
-            }
-            let mut examined = 0;
-            let budget = (limit - work).min(64);
-            let more = self
-                .index
-                .with_page_slot(slot, false, |id, rows| {
-                    let (cleanup, retries) = {
-                        let pending = self.index.page_work.pending.lock().unwrap();
-                        pending.get(&slot).map_or((false, Vec::new()), |pending| {
-                            let retries = if tti.is_none() {
-                                u32::try_from(cursor.page).ok().map_or(Vec::new(), |start| {
-                                    pending
-                                        .retries
-                                        .range(start..)
-                                        .copied()
-                                        .take(budget + 1)
-                                        .collect()
-                                })
-                            } else {
-                                Vec::new()
-                            };
-                            (pending.cleanup, retries)
-                        })
-                    };
-                    if cleanup {
-                        report.empty.push(self.mutation(id.clone()));
-                        return false;
-                    }
-                    let Ok(start) = u32::try_from(cursor.page) else {
-                        return false;
-                    };
-                    let inspect = |(page, row): (u32, PageRow<'_>)| {
-                        examined += 1;
-                        cursor.page = u64::from(page) + 1;
-                        report.checked += 1;
-                        let flags = row.state.load(Ordering::Acquire);
-                        let retry = retry(flags);
-                        report.retries += usize::from(retry.is_some());
-                        let idle = tti.is_some_and(|tti| expired(row.age(), now, tti));
-                        let retryable = retry.is_some_and(|reason| reason != 0 || tti.is_some());
-                        if (idle || retryable) && flags & (CLOSED | PINNED) == 0 {
-                            let block = self.mutation(id.clone());
-                            if let Some(candidate) = block.select(
-                                slot,
-                                page,
-                                row.state,
-                                if idle { 0 } else { retry.unwrap() },
-                                flags,
-                            ) {
-                                out.push(candidate);
-                            }
-                        }
-                        out.len() + report.empty.len() < delete_limit
-                    };
-                    let pages = rows.iter_from(start);
-                    fn scan_pages<'a>(
-                        mut pages: impl Iterator<Item = (u32, PageRow<'a>)>,
-                        budget: usize,
-                        mut inspect: impl FnMut((u32, PageRow<'a>)) -> bool,
-                    ) -> bool {
-                        for _ in 0..budget {
-                            let Some(page) = pages.next() else {
-                                return false;
-                            };
-                            if !inspect(page) {
-                                return true;
-                            }
-                        }
-                        pages.next().is_some()
-                    }
-                    if tti.is_some() {
-                        scan_pages(pages, budget, inspect)
-                    } else {
-                        scan_pages(
-                            retries
-                                .into_iter()
-                                .filter_map(|page| Some((page, rows.get(page)?))),
-                            budget,
-                            inspect,
-                        )
-                    }
-                })
-                .unwrap_or(false);
+            cursor.slot = slot;
             work += examined.max(1);
-            if !more {
+            if more != Some(true) {
                 cursor.slot += 1;
                 cursor.page = 0;
             }
