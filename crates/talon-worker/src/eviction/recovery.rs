@@ -9,8 +9,18 @@ pub(crate) struct RecoveredUnit {
 }
 
 impl Lru {
-    /// The input contains each resident unit exactly once. Sibling pages must
-    /// share their idle clock, just as they do after ordinary admission.
+    pub(crate) fn from_runtime(
+        index: Arc<crate::BlockIndex>,
+        units: Vec<RecoveredUnit>,
+        blocks: usize,
+        track_blocks: bool,
+    ) -> Self {
+        index.enable_compact_policy(track_blocks);
+        Self::from_recovered(index, units, blocks, track_blocks)
+    }
+
+    /// Restore explicit tokens for Small Store's legacy policy. Standalone
+    /// policy tests also exercise Whole and Page units through this path.
     pub(crate) fn from_recovered(
         index: Arc<crate::BlockIndex>,
         units: Vec<RecoveredUnit>,
@@ -30,7 +40,8 @@ impl Lru {
     #[cfg(test)]
     pub(crate) fn assert_empty_ordinary_policy(&self) {
         let inner = self.inner.lock().unwrap();
-        assert_eq!(inner.ordinary_units, 0);
+        assert_eq!(inner.legacy_units, 0);
+        assert_eq!(inner.index.compact.totals().1, 0);
         assert_eq!(inner.index.policy_scan_ceiling(), 0);
     }
 
@@ -53,8 +64,9 @@ impl Lru {
         track_blocks: bool,
     ) -> Self {
         let started = std::time::Instant::now();
-        for (revision, unit) in units.iter().enumerate() {
-            let revision = revision as u64;
+        for unit in &units {
+            let revision = index.compact.next_revision();
+            index.compact.admitted_at(revision);
             index.policy_insert(
                 &unit.unit,
                 PolicyEntry {
@@ -76,7 +88,7 @@ impl Lru {
             {
                 index.policy_block_insert(
                     unit.unit.block.clone(),
-                    BlockPolicy {
+                    LegacyBlockActivity {
                         pins: 0,
                         revision,
                         access: Some(unit.access.clock().clone()),
@@ -91,13 +103,11 @@ impl Lru {
         let lru = Self {
             inner: Mutex::new(Inner {
                 index,
-                ordinary_units: units.len(),
+                legacy_units: units.len(),
                 capacity_hand: (0, 0),
                 track_blocks,
                 track_small_clock: track_blocks,
-                total_bytes,
-                clock,
-                admission_ceiling: clock,
+                legacy_bytes: total_bytes,
                 small_cursor: 0,
                 small_first: false,
             }),
@@ -109,7 +119,8 @@ impl Lru {
         drop(units);
         tracing::info!(
             blocks,
-            units = clock,
+            legacy_units = clock,
+            resident_units = lru.inner.lock().unwrap().index.compact.totals().1,
             workers,
             elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
             temporary_drop_ms = drop_started.elapsed().as_secs_f64() * 1000.0,
@@ -181,7 +192,7 @@ mod tests {
                 let b = recovered.inner.lock().unwrap();
                 assert_eq!(b.index.policy_versioned_count(&first), 0);
                 assert_eq!(b.index.policy_versioned_count(&second), 0);
-                assert_eq!(a.total_bytes, b.total_bytes);
+                assert_eq!(a.legacy_bytes, b.legacy_bytes);
             }
             assert!(recovered.superseded_candidates(&second).is_empty());
             assert_eq!(recovered.block_candidates(&first).len(), 1);
@@ -225,9 +236,12 @@ mod tests {
             {
                 let a = ordinary.inner.lock().unwrap();
                 let b = recovered.inner.lock().unwrap();
-                assert_eq!(a.ordinary_units, b.ordinary_units);
-                assert_eq!(a.admission_ceiling, b.admission_ceiling);
-                assert_eq!(a.total_bytes, b.total_bytes);
+                assert_eq!(a.legacy_units, b.legacy_units);
+                assert_eq!(
+                    a.index.compact.admission_ceiling(),
+                    b.index.compact.admission_ceiling()
+                );
+                assert_eq!(a.legacy_bytes, b.legacy_bytes);
                 for (unit, _) in &input {
                     let entry = a.index.policy_get(unit).unwrap();
                     let restored = b.index.policy_get(unit).unwrap();
@@ -236,7 +250,7 @@ mod tests {
                         (restored.bytes, restored.revision, restored.pins)
                     );
                     let activity = b.index.policy_block_get(unit.block()).unwrap();
-                    assert!(Arc::ptr_eq(restored.access.clock(), &activity.access));
+                    assert_eq!(restored.access.last_access(), activity.last_access);
                 }
             }
             for lru in [&ordinary, &recovered] {

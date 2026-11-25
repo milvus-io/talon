@@ -260,7 +260,7 @@ impl WorkerRuntime {
     ) -> Self {
         let lru_started = Instant::now();
         index.prepare_runtime_recovery();
-        let mut units = index.restore_policy_units(track_blocks);
+        let mut units = Vec::new();
         let mut blocks = index.len();
         if let Some(small) = &small {
             let track_small_blocks = track_blocks && !compact_small_recency;
@@ -272,7 +272,7 @@ impl WorkerRuntime {
                 small.init_recency();
             }
         }
-        let lru = Arc::new(Lru::from_recovered(
+        let lru = Arc::new(Lru::from_runtime(
             index.clone(),
             units,
             blocks,
@@ -2017,8 +2017,6 @@ impl WorkerRuntime {
                             .index
                             .mark_page_allocated_at(&id, page, allocated, disk_id);
                         let unit = CacheUnit::Page(id.clone(), page);
-                        let access = runtime.lru.insert(unit.clone(), allocated);
-                        runtime.index.set_access(&unit, access);
                         if !warm_only && runtime.l1.is_enabled() {
                             runtime.admit_l1_page(&id, page, bytes.into_bytes());
                         }
@@ -2284,7 +2282,6 @@ impl WorkerRuntime {
         if self.index.whole_and_touch(block) == Some(disk_id) {
             self.invalidate_l1(block);
             self.index.remove(block);
-            self.lru.remove(&CacheUnit::Whole(block.clone()));
             tracing::debug!(%block, "discarded stale L2 index entry after file miss");
         }
         drop(gate);
@@ -2537,8 +2534,6 @@ impl WorkerRuntime {
                                 Some(disk_id),
                                 [(None, allocated)],
                             );
-                            let access = runtime.lru.insert(unit.clone(), allocated);
-                            runtime.index.set_access(&unit, access);
                         }
                         talon_telemetry::record("talon.cache.committed_bytes", len);
                         // Pin before releasing the gate used by candidate validation.

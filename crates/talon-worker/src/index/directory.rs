@@ -2,6 +2,7 @@ use super::DirectoryEntry;
 use crate::block_key::{BlockIdentity, BlockKey};
 use crate::small_store::lookup::Lookup;
 use std::hash::{BuildHasher, RandomState};
+use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(test)]
 use talon_core::BlockId;
 
@@ -18,6 +19,7 @@ pub(super) struct Directory {
     lookup: Lookup,
     hash: RandomState,
     slots: Vec<Slot>,
+    clocks: Option<Vec<AtomicU64>>,
     free: Vec<u32>,
 }
 
@@ -32,6 +34,19 @@ impl Directory {
         self.lookup.find(self.hash(id), |handle, _| {
             self.slots[handle as usize - 1].key.as_ref().unwrap().view() == view
         })
+    }
+
+    pub fn position(&self, id: &dyn BlockIdentity) -> Option<usize> {
+        Some(self.lookup.handle(self.find(id)?) as usize - 1)
+    }
+
+    /// A clock is addressed only while the directory protects its slot.
+    pub fn clock(&self, slot: usize) -> Option<&AtomicU64> {
+        Some(&self.clocks.as_ref()?[slot])
+    }
+
+    pub fn reset_clocks(&mut self, enabled: bool) {
+        self.clocks = enabled.then(|| (0..self.slots.len()).map(|_| AtomicU64::new(0)).collect());
     }
 
     pub fn len(&self) -> usize {
@@ -51,8 +66,11 @@ impl Directory {
                 self.hash.hash_one((id.object, id.offset, id.block_size)) as u32
             });
         }
-        self.slots
-            .reserve(additional.saturating_sub(self.free.len()));
+        let new_slots = additional.saturating_sub(self.free.len());
+        self.slots.reserve(new_slots);
+        if let Some(clocks) = &mut self.clocks {
+            clocks.reserve(new_slots);
+        }
     }
 
     pub fn get(&self, id: &dyn BlockIdentity) -> Option<&DirectoryEntry> {
@@ -78,6 +96,9 @@ impl Directory {
                         .expect("block directory handle exhausted");
                     assert!(handle < u32::MAX);
                     self.slots.push(Slot::default());
+                    if let Some(clocks) = &mut self.clocks {
+                        clocks.push(AtomicU64::new(0));
+                    }
                     handle
                 });
                 self.lookup.insert(self.hash(&id), handle, 0);
@@ -94,6 +115,9 @@ impl Directory {
         let handle = self.lookup.handle(i);
         self.lookup.remove(i);
         self.free.push(handle);
+        if let Some(clock) = self.clock(handle as usize - 1) {
+            clock.store(0, Ordering::Relaxed);
+        }
         Some(std::mem::take(&mut self.slots[handle as usize - 1]).entry)
     }
 
@@ -172,18 +196,18 @@ mod tests {
         };
         let mut directory = Directory::default();
         for n in 0..100 {
-            directory.get_or_insert(id(n)).1.policy.len = n;
+            directory.get_or_insert(id(n)).1.legacy_mut().small = if n % 3 == 0 { 1 } else { 0 };
         }
         let canonical = directory.get_key_value(&id(30)).unwrap().0.clone();
         let replacement = directory.get_or_insert(id(30)).0;
         assert!(canonical.ptr_eq(&replacement));
         for n in (0..100).step_by(2) {
-            assert_eq!(directory.remove(&id(n)).unwrap().policy.len, n);
+            assert!(directory.remove(&id(n)).is_some());
         }
-        directory.retain(|_, entry| entry.policy.len % 3 != 0);
+        directory.retain(|_, entry| entry.legacy.as_ref().unwrap().small == 0);
         let retained: Vec<_> = directory
             .iter()
-            .map(|(id, entry)| (id.clone(), entry.policy.len))
+            .map(|(id, entry)| (id.clone(), entry.legacy.as_ref().unwrap().small))
             .collect();
         let free = directory.slots.len() - directory.len();
         for n in 100..100 + free {
@@ -192,11 +216,14 @@ mod tests {
                 entry.is_empty(),
                 "reused slots must not inherit prior state"
             );
-            entry.policy.len = n;
+            entry.legacy_mut().small = (n % 2) as u8;
         }
         assert_eq!(directory.slots.len(), 100);
         for (id, value) in retained {
-            assert_eq!(directory.get(&id).unwrap().policy.len, value);
+            assert_eq!(
+                directory.get(&id).unwrap().legacy.as_ref().unwrap().small,
+                value
+            );
         }
         directory.retain(|_, _| false);
         assert!(directory.is_empty());

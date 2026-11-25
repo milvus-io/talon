@@ -295,13 +295,14 @@ impl WorkerRuntime {
         candidate: GcCandidate,
         reason: usize,
     ) -> Option<u64> {
-        self.evict_page_candidate_to_target(candidate, reason, self.capacity_bytes)
+        self.evict_page_candidate_to_target(candidate, None, reason, self.capacity_bytes)
             .await
     }
 
     async fn evict_page_candidate_to_target(
         &self,
         candidate: GcCandidate,
+        capacity: Option<crate::eviction::EvictionCandidate>,
         reason: usize,
         target: u64,
     ) -> Option<u64> {
@@ -313,6 +314,9 @@ impl WorkerRuntime {
             let _background_io = runtime.background_io().await;
             let block = &candidate.block;
             let _gate = block.lock().await;
+            if capacity.as_ref().is_some_and(|ticket| !runtime.lru.candidate_is_current(ticket)) {
+                return None;
+            }
             if reason == 1 && (runtime.capacity_bytes == 0 || runtime.resident_bytes() <= target) { return None; }
             let age = runtime.current_tti_ms();
             if reason == 0 && age == 0 { return None; }
@@ -331,7 +335,6 @@ impl WorkerRuntime {
             #[cfg(test)]
             crate::page_access_store::crash_barrier("last_page_unlink").unwrap();
             runtime.index.clear_page(id, page);
-            runtime.lru.remove(&CacheUnit::Page(id.clone(), page));
             block.finish(&candidate, runtime.page_clock.now());
             runtime.metrics.record_eviction(); runtime.refresh_l1_metrics();
             runtime.page_gc_metrics.deleted[reason].inc(); runtime.page_gc_metrics.bytes[reason].add(bytes);
@@ -630,10 +633,8 @@ impl WorkerRuntime {
                 };
                 match unit.unit.clone() {
                     CacheUnit::Page(_, _) => {
-                        if self.lru.candidate_is_current(&unit) {
-                            if let Some(c) = candidate {
-                                self.evict_page_candidate_to_target(c, reason, target).await;
-                            }
+                        if let Some(c) = candidate {
+                            self.evict_page_candidate_to_target(c, Some(unit), reason, target).await;
                         }
                     }
                     CacheUnit::ExactRange(id) => {
