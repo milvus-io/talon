@@ -1,11 +1,13 @@
 //! Snapshot-friendly slabs for durable file residency.
 use super::DiskId;
 use crate::block_key::{BlockIdentity, BlockKey};
+use crate::eviction::UnitKind;
 use crate::page_lifecycle::{PageAge, PageRow, PageWord};
 use crate::small_store::lookup::Lookup;
 use std::collections::HashMap;
 use std::hash::{BuildHasher, RandomState};
 use std::sync::Arc;
+use talon_core::PageIndex;
 
 const SLAB_ROWS: usize = 256;
 const SECTOR: u64 = 512;
@@ -51,35 +53,62 @@ enum Pages {
     Whole {
         len: u32,
         sectors: u32,
+        state: PageWord,
     },
-    WholeWide(Arc<(u32, u64)>),
+    WholeWide(Arc<(u32, u64, PageWord)>),
     Inline {
         len: u32,
-        index: u32,
-        bytes: u64,
+        page: InlinePage,
         state: PageWord,
-        age: PageAge,
     },
     Multiple(Arc<SharedPages>),
 }
 
 #[derive(Clone, Copy)]
+struct InlinePage(u32);
+
+impl InlinePage {
+    const SECTOR_BITS: u32 = 20;
+    const SECTOR_MASK: u32 = (1 << Self::SECTOR_BITS) - 1;
+
+    fn new(index: u32, bytes: u64) -> Option<Self> {
+        let page = CompactPage::new(index, bytes)?;
+        let sectors = page.sectors();
+        (index <= u32::MAX >> Self::SECTOR_BITS && sectors <= Self::SECTOR_MASK)
+            .then(|| Self((index << Self::SECTOR_BITS) | sectors))
+    }
+
+    fn index(self) -> u32 {
+        self.0 >> Self::SECTOR_BITS
+    }
+
+    fn unpack(self) -> (u32, u64) {
+        (self.index(), u64::from(self.0 & Self::SECTOR_MASK) * SECTOR)
+    }
+}
+
+#[derive(Clone, Copy)]
 struct CompactPage {
-    index: u32,
-    sectors: u32,
+    index: u16,
+    sectors: [u16; 2],
 }
 
 impl CompactPage {
     fn new(index: u32, bytes: u64) -> Option<Self> {
         (bytes % SECTOR == 0).then_some(())?;
+        let sectors = u32::try_from(bytes / SECTOR).ok()?;
         Some(Self {
-            index,
-            sectors: u32::try_from(bytes / SECTOR).ok()?,
+            index: u16::try_from(index).ok()?,
+            sectors: [sectors as u16, (sectors >> 16) as u16],
         })
     }
 
+    fn sectors(self) -> u32 {
+        u32::from(self.sectors[0]) | (u32::from(self.sectors[1]) << 16)
+    }
+
     fn unpack(self) -> (u32, u64) {
-        (self.index, u64::from(self.sectors) * SECTOR)
+        (u32::from(self.index), u64::from(self.sectors()) * SECTOR)
     }
 }
 
@@ -102,7 +131,7 @@ enum PageRows {
 impl PageRows {
     fn position(&self, index: u32) -> Result<usize, usize> {
         match self {
-            Self::Compact(rows) => rows.binary_search_by_key(&index, |page| page.index),
+            Self::Compact(rows) => rows.binary_search_by_key(&index, |page| u32::from(page.index)),
             Self::Wide(rows) => rows.binary_search_by_key(&index, |page| page.0),
         }
     }
@@ -171,16 +200,26 @@ impl Geometry {
             StoreKind::Whole => match CompactPage::new(0, bytes) {
                 Some(page) => Pages::Whole {
                     len,
-                    sectors: page.sectors,
+                    sectors: page.sectors(),
+                    state: PageWord::default(),
                 },
-                None => Pages::WholeWide(Arc::new((len, bytes))),
+                None => Pages::WholeWide(Arc::new((len, bytes, PageWord::default()))),
             },
-            StoreKind::Paged => Pages::Inline {
-                len,
-                index,
-                bytes,
-                state: PageWord::default(),
-                age: PageAge::untracked(),
+            StoreKind::Paged => match InlinePage::new(index, bytes) {
+                Some(page) => Pages::Inline {
+                    len,
+                    page,
+                    state: PageWord::default(),
+                },
+                None => Pages::Multiple(Arc::new(SharedPages {
+                    len,
+                    rows: match CompactPage::new(index, bytes) {
+                        Some(page) => PageRows::Compact(vec![page]),
+                        None => PageRows::Wide(vec![(index, bytes)]),
+                    },
+                    states: vec![PageWord::default()],
+                    ages: Vec::new(),
+                })),
             },
         };
         Self { disk_id, pages }
@@ -219,12 +258,15 @@ impl Geometry {
                 None,
             ),
             Pages::WholeWide(pair) => (after.is_none().then_some((0, pair.1)), None),
-            Pages::Inline { index, bytes, .. } => (
-                after
-                    .map_or(true, |last| *index > last)
-                    .then_some((*index, *bytes)),
-                None,
-            ),
+            Pages::Inline { page, .. } => {
+                let (index, bytes) = page.unpack();
+                (
+                    after
+                        .is_none_or(|last| index > last)
+                        .then_some((index, bytes)),
+                    None,
+                )
+            }
             Pages::Multiple(pages) => (None, Some(pages)),
         };
         one.into_iter()
@@ -241,7 +283,7 @@ impl Geometry {
         match &self.pages {
             Pages::Empty => unreachable!("empty block has no last page"),
             Pages::Whole { .. } | Pages::WholeWide(_) => 0,
-            Pages::Inline { index, .. } => *index,
+            Pages::Inline { page, .. } => page.index(),
             Pages::Multiple(pages) => pages.rows.at(pages.states.len() - 1).0,
         }
     }
@@ -252,13 +294,42 @@ impl Geometry {
             .and_then(|(index, bytes)| (index == page).then_some(bytes))
     }
 
-    pub(crate) fn page_row(&self, page: u32) -> Option<PageRow<'_>> {
+    pub(crate) fn policy_state(&self, kind: UnitKind) -> Option<&PageWord> {
+        match (kind, &self.pages) {
+            (UnitKind::Whole, Pages::Whole { state, .. }) => Some(state),
+            (UnitKind::Whole, Pages::WholeWide(value)) => Some(&value.2),
+            (UnitKind::Page(page), _) => self.page_row(page.0, None).map(|row| row.state),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn policy_units_from(
+        &self,
+        start: u64,
+    ) -> impl Iterator<Item = (UnitKind, u64)> + '_ {
+        let whole = (start == 0 && self.kind() == Some(StoreKind::Whole))
+            .then(|| (UnitKind::Whole, self.allocation(0).unwrap()));
+        let first_page = u32::try_from(start.saturating_sub(2)).ok();
+        let pages = first_page.filter(|_| self.kind() == Some(StoreKind::Paged));
+        whole.into_iter().chain(pages.into_iter().flat_map(|page| {
+            self.pages_after(page.checked_sub(1))
+                .map(|(page, bytes)| (UnitKind::Page(PageIndex(page)), bytes))
+        }))
+    }
+
+    pub(crate) fn page_row<'a>(
+        &'a self,
+        page: u32,
+        inline_age: Option<&'a PageAge>,
+    ) -> Option<PageRow<'a>> {
         match &self.pages {
             Pages::Inline {
-                index, state, age, ..
-            } if *index == page => Some(PageRow {
+                page: resident,
                 state,
-                age: Some(age),
+                ..
+            } if resident.index() == page => Some(PageRow {
+                state,
+                age: inline_age,
             }),
             Pages::Multiple(pages) => {
                 let at = pages.rows.position(page).ok()?;
@@ -271,16 +342,18 @@ impl Geometry {
         }
     }
 
-    pub(crate) fn page_rows_from(&self, start: u32) -> impl Iterator<Item = (u32, PageRow<'_>)> {
+    pub(crate) fn page_rows_from<'a>(
+        &'a self,
+        start: u32,
+        inline_age: Option<&'a PageAge>,
+    ) -> impl Iterator<Item = (u32, PageRow<'a>)> {
         let (one, many) = match &self.pages {
-            Pages::Inline {
-                index, state, age, ..
-            } if *index >= start => (
+            Pages::Inline { page, state, .. } if page.index() >= start => (
                 Some((
-                    *index,
+                    page.index(),
                     PageRow {
                         state,
-                        age: Some(age),
+                        age: inline_age,
                     },
                 )),
                 None,
@@ -305,7 +378,6 @@ impl Geometry {
 
     pub(crate) fn enable_page_ages(&mut self) {
         match &mut self.pages {
-            Pages::Inline { age, .. } => age.enable(),
             Pages::Multiple(pages) if pages.ages.is_empty() => {
                 let pages = Arc::make_mut(pages);
                 pages.ages = (0..pages.states.len())
@@ -318,10 +390,7 @@ impl Geometry {
 
     pub(crate) fn reset_page_states(&mut self) {
         match &mut self.pages {
-            Pages::Inline { state, age, .. } => {
-                *state = PageWord::default();
-                *age = PageAge::untracked();
-            }
+            Pages::Inline { state, .. } => *state = PageWord::default(),
             Pages::Multiple(pages) => {
                 let pages = Arc::make_mut(pages);
                 pages.states.fill_with(PageWord::default);
@@ -331,34 +400,28 @@ impl Geometry {
         }
     }
 
-    pub fn put(&mut self, len: u64, index: u32, bytes: u64) {
+    pub fn put(&mut self, len: u64, index: u32, bytes: u64, inline_age: Option<&PageAge>) {
         let len = u32::try_from(len).expect("validated block length");
         if let Pages::Inline {
             len: old_len,
-            index: old,
-            bytes: old_bytes,
+            page,
             state,
-            age,
         } = &mut self.pages
         {
-            if *old == index {
-                *old_len = len;
-                *old_bytes = bytes;
-                return;
+            if page.index() == index {
+                if let Some(replacement) = InlinePage::new(index, bytes) {
+                    *old_len = len;
+                    *page = replacement;
+                    return;
+                }
             }
-            let rows = match CompactPage::new(*old, *old_bytes) {
-                Some(page) => PageRows::Compact(start_pair(page)),
-                None => PageRows::Wide(start_pair((*old, *old_bytes))),
-            };
+            let (old_index, old_bytes) = page.unpack();
+            let old = CompactPage::new(old_index, old_bytes).expect("inline page fits compact row");
             self.pages = Pages::Multiple(Arc::new(SharedPages {
                 len,
-                rows,
+                rows: PageRows::Compact(start_pair(old)),
                 states: start_pair(std::mem::take(state)),
-                ages: if age.tracked() {
-                    start_pair(age.clone())
-                } else {
-                    Vec::new()
-                },
+                ages: inline_age.map_or_else(Vec::new, |age| start_pair(age.clone())),
             }));
         }
         let Pages::Multiple(pages) = &mut self.pages else {
@@ -377,9 +440,9 @@ impl Geometry {
     }
 
     /// Return true when the block has no remaining pages.
-    pub fn remove_page(&mut self, index: u32) -> bool {
-        if let Pages::Inline { index: page, .. } = self.pages {
-            return page == index;
+    pub fn remove_page(&mut self, index: u32, inline_age: Option<&mut PageAge>) -> bool {
+        if let Pages::Inline { page, .. } = self.pages {
+            return page.index() == index;
         }
         let Pages::Multiple(pages) = &mut self.pages else {
             unreachable!()
@@ -388,6 +451,9 @@ impl Geometry {
         let Ok(at) = pages.rows.position(index) else {
             return false;
         };
+        if pages.states.len() == 1 {
+            return true;
+        }
         pages.rows.remove(at);
         remove_row(&mut pages.states, at);
         if !pages.ages.is_empty() {
@@ -395,13 +461,16 @@ impl Geometry {
         }
         if pages.states.len() == 1 {
             let (index, bytes) = pages.rows.at(0);
-            self.pages = Pages::Inline {
-                len: pages.len,
-                index,
-                bytes,
-                state: pages.states.pop().unwrap(),
-                age: pages.ages.pop().unwrap_or_else(PageAge::untracked),
-            };
+            if let Some(page) = InlinePage::new(index, bytes) {
+                if let Some(inline_age) = inline_age {
+                    *inline_age = pages.ages.pop().unwrap_or_else(PageAge::unknown);
+                }
+                self.pages = Pages::Inline {
+                    len: pages.len,
+                    page,
+                    state: pages.states.pop().unwrap(),
+                };
+            }
         }
         false
     }
@@ -452,6 +521,7 @@ impl BlockRows {
         self.find(id).map(|slot| self.lookup.handle(slot))
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.lookup.len()
     }
@@ -639,10 +709,10 @@ mod tests {
 
     #[test]
     fn inline_layout_and_sparse_wide_page_roundtrip() {
-        assert_eq!(size_of::<BlockRow>(), 56);
-        assert_eq!(size_of::<Option<BlockRow>>(), 56);
-        assert_eq!(size_of::<PageWord>(), 8);
-        assert_eq!(size_of::<CompactPage>(), 8);
+        assert_eq!(size_of::<BlockRow>(), 40);
+        assert_eq!(size_of::<Option<BlockRow>>(), 40);
+        assert_eq!(size_of::<PageWord>(), 4);
+        assert_eq!(size_of::<CompactPage>(), 6);
         let id = BlockKey::new(&BlockId::new(
             ObjectId::new(Backend::S3, "bucket", "object"),
             0,
@@ -657,8 +727,8 @@ mod tests {
         );
         let frozen = rows.slabs().next().unwrap();
         let row = rows.geometry_mut(handle, StoreKind::Paged).unwrap();
-        row.put(u64::from(u32::MAX), 1 << 20, 4096);
-        row.put(u64::from(u32::MAX), 3, u64::MAX);
+        row.put(u64::from(u32::MAX), 1 << 20, 4096, None);
+        row.put(u64::from(u32::MAX), 3, u64::MAX, None);
         assert!(row
             .pages_after(None)
             .eq([(1, 512), (3, u64::MAX), (1 << 20, 4096)]));
@@ -668,10 +738,10 @@ mod tests {
             .geometry
             .pages_after(None)
             .eq([(1, 512)]));
-        row.remove_page(3);
-        row.remove_page(1);
+        row.remove_page(3, None);
+        row.remove_page(1 << 20, None);
         assert!(matches!(row.pages, Pages::Inline { .. }));
-        assert!(row.remove_page(1 << 20));
+        assert!(row.remove_page(1, None));
         rows.clear(handle, StoreKind::Paged);
         rows.release(&id);
         assert!(rows.handle(&id).is_none());

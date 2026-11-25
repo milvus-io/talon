@@ -157,8 +157,7 @@ fn scenario(count: usize, pages: u32, tracked: bool, checkpoint: bool) {
     let after_owner = Snapshot::now();
     after_owner.report("fixed_index_owner_per_scope", 1, before_owner);
     let lru = measure("capacity_policy", count, || {
-        let units = index.restore_policy_units(tracked);
-        Lru::from_recovered(index.clone(), units, count, tracked)
+        Lru::from_runtime(index.clone(), Vec::new(), count, tracked)
     });
     let before_lifecycle = Snapshot::now();
     let lifecycle = measure("fixed_lifecycle_per_scope", 1, || {
@@ -184,6 +183,7 @@ fn scenario(count: usize, pages: u32, tracked: bool, checkpoint: bool) {
         requested as f64 / count as f64,
         usable as f64 / count as f64
     );
+    catalog.live.directory.read().unwrap().memory_probe_components();
     assert_eq!(index.len(), count);
     assert_eq!(index.page_count(), count as u64 * u64::from(pages));
     assert_eq!(
@@ -192,12 +192,19 @@ fn scenario(count: usize, pages: u32, tracked: bool, checkpoint: bool) {
     );
     if pages != 0 {
         let id = identity(0);
+        let before_read = Snapshot::now();
         let (_, first, tail) = index
             .page_reads_and_touch_at(&id, talon_core::PageIndex(0), talon_core::PageIndex(pages))
             .unwrap();
         assert_eq!(tail.len(), (pages - 1) as usize);
+        Snapshot::now().report("range_while_pinned", 1, before_read);
+        drop((first, tail));
+        Snapshot::now().report("range_after_pin_release", 1, before_read);
+
+        let (_, first, _) = index
+            .page_reads_and_touch_at(&id, talon_core::PageIndex(0), talon_core::PageIndex(1))
+            .unwrap();
         first.record_access_and_release(checkpoint.then_some(100));
-        drop(tail);
         assert_eq!(lifecycle.block(&id).last_access(0), checkpoint.then_some(100));
     }
     std::hint::black_box((&catalog, &index, &lru, &lifecycle));

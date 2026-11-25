@@ -499,7 +499,7 @@ impl Machine for State {
                         return Err(invalid("invalid/duplicate snapshot page chunk"));
                     }
                     for (page, bytes) in block.pages {
-                        previous.put(block.len, page, bytes);
+                        previous.put(block.len, page, bytes, None);
                     }
                 } else {
                     if rows
@@ -513,7 +513,7 @@ impl Machine for State {
                     let (first, bytes) = pages.next().unwrap();
                     let mut geometry = Geometry::new(kind, block.disk_id, block.len, first, bytes);
                     for (page, bytes) in pages {
-                        geometry.put(block.len, page, bytes);
+                        geometry.put(block.len, page, bytes, None);
                     }
                     let handle = rows.get_or_insert(block.id);
                     rows.put(handle, geometry);

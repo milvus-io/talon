@@ -151,6 +151,7 @@ impl<V> PageMap<V> {
             .chain(few.into_iter().flatten().map(|(k, v)| (k, v)))
             .chain(many.into_iter().flatten())
     }
+    #[cfg(test)]
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (&u32, &mut V)> {
         let (one, few, many) = match self {
             Self::One(one) => (one.as_mut().map(|(k, v)| (&*k, v)), None, None),
@@ -161,6 +162,7 @@ impl<V> PageMap<V> {
             .chain(few.into_iter().flatten().map(|(k, v)| (&*k, v)))
             .chain(many.into_iter().flatten())
     }
+
     pub fn range(&self, range: impl RangeBounds<u32>) -> impl Iterator<Item = (&u32, &V)> {
         use std::ops::Bound::{Excluded, Included, Unbounded};
         let bounds = (range.start_bound().cloned(), range.end_bound().cloned());

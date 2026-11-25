@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use talon_core::Version;
 use talon_core::{BlockId, PageIndex};
 
+pub(crate) mod compact;
 mod recovery;
 pub(crate) use recovery::RecoveredUnit;
 
@@ -50,6 +51,24 @@ pub(crate) enum UnitKind {
     Whole,
     ExactRange,
     Page(PageIndex),
+}
+
+impl UnitKind {
+    pub(crate) fn order(self) -> u64 {
+        match self {
+            Self::Whole => 0,
+            Self::ExactRange => 1,
+            Self::Page(page) => u64::from(page.0) + 2,
+        }
+    }
+
+    pub(crate) fn from_order(order: u64) -> Self {
+        match order {
+            0 => Self::Whole,
+            1 => Self::ExactRange,
+            _ => Self::Page(PageIndex((order - 2) as u32)),
+        }
+    }
 }
 
 pub(crate) trait UnitKey {
@@ -223,6 +242,16 @@ impl AccessHandle {
             Access::Small(small, ..) => small.retire(),
         }
     }
+    fn same_admission(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (Access::Small(a, ..), Access::Small(b, ..)) => Arc::ptr_eq(a, b),
+            (
+                Access::Page(a, _, ga) | Access::Tracked(a, _, ga),
+                Access::Page(b, _, gb) | Access::Tracked(b, _, gb),
+            ) => ga == gb && Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
     fn referenced(&self) -> bool {
         match &self.0 {
             Access::Page(state, _, generation) | Access::Tracked(state, _, generation) => {
@@ -333,6 +362,7 @@ pub(crate) struct EvictionCandidate {
     pub unit: CacheUnit,
     pub(crate) revision: u64,
     pub(crate) small: Option<Arc<crate::small_store::policy::SmallAccess>>,
+    pub(crate) compact: Option<Arc<compact::Selection>>,
 }
 
 /// One complete resident block, independent of its whole/paged representation.
@@ -351,7 +381,7 @@ impl StaleBlockCandidate {
 }
 
 #[derive(Default)]
-pub(crate) struct BlockPolicy {
+pub(crate) struct LegacyBlockActivity {
     pins: usize,
     revision: u64,
     pub(crate) access: Option<Arc<AtomicU64>>,
@@ -359,9 +389,9 @@ pub(crate) struct BlockPolicy {
 
 pub(crate) struct BlockActivity {
     pub units: usize,
-    pins: usize,
-    revision: u64,
-    access: Arc<AtomicU64>,
+    pub(crate) pins: usize,
+    pub(crate) revision: u64,
+    pub(crate) last_access: u64,
 }
 
 impl BlockActivity {
@@ -370,18 +400,18 @@ impl BlockActivity {
             block,
             units: self.units,
             revision: self.revision,
-            last_access: self.access.load(Ordering::Relaxed),
+            last_access: self.last_access,
         }
     }
 }
 
-impl BlockPolicy {
+impl LegacyBlockActivity {
     pub(crate) fn snapshot(&self, units: usize) -> Option<BlockActivity> {
         Some(BlockActivity {
             units,
             pins: self.pins,
             revision: self.revision,
-            access: self.access.as_ref()?.clone(),
+            last_access: self.access.as_ref()?.load(Ordering::Relaxed),
         })
     }
 }
@@ -398,55 +428,6 @@ pub(crate) struct PolicyState {
 pub(crate) struct PolicyEntry {
     pub state: PolicyState,
     pub access: AccessHandle,
-}
-
-#[derive(Default)]
-pub(crate) struct PageAccessSlot {
-    state: Option<Arc<OrdinaryReference>>,
-    clock: Option<Arc<AtomicU64>>,
-    // Policy generations are even; the low bit records residency independently.
-    generation_and_resident: u64,
-}
-
-impl PageAccessSlot {
-    pub(crate) fn is_none(&self) -> bool {
-        self.state.is_none()
-    }
-    pub(crate) fn resident(&self) -> bool {
-        self.generation_and_resident & 1 != 0
-    }
-    pub(crate) fn set_resident(&mut self, resident: bool) -> bool {
-        let old = self.resident();
-        self.generation_and_resident = (self.generation_and_resident & !1) | u64::from(resident);
-        old
-    }
-    pub(crate) fn set(&mut self, access: AccessHandle) {
-        let Access::Page(state, clock, generation) = access.0 else {
-            unreachable!("paged entries require a page access token")
-        };
-        debug_assert_eq!(generation & 1, 0);
-        self.generation_and_resident = generation | (self.generation_and_resident & 1);
-        self.state = Some(state);
-        self.clock = clock;
-    }
-    pub(crate) fn clear(&mut self) {
-        self.state = None;
-        self.clock = None;
-        self.generation_and_resident &= 1;
-    }
-    pub(crate) fn get(&self) -> Option<AccessHandle> {
-        Some(AccessHandle(Access::Page(
-            self.state.as_ref()?.clone(),
-            self.clock.clone(),
-            self.generation_and_resident & !1,
-        )))
-    }
-    pub(crate) fn touch(&self) -> Option<()> {
-        let state = self.state.as_ref()?;
-        touch_clock(self.clock.as_ref());
-        state.reference(self.generation_and_resident & !1);
-        Some(())
-    }
 }
 
 fn touch_clock(clock: Option<&Arc<AtomicU64>>) {
@@ -475,71 +456,116 @@ pub struct Lru {
 }
 
 /// A cancellation-safe capacity-policy pin.
-pub struct LruPin {
-    lru: Arc<Lru>,
-    unit: CacheUnit,
+pub struct LruPin(PinOwner);
+
+enum PinOwner {
+    Compact {
+        _pin: compact::Pin,
+    },
+    Legacy {
+        lru: Arc<Lru>,
+        unit: CacheUnit,
+        access: AccessHandle,
+    },
 }
+
 impl Drop for LruPin {
     fn drop(&mut self) {
-        self.lru.unpin(&self.unit);
+        if let PinOwner::Legacy { lru, unit, access } = &self.0 {
+            let g = lru.inner.lock().unwrap();
+            if g.index
+                .policy_get(unit)
+                .is_some_and(|entry| access.same_admission(&entry.access))
+            {
+                g.unpin_legacy(unit);
+            }
+        }
     }
 }
 
 struct Inner {
     index: Arc<crate::BlockIndex>,
-    ordinary_units: usize,
+    legacy_units: usize,
     capacity_hand: (usize, u64),
     track_blocks: bool,
     track_small_clock: bool,
-    total_bytes: u64,
-    clock: u64,
-    // Unlike clock, this does not advance for capacity-policy rotations or reads.
-    admission_ceiling: u64,
+    legacy_bytes: u64,
     small_cursor: usize,
     small_first: bool,
 }
 
 impl Inner {
-    fn next_revision(&mut self) -> u64 {
-        let revision = self.clock;
-        self.clock = self
-            .clock
-            .checked_add(1)
-            .expect("eviction sequence exhausted");
-        revision
+    fn total_bytes(&self) -> u64 {
+        self.legacy_bytes + self.index.compact.totals().0 + self.index.compact_small_totals().0
     }
 
-    fn snapshot(&mut self, unit: CacheUnit) -> EvictionCandidate {
-        let access = self
-            .index
-            .policy_get(&unit)
-            .expect("tracked cache unit")
-            .access;
+    fn snapshot(&mut self, unit: CacheUnit) -> Option<EvictionCandidate> {
+        self.select(unit, true)
+    }
+
+    fn select(&mut self, unit: CacheUnit, force: bool) -> Option<EvictionCandidate> {
+        if let Some(selected) = self.index.compact_select(&unit, force) {
+            return selected.map(|(_, ticket)| EvictionCandidate {
+                unit,
+                revision: 0,
+                small: None,
+                compact: Some(ticket),
+            });
+        }
+        let access = self.index.policy_get(&unit)?.access;
         if let Some(ticket) = access.small() {
-            return EvictionCandidate {
+            return Some(EvictionCandidate {
                 revision: ticket.snapshot(),
                 unit,
                 small: Some(ticket.clone()),
-            };
+                compact: None,
+            });
         }
-        access.take_reference();
-        let revision = self.next_revision();
+        self.select_legacy(unit, access, force)
+    }
+
+    fn select_legacy(
+        &self,
+        unit: CacheUnit,
+        access: AccessHandle,
+        force: bool,
+    ) -> Option<EvictionCandidate> {
+        let referenced = access.take_reference();
+        let revision = self.index.compact.next_revision();
         self.index
             .policy_update(&unit, |entry| entry.revision = revision);
-        EvictionCandidate {
+        (force || !referenced).then_some(EvictionCandidate {
             unit,
             revision,
             small: None,
+            compact: None,
+        })
+    }
+
+    fn unpin_legacy(&self, unit: &CacheUnit) {
+        let release = self.index.policy_update(unit, |e| {
+            if e.pins == 0 {
+                return false;
+            }
+            e.pins -= 1;
+            true
+        });
+        if release.is_some_and(|(released, tracked)| released && tracked) {
+            self.index
+                .policy_block_update(unit.block(), |activity| activity.pins -= 1);
         }
     }
 
     /// Remove membership and accounting under the policy lock.
     fn remove(&mut self, unit: &CacheUnit) -> Option<u64> {
+        if let Some(bytes) = self.index.compact_remove(unit) {
+            return Some(bytes);
+        }
         let entry = self.index.policy_remove(unit)?;
         if entry.access.small().is_some() {
             return Some(entry.bytes);
         }
-        self.ordinary_units -= 1;
+        self.legacy_units -= 1;
         let block = unit.block();
         if self.track_blocks {
             self.index
@@ -549,13 +575,13 @@ impl Inner {
                 .expect("tracked block");
             if self
                 .index
-                .policy_block_get(block)
+                .legacy_block_get(block)
                 .is_some_and(|activity| activity.units == 0)
             {
                 self.index.policy_block_remove(block);
             }
         }
-        Lru::subtract_bytes(&mut self.total_bytes, entry.bytes);
+        Lru::subtract_bytes(&mut self.legacy_bytes, entry.bytes);
         Some(entry.bytes)
     }
 
@@ -604,13 +630,11 @@ impl Lru {
         Self {
             inner: Mutex::new(Inner {
                 index: Arc::new(crate::BlockIndex::new()),
-                ordinary_units: 0,
+                legacy_units: 0,
                 capacity_hand: (0, 0),
                 track_blocks,
                 track_small_clock: track_blocks,
-                total_bytes: 0,
-                clock: 0,
-                admission_ceiling: 0,
+                legacy_bytes: 0,
                 small_cursor: 0,
                 small_first: false,
             }),
@@ -623,13 +647,13 @@ impl Lru {
     /// Total bytes currently tracked.
     pub fn total_bytes(&self) -> u64 {
         let inner = self.inner.lock().unwrap();
-        inner.total_bytes + inner.index.compact_small_totals().0
+        inner.total_bytes()
     }
 
     /// Number of units currently tracked.
     pub fn len(&self) -> usize {
         let inner = self.inner.lock().unwrap();
-        inner.ordinary_units + inner.index.compact_small_totals().1
+        inner.legacy_units + inner.index.compact.totals().1 + inner.index.compact_small_totals().1
     }
 
     /// Whether the tracker holds no units.
@@ -711,8 +735,8 @@ impl Lru {
             }
         }
         assert!(!independent || !matches!(unit.kind(), UnitKind::Page(_)));
-        let position = g.next_revision();
-        g.admission_ceiling = g.clock;
+        let position = g.index.compact.next_revision();
+        g.index.compact.admitted_at(position);
         if let Some(e) = g.index.policy_get(&unit) {
             let old = e.bytes;
             g.index.policy_update(&unit, |e| {
@@ -744,16 +768,16 @@ impl Lru {
             access.touch();
             g.index
                 .policy_block_update(unit.block(), |activity| activity.revision = position);
-            Self::subtract_bytes(&mut g.total_bytes, old);
-            Self::add_bytes(&mut g.total_bytes, bytes);
+            Self::subtract_bytes(&mut g.legacy_bytes, old);
+            Self::add_bytes(&mut g.legacy_bytes, bytes);
             return access;
         }
-        Self::add_bytes(&mut g.total_bytes, bytes);
+        Self::add_bytes(&mut g.legacy_bytes, bytes);
         let block = unit.block();
-        if g.track_blocks && g.index.policy_block_get(block).is_none() {
+        if g.track_blocks && g.index.legacy_block_get(block).is_none() {
             g.index.policy_block_insert(
                 unit.shared_block(),
-                BlockPolicy {
+                LegacyBlockActivity {
                     pins: 0,
                     revision: position,
                     access: Some(Arc::new(AtomicU64::new(access_millis()))),
@@ -779,7 +803,7 @@ impl Lru {
                 .unwrap_or_else(|| unit.shared_block()),
             kind: unit.kind(),
         };
-        g.ordinary_units += 1;
+        g.legacy_units += 1;
         g.index.policy_insert(
             &unit,
             PolicyEntry {
@@ -797,16 +821,21 @@ impl Lru {
     /// Compatibility lookup for callers without a resolved access token.
     /// Data-path reads should touch the token obtained with their index lookup.
     pub fn touch(&self, unit: &CacheUnit) {
-        if let Some(e) = self.inner.lock().unwrap().index.policy_get(unit) {
-            e.access.touch();
+        let g = self.inner.lock().unwrap();
+        if g.index.compact_touch(unit).is_none() {
+            if let Some(e) = g.index.policy_get(unit) {
+                e.access.touch();
+            }
         }
     }
 
     /// Pin a unit so it cannot be evicted while an active reader holds it.
-    ///
-    /// Returns `true` if the unit exists.
     pub fn pin(&self, unit: &CacheUnit) -> bool {
         let g = self.inner.lock().unwrap();
+        g.index.compact_pin(unit).is_some() || Self::pin_legacy(&g, unit)
+    }
+
+    fn pin_legacy(g: &Inner, unit: &CacheUnit) -> bool {
         let Some(((), tracked)) = g.index.policy_update(unit, |e| e.pins += 1) else {
             return false;
         };
@@ -818,25 +847,25 @@ impl Lru {
     }
 
     pub fn pin_guard(self: &Arc<Self>, unit: CacheUnit) -> Option<LruPin> {
-        self.pin(&unit).then(|| LruPin {
-            lru: self.clone(),
-            unit,
+        let g = self.inner.lock().unwrap();
+        if let Some(pin) = g.index.compact_pin_guard(&unit) {
+            return Some(LruPin(PinOwner::Compact { _pin: pin }));
+        }
+        let access = g.index.policy_get(&unit)?.access;
+        Self::pin_legacy(&g, &unit).then(|| {
+            LruPin(PinOwner::Legacy {
+                lru: self.clone(),
+                unit,
+                access,
+            })
         })
     }
 
     /// Release one pin previously taken with [`pin`](Self::pin).
     pub fn unpin(&self, unit: &CacheUnit) {
         let g = self.inner.lock().unwrap();
-        let release = g.index.policy_update(unit, |e| {
-            if e.pins == 0 {
-                return false;
-            }
-            e.pins -= 1;
-            true
-        });
-        if release.is_some_and(|(released, tracked)| released && tracked) {
-            g.index
-                .policy_block_update(unit.block(), |activity| activity.pins -= 1);
+        if g.index.compact_unpin(unit).is_none() {
+            g.unpin_legacy(unit);
         }
     }
 
@@ -881,19 +910,20 @@ impl Lru {
         for second_pass in [false, true] {
             for small in [small_first, !small_first] {
                 if small {
-                    let (index, directories, first) = {
+                    let (directories, first) = {
                         let mut g = self.inner.lock().unwrap();
                         let directories = g.index.compact_small_directories();
                         let first = g.small_cursor;
                         g.small_cursor = first.wrapping_add(1);
-                        (g.index.clone(), directories, first)
+                        (directories, first)
                     };
                     for n in 0..directories.len() {
                         let directory = &directories[(first + n) % directories.len()];
                         let mut remaining = directory.read().unwrap().compact_capacity();
                         while remaining > 0 {
                             let g = self.inner.lock().unwrap();
-                            let mut needed = (g.total_bytes + index.compact_small_totals().0)
+                            let mut needed = g
+                                .total_bytes()
                                 .saturating_sub(selected_bytes)
                                 .saturating_sub(capacity);
                             if needed == 0 || scan_budget == 0 || out.len() == delete_budget {
@@ -938,43 +968,45 @@ impl Lru {
                             }
                             if scan_budget == 0
                                 || out.len() == delete_budget
-                                || (g.total_bytes + g.index.compact_small_totals().0)
-                                    .saturating_sub(selected_bytes)
-                                    <= capacity
+                                || g.total_bytes().saturating_sub(selected_bytes) <= capacity
                             {
                                 return out;
                             }
                             scan_budget -= 1;
-                            let next = g.index.policy_unit_at(&mut cursor);
-                            if cursor > end {
-                                break;
-                            }
+                            let next = g.index.policy_unit_at(&mut cursor, end);
                             g.capacity_hand = cursor;
                             let Some(next) = next else {
                                 continue;
                             };
+                            let unit = next.materialize();
+                            if selected.contains(&unit) || excluded.contains(&unit) {
+                                continue;
+                            }
+                            if let Some(result) = g.index.compact_select(&next, second_pass) {
+                                if let Some((bytes, ticket)) = result {
+                                    selected_bytes = selected_bytes.saturating_add(bytes);
+                                    selected.insert(unit.clone());
+                                    out.push(EvictionCandidate {
+                                        unit,
+                                        revision: 0,
+                                        small: None,
+                                        compact: Some(ticket),
+                                    });
+                                }
+                                continue;
+                            }
                             let Some(entry) = g.index.policy_get(&next) else {
                                 continue;
                             };
-                            let unit = next.materialize();
-                            if entry.pins != 0
-                                || selected.contains(&unit)
-                                || excluded.contains(&unit)
-                            {
-                                continue;
-                            }
-                            let referenced = entry.access.take_reference();
-                            let revision = g.next_revision();
-                            g.index
-                                .policy_update(&unit, |entry| entry.revision = revision);
-                            if second_pass || !referenced {
-                                selected_bytes = selected_bytes.saturating_add(entry.bytes);
-                                selected.insert(unit.clone());
-                                out.push(EvictionCandidate {
-                                    unit,
-                                    revision,
-                                    small: None,
-                                });
+                            if entry.pins == 0 {
+                                let bytes = entry.bytes;
+                                if let Some(candidate) =
+                                    g.select_legacy(unit.clone(), entry.access, second_pass)
+                                {
+                                    selected_bytes = selected_bytes.saturating_add(bytes);
+                                    selected.insert(unit);
+                                    out.push(candidate);
+                                }
                             }
                         }
                     }
@@ -994,7 +1026,10 @@ impl Lru {
             return Vec::new();
         }
         let units = g.superseded_units(keep);
-        units.into_iter().map(|unit| g.snapshot(unit)).collect()
+        units
+            .into_iter()
+            .filter_map(|unit| g.snapshot(unit))
+            .collect()
     }
 
     /// Snapshot resident units for an explicit block invalidation.
@@ -1010,7 +1045,10 @@ impl Lru {
                 UnitKind::Page(page) => CacheUnit::Page(block.clone(), page),
             })
             .collect();
-        units.into_iter().map(|unit| g.snapshot(unit)).collect()
+        units
+            .into_iter()
+            .filter_map(|unit| g.snapshot(unit))
+            .collect()
     }
 
     /// Visit each slab slot once in bounded slices, independent of the CLOCK hand.
@@ -1049,7 +1087,7 @@ impl Lru {
             let Some((block, activity)) = g.index.policy_block_at(slot) else {
                 continue;
             };
-            let access = activity.access.load(Ordering::Relaxed);
+            let access = activity.last_access;
             if activity.pins != 0 || now.saturating_sub(access) <= age || !due(block.view().object)
             {
                 continue;
@@ -1103,7 +1141,7 @@ impl Lru {
 
     /// Constant-time check for cache admissions since an ownership sweep.
     pub(crate) fn ownership_admission_ceiling(&self) -> u64 {
-        self.inner.lock().unwrap().admission_ceiling
+        self.inner.lock().unwrap().index.compact.admission_ceiling()
     }
 
     pub(crate) fn stale_candidate_is_current(&self, candidate: &StaleBlockCandidate) -> bool {
@@ -1115,7 +1153,7 @@ impl Lru {
             .is_some_and(|entry| {
                 entry.pins == 0
                     && entry.revision == candidate.revision
-                    && entry.access.load(Ordering::Relaxed) == candidate.last_access
+                    && entry.last_access == candidate.last_access
             })
     }
 
@@ -1149,7 +1187,7 @@ impl Lru {
             if include_compact
                 || g.index
                     .policy_get(&unit)
-                    .is_some_and(|entry| entry.access.small().is_none())
+                    .is_none_or(|entry| entry.access.small().is_none())
             {
                 g.remove(&unit);
             }
@@ -1158,19 +1196,20 @@ impl Lru {
 
     /// Recheck with the block mutation gate held. Commits also pin under that gate.
     pub(crate) fn candidate_is_current(&self, candidate: &EvictionCandidate) -> bool {
+        let g = self.inner.lock().unwrap();
+        Self::is_current(&g, candidate)
+    }
+
+    fn is_current(g: &Inner, candidate: &EvictionCandidate) -> bool {
+        if let Some(ticket) = &candidate.compact {
+            return g.index.compact_is_current(&candidate.unit, ticket);
+        }
         if let Some(small) = &candidate.small {
             return small.is_current(candidate.revision);
         }
-        self.inner
-            .lock()
-            .unwrap()
-            .index
-            .policy_get(&candidate.unit)
-            .is_some_and(|entry| {
-                entry.pins == 0
-                    && entry.revision == candidate.revision
-                    && !entry.access.referenced()
-            })
+        g.index.policy_get(&candidate.unit).is_some_and(|entry| {
+            entry.pins == 0 && entry.revision == candidate.revision && !entry.access.referenced()
+        })
     }
 
     /// Evict and return every *superseded* unit — whole block or page — for the
@@ -1210,13 +1249,16 @@ impl Lru {
         for batch in candidates.chunks(64) {
             let mut g = self.inner.lock().unwrap();
             for candidate in batch {
-                if g.total_bytes + g.index.compact_small_totals().0 <= capacity {
+                if g.total_bytes() <= capacity {
                     return out;
                 }
-                let current = g
-                    .index
-                    .policy_get(&candidate.unit)
-                    .is_some_and(|entry| entry.pins == 0 && entry.revision == candidate.revision);
+                let current = if let Some(ticket) = &candidate.compact {
+                    g.index.compact_is_current(&candidate.unit, ticket)
+                } else {
+                    g.index.policy_get(&candidate.unit).is_some_and(|entry| {
+                        entry.pins == 0 && entry.revision == candidate.revision
+                    })
+                };
                 if current {
                     g.remove(&candidate.unit);
                     out.push(candidate.unit.clone());
@@ -1237,42 +1279,6 @@ impl Default for Lru {
 mod tests {
     use super::*;
     use talon_core::{Backend, ObjectId, Version};
-
-    #[test]
-    fn page_access_residency_preserves_generations_and_releases_tokens() {
-        let mut slot = PageAccessSlot::default();
-        let first = AccessHandle::new(true);
-        let state = first.page_state().clone();
-        let clock = Arc::downgrade(first.clock());
-        assert!(!slot.set_resident(true));
-        slot.set(first.clone());
-        assert!(slot.resident());
-        slot.touch().unwrap();
-        assert!(first.take_reference());
-        first.retire();
-        let second = AccessHandle::with_state(state, None);
-        slot.touch().unwrap();
-        assert!(
-            !second.referenced(),
-            "retired token touched a later admission"
-        );
-        slot.set(second.clone());
-        assert!(slot.set_resident(false));
-        slot.touch().unwrap();
-        assert!(
-            second.take_reference(),
-            "nonresident policy still owns its token"
-        );
-        slot.set_resident(true);
-        slot.clear();
-        assert!(
-            slot.resident(),
-            "access retirement must not clear residency"
-        );
-        assert!(slot.get().is_none());
-        drop(first);
-        assert!(clock.upgrade().is_none());
-    }
 
     fn blk(n: u64) -> BlockId {
         BlockId::new(
@@ -1403,7 +1409,7 @@ mod tests {
         assert!(lru.is_empty());
         let g = lru.inner.lock().unwrap();
         assert!(g.index.policy_block_get(&blk(0)).is_none());
-        assert_eq!(g.total_bytes, 0);
+        assert_eq!(g.legacy_bytes, 0);
     }
 
     #[test]

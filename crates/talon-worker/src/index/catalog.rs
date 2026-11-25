@@ -21,10 +21,14 @@ pub(super) fn metadata(key: &BlockKey, geometry: &Geometry, page_size: u32) -> B
 
 impl BlockIndex {
     pub(crate) fn from_catalog(entries: Arc<RwLock<Directory>>) -> Self {
-        let page_work = entries.read().unwrap().page_work.clone();
+        let (page_work, compact) = {
+            let directory = entries.read().unwrap();
+            (directory.page_work.clone(), directory.compact.clone())
+        };
         Self {
             entries,
             page_work,
+            compact,
             catalog: true,
             ..Self::default()
         }
@@ -46,15 +50,15 @@ impl BlockIndex {
         let disk_id = {
             let entries = self.entries.read().unwrap();
             let slot = entries.slot(id)?;
-            let (_, geometry, runtime) = entries.resident_at(slot)?;
-            let mut rows = geometry.page_rows_from(start.0);
+            let (_, geometry, _) = entries.resident_at(slot)?;
+            let mut rows = geometry.page_rows_from(start.0, entries.inline_age(slot));
             let mut acquire = |page| {
                 let (found, row) = rows.next()?;
                 if found != page {
                     return None;
                 }
                 let guard = PageReadGuard::acquire(self, slot, page, row.state)?;
-                runtime.policy.touch_catalog_page(page);
+                row.state.touch(entries.clock(slot));
                 Some(guard)
             };
             first = acquire(start.0)?;
@@ -64,43 +68,5 @@ impl BlockIndex {
             geometry.disk_id
         };
         Some((disk_id, first, tail))
-    }
-
-    pub(super) fn catalog_recover_policy(
-        &self,
-        track_clock: bool,
-    ) -> Vec<crate::eviction::RecoveredUnit> {
-        let entries = self.entries.read().unwrap();
-        let (blocks, pages, _) = entries.totals();
-        let mut units = Vec::with_capacity((blocks + pages) as usize);
-        for (key, geometry) in entries.residents() {
-            let clock =
-                track_clock.then(|| Arc::new(AtomicU64::new(crate::eviction::access_millis())));
-            for (page, bytes) in geometry.pages_after(None) {
-                let kind = if geometry.kind() == Some(StoreKind::Whole) {
-                    UnitKind::Whole
-                } else {
-                    UnitKind::Page(PageIndex(page))
-                };
-                units.push(crate::eviction::RecoveredUnit {
-                    independent: false,
-                    unit: SharedUnit {
-                        block: key.clone(),
-                        kind,
-                    },
-                    bytes,
-                    access: AccessHandle::with_state(Arc::default(), clock.clone()),
-                });
-            }
-        }
-        units
-    }
-}
-
-pub(super) fn touch_whole(runtime: &DirectoryEntry) {
-    if let Some(slot) = &runtime.policy.whole {
-        if let Some(access) = &slot.read().unwrap().access {
-            access.touch();
-        }
     }
 }

@@ -121,6 +121,7 @@ impl Directory {
                 unit,
                 revision,
                 small: Some(ticket),
+                compact: None,
             });
         }
         out

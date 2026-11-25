@@ -260,7 +260,7 @@ impl WorkerRuntime {
     ) -> Self {
         let lru_started = Instant::now();
         index.prepare_runtime_recovery();
-        let mut units = index.restore_policy_units(track_blocks);
+        let mut units = Vec::new();
         let mut blocks = index.len();
         if let Some(small) = &small {
             let track_small_blocks = track_blocks && !compact_small_recency;
@@ -272,7 +272,7 @@ impl WorkerRuntime {
                 small.init_recency();
             }
         }
-        let lru = Arc::new(Lru::from_recovered(
+        let lru = Arc::new(Lru::from_runtime(
             index.clone(),
             units,
             blocks,
@@ -2015,10 +2015,6 @@ impl WorkerRuntime {
                         let now = runtime.page_access_time();
                         state.register(page, now, now.unwrap_or_default(), true);
                         let unit = CacheUnit::Page(id.clone(), page);
-                        let access = runtime.lru.insert(unit.clone(), allocated);
-                        if !runtime.index.uses_catalog() {
-                            runtime.index.set_access(&unit, access);
-                        }
                         if !warm_only && runtime.l1.is_enabled() {
                             runtime.admit_l1_page(&id, page, bytes.into_bytes());
                         }
@@ -2560,10 +2556,6 @@ impl WorkerRuntime {
                                     [(None, allocated)],
                                 );
                             }
-                            let access = runtime.lru.insert(unit.clone(), allocated);
-                            if !runtime.index.uses_catalog() {
-                                runtime.index.set_access(&unit, access);
-                            }
                         }
                         talon_telemetry::record("talon.cache.committed_bytes", len);
                         // Pin before releasing the gate used by candidate validation.
@@ -3099,13 +3091,12 @@ fn disk_unit() -> u64 {
     use std::{io::Write, os::unix::fs::MetadataExt, sync::OnceLock};
     static UNIT: OnceLock<u64> = OnceLock::new();
     *UNIT.get_or_init(|| {
-        // Keep the name until allocation is measured. Some mounted test
-        // filesystems cannot stat a file descriptor after unlink.
-        let mut temp = tempfile::NamedTempFile::new().unwrap();
-        let file = temp.as_file_mut();
+        // Keep the file linked until the allocation is measured. Shared
+        // filesystems may reject metadata lookups on unlinked open files.
+        let mut file = tempfile::NamedTempFile::new().unwrap();
         file.write_all(&[0; 16]).unwrap();
-        file.sync_all().unwrap();
-        file.metadata().unwrap().blocks() * 512
+        file.as_file().sync_all().unwrap();
+        file.as_file().metadata().unwrap().blocks() * 512
     })
 }
 

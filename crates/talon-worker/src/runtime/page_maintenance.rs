@@ -273,13 +273,14 @@ impl WorkerRuntime {
         candidate: GcCandidate,
         reason: usize,
     ) -> Option<u64> {
-        self.evict_page_candidate_to_target(candidate, reason, self.capacity_bytes)
+        self.evict_page_candidate_to_target(candidate, None, reason, self.capacity_bytes)
             .await
     }
 
     async fn evict_page_candidate_to_target(
         &self,
         candidate: GcCandidate,
+        capacity: Option<crate::eviction::EvictionCandidate>,
         reason: usize,
         target: u64,
     ) -> Option<u64> {
@@ -291,6 +292,9 @@ impl WorkerRuntime {
             let _background_io = runtime.background_io().await;
             let block = &candidate.block;
             let _gate = block.lock().await;
+            if capacity.as_ref().is_some_and(|ticket| !runtime.lru.candidate_is_current(ticket)) {
+                return None;
+            }
             if reason == 1 && (runtime.capacity_bytes == 0 || runtime.resident_bytes() <= target) { return None; }
             let age = runtime.current_tti_ms();
             if reason == 0 && age == 0 { return None; }
@@ -309,7 +313,6 @@ impl WorkerRuntime {
             #[cfg(test)]
             crate::page_access_store::crash_barrier("last_page_unlink").unwrap();
             runtime.index.clear_page(id, page);
-            runtime.lru.remove(&CacheUnit::Page(id.clone(), page));
             runtime.metrics.record_eviction(); runtime.refresh_l1_metrics();
             runtime.page_gc_metrics.deleted[reason].inc(); runtime.page_gc_metrics.bytes[reason].add(bytes);
             if !block.has_pages() {
@@ -601,10 +604,8 @@ impl WorkerRuntime {
             futures::stream::iter(candidates.into_iter().map(|(unit, candidate)| async move {
                 match unit.unit.clone() {
                     CacheUnit::Page(_, _) => {
-                        if self.lru.candidate_is_current(&unit) {
-                            if let Some(c) = candidate {
-                                self.evict_page_candidate_to_target(c, reason, target).await;
-                            }
+                        if let Some(c) = candidate {
+                            self.evict_page_candidate_to_target(c, Some(unit), reason, target).await;
                         }
                     }
                     CacheUnit::ExactRange(id) => {
@@ -1172,6 +1173,50 @@ mod tests {
             crate::page_access_shard::load(&dir, shard, paged.page_size(), now + 1).unwrap();
         assert!(!snapshot.records.contains_key(&id));
         assert_eq!(worker.page_lifecycle.dirty_summary(), (0, None));
+    }
+
+    #[tokio::test]
+    async fn page_capacity_rechecks_ticket_after_waiting_for_mutation_gate() {
+        use futures::FutureExt;
+        let root = tempfile::tempdir().unwrap();
+        let (worker, _, _) = runtime(root.path());
+        let id = block();
+        let page = PageIndex(0);
+        worker
+            .commit_fetched_page(&id, page, 16, Bytes::from_static(b"data"))
+            .await
+            .unwrap();
+        let bytes = worker.lru.total_bytes();
+        assert!(bytes > 0);
+        let state = worker.page_lifecycle.block(&id);
+        let guard = state.lock_page_fill().await;
+        let tickets = worker.lru.block_candidates(&id);
+        assert_eq!(tickets.len(), 1);
+        let unlink = tokio::spawn({
+            let worker = worker.clone();
+            async move { worker.unlink_units_to_target(tickets, 1, 0).await }
+        });
+
+        // Tokio queues later readers behind a pending writer. Once a shared
+        // acquisition stalls, the unlink has selected the page and reached its gate.
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while state.lock_page_fill().now_or_never().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("capacity unlink did not queue at the page gate");
+        let replacement = worker.lru.block_candidates(&id);
+        assert_eq!(replacement.len(), 1);
+        drop(guard);
+        unlink.await.unwrap();
+
+        assert_eq!(worker.lru.total_bytes(), bytes);
+        assert_eq!(worker.resident_bytes(), bytes);
+        assert_eq!(
+            worker.cached_page(&id, page, 16).await.unwrap(),
+            Some(Bytes::from_static(b"data"))
+        );
     }
 
     #[tokio::test]
