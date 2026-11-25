@@ -179,10 +179,12 @@ pins, then claims all resident pages. An active page reader defers the block.
 Successful deletion clears L1, lifecycle, index and accounting entries. Failures
 retain conservative accounting and release page claims.
 
-For a packed entry, the reclaimer checks its locator ticket, pins, read activity
-and membership at tombstone publication. It retires just that whole object or
-exact range. An exact-range retirement leaves any ordinary whole block, paged
-block or L1 data for the same block identity available.
+For a packed entry, both collectors recheck the locator ticket, pins and read
+activity at tombstone publication. Ownership GC also requires current membership
+of the expected generation. Stale GC can retire the entry on an authoritative
+backend `NotFound` even when membership is unavailable. Deletion retires just
+that whole object or exact range. An exact-range retirement leaves any ordinary
+whole block, paged block or L1 data for the same block identity available.
 
 Ownership charges all deletion credits before reading the latest valid snapshot
 of the expected generation. This permits renewal while a large block waits for

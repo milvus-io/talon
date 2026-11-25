@@ -40,7 +40,8 @@ fills coalesce. LOAD never populates L1.
 `SmallObjectStore` as peer stores. Whole-block storage has no small-object engine,
 routing, or maintenance responsibilities. Runtime initialization validates the
 cache-root routing metadata before recovery, passes the shared root lease to
-each store, and binds recovered small-object access tokens to the runtime LRU.
+each store, and binds the recovered Small Store to the runtime LRU. Packed
+entries keep their restored access ages in the catalog rows.
 The runtime coordinates store selection, capacity accounting, GC, and shutdown
 checkpoints.
 
