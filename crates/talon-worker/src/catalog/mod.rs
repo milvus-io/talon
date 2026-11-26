@@ -206,6 +206,10 @@ impl Catalog {
         self.live.index(page_size)
     }
 
+    pub(crate) fn publishes_to(&self, index: &crate::BlockIndex) -> bool {
+        index.shares_directory(&self.live.directory)
+    }
+
     pub(crate) fn disk_id(&self, store: &str, block: &BlockId) -> std::io::Result<Option<DiskId>> {
         Ok(StoreKind::from_path(store).and_then(|kind| self.live.disk_id(kind, block)))
     }

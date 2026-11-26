@@ -38,6 +38,43 @@ impl BlockIndex {
         self.catalog
     }
 
+    pub(crate) fn shares_directory(&self, directory: &Arc<RwLock<Directory>>) -> bool {
+        Arc::ptr_eq(&self.entries, directory)
+    }
+
+    pub(crate) fn has_journaled_pages(&self, id: &BlockId) -> bool {
+        self.catalog
+            && self
+                .entries
+                .read()
+                .unwrap()
+                .store_geometry(StoreKind::Paged, id)
+                .is_some()
+    }
+
+    pub(crate) fn publish_page(
+        &self,
+        id: &BlockId,
+        page: PageIndex,
+        page_size: u32,
+        len: u64,
+        allocated: u64,
+        disk_id: Option<DiskId>,
+    ) {
+        if self.catalog {
+            // The public attachment is a standalone sidecar. Journal-backed
+            // namespace stores publish into their own directory after sync.
+            debug_assert!(disk_id.is_none());
+            self.entries
+                .write()
+                .unwrap()
+                .publish_sidecar_page(id, page, page_size, len, allocated);
+        } else {
+            self.init_paged(id.clone(), page_size, len);
+            self.mark_page_allocated_at(id, page, allocated, disk_id);
+        }
+    }
+
     pub(super) fn catalog_read_pages(
         self: &Arc<Self>,
         id: &BlockId,
@@ -70,5 +107,34 @@ impl BlockIndex {
             (geometry.disk_id, read)
         };
         read.covers(end.0 - start.0).then_some((disk_id, read))
+    }
+
+    /// Under the block mutation gate, sample recency and claim the complete
+    /// range with one exclusive directory borrow. A busy journal publisher
+    /// leaves this candidate eligible for the next ownership attempt.
+    pub(crate) fn try_claim_catalog_ownership(
+        &self,
+        candidate: &crate::eviction::StaleBlockCandidate,
+        claim: impl FnOnce(usize, usize) -> Option<()>,
+    ) -> Option<u64> {
+        let entries = crate::runtime::uncontended(self.entries.try_write())?;
+        let slot = entries.slot(&candidate.block)?;
+        let (_, geometry, entry) = entries.resident_at(slot)?;
+        let pins = self.compact.try_block_pins(slot)?;
+        let activity = self.block_activity_with_pins(&entries, slot, || pins)?;
+        if !candidate.matches(&activity) {
+            return None;
+        }
+        if geometry.kind() == Some(StoreKind::Whole) {
+            return Some(geometry.len());
+        }
+        claim(slot, geometry.page_count())?;
+        let page_size = entries.page_size(entry);
+        Some(
+            geometry
+                .pages_after(None)
+                .map(|(page, _)| talon_core::page_len(geometry.len(), page_size, PageIndex(page)))
+                .sum(),
+        )
     }
 }

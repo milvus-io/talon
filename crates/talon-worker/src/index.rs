@@ -66,6 +66,8 @@ pub struct BlockIndex {
 pub(crate) struct DirectoryEntry {
     resident: Option<Arc<Entry>>,
     legacy: Option<Box<LegacyPolicy>>,
+    // Only a standalone Paged attachment needs geometry independent of the journal.
+    sidecar_page_size: u32,
 }
 
 #[derive(Default)]
@@ -119,7 +121,7 @@ impl DirectoryEntry {
     }
 
     fn is_empty(&self) -> bool {
-        self.resident.is_none() && self.legacy.is_none()
+        self.resident.is_none() && self.legacy.is_none() && self.sidecar_page_size == 0
     }
 }
 
@@ -460,6 +462,45 @@ impl BlockIndex {
         self.with_slot_ceiling(std::convert::identity)
     }
 
+    pub(crate) fn enable_ownership_changes(&self) {
+        self.entries.write().unwrap().enable_ownership_changes();
+    }
+
+    pub(crate) fn capture_ownership_ceiling(&self, topology_change: bool) -> u64 {
+        if !self.catalog {
+            return self.compact.admission_ceiling();
+        }
+        self.entries
+            .write()
+            .unwrap()
+            .capture_ownership_ceiling(topology_change)
+    }
+
+    pub(crate) fn ownership_changes_cover(&self, range: &std::ops::Range<u64>) -> bool {
+        self.entries.read().unwrap().ownership_changes_cover(range)
+    }
+
+    pub(crate) fn retire_ownership_changes(&self, cutoff: u64) {
+        self.entries
+            .write()
+            .unwrap()
+            .retire_ownership_changes(cutoff);
+    }
+
+    pub(crate) fn ownership_change_step(
+        &self,
+        cursor: &mut std::ops::Range<u64>,
+    ) -> Option<Option<(BlockKey, BlockActivity)>> {
+        let entries = self.entries.read().unwrap();
+        let (revision, slot) = entries.next_ownership_change(cursor)?;
+        cursor.start = revision + 1;
+        let candidate = entries.at(slot).and_then(|(id, _)| {
+            let activity = self.block_activity(&entries, slot)?;
+            (activity.revision == revision).then(|| (id.clone(), activity))
+        });
+        Some(candidate)
+    }
+
     pub(crate) fn with_slot_ceiling<T>(&self, capture: impl FnOnce(usize) -> T) -> T {
         let entries = self.entries.read().unwrap();
         capture(entries.slot_count())
@@ -487,6 +528,15 @@ impl BlockIndex {
     }
 
     fn block_activity(&self, entries: &Directory, slot: usize) -> Option<BlockActivity> {
+        self.block_activity_with_pins(entries, slot, || self.compact.block_pins(slot))
+    }
+
+    fn block_activity_with_pins(
+        &self,
+        entries: &Directory,
+        slot: usize,
+        pins: impl Fn() -> usize,
+    ) -> Option<BlockActivity> {
         let (_, entry) = entries.at(slot)?;
         let legacy = entry
             .legacy
@@ -496,7 +546,7 @@ impl BlockIndex {
             let last_access = entries.clock(slot)?.load(Ordering::Relaxed);
             (last_access != 0).then(|| BlockActivity {
                 units: geometry.page_count(),
-                pins: self.compact.block_pins(slot),
+                pins: pins(),
                 revision: entries.revision(slot).unwrap(),
                 last_access,
             })
@@ -508,7 +558,7 @@ impl BlockIndex {
                 let last_access = entries.clock(slot)?.load(Ordering::Relaxed);
                 (block.policy_units > 0 && last_access != 0).then(|| BlockActivity {
                     units: block.policy_units as usize,
-                    pins: self.compact.block_pins(slot),
+                    pins: pins(),
                     revision: block.policy_revision,
                     last_access,
                 })
@@ -980,6 +1030,11 @@ impl BlockIndex {
             .map(|(id, _)| id.clone())
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_directory_writer<T>(&self, work: impl FnOnce(&mut Directory) -> T) -> T {
+        work(&mut self.entries.write().unwrap())
+    }
+
     pub(crate) fn enable_page_ages(&self) {
         let mut entries = self.entries.write().unwrap();
         if self.page_work.tracking() {
@@ -1330,7 +1385,8 @@ impl BlockIndex {
             return entries
                 .residents()
                 .map(|(key, geometry)| {
-                    catalog::metadata(key, geometry, entries.page_size()).resident_bytes()
+                    let entry = entries.get(key).unwrap();
+                    catalog::metadata(key, geometry, entries.page_size(entry)).resident_bytes()
                 })
                 .sum();
         }
@@ -1357,8 +1413,8 @@ impl BlockIndex {
     pub fn get(&self, id: &BlockId) -> Option<BlockMeta> {
         if self.catalog {
             let entries = self.entries.read().unwrap();
-            let (key, geometry, _) = entries.resident(id)?;
-            return Some(catalog::metadata(key, geometry, entries.page_size()));
+            let (key, geometry, entry) = entries.resident(id)?;
+            return Some(catalog::metadata(key, geometry, entries.page_size(entry)));
         }
         self.read_entry(id, |entry| entry.metadata().into())
     }
@@ -1371,14 +1427,14 @@ impl BlockIndex {
     pub(crate) fn get_and_touch_at(&self, id: &BlockId) -> Option<(BlockMeta, Option<DiskId>)> {
         if self.catalog {
             let entries = self.entries.read().unwrap();
-            let (key, geometry, _) = entries.resident(id)?;
+            let (key, geometry, entry) = entries.resident(id)?;
             if geometry.kind() == Some(StoreKind::Whole) {
                 geometry
                     .policy_state(UnitKind::Whole)?
                     .touch(entries.clock(entries.slot(id)?));
             }
             return Some((
-                catalog::metadata(key, geometry, entries.page_size()),
+                catalog::metadata(key, geometry, entries.page_size(entry)),
                 geometry.disk_id,
             ));
         }
@@ -1749,6 +1805,17 @@ impl BlockIndex {
     /// Used by page-level eviction: the block entry (and its other pages) stays
     /// intact. Returns `true` if the page was present and is now cleared.
     pub fn clear_page(&self, id: &BlockId, page: PageIndex) -> bool {
+        if self.catalog {
+            let mut entries = self.entries.write().unwrap();
+            if !entries
+                .sidecar(id)
+                .is_some_and(|(_, row)| row.allocation(page.0).is_some())
+            {
+                return false;
+            }
+            entries.remove_sidecar(id, crate::catalog::Operation::DeletePage { page: page.0 });
+            return true;
+        }
         let cleared = self
             .write_paged_entry(id, |entry, cursor, clock, attached| {
                 let IndexedUnits::Paged(pages) = &mut entry.units else {
@@ -1851,6 +1918,12 @@ impl BlockIndex {
     /// accounting finish; retained operations may complete in that interval.
     pub fn remove(&self, id: &BlockId) -> Option<BlockMeta> {
         let mut entries = self.entries.write().unwrap();
+        if let Some((key, geometry)) = entries.sidecar(id) {
+            let meta =
+                catalog::metadata(key, geometry, entries.page_size(entries.get(key).unwrap()));
+            entries.remove_sidecar(id, crate::catalog::Operation::DeleteBlock);
+            return Some(meta);
+        }
         let cursor = entries.slot(id)?;
         let key = entries.at(cursor)?.0.clone();
         let slot = entries.get_mut(id)?;

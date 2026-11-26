@@ -225,7 +225,10 @@ impl State {
         let blocks: Vec<_> = directory
             .rows
             .iter()
-            .filter_map(|(handle, b)| Some((&b.id, directory.rows.geometry(handle, kind)?)))
+            .filter_map(|(handle, b)| {
+                let geometry = directory.rows.geometry(handle, kind)?;
+                geometry.disk_id.is_some().then_some((&b.id, geometry))
+            })
             .collect();
         Ok(Some(crate::recovery::map(blocks, threads, |(id, b)| {
             if store.page_size == 0 {
@@ -318,7 +321,7 @@ impl Iterator for Snapshot {
         let record = loop {
             if let Some(slab) = &mut self.slab {
                 while let Some(row) = slab.rows.get(slab.slot) {
-                    if let Some(row) = row {
+                    if let Some(row) = row.as_ref().filter(|row| row.geometry.disk_id.is_some()) {
                         let pages: PageMap<_> = row
                             .geometry
                             .pages_after(slab.after)

@@ -235,6 +235,7 @@ impl NamespaceRuntimes {
         .with_rate_limiter(self.limiter.clone())
         .with_paged_miss_run_concurrency(config.paged_miss_run_concurrency);
         if config.ownership_gc_enabled {
+            worker.index.enable_ownership_changes();
             if let Some(small) = &worker.small {
                 small.init_ownership();
             }

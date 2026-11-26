@@ -96,6 +96,13 @@ fn block_addresses(slot: usize) -> std::ops::RangeInclusive<Address> {
     (slot, 0)..=(slot, u64::MAX)
 }
 
+fn count_block_pins(active: &Active, slot: usize) -> usize {
+    active
+        .range(block_addresses(slot))
+        .map(|(_, op)| op.pins as usize)
+        .sum()
+}
+
 #[derive(Default, Debug)]
 struct Operation {
     selection: Option<u64>,
@@ -208,12 +215,12 @@ impl CompactPolicy {
     }
 
     pub fn block_pins(&self, slot: usize) -> usize {
-        self.active
-            .lock()
-            .unwrap()
-            .range(block_addresses(slot))
-            .map(|(_, op)| op.pins as usize)
-            .sum()
+        count_block_pins(&self.active.lock().unwrap(), slot)
+    }
+
+    pub fn try_block_pins(&self, slot: usize) -> Option<usize> {
+        let active = crate::runtime::uncontended(self.active.try_lock())?;
+        Some(count_block_pins(&active, slot))
     }
 
     pub fn pin(&self, slot: usize, kind: UnitKind) -> u64 {

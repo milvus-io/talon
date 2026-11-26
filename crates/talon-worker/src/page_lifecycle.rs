@@ -741,27 +741,25 @@ impl PagedMutation {
     }
 
     pub fn claim_all_pages(&self) -> Option<BlockPageClaim> {
-        let work = &self.index.page_work;
-        let mut claim = BlockPageClaim {
-            work: work.clone(),
-            operation: None,
-            len: 0,
-        };
+        let mut claim = BlockPageClaim::new(self.index.page_work.clone());
         // The exclusive directory (standalone: page table) borrow serializes
         // this check with complete range pin and release, while the stripe
         // separates pending GC selections from reads and claimed deletions.
         let valid = self.index.with_pages(&self.id, true, |slot, rows| {
-            let mut active = work.operations(slot).lock().unwrap();
-            if active.blocks_claim(slot) {
-                return false;
-            }
-            let identity = work.next_identity();
-            active.insert((slot, BLOCK_CLAIM), identity);
-            claim.operation = Some((slot, identity));
-            claim.len = rows.len();
-            true
+            claim.acquire(slot, rows.len(), false).is_some()
         });
         valid.unwrap_or(true).then_some(claim)
+    }
+
+    pub(crate) fn try_claim_catalog_ownership(
+        &self,
+        candidate: &crate::eviction::StaleBlockCandidate,
+    ) -> Option<(BlockPageClaim, u64)> {
+        let mut claim = BlockPageClaim::new(self.index.page_work.clone());
+        let bytes = self
+            .index
+            .try_claim_catalog_ownership(candidate, |slot, len| claim.acquire(slot, len, true))?;
+        Some((claim, bytes))
     }
 
     #[cfg(test)]
@@ -794,6 +792,31 @@ pub(crate) struct BlockPageClaim {
     len: usize,
 }
 impl BlockPageClaim {
+    fn new(work: Arc<PageWork>) -> Self {
+        Self {
+            work,
+            operation: None,
+            len: 0,
+        }
+    }
+
+    fn acquire(&mut self, slot: usize, len: usize, nonblocking: bool) -> Option<()> {
+        let operations = self.work.operations(slot);
+        let mut active = if nonblocking {
+            crate::runtime::uncontended(operations.try_lock())?
+        } else {
+            operations.lock().unwrap()
+        };
+        if active.blocks_claim(slot) {
+            return None;
+        }
+        let identity = self.work.next_identity();
+        active.insert((slot, BLOCK_CLAIM), identity);
+        self.operation = Some((slot, identity));
+        self.len = len;
+        Some(())
+    }
+
     pub fn len(&self) -> usize {
         self.len
     }
@@ -1386,7 +1409,7 @@ impl PageLifecycle {
         )
     }
 
-    fn mutation(&self, id: BlockKey) -> PagedMutation {
+    pub(crate) fn mutation(&self, id: BlockKey) -> PagedMutation {
         PagedMutation {
             id,
             index: self.index.clone(),

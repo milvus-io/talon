@@ -24,12 +24,14 @@ pub(super) struct OwnershipGc {
     next_supplement: tokio::time::Instant,
     pass: Option<OwnershipPass>,
     round_ended: bool,
+    #[cfg(test)]
+    discovery_visits: usize,
 }
 
 struct OwnershipPass {
     generation: u64,
     range: std::ops::Range<u64>,
-    cursor: std::ops::Range<usize>,
+    cursor: OwnershipScan,
     scanning: bool,
     retry_cursor: u64,
     retries: BTreeMap<u64, StaleBlockCandidate>,
@@ -38,6 +40,11 @@ struct OwnershipPass {
     attempt: Option<(StaleBlockCandidate, u64)>,
     block_round_done: bool,
     small: Option<SmallPass>,
+}
+
+enum OwnershipScan {
+    Occupied(std::ops::Range<usize>),
+    Changed(std::ops::Range<u64>),
 }
 
 struct SmallPass {
@@ -83,6 +90,8 @@ impl OwnershipGc {
             next_supplement: tokio::time::Instant::now() + SUPPLEMENT_INTERVAL,
             pass: None,
             round_ended: false,
+            #[cfg(test)]
+            discovery_visits: 0,
         }
     }
 
@@ -186,14 +195,16 @@ impl OwnershipGc {
                         .take_superseded_retries(pass.limit),
                 );
             }
-            let ceiling = if range.is_empty() {
-                0
+            let cursor = if range.is_empty() {
+                OwnershipScan::Occupied(0..0)
+            } else if self.supplement.is_some() && worker.index.ownership_changes_cover(&range) {
+                OwnershipScan::Changed(range.clone())
             } else {
-                worker.lru.block_scan_ceiling()
+                OwnershipScan::Occupied(0..worker.lru.block_scan_ceiling())
             };
             self.pass = Some(OwnershipPass {
                 generation: view.generation,
-                cursor: 0..ceiling,
+                cursor,
                 retry_cursor: range.start,
                 scanning: !range.is_empty(),
                 range,
@@ -230,14 +241,23 @@ impl OwnershipGc {
             let pass = self.pass.as_mut().unwrap();
             if pass.attempt.is_none() {
                 let candidate = if pass.scanning {
-                    let Some(candidate) = worker
-                        .lru
-                        .ownership_block_step(&mut pass.cursor, &pass.range)
-                    else {
+                    let step = match &mut pass.cursor {
+                        OwnershipScan::Occupied(slots) => {
+                            worker.lru.ownership_block_step(slots, &pass.range)
+                        }
+                        OwnershipScan::Changed(revisions) => {
+                            worker.lru.ownership_change_step(revisions)
+                        }
+                    };
+                    let Some(candidate) = step else {
                         pass.scanning = false;
-                        self.finish_block_round(&view);
+                        self.finish_block_round(worker, &view);
                         return;
                     };
+                    #[cfg(test)]
+                    {
+                        self.discovery_visits += 1;
+                    }
                     let Some(candidate) = candidate else {
                         continue;
                     };
@@ -245,7 +265,7 @@ impl OwnershipGc {
                 } else {
                     let Some((&revision, retry)) = pass.retries.range(pass.retry_cursor..).next()
                     else {
-                        self.finish_block_round(&view);
+                        self.finish_block_round(worker, &view);
                         return;
                     };
                     pass.retry_cursor = revision + 1;
@@ -297,11 +317,11 @@ impl OwnershipGc {
         }
     }
 
-    fn finish_block_round(&mut self, view: &MembershipSnapshot) {
+    fn finish_block_round(&mut self, worker: &WorkerRuntime, view: &MembershipSnapshot) {
         let pass = self.pass.as_mut().unwrap();
         pass.block_round_done = true;
         if pass.small.is_none() {
-            self.finish_round(view, false);
+            self.finish_round(worker, view, false);
         }
     }
 
@@ -338,7 +358,7 @@ impl OwnershipGc {
                 let Some(mut candidate) = pass.pending.pop_front() else {
                     if pass.scan_done {
                         let retries = small.has_ownership_retries(pass.limit);
-                        self.finish_round(view, retries);
+                        self.finish_round(worker, view, retries);
                     }
                     return;
                 };
@@ -375,12 +395,18 @@ impl OwnershipGc {
         }
     }
 
-    fn finish_round(&mut self, view: &MembershipSnapshot, small_retries: bool) {
+    fn finish_round(
+        &mut self,
+        worker: &WorkerRuntime,
+        view: &MembershipSnapshot,
+        small_retries: bool,
+    ) {
         let pass = self.pass.as_ref().unwrap();
         self.round_ended = true;
         if pass.retries.is_empty() && !small_retries {
             self.completed_generation = view.generation;
             self.completed_limit = pass.range.end;
+            worker.index.retire_ownership_changes(self.completed_limit);
             if let Some(small) = &pass.small {
                 self.completed_small_epoch = small.limit.epoch;
             } else if self.supplement.is_none() {
@@ -461,13 +487,9 @@ impl OwnershipGc {
             .page_gc_metrics
             .ownership_attempted
             .add(candidate.units as u64);
-        let id = candidate.block.clone();
         worker
             .unlink_stale_block_for(candidate, Some(snapshot))
-            .await;
-        // Protection, activity races and errors retain the block. A concurrent
-        // replacement is conservatively retried, then excluded by its revision.
-        !worker.lru.contains_tracked_block(&id)
+            .await
     }
 }
 
@@ -761,6 +783,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dense_ownership_supplement_visits_one_refill_before_packed_work() {
+        let root = tempfile::tempdir().unwrap();
+        let (worker, fixture) = namespace_runtime(root.path(), true);
+        let table = CachePlacementTable::new(&["a", "b"].map(|name| NodeInfo {
+            id: NodeId::new(name),
+            address: String::new(),
+            role: NodeRole::Worker,
+        }));
+        let rows = 16_384;
+        let refill = placed("a", 0);
+        worker.index.with_directory_writer(|directory| {
+            let put = |directory: &mut crate::index::Directory, id: &BlockId| {
+                directory.apply(
+                    id,
+                    crate::catalog::StoreKind::Paged,
+                    &crate::catalog::Operation::Put { page: 0, len: 32 },
+                    None,
+                    Some(16),
+                );
+            };
+            // The refill sits near the end of the directory to expose linear discovery.
+            for id in (0..)
+                .map(block)
+                .filter(|id| *id != refill && table.primary(id).unwrap().id.0 == "a")
+                .take(rows - 1)
+            {
+                put(directory, &id);
+            }
+            put(directory, &refill);
+        });
+        let mut gc = fixture.gc(&worker);
+        gc.run_round(&worker).await;
+        assert_eq!(gc.discovery_visits, rows);
+        gc.discovery_visits = 0;
+        worker.index.with_directory_writer(|directory| {
+            directory.apply(
+                &refill,
+                crate::catalog::StoreKind::Paged,
+                &crate::catalog::Operation::Put { page: 1, len: 32 },
+                None,
+                Some(16),
+            );
+        });
+        let packed = packed_placed("b", 0);
+        let small = worker.small.as_ref().unwrap();
+        small
+            .put(&packed, Bytes::from_static(b"packed"))
+            .await
+            .unwrap();
+
+        gc.next_supplement = tokio::time::Instant::now();
+        gc.run_slice(&worker).await;
+        println!(
+            "dense_rows={rows} supplement_visited={}",
+            gc.discovery_visits
+        );
+        assert_eq!(gc.discovery_visits, 1);
+        assert!(small.contains(&packed));
+        gc.run_slice(&worker).await;
+        assert!(!small.contains(&packed));
+        assert_eq!(gc.discovery_visits, 1);
+    }
+
+    #[tokio::test]
     async fn small_ownership_gc_uses_store_residency_and_respects_policy_pins() {
         let root = tempfile::tempdir().unwrap();
         let (worker, fixture) = namespace_runtime(root.path(), false);
@@ -1012,6 +1098,147 @@ mod tests {
             .unlink_small_gc(candidate, revision, Some(membership))
             .await;
         assert!(!small.contains(&id));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ownership_callbacks_release_io_while_ordinary_directory_writer_is_held() {
+        let mut observations = Vec::new();
+        for (packed, hold_gate) in [(true, true), (false, true), (false, false)] {
+            let root = tempfile::tempdir().unwrap();
+            let (worker, fixture) = namespace_runtime(root.path(), true);
+            let small = worker.small.as_ref().unwrap();
+            let id = if packed {
+                packed_placed("b", 0)
+            } else {
+                placed("b", 0)
+            };
+            if packed {
+                small.put(&id, Bytes::from_static(b"packed")).await.unwrap();
+            } else {
+                fill(&worker, &id, true).await;
+            }
+            fixture.publish(&worker);
+            let mut packed_attempt = None;
+            let mut ordinary_attempt = None;
+            let path = if packed {
+                let membership = worker.membership_snapshot().unwrap();
+                let limit = membership.scan_limits[&worker.cache_identity]
+                    .small
+                    .unwrap();
+                drop(small.take_superseded_retries(limit));
+                let (_, mut selected) = small.ownership_candidates(
+                    &mut OwnershipCursor::default(),
+                    0,
+                    limit,
+                    64,
+                    |_| false,
+                );
+                let mut candidate = selected.pop().unwrap();
+                let revision = candidate.observe_ownership(limit.epoch).unwrap();
+                packed_attempt = Some((candidate, revision));
+                None
+            } else {
+                ordinary_attempt = worker
+                    .lru
+                    .first_ownership_candidate(0..worker.lru.ownership_admission_ceiling());
+                assert!(ordinary_attempt.is_some());
+                Some(
+                    worker
+                        .paged
+                        .as_ref()
+                        .unwrap()
+                        .catalog_dir_for(&id)
+                        .unwrap()
+                        .join("0.page"),
+                )
+            };
+            let gate = worker.page_lifecycle.block(&id);
+            let gate = if hold_gate {
+                Some(gate.lock().await)
+            } else {
+                None
+            };
+            let budget = worker.background_budget.as_ref().unwrap();
+            let full = (worker.page_gc_io.available_permits(), budget.available_io());
+            let (held, ready) = tokio::sync::oneshot::channel();
+            let (release, released) = std::sync::mpsc::channel();
+            let index = worker.index.clone();
+            let holder = std::thread::spawn(move || {
+                index.with_directory_writer(|_| {
+                    held.send(()).unwrap();
+                    released.recv().unwrap();
+                });
+            });
+            ready.await.unwrap();
+
+            let expires = Instant::now() + Duration::from_millis(250);
+            let view = {
+                let mut membership = worker.membership.lock().unwrap();
+                Arc::make_mut(membership.as_mut().unwrap()).valid_until = expires;
+                membership.as_ref().unwrap().clone()
+            };
+            let invoke = |view| {
+                let worker = worker.clone();
+                let packed_attempt = packed_attempt.clone();
+                let ordinary_attempt = ordinary_attempt.clone();
+                async move {
+                    if let Some((candidate, revision)) = packed_attempt {
+                        worker
+                            .unlink_small_gc(candidate, revision, Some(view))
+                            .await;
+                    } else {
+                        worker
+                            .unlink_stale_block_for(ordinary_attempt.unwrap(), Some(view))
+                            .await;
+                    }
+                }
+            };
+            let callback = tokio::spawn(invoke(view));
+            let borrowed = tokio::time::timeout_at(expires.into(), async {
+                if hold_gate {
+                    while worker.page_gc_io.available_permits() == full.0
+                        || budget.available_io() == full.1
+                    {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                }
+            })
+            .await
+            .is_ok();
+            tokio::time::sleep_until((expires + Duration::from_millis(100)).into()).await;
+            let observed = (
+                borrowed,
+                callback.is_finished(),
+                worker.page_gc_io.available_permits(),
+                budget.available_io(),
+            );
+            let resident = if let Some(path) = &path {
+                path.exists()
+            } else {
+                small.contains(&id)
+            };
+            release.send(()).unwrap();
+            holder.join().unwrap();
+            drop(gate);
+            callback.await.unwrap();
+            worker.page_mutations.drain().await;
+
+            println!("packed={packed} gate={hold_gate} held_writer={observed:?} expected_full={full:?} resident={resident}");
+            observations.push((packed, hold_gate, observed, full, resident));
+            fixture.publish(&worker);
+            invoke(worker.membership_snapshot().unwrap()).await;
+            assert!(!path
+                .as_ref()
+                .map_or_else(|| small.contains(&id), |path| path.exists()));
+        }
+        for (packed, hold_gate, observed, full, resident) in observations {
+            assert!(resident, "expired membership must leave the payload intact");
+            assert_eq!(
+                observed,
+                (true, true, full.0, full.1),
+                "packed={packed} gate={hold_gate}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1380,7 +1607,10 @@ mod tests {
             gc.run_slice(&worker).await;
             let pass = gc.pass.as_ref().unwrap();
             assert_eq!(pass.range, limit..limit);
-            assert_eq!(pass.cursor, 0..0, "no ordinary slot visits");
+            assert!(
+                matches!(&pass.cursor, OwnershipScan::Occupied(slots) if slots.is_empty()),
+                "no ordinary slot visits"
+            );
             assert!(
                 gc.round_ended,
                 "the Small retry round finished in one slice"
@@ -1719,9 +1949,8 @@ mod tests {
 
     #[tokio::test]
     async fn supplement_retries_keep_bounds_across_membership_outage() {
-        let fixture = MembershipFixture::new();
         let root = tempfile::tempdir().unwrap();
-        let r = runtime(root.path(), true, Arc::new(Origin::default()));
+        let (r, fixture) = namespace_runtime(root.path(), true);
         let mut gc = fixture.gc(&r);
         gc.run_round(&r).await;
         let old = placed("b", 0);
@@ -1777,9 +2006,8 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_supplement_keeps_bounds_and_defers_later_page_fills() {
-        let fixture = MembershipFixture::new();
         let root = tempfile::tempdir().unwrap();
-        let r = runtime(root.path(), true, Arc::new(Origin::default()));
+        let (r, fixture) = namespace_runtime(root.path(), true);
         let mut gc = fixture.gc(&r);
         gc.run_round(&r).await;
         let old = placed("b", 0);

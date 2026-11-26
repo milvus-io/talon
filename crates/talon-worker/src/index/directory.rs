@@ -4,6 +4,7 @@ use crate::catalog::{BlockRow, BlockRows, Geometry, Operation, StoreKind};
 use crate::eviction::{access_millis, compact::CompactPolicy, UnitKind};
 use crate::page_lifecycle::{PageAge, PageWork};
 use std::collections::BTreeMap;
+use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, LazyLock};
 #[cfg(test)]
@@ -21,6 +22,7 @@ pub(crate) struct Directory {
     runtime: BTreeMap<usize, DirectoryEntry>,
     clocks: Option<Vec<AtomicU64>>,
     revisions: CatalogRevisions,
+    ownership_changes: OwnershipChanges,
     inline_ages: Option<Vec<PageAge>>,
     catalog_policy: bool,
     pub(super) compact: Arc<CompactPolicy>,
@@ -183,11 +185,15 @@ impl Directory {
                 .collect()
         });
         self.revisions = CatalogRevisions::Off;
+        self.ownership_changes = OwnershipChanges::default();
     }
 
     fn clear_clock(&mut self, slot: usize) {
         if let Some(clock) = self.clock(slot) {
             clock.store(0, Relaxed);
+            if let Some(revision) = self.revision(slot) {
+                self.ownership_changes.pending.remove(&revision);
+            }
             self.revisions.set(slot, 0);
         }
     }
@@ -196,9 +202,59 @@ impl Directory {
         let revision = self.compact.next_revision();
         self.compact.admitted_at(revision);
         if let Some(clock) = self.clock(slot) {
-            clock.fetch_max(access_millis().max(1), Relaxed);
+            if clock.fetch_max(access_millis().max(1), Relaxed) != 0 {
+                if let Some(old) = self.revision(slot) {
+                    self.ownership_changes.pending.remove(&old);
+                }
+            }
             self.revisions.set(slot, revision);
+            self.ownership_changes.insert(revision, slot as u32);
         }
+    }
+
+    pub(super) fn enable_ownership_changes(&mut self) {
+        self.ownership_changes.enabled = true;
+    }
+
+    pub(super) fn capture_ownership_ceiling(&mut self, topology_change: bool) -> u64 {
+        let cutoff = self.compact.admission_ceiling();
+        if self.ownership_changes.enabled {
+            if topology_change {
+                self.ownership_changes.floor = None;
+                self.ownership_changes.pending.clear();
+                self.ownership_changes.overflow = 0..0;
+            }
+            self.ownership_changes.floor.get_or_insert(cutoff);
+        }
+        cutoff
+    }
+
+    pub(super) fn ownership_changes_cover(&self, range: &Range<u64>) -> bool {
+        let changes = &self.ownership_changes;
+        changes.floor.is_some_and(|floor| range.start >= floor)
+            && (changes.overflow.is_empty()
+                || range.end <= changes.overflow.start
+                || range.start >= changes.overflow.end)
+    }
+
+    pub(super) fn next_ownership_change(&self, range: &Range<u64>) -> Option<(u64, usize)> {
+        let (&revision, &slot) = self.ownership_changes.pending.range(range.clone()).next()?;
+        Some((revision, slot as usize))
+    }
+
+    pub(super) fn retire_ownership_changes(&mut self, cutoff: u64) {
+        let changes = &mut self.ownership_changes;
+        while changes
+            .pending
+            .first_key_value()
+            .is_some_and(|(&revision, _)| revision < cutoff)
+        {
+            changes.pending.pop_first();
+        }
+        if changes.pending.is_empty() {
+            changes.pending.clear();
+        }
+        changes.overflow.start = changes.overflow.start.max(cutoff).min(changes.overflow.end);
     }
 
     pub(super) fn enable_catalog_policy(&mut self) {
@@ -254,8 +310,12 @@ impl Directory {
         self.bytes = total.bytes;
     }
 
-    pub fn page_size(&self) -> u32 {
-        self.page_size.unwrap_or_default()
+    pub fn page_size(&self, entry: &DirectoryEntry) -> u32 {
+        if entry.sidecar_page_size != 0 {
+            entry.sidecar_page_size
+        } else {
+            self.page_size.unwrap_or_default()
+        }
     }
 
     pub fn totals(&self) -> (u64, u64, u64) {
@@ -267,7 +327,10 @@ impl Directory {
     }
 
     fn visible<'a>(&'a self, handle: u32, row: &'a BlockRow) -> Option<&'a Geometry> {
-        if self.page_size? == 0 {
+        if self.page_size? == 0
+            && !(row.geometry.kind() == Some(StoreKind::Paged)
+                && self.runtime_at(handle as usize - 1).sidecar_page_size != 0)
+        {
             return self.rows.geometry(handle, StoreKind::Whole);
         }
         row.geometry.kind().map(|_| &row.geometry)
@@ -303,7 +366,36 @@ impl Directory {
         kind: StoreKind,
         id: &dyn BlockIdentity,
     ) -> Option<&Geometry> {
-        self.rows.geometry(self.rows.handle(id)?, kind)
+        self.rows
+            .geometry(self.rows.handle(id)?, kind)
+            .filter(|geometry| geometry.disk_id.is_some())
+    }
+
+    pub(super) fn publish_sidecar_page(
+        &mut self,
+        id: &talon_core::BlockId,
+        page: PageIndex,
+        page_size: u32,
+        len: u64,
+        allocated: u64,
+    ) {
+        self.get_or_insert(BlockKey::new(id)).1.sidecar_page_size = page_size;
+        self.apply(
+            id,
+            StoreKind::Paged,
+            &Operation::Put { page: page.0, len },
+            None,
+            Some(allocated),
+        );
+    }
+
+    pub(super) fn remove_sidecar(&mut self, id: &talon_core::BlockId, operation: Operation) {
+        self.apply(id, StoreKind::Paged, &operation, None, None);
+    }
+
+    pub(super) fn sidecar(&self, id: &dyn BlockIdentity) -> Option<(&BlockKey, &Geometry)> {
+        let (key, geometry, entry) = self.resident(id)?;
+        (entry.sidecar_page_size != 0 && geometry.disk_id.is_none()).then_some((key, geometry))
     }
 
     fn usage(&self, handle: u32, page: Option<u32>) -> Usage {
@@ -387,7 +479,9 @@ impl Directory {
                 operation,
                 Operation::Put { .. } | Operation::PutWhole { .. }
             );
-        let live_paged = kind == StoreKind::Paged && self.page_size.is_some_and(|size| size != 0);
+        let live_paged = kind == StoreKind::Paged
+            && (self.page_size.unwrap_or_default() != 0
+                || self.runtime_at(slot).sidecar_page_size != 0);
         let key = live_paged.then(|| self.rows.at(slot).unwrap().id.clone());
         match (operation, allocated) {
             (Operation::PutWhole { len }, Some(bytes)) => {
@@ -490,6 +584,14 @@ impl Directory {
                 );
             }
         }
+        if !putting {
+            if let Some(entry) = self.runtime.get_mut(&slot).filter(|entry| {
+                entry.sidecar_page_size != 0
+                    && self.rows.geometry(handle, StoreKind::Paged).is_none()
+            }) {
+                entry.sidecar_page_size = 0;
+            }
+        }
         if !putting && self.runtime_at(slot).is_empty() {
             self.runtime.remove(&slot);
             self.release(id, slot);
@@ -498,6 +600,35 @@ impl Directory {
         self.blocks = self.blocks - before.blocks + after.blocks;
         self.pages = self.pages - before.pages + after.pages;
         self.bytes = self.bytes - before.bytes + after.bytes;
+    }
+}
+
+// Only revisions admitted after a topology capture need supplemental discovery.
+// Keep one entry per changed slot and cap burst memory even without renewals.
+// Retained entries in a captured, covered range remain available while later
+// admissions overflow. A range crossing overflow uses the occupied scan.
+const MAX_OWNERSHIP_CHANGES: usize = 4096;
+
+#[derive(Default)]
+struct OwnershipChanges {
+    enabled: bool,
+    floor: Option<u64>,
+    pending: BTreeMap<u64, u32>,
+    overflow: Range<u64>,
+}
+
+impl OwnershipChanges {
+    fn insert(&mut self, revision: u64, slot: u32) {
+        if self.floor.is_none() {
+            return;
+        }
+        if self.pending.len() < MAX_OWNERSHIP_CHANGES {
+            self.pending.insert(revision, slot);
+        } else if self.overflow.is_empty() {
+            self.overflow = revision..revision + 1;
+        } else {
+            self.overflow.end = revision + 1;
+        }
     }
 }
 
@@ -561,6 +692,91 @@ impl std::ops::Index<&BlockId> for Directory {
 mod tests {
     use super::*;
     use talon_core::{Backend, ObjectId, Version};
+
+    #[test]
+    fn ownership_changes_coalesce_refills_and_bound_retained_churn() {
+        let id = |n| {
+            BlockId::new(
+                ObjectId::new(Backend::S3, "b", format!("o/{n}")),
+                0,
+                32,
+                Version::new("v1"),
+            )
+        };
+        let put = |directory: &mut Directory, block: &BlockId, page| {
+            directory.apply(
+                block,
+                StoreKind::Paged,
+                &Operation::Put { page, len: 32 },
+                None,
+                Some(16),
+            );
+        };
+        let mut directory = Directory::default();
+        directory.attach(16);
+        directory.reset_clocks(true);
+        directory.enable_catalog_policy();
+        directory.enable_ownership_changes();
+        let first = id(0);
+        put(&mut directory, &first, 0);
+        assert!(directory.ownership_changes.pending.is_empty());
+
+        let floor = directory.capture_ownership_ceiling(true);
+        for _ in 0..100 {
+            put(&mut directory, &first, 1);
+        }
+        assert_eq!(directory.ownership_changes.pending.len(), 1);
+        let retired_slot = directory.slot(&first).unwrap();
+        let cutoff = directory.capture_ownership_ceiling(false);
+        assert_eq!(
+            directory.next_ownership_change(&(floor..cutoff)),
+            Some((cutoff - 1, retired_slot))
+        );
+
+        // A refill and a replacement after capture have different revisions,
+        // even when the replacement immediately reuses the old slot.
+        put(&mut directory, &first, 0);
+        assert!(directory.next_ownership_change(&(floor..cutoff)).is_none());
+        directory.apply(
+            &first,
+            StoreKind::Paged,
+            &Operation::DeleteBlock,
+            None,
+            None,
+        );
+        put(&mut directory, &id(1), 0);
+        assert_eq!(directory.slot(&id(1)), Some(retired_slot));
+        assert_eq!(directory.ownership_changes.pending.len(), 1);
+        assert!(directory.next_ownership_change(&(floor..cutoff)).is_none());
+
+        let covered_end = directory.capture_ownership_ceiling(false);
+        for n in 2..=2 * MAX_OWNERSHIP_CHANGES {
+            put(&mut directory, &id(n), 0);
+        }
+        let end = directory.capture_ownership_ceiling(false);
+        assert!(directory.ownership_changes_cover(&(cutoff..covered_end)));
+        assert!(!directory.ownership_changes_cover(&(covered_end..end)));
+        assert_eq!(
+            directory.ownership_changes.pending.len(),
+            MAX_OWNERSHIP_CHANGES
+        );
+        println!(
+            "changed_blocks={} retained_changes={} resident_rows={}",
+            2 * MAX_OWNERSHIP_CHANGES,
+            directory.ownership_changes.pending.len(),
+            directory.totals().0,
+        );
+
+        directory.retire_ownership_changes(end);
+        assert!(directory.ownership_changes.pending.is_empty());
+        put(&mut directory, &id(1), 1);
+        let next = end..directory.capture_ownership_ceiling(false);
+        assert!(directory.ownership_changes_cover(&next));
+        assert_eq!(
+            directory.next_ownership_change(&next),
+            Some((end, retired_slot))
+        );
+    }
 
     #[test]
     fn admission_revisions_widen_without_changing_existing_slots() {

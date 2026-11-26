@@ -449,7 +449,7 @@ impl WorkerRuntime {
 
     fn capture_ownership_limits(&self) -> OwnershipLimits {
         OwnershipLimits {
-            block: self.lru.ownership_admission_ceiling(),
+            block: self.lru.capture_ownership_ceiling(true),
             small: self
                 .small
                 .as_ref()
@@ -469,7 +469,7 @@ impl WorkerRuntime {
             return None;
         }
         Some(OwnershipLimits {
-            block: self.lru.ownership_admission_ceiling(),
+            block: self.lru.capture_ownership_ceiling(false),
             small: self
                 .small
                 .as_ref()
@@ -2002,17 +2002,29 @@ impl WorkerRuntime {
                             return Ok::<_, anyhow::Error>(());
                         }
                         let paged = runtime.paged.as_ref().expect("paged store").clone();
+                        let publishes = paged.publishes_to(&runtime.index);
+                        anyhow::ensure!(
+                            publishes || !paged.journaled() || !runtime.index.uses_catalog(),
+                            "paged store and runtime have different catalogs"
+                        );
+                        // A standalone attachment owns only the pages it publishes.
+                        // Keep existing journal-owned geometry intact.
+                        if !paged.journaled() && runtime.index.has_journaled_pages(&id) {
+                            return Ok(());
+                        }
                         let value = bytes.clone();
                         let (allocated, disk_id) = paged
                             .commit_page_payload(&id, page, block_len, value)
                             .await?;
-                        if !runtime.index.uses_catalog() {
-                            runtime
-                                .index
-                                .init_paged(id.clone(), paged.page_size(), block_len);
-                            runtime
-                                .index
-                                .mark_page_allocated_at(&id, page, allocated, disk_id);
+                        if !publishes {
+                            runtime.index.publish_page(
+                                &id,
+                                page,
+                                paged.page_size(),
+                                block_len,
+                                allocated,
+                                disk_id,
+                            );
                         }
                         let now = runtime.page_access_time();
                         state.register(page, now, now.unwrap_or_default(), true);
@@ -3161,6 +3173,10 @@ mod tests {
                 len: 8,
                 version: Version::new("v1"),
             })
+        }
+
+        async fn delete(&self, _object: &ObjectId) -> Result<()> {
+            Ok(())
         }
     }
 
@@ -4429,6 +4445,83 @@ mod tests {
         // No second backend fetch.
         assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn whole_namespace_with_standalone_paged_store_retains_and_reclaims_a_fill() {
+        use std::os::unix::fs::MetadataExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let sidecar = tempfile::tempdir().unwrap();
+        let config = talon_core::WorkerConfig {
+            backend: Some("s3".into()),
+            l1_capacity_bytes: 0,
+            l2_page_size_bytes: 0,
+            small_object_threshold_bytes: 0,
+            ..Default::default()
+        };
+        let origin = Arc::new(MockBackend {
+            calls: AtomicUsize::new(0),
+        });
+        let lock = Arc::new(crate::page_access_store::CacheRootLock::acquire(root.path()).unwrap());
+        let runtime =
+            WorkerRuntime::open_namespaces(&config, lock, origin.clone(), WorkerMetrics::new(0))
+                .unwrap()
+                .with_paged_store(PagedBlockStore::open(sidecar.path(), 4096).unwrap());
+        let request = RangeRequest {
+            object: ObjectId::new(Backend::S3, "bucket", "ok"),
+            offset: 0,
+            len: 8,
+        };
+        let block = BlockId::new(
+            request.object.clone(),
+            0,
+            config.block_size,
+            Version::new("v1"),
+        );
+        let probe = CachedRangeRequest {
+            object: request.object.clone(),
+            version: block.version.clone(),
+            offset: 0,
+            len: 8,
+        };
+        let dir = runtime.paged.as_ref().unwrap().dir_for(&block);
+
+        assert_eq!(
+            runtime.serve_range(&request).await.unwrap(),
+            &b"abcdefgh"[..]
+        );
+        let allocated = std::fs::metadata(dir.join("0.page")).unwrap().blocks() * 512;
+        assert!(allocated > 0);
+        assert_eq!(
+            runtime.serve_cached(&probe).await.unwrap(),
+            &b"abcdefgh"[..]
+        );
+        assert_eq!(
+            runtime.serve_range(&request).await.unwrap(),
+            &b"abcdefgh"[..]
+        );
+        assert_eq!(origin.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.resident_bytes(), allocated);
+        assert_eq!(runtime.lru.total_bytes(), allocated);
+        assert_eq!(runtime.index.page_count(), 1);
+        assert_eq!(runtime.lru.len(), 1);
+
+        // A journal checkpoint must continue to contain only journal-owned rows.
+        runtime.store.checkpoint_catalog().await.unwrap();
+        let candidates = runtime.lru.block_candidates(&block);
+        assert_eq!(candidates.len(), 1);
+        runtime.delete_object(&request.object).await.unwrap();
+        assert!(!dir.exists());
+        assert_eq!(runtime.index.page_count(), 0);
+        assert_eq!(runtime.resident_bytes(), 0);
+        assert_eq!(runtime.lru.total_bytes(), 0);
+        assert!(runtime
+            .serve_cached(&probe)
+            .await
+            .unwrap_err()
+            .is::<CacheMiss>());
+        assert_eq!(origin.calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

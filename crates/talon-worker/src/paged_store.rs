@@ -133,6 +133,12 @@ impl PagedBlockStore {
         self.catalog.is_some()
     }
 
+    pub(crate) fn publishes_to(&self, index: &crate::BlockIndex) -> bool {
+        self.catalog
+            .as_ref()
+            .is_some_and(|(catalog, _)| catalog.publishes_to(index))
+    }
+
     async fn commit_catalog_page(
         self: &Arc<Self>,
         id: &BlockId,

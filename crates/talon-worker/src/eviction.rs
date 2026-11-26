@@ -378,6 +378,12 @@ impl StaleBlockCandidate {
     pub(crate) fn is_idle(&self, now: u64, age: u64) -> bool {
         age > 0 && now.saturating_sub(self.last_access) > age
     }
+
+    pub(crate) fn matches(&self, activity: &BlockActivity) -> bool {
+        activity.pins == 0
+            && activity.revision == self.revision
+            && activity.last_access == self.last_access
+    }
 }
 
 #[derive(Default)]
@@ -1123,6 +1129,18 @@ impl Lru {
         )
     }
 
+    pub(crate) fn ownership_change_step(
+        &self,
+        range: &mut std::ops::Range<u64>,
+    ) -> Option<Option<StaleBlockCandidate>> {
+        let g = self.inner.lock().unwrap();
+        Some(
+            g.index
+                .ownership_change_step(range)?
+                .map(|(block, activity)| activity.candidate(block.materialize())),
+        )
+    }
+
     pub(crate) fn refresh_ownership_candidate(
         &self,
         candidate: &StaleBlockCandidate,
@@ -1148,7 +1166,16 @@ impl Lru {
         self.inner.lock().unwrap().index.policy_scan_ceiling()
     }
 
+    pub(crate) fn capture_ownership_ceiling(&self, topology_change: bool) -> u64 {
+        self.inner
+            .lock()
+            .unwrap()
+            .index
+            .capture_ownership_ceiling(topology_change)
+    }
+
     /// Constant-time check for cache admissions since an ownership sweep.
+    #[cfg(test)]
     pub(crate) fn ownership_admission_ceiling(&self) -> u64 {
         self.inner.lock().unwrap().index.compact.admission_ceiling()
     }
@@ -1159,11 +1186,7 @@ impl Lru {
             .unwrap()
             .index
             .policy_block_get(&candidate.block)
-            .is_some_and(|entry| {
-                entry.pins == 0
-                    && entry.revision == candidate.revision
-                    && entry.last_access == candidate.last_access
-            })
+            .is_some_and(|entry| candidate.matches(&entry))
     }
 
     pub(crate) fn contains_tracked_block(&self, block: &BlockId) -> bool {

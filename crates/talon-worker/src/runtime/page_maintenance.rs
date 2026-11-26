@@ -1,6 +1,6 @@
 //! Page mutations are owned worker tasks: cancellation never splits disk and index updates.
 use super::*;
-use crate::block_key::BlockIdentity;
+use crate::block_key::{BlockIdentity, BlockKey};
 use crate::page_access_store::{AccessSnapshot, PageAccessStore};
 use crate::page_gc::{CheckpointReport, GcReport};
 use crate::page_lifecycle::{
@@ -321,8 +321,19 @@ impl WorkerRuntime {
             let paged = runtime.paged.as_ref()?;
             let page = candidate.page;
             let id = &block.id.materialize();
-            let bytes = runtime.index.get(id).map(|m| talon_core::page_len(m.len, paged.page_size(), page)).unwrap_or(0);
-            if let Err(error) = paged.evict_page_async(id, page).await {
+            let (bytes, last_sidecar_page) = runtime.index.get(id).map_or((0, false), |meta| {
+                let last = !paged.journaled() && runtime.index.uses_catalog()
+                    && matches!(meta.form, BlockForm::Paged { ref present, .. } if present.count() == 1);
+                (talon_core::page_len(meta.len, paged.page_size(), page), last)
+            });
+            let removed = if last_sidecar_page {
+                // The compact row retires with its final page. Retry a failed
+                // directory unlink before removing that page from accounting.
+                paged.delete_block_async(id).await
+            } else {
+                paged.evict_page_async(id, page).await
+            };
+            if let Err(error) = removed {
                 block.abort(&candidate, reason); runtime.page_gc_metrics.delete_errors.inc();
                 tracing::warn!(block = %id, page = page.0, %error, "page unlink failed; retaining accounting for retry");
                 return None;
@@ -337,7 +348,7 @@ impl WorkerRuntime {
             runtime.page_gc_metrics.deleted[reason].inc(); runtime.page_gc_metrics.bytes[reason].add(bytes);
             // A durable catalog completion already retires the page and
             // removes the block row when its last page is gone.
-            if !paged.journaled() && !block.has_pages() {
+            if !paged.journaled() && !last_sidecar_page && !block.has_pages() {
                 match paged.delete_block_async(id).await {
                     Ok(()) => { block.cleanup_finished(); if runtime.index.get(id).is_some_and(|m| matches!(m.form, BlockForm::Paged {..})) {runtime.index.remove(id);} }
                     Err(error) => {runtime.page_gc_metrics.delete_errors.inc(); tracing::warn!(block = %id, %error, "empty page directory cleanup failed");}
@@ -393,9 +404,9 @@ impl WorkerRuntime {
         &self,
         candidate: crate::eviction::StaleBlockCandidate,
         membership: Option<Arc<super::MembershipSnapshot>>,
-    ) {
+    ) -> bool {
         self.unlink_stale_block_inner(candidate, membership, false, None)
-            .await;
+            .await
     }
 
     pub(super) async fn unlink_stale_block_prepaid(
@@ -486,21 +497,19 @@ impl WorkerRuntime {
                 };
                 let block = candidate.unit.block().clone();
                 let whole = matches!(candidate.unit, CacheUnit::Whole(_));
-                let state = runtime.page_lifecycle.block(&block);
+                let state = if deadline.is_some() {
+                    runtime.page_lifecycle.mutation(BlockKey::new(&block))
+                } else {
+                    runtime.page_lifecycle.block(&block)
+                };
                 if let Some(_gate) = before_deadline(deadline, state.lock()).await {
                     let validator = runtime.clone();
                     let small = runtime.small.as_ref().unwrap();
                     match small
                         .delete_gc(candidate, revision, deadline, move || {
                             membership.as_ref().map_or(true, |view| {
-                                uncontended(validator.membership.try_lock()).is_some_and(|held| {
-                                    let now = Instant::now();
-                                    now < view.valid_until
-                                        && held.as_ref().is_some_and(|current| {
-                                            current.generation == view.generation
-                                                && now < current.valid_until
-                                        })
-                                })
+                                uncontended(validator.membership.try_lock())
+                                    .is_some_and(|held| ownership_authorized(held.as_deref(), view))
                             })
                         })
                         .await
@@ -529,33 +538,49 @@ impl WorkerRuntime {
         membership: Option<Arc<super::MembershipSnapshot>>,
         prepaid: bool,
         idle_at: Option<u64>,
-    ) {
+    ) -> bool {
         let runtime = self.clone();
         self.page_mutations.run(async move {
             let ownership_deadline = membership.as_ref().map(|view| view.valid_until);
             let reason = if ownership_deadline.is_some() { 4 } else { 3 };
-            let Some(permit) = before_deadline(ownership_deadline, runtime.page_gc_io.clone().acquire_owned()).await else { return; };
+            let Some(permit) = before_deadline(ownership_deadline, runtime.page_gc_io.clone().acquire_owned()).await else { return false; };
             let _permit = permit.expect("page GC semaphore closed");
             if ownership_deadline.is_none() && !prepaid {
                 if let Some(budget) = &runtime.background_budget {
                     budget.delete_units(candidate.units as u64).await;
                 }
             }
-            let Some(_background_io) = before_deadline(ownership_deadline, runtime.background_io()).await else { return; };
-            let state = runtime.page_lifecycle.block(&candidate.block);
+            let Some(_background_io) = before_deadline(ownership_deadline, runtime.background_io()).await else { return false; };
+            let state = if ownership_deadline.is_some() {
+                runtime.page_lifecycle.mutation(BlockKey::new(&candidate.block))
+            } else {
+                runtime.page_lifecycle.block(&candidate.block)
+            };
             {
-                let Some(_gate) = before_deadline(ownership_deadline, state.lock()).await else { return; };
-                if idle_at.is_some_and(|now| !candidate.is_idle(now.max(crate::eviction::access_millis()), runtime.current_tti_ms())) { return; }
-                if !runtime.lru.stale_candidate_is_current(&candidate) { return; }
-                let Some(claim) = state.claim_all_pages() else { return; };
-                // A reader may have completed before the block claim.
-                if !runtime.lru.stale_candidate_is_current(&candidate) { return; }
-                if membership.as_ref().is_some_and(|view|
-                    Instant::now() >= view.valid_until || !runtime.membership_is_current(view)) { return; }
+                let Some(_gate) = before_deadline(ownership_deadline, state.lock()).await else { return false; };
+                if idle_at.is_some_and(|now| !candidate.is_idle(now.max(crate::eviction::access_millis()), runtime.current_tti_ms())) { return false; }
                 let id = &candidate.block;
-                let bytes = runtime.index.get(id).map_or(0, |meta| meta.resident_bytes());
+                let (claim, bytes) = if ownership_deadline.is_some() && runtime.index.uses_catalog() {
+                    let Some(observed) = state.try_claim_catalog_ownership(&candidate) else { return false; };
+                    observed
+                } else {
+                    if !runtime.lru.stale_candidate_is_current(&candidate) { return false; }
+                    let Some(claim) = state.claim_all_pages() else { return false; };
+                    // A reader may have completed before the block claim.
+                    if !runtime.lru.stale_candidate_is_current(&candidate) { return false; }
+                    let bytes = runtime.index.get(id).map_or(0, |meta| meta.resident_bytes());
+                    (claim, bytes)
+                };
                 let pages = claim.len();
-                let compact = runtime.small.as_ref().is_some_and(|small| small.has_recency());
+                let compact = if let Some(small) = &runtime.small {
+                    let Some(compact) = small.recency_for_unlink(ownership_deadline.is_some()) else { return false; };
+                    compact
+                } else {
+                    false
+                };
+                if membership.as_ref().is_some_and(|view|
+                    !uncontended(runtime.membership.try_lock())
+                        .is_some_and(|held| ownership_authorized(held.as_deref(), view))) { return false; }
                 let whole = if compact {
                     runtime.store.delete(id).await
                 } else {
@@ -564,19 +589,19 @@ impl WorkerRuntime {
                 if let Err(error) = whole {
                     runtime.page_gc_metrics.delete_errors.inc();
                     tracing::warn!(block = %id, %error, "stale block unlink failed; retaining accounting");
-                    return;
+                    return false;
                 }
                 if let Some(small) = runtime.small.as_ref().filter(|_| !compact) {
                     if let Err(error) = small.delete(&CacheUnit::ExactRange(id.clone())).await {
                         tracing::warn!(block = %id, %error, "exact range unlink failed");
-                        return;
+                        return false;
                     }
                 }
                 if let Some(paged) = runtime.paged.as_ref().filter(|_| pages > 0) {
                     if let Err(error) = paged.delete_block_async(id).await {
                         runtime.page_gc_metrics.delete_errors.inc();
                         tracing::warn!(block = %id, %error, "stale paged block unlink failed; retaining accounting");
-                        return;
+                        return false;
                     }
                 }
                 runtime.invalidate_l1(id);
@@ -588,8 +613,9 @@ impl WorkerRuntime {
                     runtime.page_gc_metrics.deleted[reason].add(pages as u64);
                     runtime.page_gc_metrics.bytes[reason].add(bytes);
                 }
+                true
             }
-        }).await;
+        }).await
     }
 
     /// Capacity and superseded page eviction share the same commit protocol as TTI.
@@ -916,6 +942,16 @@ impl WorkerRuntime {
         self.page_gc_metrics.dirty_blocks.set(remaining as f64);
         self.page_gc_metrics.dirty_age.set(oldest as f64 / 1000.0);
     }
+}
+
+fn ownership_authorized(
+    current: Option<&super::MembershipSnapshot>,
+    expected: &super::MembershipSnapshot,
+) -> bool {
+    let now = Instant::now();
+    now < expected.valid_until
+        && current
+            .is_some_and(|view| view.generation == expected.generation && now < view.valid_until)
 }
 
 pub(crate) async fn before_deadline<F: std::future::Future>(
