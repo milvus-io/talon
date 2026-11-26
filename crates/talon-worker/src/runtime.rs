@@ -2842,13 +2842,34 @@ impl WorkerRuntime {
         namespace: &Self,
         capacity: u64,
     ) -> u64 {
+        let peers = workers
+            .iter()
+            .filter(|worker| !std::ptr::eq(worker.as_ref(), namespace));
         let mut target = capacity;
-        for worker in workers {
-            if !std::ptr::eq(worker.as_ref(), namespace) {
-                target = target.saturating_sub(worker.resident_bytes_after_small_reclaim().await);
+        for worker in peers.clone() {
+            if let Some(small) = &worker.small {
+                let usage = small.capacity_usage().await;
+                target = target
+                    .saturating_sub(usage.allocated_bytes.saturating_sub(usage.reclaim_credit));
             }
         }
-        target
+
+        // Earlier peers can release indexed bytes while a later scan waits.
+        // Use the same post-scan index samples for the target and physical cap.
+        let mut peer_physical = 0u64;
+        for worker in peers {
+            let indexed = worker.index.resident_bytes();
+            target = target.saturating_sub(indexed);
+            let small = worker
+                .small
+                .as_ref()
+                .and_then(|s| s.stats().ok())
+                .map_or(0, |s| s.allocated_bytes);
+            peer_physical = peer_physical.saturating_add(indexed).saturating_add(small);
+        }
+        let local = namespace.resident_bytes();
+        let physical_excess = peer_physical.saturating_add(local).saturating_sub(capacity);
+        target.max(local.saturating_sub(physical_excess))
     }
 
     async fn resident_bytes_after_small_reclaim(&self) -> u64 {

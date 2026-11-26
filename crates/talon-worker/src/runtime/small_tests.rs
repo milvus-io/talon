@@ -1227,6 +1227,67 @@ async fn small_capacity_shares_pending_reclaim_credit_across_namespaces() {
     );
 }
 
+#[tokio::test]
+async fn shared_capacity_resamples_indexed_bytes_after_peer_scan() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = WorkerConfig {
+        backend: Some("s3".into()),
+        block_size: 1 << 20,
+        capacity_bytes: 16 << 20,
+        l2_page_size_bytes: 0,
+        small_object_threshold_bytes: 128 << 10,
+        small_object_segment_bytes: 256 << 10,
+        background_io_max_mb_per_sec: 0,
+        ..Default::default()
+    };
+    let (worker, namespaces) = small_capacity_namespaces(dir.path(), &config).await;
+    let [victims, stalled] = namespaces.as_slice() else {
+        unreachable!();
+    };
+    let releasing = worker
+        .for_namespace(&talon_core::NamespaceId::named("a-ordinary"))
+        .await
+        .unwrap();
+    let ordinary = id(&releasing);
+    releasing
+        .commit_cached_block(&ordinary, Bytes::from(vec![7; 256 << 10]))
+        .await
+        .unwrap();
+    let released = releasing.index.resident_bytes();
+    assert!(released > 0);
+    let resident = || {
+        worker
+            .namespace_runtimes()
+            .iter()
+            .map(|w| w.resident_bytes())
+            .sum::<u64>()
+    };
+    let mut enforcing = victims.as_ref().clone();
+    let capacity = resident() - released / 2;
+    enforcing.capacity_bytes = capacity;
+    let mut enforcement = std::pin::pin!(enforcing.enforce_capacity());
+    let mut packed = id(stalled);
+    packed.object.object_path = "ns-object-0".into();
+    stalled
+        .small
+        .as_ref()
+        .unwrap()
+        .with_capacity_state_locked(&packed, async {
+            // The registry orders a-ordinary before credit-1, whose stream lock
+            // stalls the peer scan after it has visited the releasing runtime.
+            assert!(futures::poll!(enforcement.as_mut()).is_pending());
+            releasing
+                .unlink_units(releasing.lru.block_candidates(&ordinary), 2)
+                .await;
+            assert_eq!(releasing.index.resident_bytes(), 0);
+            assert!(resident() < capacity);
+        })
+        .await;
+    enforcement.await;
+    assert_eq!(victims.block_count(), 4);
+    assert_eq!(stalled.block_count(), 4);
+}
+
 async fn small_capacity_namespaces(
     root: &Path,
     config: &WorkerConfig,

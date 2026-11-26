@@ -460,6 +460,17 @@ impl SmallObjectStore {
         pause
     }
 
+    #[cfg(test)]
+    pub(crate) async fn with_capacity_state_locked(
+        &self,
+        id: &BlockId,
+        work: impl std::future::Future<Output = ()>,
+    ) {
+        let stream = self.owner(id).unwrap();
+        let _state = stream.state.lock().await;
+        work.await;
+    }
+
     /// Startup only. Attach access tokens to locators and contribute units to
     /// the shared bulk policy construction without registering in BlockIndex.
     pub(crate) fn restore_policy_units(
