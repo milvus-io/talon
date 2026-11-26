@@ -8,6 +8,12 @@ use tokio::sync::OnceCell;
 
 type Stream = Arc<OnceCell<Arc<SegmentStore>>>;
 
+#[derive(Default)]
+pub(crate) struct SmallStoreCapacity {
+    pub(crate) allocated_bytes: u64,
+    pub(crate) reclaim_credit: u64,
+}
+
 pub struct SmallObjectStore {
     pub(super) root: PathBuf,
     fallback: Arc<SegmentStore>,
@@ -395,14 +401,6 @@ impl SmallObjectStore {
         let store = self.clone();
         self.tasks
             .run(async move {
-                let guard = if deadline.is_some() {
-                    store.mutations.try_admit_owned(Self::mutation_key(&id))
-                } else {
-                    Some(store.mutation(&id).await)
-                };
-                let Some(_guard) = guard else {
-                    return Ok(false);
-                };
                 let owner = if deadline.is_some() {
                     store.try_owner(&id)
                 } else {
@@ -411,20 +409,28 @@ impl SmallObjectStore {
                 let Some(stream) = owner else {
                     return Ok(false);
                 };
-                let removed = stream
+                let guard = stream
                     .delete_inner_if(&id, deadline, |loc| {
-                        loc.access
+                        let current = loc
+                            .access
                             .as_ref()
                             .and_then(AccessHandle::small)
                             .is_some_and(|current| {
                                 Arc::ptr_eq(current, &ticket) && eligible(current)
-                            })
+                            });
+                        if !current || deadline.is_some_and(|at| Instant::now() >= at) {
+                            return None;
+                        }
+                        // A put or unconditional delete can hold this key while
+                        // waiting for stream state. Defer on contention.
+                        store.mutations.try_admit_owned(Self::mutation_key(&id))
                     })
                     .await?;
-                if removed {
+                if let Some(_guard) = guard {
                     store.policy().expect("compact small policy").remove(&id);
+                    return Ok(true);
                 }
-                Ok(removed)
+                Ok(false)
             })
             .await
     }
@@ -439,9 +445,30 @@ impl SmallObjectStore {
             total.dead_bytes += stats.dead_bytes;
             total.segments += stats.segments;
         }
-        total.allocated_bytes +=
-            self.access_bytes.load(std::sync::atomic::Ordering::Relaxed) + self.journal.allocated();
+        total.allocated_bytes += self.metadata_allocated_bytes();
         Ok(total)
+    }
+
+    fn metadata_allocated_bytes(&self) -> u64 {
+        self.access_bytes.load(std::sync::atomic::Ordering::Relaxed) + self.journal.allocated()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_compaction_unlink(&self, id: &BlockId) -> Arc<super::tests::AppendPause> {
+        let pause = Arc::new(super::tests::AppendPause::default());
+        *self.owner(id).unwrap().unlink_pause.lock().unwrap() = Some(pause.clone());
+        pause
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn with_capacity_state_locked(
+        &self,
+        id: &BlockId,
+        work: impl std::future::Future<Output = ()>,
+    ) {
+        let stream = self.owner(id).unwrap();
+        let _state = stream.state.lock().await;
+        work.await;
     }
 
     /// Startup only. Attach access tokens to locators and contribute units to
@@ -539,15 +566,22 @@ impl SmallObjectStore {
         self.lookup_entry(&id.view()).ok().flatten()?.access
     }
 
-    /// Only threshold-eligible segments provide planning credit. Garbage in a
-    /// mostly-live segment cannot cover pressure until more items are evicted.
-    /// Planning credit, never physical accounting. Round live record extents
-    /// to destination file allocation units. Computed only on the
-    /// pressure path, not by walking all segments on each append.
-    pub(crate) async fn reclaimable_bytes(&self) -> u64 {
-        let mut bytes = 0;
+    /// Sample allocation and planning credit together per stream. Publication
+    /// moves credit from eligible segments to pending unlinks, then unlink
+    /// either releases that allocation or transfers it to reader-retained bytes.
+    pub(crate) async fn capacity_usage(&self) -> SmallStoreCapacity {
+        let mut usage = SmallStoreCapacity::default();
         for stream in self.streams() {
             let state = stream.state.lock().await;
+            {
+                let mut cached = stream.cached_stats.lock().unwrap();
+                let stats = cached.snapshot();
+                usage.allocated_bytes += stats.allocated_bytes;
+                usage.reclaim_credit += cached.pending_unlink + stats.retired_bytes;
+            }
+            if state.poisoned {
+                continue;
+            }
             for (&id, s) in &state.segments {
                 if Some(id) == state.standby
                     || !s.in_flight.is_empty()
@@ -560,10 +594,11 @@ impl SmallObjectStore {
                 } else {
                     s.live_data_bytes.div_ceil(self.allocation_unit) * self.allocation_unit
                 };
-                bytes += s.allocated.saturating_sub(destination);
+                usage.reclaim_credit += s.allocated.saturating_sub(destination);
             }
         }
-        bytes
+        usage.allocated_bytes += self.metadata_allocated_bytes();
+        usage
     }
 
     /// One segment per stream, stopping once enough physical space was released.
@@ -1144,6 +1179,147 @@ mod recovery_tests {
         store.maintain(true).await.unwrap();
         assert!(!store.contains(&id(0)));
         assert_eq!(retained.read().await.unwrap(), Bytes::from_static(b"data"));
+    }
+
+    #[tokio::test]
+    async fn compaction_publishes_before_waiting_for_old_open_and_survives_cancellation() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Arc::new(open(dir.path()).unwrap());
+            let stream = store.writer(1).await.unwrap();
+            stream
+                .put(&id(0), Bytes::from(vec![0; 8192]))
+                .await
+                .unwrap();
+            stream
+                .put(&id(1), Bytes::from_static(b"survivor"))
+                .await
+                .unwrap();
+            stream
+                .put(&id(3), Bytes::from_static(b"late delete"))
+                .await
+                .unwrap();
+            stream.checkpoint().await.unwrap();
+            store.delete(&id(0)).await.unwrap();
+            let old = store.lookup_entry(&id(1)).unwrap().unwrap();
+            let before = stream.stats().unwrap();
+            let pause = Arc::new(super::super::tests::AppendPause::default());
+            *stream.reconcile_pause.lock().unwrap() = Some(pause.clone());
+            let compaction = tokio::spawn({
+                let stream = stream.clone();
+                async move { stream.maintain(false).await }
+            });
+            pause.entered.notified().await;
+            let staged = stream.stats().unwrap();
+            assert!(staged.allocated_bytes > before.allocated_bytes);
+            assert_eq!(staged.live_bytes, before.live_bytes);
+            assert_eq!(staged.segments, before.segments);
+            compaction.abort();
+            assert!(compaction.await.unwrap_err().is_cancelled());
+            store.delete(&id(3)).await.unwrap();
+            let held = old.file.fd.lock().await;
+            let reader = tokio::spawn({
+                let store = store.clone();
+                async move { store.read(&id(1)).await }
+            });
+            while stream.readers.try_write().is_ok() {
+                tokio::task::yield_now().await;
+            }
+            pause.resume.notify_one();
+            while store.lookup_entry(&id(1)).unwrap().unwrap().segment == old.segment {
+                tokio::task::yield_now().await;
+            }
+            assert!(old.file.path.is_file());
+            stream
+                .put(&id(2), Bytes::from_static(b"foreground append"))
+                .await
+                .unwrap();
+            drop(held);
+            assert_eq!(reader.await.unwrap().unwrap().unwrap(), b"survivor"[..]);
+            stream.tasks.drain().await;
+            assert!(stream.state.lock().await.compaction_deletes.is_none());
+            assert!(!old.file.path.exists());
+            assert!(!store.contains(&id(3)));
+            assert_eq!(store.read(&id(1)).await.unwrap().unwrap(), b"survivor"[..]);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn discarded_compaction_credit_clears_on_unlink_success_or_failure() {
+        for fail_unlink in [false, true] {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let dir = tempfile::tempdir().unwrap();
+                let store = Arc::new(open(dir.path()).unwrap());
+                let garbage = id(0);
+                let survivor = id(1);
+                store
+                    .put(&garbage, Bytes::from(vec![0; 64 << 10]))
+                    .await
+                    .unwrap();
+                store
+                    .put(&survivor, Bytes::from(vec![1; 16 << 10]))
+                    .await
+                    .unwrap();
+                store.maintain(true).await.unwrap();
+                store.delete(&garbage).await.unwrap();
+                let stream = store.owner(&survivor).unwrap();
+                let source = store
+                    .lookup_entry(&survivor)
+                    .unwrap()
+                    .unwrap()
+                    .file
+                    .path
+                    .clone();
+                let source_bytes = std::fs::metadata(&source).unwrap().blocks() * 512;
+                let reconcile = Arc::new(super::super::tests::AppendPause::default());
+                *stream.reconcile_pause.lock().unwrap() = Some(reconcile.clone());
+                let unlink = store.pause_compaction_unlink(&survivor);
+                let maintenance = store.maintain(false);
+                let observe = async {
+                    reconcile.entered.notified().await;
+                    let staged = stream.path(
+                        super::super::tests::staged_compaction_id(&stream).await,
+                        "data",
+                    );
+                    let staged_bytes = std::fs::metadata(&staged).unwrap().blocks() * 512;
+                    assert!(source_bytes > 0 && staged_bytes > 0);
+                    store.delete(&survivor).await.unwrap();
+                    reconcile.resume.notify_one();
+                    unlink.entered.notified().await;
+                    assert!(source.is_file() && staged.is_file());
+                    let pending = store.capacity_usage().await;
+                    assert_eq!(pending.reclaim_credit, source_bytes + staged_bytes);
+                    if fail_unlink {
+                        // Keep the staged inode allocated and force unlink to fail.
+                        std::fs::rename(&staged, staged.with_extension("kept")).unwrap();
+                        std::fs::create_dir(&staged).unwrap();
+                    }
+                    unlink.resume.notify_one();
+                    (staged, staged_bytes, pending.allocated_bytes)
+                };
+                let (result, (staged, staged_bytes, allocated)) =
+                    tokio::join!(maintenance, observe);
+                assert!(!source.exists());
+                let after = store.capacity_usage().await;
+                assert_eq!(after.reclaim_credit, 0);
+                if fail_unlink {
+                    assert!(result.is_err());
+                    assert!(staged.with_extension("kept").is_file());
+                    assert_eq!(after.allocated_bytes + source_bytes, allocated);
+                } else {
+                    assert!(result.unwrap());
+                    assert!(!staged.exists());
+                    assert_eq!(
+                        after.allocated_bytes + source_bytes + staged_bytes,
+                        allocated
+                    );
+                }
+            })
+            .await
+            .unwrap();
+        }
     }
 
     #[tokio::test]

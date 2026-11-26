@@ -301,7 +301,13 @@ async fn small_background_reclaims_after_bounded_scans_of_hot_or_pinned_keys() {
             ..Default::default()
         };
         let target = (before as f64 * config.async_eviction_low_watermark) as u64;
-        let credit = w.small_reclaim_credit().await;
+        let credit = w
+            .small
+            .as_ref()
+            .unwrap()
+            .capacity_usage()
+            .await
+            .reclaim_credit;
         assert!(credit > 0 && credit < before - target);
         assert!(w.lru.len() > w.page_gc_config.scan_batch_size);
         let live = w.block_count();
@@ -1036,7 +1042,15 @@ async fn small_background_capacity_keeps_evicting_until_segment_threshold() {
                     original_payloads,
                     "pressure cannot bypass compaction threshold"
                 );
-                assert_eq!(w.small.as_ref().unwrap().reclaimable_bytes().await, 0);
+                assert_eq!(
+                    w.small
+                        .as_ref()
+                        .unwrap()
+                        .capacity_usage()
+                        .await
+                        .reclaim_credit,
+                    0
+                );
                 cycle.tick(&w).await;
             }
             assert!(
@@ -1181,15 +1195,112 @@ async fn small_capacity_shares_pending_reclaim_credit_across_namespaces() {
         background_io_max_mb_per_sec: 0,
         ..Default::default()
     };
+    let (worker, namespaces) = small_capacity_namespaces(dir.path(), &config).await;
+    let resident = || namespaces.iter().map(|w| w.resident_bytes()).sum::<u64>();
+    let before = resident();
+    // Only eligible garbage in another namespace may cover the shared deficit.
+    let first = &namespaces[0];
+    delete_small_capacity_sources(first).await;
+    assert!(
+        first
+            .small
+            .as_ref()
+            .unwrap()
+            .capacity_usage()
+            .await
+            .reclaim_credit
+            > 0
+    );
+    let target = (before as f64 * config.async_eviction_low_watermark) as u64;
+    let mut cycle = async_eviction::EvictionCycle::new(before, &config);
+    for _ in 0..8 {
+        cycle.tick(&worker).await;
+        if resident() <= target {
+            break;
+        }
+    }
+    assert!(resident() <= target);
+    assert_eq!(
+        namespaces.iter().map(|w| w.block_count()).sum::<u64>(),
+        6,
+        "pending tombstones in another namespace must not trigger duplicate victim selection"
+    );
+}
+
+#[tokio::test]
+async fn shared_capacity_resamples_indexed_bytes_after_peer_scan() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = WorkerConfig {
+        backend: Some("s3".into()),
+        block_size: 1 << 20,
+        capacity_bytes: 16 << 20,
+        l2_page_size_bytes: 0,
+        small_object_threshold_bytes: 128 << 10,
+        small_object_segment_bytes: 256 << 10,
+        background_io_max_mb_per_sec: 0,
+        ..Default::default()
+    };
+    let (worker, namespaces) = small_capacity_namespaces(dir.path(), &config).await;
+    let [victims, stalled] = namespaces.as_slice() else {
+        unreachable!();
+    };
+    let releasing = worker
+        .for_namespace(&talon_core::NamespaceId::named("a-ordinary"))
+        .await
+        .unwrap();
+    let ordinary = id(&releasing);
+    releasing
+        .commit_cached_block(&ordinary, Bytes::from(vec![7; 256 << 10]))
+        .await
+        .unwrap();
+    let released = releasing.index.resident_bytes();
+    assert!(released > 0);
+    let resident = || {
+        worker
+            .namespace_runtimes()
+            .iter()
+            .map(|w| w.resident_bytes())
+            .sum::<u64>()
+    };
+    let mut enforcing = victims.as_ref().clone();
+    let capacity = resident() - released / 2;
+    enforcing.capacity_bytes = capacity;
+    let mut enforcement = std::pin::pin!(enforcing.enforce_capacity());
+    let mut packed = id(stalled);
+    packed.object.object_path = "ns-object-0".into();
+    stalled
+        .small
+        .as_ref()
+        .unwrap()
+        .with_capacity_state_locked(&packed, async {
+            // The registry orders a-ordinary before credit-1, whose stream lock
+            // stalls the peer scan after it has visited the releasing runtime.
+            assert!(futures::poll!(enforcement.as_mut()).is_pending());
+            releasing
+                .unlink_units(releasing.lru.block_candidates(&ordinary), 2)
+                .await;
+            assert_eq!(releasing.index.resident_bytes(), 0);
+            assert!(resident() < capacity);
+        })
+        .await;
+    enforcement.await;
+    assert_eq!(victims.block_count(), 4);
+    assert_eq!(stalled.block_count(), 4);
+}
+
+async fn small_capacity_namespaces(
+    root: &Path,
+    config: &WorkerConfig,
+) -> (Arc<WorkerRuntime>, Vec<Arc<WorkerRuntime>>) {
     let origin = Arc::new(Origin {
         len: AtomicU64::new(3072),
         fetches: AtomicUsize::new(0),
         short: AtomicBool::new(false),
         ranges: Mutex::new(Vec::new()),
     });
-    let lock = Arc::new(crate::page_access_store::CacheRootLock::acquire(dir.path()).unwrap());
+    let lock = Arc::new(crate::page_access_store::CacheRootLock::acquire(root).unwrap());
     let worker = WorkerRuntime::open_namespaces(
-        &config,
+        config,
         lock,
         origin,
         WorkerMetrics::new(config.capacity_bytes),
@@ -1212,10 +1323,10 @@ async fn small_capacity_shares_pending_reclaim_credit_across_namespaces() {
         w.maintain_small(true).await.unwrap();
         namespaces.push(w);
     }
-    let resident = || namespaces.iter().map(|w| w.resident_bytes()).sum::<u64>();
-    let before = resident();
-    // Only eligible garbage in another namespace may cover the shared deficit.
-    let first = &namespaces[0];
+    (worker, namespaces)
+}
+
+async fn delete_small_capacity_sources(first: &WorkerRuntime) {
     for n in 0..2 {
         let mut block = id(first);
         block.object.object_path = format!("ns-object-{n}");
@@ -1223,21 +1334,99 @@ async fn small_capacity_shares_pending_reclaim_credit_across_namespaces() {
             .unlink_units(first.lru.block_candidates(&block), 2)
             .await;
     }
-    assert!(first.small.as_ref().unwrap().reclaimable_bytes().await > 0);
-    let target = (before as f64 * config.async_eviction_low_watermark) as u64;
-    let mut cycle = async_eviction::EvictionCycle::new(before, &config);
-    for _ in 0..8 {
-        cycle.tick(&worker).await;
-        if resident() <= target {
-            break;
+}
+
+#[tokio::test]
+async fn small_capacity_credits_published_compaction_before_unlink() {
+    use std::os::unix::fs::MetadataExt;
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let dir = tempfile::tempdir().unwrap();
+        let config = WorkerConfig {
+            backend: Some("s3".into()),
+            block_size: 1 << 20,
+            capacity_bytes: 16 << 20,
+            l2_page_size_bytes: 0,
+            small_object_threshold_bytes: 128 << 10,
+            small_object_segment_bytes: 256 << 10,
+            background_io_max_mb_per_sec: 0,
+            ..Default::default()
+        };
+        let (worker, namespaces) = small_capacity_namespaces(dir.path(), &config).await;
+        let first = &namespaces[0];
+        let second = &namespaces[1];
+        delete_small_capacity_sources(first).await;
+        let small = first.small.as_ref().unwrap();
+        let mut survivor = id(first);
+        survivor.object.object_path = "ns-object-2".into();
+        let held = small.get(&survivor).await.unwrap().unwrap();
+        let source_bytes = std::fs::File::from(held.fd.try_clone().unwrap())
+            .metadata()
+            .unwrap()
+            .blocks()
+            * 512;
+        let pause = small.pause_compaction_unlink(&survivor);
+        let gc = tokio::spawn({
+            let small = small.clone();
+            async move { small.maintain(false).await.unwrap() }
+        });
+        pause.entered.notified().await;
+        let pending = small.capacity_usage().await;
+        assert_eq!(pending.reclaim_credit, source_bytes);
+        assert_eq!(small.stats().unwrap().retired_bytes, 0);
+        assert!(pending.allocated_bytes > source_bytes);
+
+        let mut enforcing = second.as_ref().clone();
+        enforcing.capacity_bytes = worker
+            .namespace_runtimes()
+            .iter()
+            .map(|w| w.resident_bytes())
+            .sum::<u64>()
+            - source_bytes;
+        let capacity = enforcing.capacity_bytes;
+        let enforcement = tokio::spawn(async move { enforcing.enforce_capacity().await });
+        while first.small_capacity_eviction.try_lock().is_ok() {
+            assert!(
+                !enforcement.is_finished(),
+                "enforcement must reach the compacting namespace"
+            );
+            tokio::task::yield_now().await;
         }
-    }
-    assert!(resident() <= target);
-    assert_eq!(
-        namespaces.iter().map(|w| w.block_count()).sum::<u64>(),
-        6,
-        "pending tombstones in another namespace must not trigger duplicate victim selection"
-    );
+        assert_eq!(
+            second.block_count(),
+            4,
+            "pending unlink covers the shared deficit"
+        );
+        pause.resume.notify_one();
+        assert!(gc.await.unwrap());
+        enforcement.await.unwrap();
+        assert_eq!(first.block_count(), 2);
+        assert_eq!(second.block_count(), 4);
+        assert_eq!(
+            small.read(&survivor).await.unwrap().unwrap(),
+            vec![2; 48 << 10]
+        );
+        let retired = small.capacity_usage().await;
+        assert_eq!(retired.reclaim_credit, source_bytes);
+        assert_eq!(small.stats().unwrap().retired_bytes, source_bytes);
+        drop(held);
+        let released = small.capacity_usage().await;
+        assert_eq!(released.reclaim_credit, 0);
+        assert_eq!(
+            released.allocated_bytes + source_bytes,
+            retired.allocated_bytes
+        );
+        assert!(
+            worker
+                .namespace_runtimes()
+                .iter()
+                .map(|w| w.resident_bytes())
+                .sum::<u64>()
+                <= capacity
+        );
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -1353,7 +1542,15 @@ async fn small_pressure_does_not_rewrite_64mb_segment_for_one_kib_tombstone() {
     };
     let before = payload_allocation();
     w.unlink_units(w.lru.block_candidates(&tiny), 2).await;
-    assert_eq!(w.small.as_ref().unwrap().reclaimable_bytes().await, 0);
+    assert_eq!(
+        w.small
+            .as_ref()
+            .unwrap()
+            .capacity_usage()
+            .await
+            .reclaim_credit,
+        0
+    );
     w.small
         .as_ref()
         .unwrap()
@@ -2215,7 +2412,7 @@ rate_limits = {{ enabled = false }}
         .pop()
         .unwrap();
     let permit = worker
-        .page_gc_io
+        .background_io_slots()
         .clone()
         .acquire_many_owned(worker.page_gc_config.io_concurrency as u32)
         .await

@@ -685,8 +685,8 @@ mod tests {
         assert_eq!(scan(supplement.epoch, next).len(), 2);
     }
 
-    #[tokio::test]
-    async fn packed_ownership_deadline_bounds_stream_publication_wait() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn packed_ownership_deadline_skips_registry_during_stream_wait() {
         let root = tempfile::tempdir().unwrap();
         let store = compact_store(root.path());
         store.init_ownership();
@@ -699,18 +699,36 @@ mod tests {
         let mut candidate = rows.pop().unwrap();
         let revision = candidate.observe_ownership(limit.epoch).unwrap();
         let streams = store.streams();
-        let _publication = streams[0].publication.lock().await;
         use std::time::{Duration, Instant};
-        let deadline = Instant::now() + Duration::from_millis(50);
-        assert!(!tokio::time::timeout(
-            Duration::from_secs(2),
-            store.delete_gc(candidate, revision, Some(deadline), || panic!(
-                "authorization after a stalled wait"
-            ),)
-        )
-        .await
-        .unwrap()
-        .unwrap());
+        let runtime = tokio::runtime::Handle::current();
+        for publication in [true, false] {
+            let (_publication, _state);
+            if publication {
+                _publication = streams[0].publication.lock().await;
+            } else {
+                _state = streams[0].state.lock().await;
+            }
+            store.under_mutation_registry(|| {
+                runtime.block_on(async {
+                    let deadline = Instant::now() + Duration::from_millis(150);
+                    let deletion =
+                        store.delete_gc(candidate.clone(), revision, Some(deadline), || {
+                            panic!("authorization after a stalled wait")
+                        });
+                    tokio::pin!(deletion);
+                    // Registry contention must not short-circuit the stream wait.
+                    assert!(
+                        tokio::time::timeout(Duration::from_millis(20), &mut deletion)
+                            .await
+                            .is_err()
+                    );
+                    assert!(!tokio::time::timeout(Duration::from_secs(2), &mut deletion)
+                        .await
+                        .expect("deletion must finish before the stream lock is released")
+                        .unwrap());
+                });
+            });
+        }
         assert!(store.contains(&id));
     }
 

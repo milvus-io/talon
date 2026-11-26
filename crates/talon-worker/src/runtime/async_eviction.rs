@@ -86,15 +86,9 @@ impl EvictionCycle {
                     if total <= self.low {
                         break;
                     }
-                    let other_credit =
-                        WorkerRuntime::other_small_reclaim_credit(&workers, namespace).await;
-                    let total: u64 = workers.iter().map(|w| w.resident_bytes()).sum();
-                    if total <= self.low {
-                        break;
-                    }
-                    let target = namespace
-                        .resident_bytes()
-                        .saturating_sub((total - self.low).saturating_sub(other_credit));
+                    let target =
+                        WorkerRuntime::namespace_eviction_target(&workers, namespace, self.low)
+                            .await;
                     namespace.evict_background_batch(target).await;
                 }
                 let remaining = workers.iter().map(|w| w.resident_bytes()).sum::<u64>();
@@ -147,9 +141,9 @@ impl WorkerRuntime {
             };
         }
         let missing = self
-            .resident_bytes()
-            .saturating_sub(target)
-            .saturating_sub(self.small_reclaim_credit().await);
+            .resident_bytes_after_small_reclaim()
+            .await
+            .saturating_sub(target);
         if missing == 0 {
             *phase = SmallCapacityPhase::Reclaiming;
         }
@@ -177,8 +171,7 @@ impl WorkerRuntime {
                 *empty_scan_remaining = count.saturating_mul(2);
             }
             let exhausted = *empty_scan_remaining == 0;
-            let excess = self.resident_bytes().saturating_sub(target);
-            if self.small_reclaim_credit().await >= excess || exhausted {
+            if exhausted || self.resident_bytes_after_small_reclaim().await <= target {
                 // Exhausted unpinned victims may yield only partial progress.
                 *phase = SmallCapacityPhase::Reclaiming;
             } else {

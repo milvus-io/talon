@@ -814,7 +814,6 @@ mod tests {
         let mut candidate = candidates.pop().unwrap();
         let revision = candidate.observe_ownership(limit.epoch).unwrap();
         let state = worker.page_lifecycle.block(&id);
-        let gc_permits = worker.page_gc_io.available_permits();
         let budget = worker.background_budget.as_ref().unwrap();
         let io_permits = budget.available_io();
         let handle = tokio::runtime::Handle::current();
@@ -827,7 +826,6 @@ mod tests {
                     .await;
                 assert!(worker.membership_is_current(&membership));
                 assert!(state.gate.lock().now_or_never().is_some());
-                assert_eq!(worker.page_gc_io.available_permits(), gc_permits);
                 assert_eq!(budget.available_io(), io_permits);
             });
         });
@@ -857,7 +855,6 @@ mod tests {
         let mut candidate = candidates.pop().unwrap();
         let revision = candidate.observe_ownership(limit.epoch).unwrap();
         let state = worker.page_lifecycle.block(&id);
-        let gc_permits = worker.page_gc_io.available_permits();
         let budget = worker.background_budget.as_ref().unwrap();
         let io_permits = budget.available_io();
         let handle = tokio::runtime::Handle::current();
@@ -870,7 +867,6 @@ mod tests {
                     .await;
                 assert!(worker.membership_is_current(&membership));
                 assert!(state.gate.lock().now_or_never().is_some());
-                assert_eq!(worker.page_gc_io.available_permits(), gc_permits);
                 assert_eq!(budget.available_io(), io_permits);
             });
         });
@@ -1116,9 +1112,9 @@ mod tests {
             .await
             .unwrap();
         let permit = worker
-            .page_gc_io
+            .background_io_slots()
             .clone()
-            .acquire_many_owned(worker.page_gc_config.io_concurrency as u32)
+            .acquire_many_owned(worker.background_io_slots().available_permits() as u32)
             .await
             .unwrap();
         let mut gc = fixture.gc(&worker);

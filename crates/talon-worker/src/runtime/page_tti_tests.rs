@@ -1498,7 +1498,8 @@ fn maintenance_rate_waits_release_blocking_threads_and_survive_caller_cancellati
                                         .starts_with(crate::page_access_shard::TEMP_PREFIX)
                                 })
                         } else {
-                            worker.page_mutations.active_count() > 0 && budget.available_io() == 0
+                            worker.page_mutations.active_count() > 0
+                                && budget.charged_deletes() == 2
                         };
                         if waiting {
                             break;
@@ -1531,8 +1532,8 @@ fn maintenance_rate_waits_release_blocking_threads_and_survive_caller_cancellati
                 assert!(caller.await.unwrap_err().is_cancelled());
                 assert_eq!(
                     budget.available_io(),
-                    0,
-                    "owned mutation retains its I/O slot"
+                    usize::from(!checkpoint),
+                    "cleanup releases its I/O slot while paying the deletion rate"
                 );
                 tokio::time::timeout(Duration::from_secs(5), worker.drain_page_mutations())
                     .await
@@ -1627,7 +1628,7 @@ rate_limits = {{ enabled = false }}
             .scan(&mut cursor, 4096, r.page_clock.now(), Some(3_600_000), 64);
     let candidate = candidates.into_iter().next().expect("idle candidate");
     let permit = r
-        .page_gc_io
+        .background_io_slots()
         .clone()
         .acquire_many_owned(r.page_gc_config.io_concurrency as u32)
         .await
