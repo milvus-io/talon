@@ -628,7 +628,7 @@ Worker-wide LOAD payload byte budget through cache commit; excludes L1 and trans
 
 ### `backend`
 
-Object-store backend and default Broker IAM cloud. Accepts azure (default) or az, s3 or aws, gcs or gcp, and S3-compatible ali and tc.
+Object-store backend and default Broker IAM cloud. Accepts `aws` or `s3`, `gcs` or `gcp`, `az`, `azure` or `blob`, `oss` or `ali`, and `cos` or `tc`.
 
 - **Environment variable:** `TALON_WORKER_BACKEND`
 - **Default:** `azure`

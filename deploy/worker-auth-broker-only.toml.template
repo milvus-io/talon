@@ -8,17 +8,25 @@ listen = "127.0.0.1:7001"
 admin_listen = "127.0.0.1:8001"
 cache_dirs = ["./talon-cache"]
 
-# Use "ali" for OSS or "tc" for COS.
+# Worker backend names and their internal backends.
+# aws / s3          -> Backend::S3
+# gcs / gcp         -> Backend::Gcs
+# az / azure / blob -> Backend::Azure
+# oss / ali         -> Backend::Ali
+# cos / tc          -> Backend::Tc
 backend = "s3"
 
 [broker]
 endpoint = "https://broker.example/v1/credentials/assume-role"
+# Timeout in milliseconds for one Broker attempt. Initial Pod IAM acquisition
+# can make up to four attempts with backoff between them.
 timeout_ms = 3000
 # Origin fields here inherit the corresponding Worker settings when omitted.
 s3_region = "us-west-2"
 # Set s3_endpoint and the matching s3_region for OSS or COS.
 # s3_endpoint = "https://s3.example.com"
-# s3_path_style = true
+# Set to true to use path-style addressing.
+s3_path_style = false
 
 # For backend = "gcs", optionally override the GCS origin.
 # gcs_endpoint = "https://storage.googleapis.com"

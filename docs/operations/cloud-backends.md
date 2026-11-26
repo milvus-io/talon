@@ -153,10 +153,10 @@ With a configured endpoint and no request Broker parameters, the Worker sends
 | Worker `backend` | Broker `csp` | Object URI scheme | Storage protocol |
 |---|---|---|---|
 | `s3` or `aws` | `aws` | `s3://` | S3 |
-| `ali` | `ali` | `ali://` | S3 (OSS) |
-| `tc` | `tc` | `tc://` | S3 (COS) |
+| `oss` or `ali` | `ali` | `ali://` | S3 (OSS) |
+| `cos` or `tc` | `tc` | `tc://` | S3 (COS) |
 | `gcs` or `gcp` | `gcp` | `gcs://` | GCS |
-| `azure` or `az` | `azure` | `az://` | Azure Blob |
+| `az`, `azure`, or `blob` | `azure` | `az://` | Azure Blob |
 
 Set `s3_region` for S3 and `azure_account` for Azure. The Azure IAM request
 also includes the requested container. OSS and COS require an explicit

@@ -513,9 +513,12 @@ impl WorkerConfig {
     /// Parse the Worker backend, including the cloud names accepted as configuration aliases.
     pub fn resolved_backend(&self) -> Result<Backend> {
         match self.backend.as_deref().unwrap_or("azure") {
-            "aws" => Ok(Backend::S3),
-            "gcp" => Ok(Backend::Gcs),
-            value => value.parse(),
+            "aws" | "s3" => Ok(Backend::S3),
+            "gcs" | "gcp" => Ok(Backend::Gcs),
+            "az" | "azure" | "blob" => Ok(Backend::Azure),
+            "oss" | "ali" => Ok(Backend::Ali),
+            "cos" | "tc" => Ok(Backend::Tc),
+            value => Err(Error::Other(format!("unknown backend: {value}"))),
         }
     }
 
@@ -1340,7 +1343,7 @@ pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
         default: Some("azure"),
         cli: false,
         secret: false,
-        help: "Object-store backend and default Broker IAM cloud. Accepts azure (default) or az, s3 or aws, gcs or gcp, and S3-compatible ali and tc.",
+        help: "Object-store backend and default Broker IAM cloud. Accepts `aws` or `s3`, `gcs` or `gcp`, `az`, `azure` or `blob`, `oss` or `ali`, and `cos` or `tc`.",
     },
     ConfigVar {
         env: "TALON_WORKER_AZURE_ACCOUNT",
@@ -3209,10 +3212,13 @@ mod tests {
             (None, Backend::Azure),
             (Some("azure"), Backend::Azure),
             (Some("az"), Backend::Azure),
+            (Some("blob"), Backend::Azure),
             (Some("s3"), Backend::S3),
             (Some("aws"), Backend::S3),
             (Some("ali"), Backend::Ali),
+            (Some("oss"), Backend::Ali),
             (Some("tc"), Backend::Tc),
+            (Some("cos"), Backend::Tc),
             (Some("gcs"), Backend::Gcs),
             (Some("gcp"), Backend::Gcs),
         ] {

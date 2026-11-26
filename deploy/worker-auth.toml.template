@@ -10,6 +10,12 @@ listen = "127.0.0.1:7001"
 admin_listen = "127.0.0.1:8001"
 cache_dirs = ["./talon-cache"]
 
+# Worker backend names and their internal backends.
+# aws / s3          -> Backend::S3
+# gcs / gcp         -> Backend::Gcs
+# az / azure / blob -> Backend::Azure
+# oss / ali         -> Backend::Ali
+# cos / tc          -> Backend::Tc
 backend = "s3"
 s3_region = "us-west-2"
 s3_path_style = false
@@ -22,6 +28,8 @@ s3_path_style = false
 # The bucket entries then supply the allowlist and source storage settings.
 # [broker]
 # endpoint = "https://broker.example/v1/credentials/assume-role"
+# Timeout in milliseconds for one Broker attempt. Initial Pod IAM acquisition
+# can make up to four attempts with backoff between them.
 # timeout_ms = 3000
 
 [[buckets]]
