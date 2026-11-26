@@ -977,6 +977,64 @@ async fn dynamic_keys_separate_roles_urls_and_azure_accounts() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn requests_inheriting_worker_broker_url_also_inherit_its_timeout() {
+    for (url, request_timeout, worker_timeout, expected_timeout) in [
+        ("", None, Some(10_000), 10_000),
+        ("", Some(2_000), Some(10_000), 2_000),
+        ("", None, None, 3_000),
+        (
+            "https://request-broker.example/exchange",
+            None,
+            Some(10_000),
+            3_000,
+        ),
+    ] {
+        let http = Arc::new(Http {
+            gate: Some(Arc::new(tokio::sync::Semaphore::new(0))),
+            ..Default::default()
+        });
+        let resolver = DefaultBackendResolver::from_configs(
+            Backend::S3,
+            BackendResolverConfig {
+                credential_endpoint: Some(
+                    "https://worker-broker.example/exchange".to_owned().into(),
+                ),
+                defaults: talon_core::BucketConfig {
+                    credential_broker_timeout_ms: worker_timeout,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            http.clone(),
+            http.clone(),
+            Arc::new(NoopObserver),
+        )
+        .await
+        .unwrap();
+        let router = BackendRouter::new(Backend::S3, Arc::new(resolver));
+        let mut broker = aws();
+        broker.url = url.into();
+        broker.origin.as_mut().unwrap().request_timeout_ms = request_timeout;
+
+        let start = tokio::time::Instant::now();
+        let error = router
+            .bind_request(Backend::S3, "bucket", &broker)
+            .await
+            .err()
+            .expect("hanging Broker should time out");
+        assert!(error.to_string().contains("broker request timed out"));
+        let attempts = talon_core::BROKER_INITIAL_ATTEMPTS;
+        assert_eq!(http.requests.lock().unwrap().len(), attempts as usize);
+        assert_eq!(
+            start.elapsed(),
+            Duration::from_millis(
+                u64::from(attempts) * expected_timeout + talon_core::BROKER_INITIAL_BACKOFF_MS
+            )
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn failed_dynamic_acquisition_is_retryable_and_never_uses_static_route() {
     let http = Arc::new(Http::default());
     let config = talon_core::BucketConfig {

@@ -144,7 +144,9 @@ file settings.
 
 The Worker uses `credential_broker.url` when supplied. A descriptor with Broker
 parameters can omit `url` or set it to an empty string to use the configured
-endpoint. The request's `credentialType` selects the credential mode. With no
+endpoint. When a descriptor inherits the URL, its per-attempt timeout uses
+`origin.request_timeout_ms` if supplied, then `[broker].timeout_ms`, then 3000 ms.
+The request's `credentialType` selects the credential mode. With no
 Broker URL available, the Worker uses its existing credential configuration.
 
 With a configured endpoint and no request Broker parameters, the Worker sends

@@ -30,7 +30,7 @@ use crate::{
     S3Credentials,
 };
 
-const MAX_DYNAMIC_BACKENDS: usize = 4096;
+const MAX_DYNAMIC_BACKENDS: usize = 65_535;
 
 /// The backend family, bucket, and optional request-owned credential configuration.
 #[derive(Debug, Clone, Copy)]
@@ -270,11 +270,8 @@ impl DefaultBackendResolver {
         let Some(broker) = request.broker else {
             return Ok(None);
         };
-        let worker_endpoint = self
-            .iam_broker
-            .as_ref()
-            .filter(|_| broker.url.is_empty())
-            .map(|iam| iam.endpoint.load_full());
+        let worker_broker = self.iam_broker.as_ref().filter(|_| broker.url.is_empty());
+        let worker_endpoint = worker_broker.map(|iam| iam.endpoint.load_full());
         let worker_url = worker_endpoint
             .as_deref()
             .map(|endpoint| endpoint.expose().as_str());
@@ -291,6 +288,11 @@ impl DefaultBackendResolver {
             request: broker.request.clone(),
             origin: broker.origin.clone(),
         };
+        if let (Some(iam), Some(origin)) = (worker_broker, &mut broker.origin) {
+            origin.request_timeout_ms = origin
+                .request_timeout_ms
+                .or(iam.defaults.credential_broker_timeout_ms);
+        }
         if !broker.request.is_object() {
             return Err(Error::Backend(
                 "broker request must be a JSON object".into(),
