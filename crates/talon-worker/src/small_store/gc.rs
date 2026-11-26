@@ -722,7 +722,10 @@ mod tests {
                             .await
                             .is_err()
                     );
-                    assert!(!deletion.await.unwrap());
+                    assert!(!tokio::time::timeout(Duration::from_secs(2), &mut deletion)
+                        .await
+                        .expect("deletion must finish before the stream lock is released")
+                        .unwrap());
                 });
             });
         }

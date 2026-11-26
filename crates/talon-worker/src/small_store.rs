@@ -914,15 +914,19 @@ impl SegmentStore {
         // Full access checkpoints take this gate before I/O. Preserve that
         // ordering so a snapshot and relocation cannot wait on each other.
         let tracks_access = self.journal.model.0.read().unwrap().recency.is_some();
-        let access_relocation = if tracks_access {
-            Some(self.journal.access_relocation.read().await)
-        } else {
-            None
+        let acquire_io = || async {
+            let access_relocation = if tracks_access {
+                Some(self.journal.access_relocation.read().await)
+            } else {
+                None
+            };
+            let io = match budget {
+                Some(budget) => Some(budget.io().await),
+                None => None,
+            };
+            (access_relocation, io)
         };
-        let io = match budget {
-            Some(budget) => Some(budget.io().await),
-            None => None,
-        };
+        let mut io = acquire_io().await;
         let mut staged = if entries.is_empty() {
             None
         } else {
@@ -934,22 +938,56 @@ impl SegmentStore {
             Self::pause_compaction(&self.copied_pause).await;
         }
 
-        let Some((mut source, reconcile_bytes)) = self.publish_compaction(old, &mut staged).await?
-        else {
-            return Ok(false);
+        let mut source = loop {
+            let publication = self.publication.lock().await;
+            let mut state = self.state.lock().await;
+            self.healthy(&state)?;
+            let source = &state.segments[&old];
+            // An empty active source may have accepted appends and sealed
+            // during the unlocked phase. This pass has no copy of those rows.
+            if staged.is_none()
+                && (source.live != 0 || source.records != 0 || !reclaimable(&state, old))
+            {
+                return Ok(false);
+            }
+            let Some(copy) = staged
+                .as_mut()
+                .filter(|s| s.records.len() != source.records)
+            else {
+                break self
+                    .publish_compaction(&mut state, old, &mut staged)
+                    .await?;
+            };
+            // A sealed source can only lose rows. Remove the confirmed stale
+            // copies before retrying, so only the final Replace needs the locks.
+            let stale = self
+                .entries
+                .read()
+                .unwrap()
+                .retain_visible(old, &mut copy.records);
+            debug_assert!(!stale.is_empty());
+            debug_assert_eq!(copy.records.len(), source.records);
+            drop(state);
+            drop(publication);
+            if let Some(budget) = budget {
+                drop(io);
+                let frames = if copy.records.is_empty() {
+                    1
+                } else {
+                    stale.len()
+                };
+                budget.bytes(49 * frames).await;
+                io = acquire_io().await;
+            }
+            self.reconcile_copy(copy, stale).await?;
         };
         drop(io);
-        drop(access_relocation);
 
         // A reader which resolved the old address must retain its fd before
         // the path goes away. Readers starting after this barrier see new locators.
         drop(self.readers.write().await);
         #[cfg(test)]
         tests::crash("compact_before_unlink");
-        if let Some(budget) = budget.filter(|_| reconcile_bytes > 0) {
-            // Charge the extra journal frames discovered during publication.
-            budget.bytes(reconcile_bytes).await;
-        }
         source.close_writers();
         let readers = source.file.fd.lock().await.clone();
         self.unlink_compacted_segment(old, budget).await?;
@@ -1036,58 +1074,51 @@ impl SegmentStore {
         })
     }
 
+    async fn reconcile_copy(
+        &self,
+        copy: &mut StagedSegment,
+        stale: Vec<CopiedRecord>,
+    ) -> io::Result<()> {
+        if copy.records.is_empty() {
+            return self
+                .journal
+                .append(
+                    journal::Event::Replace {
+                        old: copy.id,
+                        new: None,
+                    },
+                    false,
+                )
+                .await;
+        }
+        for record in stale {
+            self.journal
+                .append(
+                    journal::Event::Delete {
+                        segment: copy.id,
+                        offset: record.new_offset,
+                    },
+                    false,
+                )
+                .await?;
+            copy.segment.metadata += 21;
+            copy.segment.live -= record.charge;
+            copy.segment.live_data_bytes -= record.stored_len;
+            copy.segment.records -= 1;
+        }
+        Ok(())
+    }
+
     async fn publish_compaction(
         &self,
+        state: &mut State,
         old: u64,
         staged: &mut Option<StagedSegment>,
-    ) -> io::Result<Option<(Segment, usize)>> {
-        let _publication = self.publication.lock().await;
-        let mut state = self.state.lock().await;
-        self.healthy(&state)?;
-        if !reclaimable(&state, old) {
-            // Only an empty active segment can have changed eligibility.
-            debug_assert!(staged.is_none());
-            return Ok(None);
-        }
-        let mut replacement = None;
-        let mut reconcile_bytes = 0;
-        if let Some(staged) = staged {
-            let stale = self
-                .entries
-                .read()
-                .unwrap()
-                .retain_visible(old, &mut staged.records);
-            if staged.records.is_empty() {
-                reconcile_bytes = 49;
-                self.journal
-                    .append(
-                        journal::Event::Replace {
-                            old: staged.id,
-                            new: None,
-                        },
-                        false,
-                    )
-                    .await?;
-            } else {
-                reconcile_bytes = 49 * stale.len();
-                for record in stale {
-                    self.journal
-                        .append(
-                            journal::Event::Delete {
-                                segment: staged.id,
-                                offset: record.new_offset,
-                            },
-                            false,
-                        )
-                        .await?;
-                    staged.segment.metadata += 21;
-                    staged.segment.live -= record.charge;
-                    staged.segment.live_data_bytes -= record.stored_len;
-                    staged.segment.records -= 1;
-                }
-                replacement = Some(staged.id);
-            }
-        }
+    ) -> io::Result<Segment> {
+        let replacement = staged
+            .as_ref()
+            .filter(|copy| !copy.records.is_empty())
+            .map(|copy| copy.id);
         #[cfg(test)]
         tests::crash("compact_reconciled");
         self.journal
@@ -1125,8 +1156,8 @@ impl SegmentStore {
             state.segments.insert(new.id, new.segment);
             cached.staging_allocated = 0;
         }
-        cached.published = Self::snapshot_stats(&state);
-        Ok(Some((source, reconcile_bytes)))
+        cached.published = Self::snapshot_stats(state);
+        Ok(source)
     }
 
     async fn unlink_compacted_segment(

@@ -367,12 +367,14 @@ establish object residency.
 Logical eviction decreases live record bytes; it does not pretend to release
 physical disk space. A maintenance call processes at most one eligible segment per writer stream:
 
-1. An empty segment is durably retired in the metadata log and unlinked.
+1. A segment that is still empty at publication is durably retired in the
+   metadata log and unlinked.
 2. A sealed segment with less than half its logical record bytes live is relocated.
 3. Relocation copies and syncs a staged segment while foreground appends and
-   deletes proceed. During publication it checks which source addresses still
-   exist and tombstones stale destination rows before committing replacement.
-   If every copied address is stale, it discards the staged segment.
+   deletes proceed. It checks which source addresses still exist, then pays for
+   and writes any stale destination tombstones outside the publication lock.
+   It repeats the check before committing replacement. If every copied address
+   is stale, it discards the staged segment.
 4. Once the new locators are visible, the collector waits for readers still
    opening the old file, pays the delete budget, and unlinks the old path.
 

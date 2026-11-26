@@ -1138,7 +1138,7 @@ pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
     ConfigVar { env: "TALON_WORKER_WHOLE_FD_CACHE_CAPACITY", key: "whole_fd_cache_capacity", default: Some("1024"), cli: false, secret: false, help: "Worker-wide whole-block cached FD limit shared by all namespaces; 0 disables caching. Startup-only; active readers and sockets need additional FDs." },
     ConfigVar { env: "TALON_WORKER_PAGE_FD_CACHE_CAPACITY", key: "page_fd_cache_capacity", default: Some("16384"), cli: false, secret: false, help: "Worker-wide paged cached FD limit shared by all namespaces; 0 disables caching. Startup-only; active readers and sockets need additional FDs." },
     ConfigVar { env: "TALON_WORKER_BACKGROUND_TASK_CONCURRENCY", key: "background_task_concurrency", default: Some("2"), cli: false, secret: false, help: "Maximum concurrently running background maintenance tasks." },
-    ConfigVar { env: "TALON_WORKER_BACKGROUND_IO_CONCURRENCY", key: "background_io_concurrency", default: Some("4"), cli: false, secret: false, help: "Shared local disk I/O concurrency for background maintenance." },
+    ConfigVar { env: "TALON_WORKER_BACKGROUND_IO_CONCURRENCY", key: "background_io_concurrency", default: Some("4"), cli: false, secret: false, help: "Shared local disk I/O concurrency for background maintenance, including page and Small Store GC. Page GC pays deletion charges before taking an I/O slot." },
     ConfigVar { env: "TALON_WORKER_BACKGROUND_SCAN_BATCH_SIZE", key: "background_scan_batch_size", default: Some("65536"), cli: false, secret: false, help: "Maximum entries scanned per watermark eviction or stale GC batch." },
     ConfigVar { env: "TALON_WORKER_BACKGROUND_DELETE_BATCH_SIZE", key: "background_delete_batch_size", default: Some("1024"), cli: false, secret: false, help: "Maximum deletion candidates per watermark eviction or stale GC batch." },
     ConfigVar { env: "TALON_WORKER_BACKGROUND_IO_MAX_MB_PER_SEC", key: "background_io_max_mb_per_sec", default: Some("8"), cli: false, secret: false, help: "Shared background disk read/write MB/s (decimal); zero disables throttling." },
@@ -1184,7 +1184,7 @@ pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
     ConfigVar { env: "TALON_WORKER_FILE_CLEANUP_INTERVAL_HOURS", key: "file_cleanup_interval_hours", default: Some("1"), cli: false, secret: false, help: "Delay between complete file cleanup passes in hours, independent of page GC." },
     ConfigVar { env: "TALON_WORKER_PAGE_GC_SCAN_BATCH_SIZE", key: "page_gc_scan_batch_size", default: Some("65536"), cli: false, secret: false, help: "Maximum entries per watermark eviction or stale GC batch; does not limit page GC or file cleanup." },
     ConfigVar { env: "TALON_WORKER_PAGE_GC_DELETE_BATCH_SIZE", key: "page_gc_delete_batch_size", default: Some("1024"), cli: false, secret: false, help: "Maximum deletion candidates per watermark eviction or stale GC batch; does not limit page GC or file cleanup." },
-    ConfigVar { env: "TALON_WORKER_PAGE_GC_IO_CONCURRENCY", key: "page_gc_io_concurrency", default: Some("4"), cli: false, secret: false, help: "Maximum concurrent page GC deletion tasks." },
+    ConfigVar { env: "TALON_WORKER_PAGE_GC_IO_CONCURRENCY", key: "page_gc_io_concurrency", default: Some("4"), cli: false, secret: false, help: "Maximum concurrent deletion tasks within a page GC batch. This also sizes the fallback I/O semaphore for runtimes without a shared background budget." },
     ConfigVar {
         env: "TALON_WORKER_PAGED_MISS_RUN_CONCURRENCY",
         key: "paged_miss_run_concurrency",

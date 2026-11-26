@@ -31,8 +31,10 @@ async fn crash_child() {
     if let Ok(mode) = std::env::var("TALON_SMALL_TEST_STALE_COPY") {
         let pause = Arc::new(AppendPause::default());
         *store.copied_pause.lock().unwrap() = Some(pause.clone());
-        let (compaction, ()) = tokio::join!(store.maintain(false), async {
+        let (compaction, staged_path) = tokio::join!(store.maintain(false), async {
             pause.entered.notified().await;
+            let staged_path = store.path(staged_compaction_id(&store).await, "data");
+            assert!(staged_path.exists());
             store.delete(&id("8")).await.unwrap();
             put(&store, &id("8"), b"re-admitted").await.unwrap();
             if mode == "all" {
@@ -43,8 +45,18 @@ async fn crash_child() {
             store.checkpoint().await.unwrap();
             store.journal.checkpoint().await.unwrap();
             pause.resume.notify_one();
+            staged_path
         });
-        compaction.unwrap();
+        assert!(compaction.unwrap());
+        assert_eq!(
+            store.read(&id("8")).await.unwrap().unwrap(),
+            b"re-admitted"[..]
+        );
+        assert_eq!(
+            store.read(&id("9")).await.unwrap(),
+            (mode == "partial").then(|| Bytes::from(vec![9; 4096]))
+        );
+        assert_eq!(staged_path.exists(), mode == "partial");
         return;
     }
     store.maintain(false).await.unwrap();
@@ -133,6 +145,166 @@ async fn recovery_preserves_readmission_across_partial_and_all_stale_compaction(
             }
         }
     }
+}
+
+#[tokio::test]
+async fn empty_reclaim_candidate_can_gain_live_rows_and_roll_during_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    for key in ["garbage-1", "garbage-2"] {
+        put(&store, &id(key), &vec![1; 96 << 10]).await.unwrap();
+        store.delete(&id(key)).await.unwrap();
+    }
+    let old = store.state.lock().await.active.unwrap();
+    let pause = Arc::new(AppendPause::default());
+    *store.copied_pause.lock().unwrap() = Some(pause.clone());
+    let compaction = store.maintain(false);
+    let foreground = async {
+        pause.entered.notified().await;
+        put(&store, &id("survivor"), b"kept").await.unwrap();
+        put(&store, &id("rollover"), &vec![2; 96 << 10])
+            .await
+            .unwrap();
+        store.checkpoint().await.unwrap();
+        {
+            let state = store.state.lock().await;
+            let source = &state.segments[&old];
+            assert!(source.sealed && reclaimable(&state, old));
+            assert_eq!(source.records, 1);
+        }
+        assert_eq!(
+            store
+                .entries
+                .read()
+                .unwrap()
+                .get(&id("survivor").view())
+                .unwrap()
+                .segment,
+            old
+        );
+        pause.resume.notify_one();
+    };
+    let (compaction, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(compaction, foreground)
+    })
+    .await
+    .unwrap();
+    assert!(!compaction.unwrap());
+    assert_eq!(
+        store.read(&id("survivor")).await.unwrap().unwrap(),
+        b"kept"[..]
+    );
+    drop(store);
+    let store = open(dir.path());
+    assert_eq!(
+        store.read(&id("survivor")).await.unwrap().unwrap(),
+        b"kept"[..]
+    );
+}
+
+#[tokio::test]
+async fn compaction_pays_for_late_deletes_before_publication() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    put(&store, &id("garbage"), &vec![1; 96 << 10])
+        .await
+        .unwrap();
+    for key in ["first", "second", "survivor"] {
+        put(&store, &id(key), key.as_bytes()).await.unwrap();
+    }
+    store.checkpoint().await.unwrap();
+    store.delete(&id("garbage")).await.unwrap();
+    let segment_of = |key| {
+        store
+            .entries
+            .read()
+            .unwrap()
+            .get(&id(key).view())
+            .unwrap()
+            .segment
+    };
+    let old = segment_of("survivor");
+    let budget = crate::background::BackgroundBudget::new(&talon_core::WorkerConfig {
+        background_io_concurrency: 1,
+        background_io_max_mb_per_sec: 0,
+        background_delete_max_per_sec: 0,
+        ..Default::default()
+    });
+    let pause = Arc::new(AppendPause::default());
+    *store.copied_pause.lock().unwrap() = Some(pause.clone());
+    let compaction = store.compact(false, Some(&budget));
+    tokio::pin!(compaction);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            () = pause.entered.notified() => (),
+            result = &mut compaction => panic!("compaction completed before pause: {result:?}"),
+        }
+    })
+    .await
+    .unwrap();
+    let staged = staged_compaction_id(&store).await;
+    store.delete(&id("first")).await.unwrap();
+    let initial_bytes = budget.charged_bytes();
+    tokio::time::pause();
+    budget.update(&talon_core::dynamic_config::WorkerDynamicConfig {
+        background_io_max_mb_per_sec: Some(1),
+        ..Default::default()
+    });
+    let queued_bytes = 60_000_000;
+    let ahead = budget.bytes(queued_bytes);
+    tokio::pin!(ahead);
+    assert!(futures::poll!(&mut ahead).is_pending());
+    pause.resume.notify_one();
+    assert!(futures::poll!(&mut compaction).is_pending());
+    assert_eq!(
+        budget.charged_bytes(),
+        initial_bytes + queued_bytes as u64 + 49
+    );
+    assert_eq!(budget.available_io(), 1);
+    assert_eq!(segment_of("survivor"), old);
+    assert_eq!(
+        store.journal.model.0.read().unwrap().model.segments[&staged]
+            .records
+            .len(),
+        3,
+        "staging must retain all copied rows until the tombstone is paid for"
+    );
+    assert!(store.publication.try_lock().is_ok());
+    assert!(store.state.try_lock().is_ok());
+    store.delete(&id("second")).await.unwrap();
+    put(&store, &id("new"), b"foreground append").await.unwrap();
+    tokio::time::advance(Duration::from_secs(61)).await;
+    tokio::time::resume();
+    assert!(tokio::time::timeout(Duration::from_secs(5), compaction)
+        .await
+        .unwrap()
+        .unwrap());
+    assert_eq!(
+        budget.charged_bytes(),
+        initial_bytes + queued_bytes as u64 + 98
+    );
+    assert_ne!(segment_of("survivor"), old);
+    assert!(!store.contains(&id("first")));
+    assert!(!store.contains(&id("second")));
+    assert_eq!(
+        store.read(&id("survivor")).await.unwrap().unwrap(),
+        b"survivor"[..]
+    );
+    assert_eq!(
+        store.read(&id("new")).await.unwrap().unwrap(),
+        b"foreground append"[..]
+    );
+}
+
+async fn staged_compaction_id(store: &SegmentStore) -> u64 {
+    let state = store.state.lock().await;
+    let catalog = store.journal.model.0.read().unwrap();
+    *catalog
+        .model
+        .segments
+        .keys()
+        .find(|id| !state.segments.contains_key(id))
+        .expect("staged segment is journaled but unpublished")
 }
 
 fn id(name: &str) -> BlockId {
