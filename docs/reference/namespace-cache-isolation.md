@@ -51,8 +51,10 @@ TTI and page GC apply to paged L2 storage. A zero TTI disables idle expiration;
 a zero L2 page size selects whole-block storage. Checkpoint and GC intervals
 are scheduled separately for each namespace. Ownership GC shares the worker's
 membership observation across namespaces, while keeping separate admission
-boundaries and scan progress for each namespace. New admissions after a topology
-observation are handled by the hourly supplemental scan; all scans use the
+boundaries and scan progress for each namespace. Ordinary blocks admitted after
+a topology observation are eligible at the next hourly supplemental scan or
+membership event. A packed scan can find later rows within segments captured
+for the current event, subject to the segment cutoff. All scans use the
 process-wide background I/O and deletion budgets.
 
 ## Files and state

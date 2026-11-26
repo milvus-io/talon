@@ -202,13 +202,29 @@ impl SmallAccess {
     }
 
     pub(crate) fn gc_is_current(&self, revision: u64) -> bool {
+        self.gc_is_current_for_unlink(revision, false)
+    }
+
+    pub(super) fn gc_is_current_for_unlink(&self, revision: u64, nonblocking: bool) -> bool {
         let Some(catalog) = self.catalog.upgrade() else {
             return false;
         };
-        let catalog = catalog.read().unwrap();
-        self.slot(&catalog).is_some_and(|slot| {
-            catalog.lookup.flags(slot) & VISIBLE != 0
-                && self.state.lock().unwrap().pins == 0
+        let Some(catalog) = super::read_for_unlink(&catalog, nonblocking) else {
+            return false;
+        };
+        let Some(slot) = self.slot_for_unlink(&catalog, nonblocking) else {
+            return false;
+        };
+        if catalog.lookup.flags(slot) & VISIBLE == 0 {
+            return false;
+        }
+        let state = if nonblocking {
+            crate::runtime::uncontended(self.state.try_lock())
+        } else {
+            Some(self.state.lock().unwrap())
+        };
+        state.is_some_and(|state| {
+            state.pins == 0
                 && self.gc_revision.load(Relaxed) == revision
                 && catalog
                     .recency_at(slot)

@@ -147,12 +147,12 @@ impl SmallObjectStore {
     }
 
     pub(super) fn streams(&self) -> Vec<Arc<SegmentStore>> {
-        self.streams
-            .read()
-            .unwrap()
-            .values()
-            .filter_map(|s| s.get().cloned())
-            .collect()
+        self.stream_snapshot(false).unwrap()
+    }
+
+    fn stream_snapshot(&self, nonblocking: bool) -> Option<Vec<Arc<SegmentStore>>> {
+        let streams = read_for_unlink(&self.streams, nonblocking)?;
+        Some(streams.values().filter_map(|s| s.get().cloned()).collect())
     }
 
     async fn writer(&self, slot: usize) -> io::Result<Arc<SegmentStore>> {
@@ -184,6 +184,17 @@ impl SmallObjectStore {
 
     fn owner(&self, id: &(impl SmallStoreKey + ?Sized)) -> Option<Arc<SegmentStore>> {
         self.streams().into_iter().find(|s| s.contains(id))
+    }
+
+    fn try_owner(&self, id: &impl SmallStoreKey) -> Option<Arc<SegmentStore>> {
+        let id = id.view();
+        format::validate_key(&id).ok()?;
+        for stream in self.stream_snapshot(true)? {
+            if stream.unlink_location(&id, true)?.is_some() {
+                return Some(stream);
+            }
+        }
+        None
     }
 
     async fn mutation(&self, id: &(impl SmallStoreKey + ?Sized)) -> InFlightGuard {
@@ -360,7 +371,7 @@ impl SmallObjectStore {
         authorized: impl FnOnce() -> bool + Send + 'static,
     ) -> io::Result<bool> {
         self.delete_if_current(candidate.unit, candidate.ticket, deadline, move |current| {
-            current.gc_is_current(revision) && authorized()
+            current.gc_is_current_for_unlink(revision, deadline.is_some()) && authorized()
         })
         .await
     }
@@ -380,7 +391,12 @@ impl SmallObjectStore {
                 else {
                     return Ok(false);
                 };
-                let Some(stream) = store.owner(&id) else {
+                let owner = if deadline.is_some() {
+                    store.try_owner(&id)
+                } else {
+                    store.owner(&id)
+                };
+                let Some(stream) = owner else {
                     return Ok(false);
                 };
                 let removed = stream

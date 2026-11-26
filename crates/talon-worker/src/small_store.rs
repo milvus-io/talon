@@ -42,6 +42,17 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 use talon_core::{BlockHandle, BlockId};
 
+fn read_for_unlink<T>(
+    lock: &RwLock<T>,
+    nonblocking: bool,
+) -> Option<std::sync::RwLockReadGuard<'_, T>> {
+    if nonblocking {
+        crate::runtime::uncontended(lock.try_read())
+    } else {
+        Some(lock.read().unwrap())
+    }
+}
+
 const CHECKSUM_BYTES: u64 = size_of::<u64>() as u64;
 
 fn checksum_len(legacy_checksum: Option<u64>) -> u64 {
@@ -415,6 +426,15 @@ impl SegmentStore {
             && self.entries.read().unwrap().contains_key(&id.view())
     }
 
+    // The outer option distinguishes lock contention from an absent entry.
+    fn unlink_location(
+        &self,
+        id: &dyn SmallIdentity,
+        nonblocking: bool,
+    ) -> Option<Option<Location>> {
+        read_for_unlink(&self.entries, nonblocking)?.get_for_unlink(id, nonblocking)
+    }
+
     #[cfg(test)]
     async fn lookup(&self, id: &(impl SmallStoreKey + ?Sized)) -> io::Result<Option<ReadLocation>> {
         let _readers = self.readers.read().await;
@@ -701,7 +721,7 @@ impl SegmentStore {
             return Ok(false);
         };
         self.healthy(&state)?;
-        let Some(loc) = self.entries.read().unwrap().get(&id.view()) else {
+        let Some(Some(loc)) = self.unlink_location(&id.view(), deadline.is_some()) else {
             return Ok(false);
         };
         if !eligible(&loc) {

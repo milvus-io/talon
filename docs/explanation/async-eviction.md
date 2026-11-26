@@ -167,8 +167,11 @@ Set `TALON_WORKER_STALE_GC_ENABLED=false` to disable backend-deletion checks.
 
 [Ownership cleanup](ownership-gc.md) runs as a separate `ownership_gc` task and
 is enabled by default. Set `ownership_gc_enabled = false` to disable it. Logical
-membership changes trigger scans of pre-event blocks; hourly supplemental checks
-handle later admissions, skipping the resident scan when no admissions occurred.
+membership changes trigger scans of the pre-event ordinary block prefix and
+captured packed segments. Later ordinary admissions are eligible at an hourly
+supplement or a new event. Packed scans can find later rows within captured
+segments, subject to the segment cutoff. Hourly checks skip the resident scan
+when no admissions occurred.
 Ownership uses the snapshot published by the Worker control plane and never issues
 backend HEADs. The tasks share deletion budgets and guarded deletion paths for
 ordinary blocks and packed entries. Their scans and schedules are independent.

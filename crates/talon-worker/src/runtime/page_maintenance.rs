@@ -489,8 +489,14 @@ impl WorkerRuntime {
                     match small
                         .delete_gc(candidate, revision, deadline, move || {
                             membership.as_ref().map_or(true, |view| {
-                                Instant::now() < view.valid_until
-                                    && validator.membership_is_current(view)
+                                uncontended(validator.membership.try_lock()).is_some_and(|held| {
+                                    let now = Instant::now();
+                                    now < view.valid_until
+                                        && held.as_ref().is_some_and(|current| {
+                                            current.generation == view.generation
+                                                && now < current.valid_until
+                                        })
+                                })
                             })
                         })
                         .await
@@ -902,6 +908,13 @@ pub(crate) async fn before_deadline<F: std::future::Future>(
             .await
             .ok(),
         None => Some(work.await),
+    }
+}
+
+pub(crate) fn uncontended<T>(result: std::sync::TryLockResult<T>) -> Option<T> {
+    match result {
+        Err(std::sync::TryLockError::WouldBlock) => None,
+        acquired => Some(acquired.unwrap()),
     }
 }
 

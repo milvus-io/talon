@@ -58,8 +58,10 @@ Ordinary scans exclude blocks with later admission revisions, including
 post-event replacements and page fills. Packed segments enter the scan order
 when their first row becomes visible, and a replacement inherits its source's
 position. A tail append can set a cutoff for the captured epoch. Scans can
-still find later rows, including after relocation discards that cutoff. A fresh
-observation of a cold, unpinned foreign row can authorize reclamation.
+still find later rows within captured segments, including after relocation
+discards that cutoff. Ownership imposes no minimum age. A fresh observation
+of an unpinned foreign row can authorize reclamation if the locator ticket,
+access revision and membership are still current.
 
 A complete pass marks the generation converged once all selected misplaced entries
 have been reclaimed or superseded by a later admission and the generation remains
@@ -67,7 +69,8 @@ valid. Reader and pin protection, activity races and unlink failure leave the ev
 pending. After one second, the sweep retries protected or failed ordinary entries by
 queue position. Packed retries keep deduplicated admission addresses that move with
 the locator. Each retry batch obtains fresh tickets, and a later admission removes
-the old retry. A journaled deletion that still has a readable, charged locator
+the old retry, including when that retry has already been selected. A journaled
+deletion that still has a readable, charged locator
 remains discoverable until accounting completes or recovery applies the tombstone.
 The cursor and current candidate survive cancellation. Once converged, ownership
 waits for the next event or supplemental check.
@@ -181,10 +184,11 @@ whole block, paged block or L1 data for the same block identity available.
 Ownership charges all deletion credits before reading the latest valid snapshot
 of the expected generation. This permits renewal while a large block waits for
 credits. The snapshot expiry bounds semaphore, disk-permit and mutation-gate
-waits, including packed identity, publication and stream-state waits. Unlink
-authorization verifies expiry and the current generation. An authorized unlink
-finishes its owned accounting
-transaction even if the caller is cancelled or membership subsequently changes.
+waits, including packed identity, publication and stream-state waits. Packed
+unlink defers on synchronous lock contention during owner lookup and
+revalidation. Authorization verifies expiry and the current generation.
+An authorized unlink finishes its owned accounting transaction even if the
+caller is cancelled or membership subsequently changes.
 
 Polling cannot detect every remote transition; the boundary reflects local
 observation. Cleanup is cache policy, not a distributed ownership transaction.

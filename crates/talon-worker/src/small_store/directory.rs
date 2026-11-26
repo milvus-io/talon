@@ -215,8 +215,18 @@ impl Directory {
         catalog.retired.get(id).map(|entry| entry.key.clone())
     }
     pub fn get(&self, id: &dyn SmallIdentity) -> Option<Location> {
-        let catalog = self.catalog.0.read().unwrap();
-        if let Some(slot) = self.find(&catalog, id, VISIBLE) {
+        self.get_in(&self.catalog.0.read().unwrap(), id)
+    }
+    pub(super) fn get_for_unlink(
+        &self,
+        id: &dyn SmallIdentity,
+        nonblocking: bool,
+    ) -> Option<Option<Location>> {
+        let catalog = super::read_for_unlink(&self.catalog.0, nonblocking)?;
+        Some(self.get_in(&catalog, id))
+    }
+    fn get_in(&self, catalog: &Catalog, id: &dyn SmallIdentity) -> Option<Location> {
+        if let Some(slot) = self.find(catalog, id, VISIBLE) {
             return catalog.location(slot);
         }
         catalog

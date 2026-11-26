@@ -105,23 +105,30 @@ fn completed_slices(worker: &WorkerRuntime) -> talon_core::Counter {
     )
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn two_protected_namespaces_respect_retry_deadlines() {
     let root = tempfile::tempdir().unwrap();
-    let config = fixture_config();
+    let config = WorkerConfig {
+        background_delete_max_per_sec: 0,
+        background_io_max_mb_per_sec: 0,
+        ..fixture_config()
+    };
     let worker = open_worker(root.path(), &config);
+    // The scheduler visits this namespace after default.
     let other = worker
-        .for_namespace(&NamespaceId::named("analytics"))
+        .for_namespace(&NamespaceId::named("reports"))
         .await
         .unwrap();
-    let misplaced = packed_blocks("b").next().unwrap();
+    let mut foreign = packed_blocks("b");
+    let misplaced = foreign.next().unwrap();
+    let blocker = foreign.next().unwrap();
     for namespace in [&worker, &other] {
         fill(namespace, &misplaced).await;
     }
-    // The extra scan slice puts the two protected rows in opposite retry phases.
-    for owned in packed_blocks("a").take(64) {
-        fill(&other, &owned).await;
-    }
+    // Delay completion of the second scan to stagger the two retry deadlines.
+    fill(&other, &blocker).await;
+    let state = other.page_lifecycle.block(&blocker);
+    let gate = state.gate.lock().await;
     let first_pin = worker
         .lru
         .pin_guard(crate::CacheUnit::Whole(misplaced.clone()))
@@ -131,27 +138,56 @@ async fn two_protected_namespaces_respect_retry_deadlines() {
         .pin_guard(crate::CacheUnit::Whole(misplaced.clone()))
         .unwrap();
     publish(&worker, None);
+    let membership = worker.membership_snapshot().unwrap();
     let completed = completed_slices(&worker);
-    let started = Instant::now();
+    let first = worker.small.as_ref().unwrap();
+    let second = other.small.as_ref().unwrap();
+
+    tokio::time::pause();
+    let started = tokio::time::Instant::now();
     let service = WorkerBackground::start(worker.clone(), &config);
-    tokio::time::sleep(Duration::from_millis(250)).await;
-    let elapsed = started.elapsed();
-    let count = completed.get();
-    eprintln!("ownership slices in {elapsed:?}: {count}");
-    assert!(
-        count <= 8 + 4 * elapsed.as_secs(),
-        "protected namespaces must wait for their own retry deadlines"
-    );
+    drive_scheduler_until(|| {
+        first.ownership_retry_count() == 1
+            && second.ownership_retry_count() == 1
+            && other.page_mutations.active_count() == 1
+    })
+    .await;
+    let first_scan_finished = tokio::time::Instant::now();
+    tokio::time::advance(Duration::from_millis(300)).await;
+    let second_scan_released = tokio::time::Instant::now();
+    let blocked = completed.get();
+    drop(gate);
+    drive_scheduler_until(|| completed.get() > blocked && !other.contains_block(&blocker)).await;
+    // A slice that hit its wall-clock work limit can finish on a continuation.
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let second_scan_finished = tokio::time::Instant::now();
+    assert_eq!(first.ownership_retry_count(), 1);
+    assert_eq!(second.ownership_retry_count(), 1);
+    let before_retries = completed.get();
+    drop((first_pin, second_pin));
+
+    let before_first_retry = started + Duration::from_millis(995);
+    assert!(second_scan_finished < before_first_retry);
+    tokio::time::sleep_until(before_first_retry).await;
+    assert_eq!(completed.get(), before_retries, "no slice is due yet");
     assert!(worker.contains_block(&misplaced));
     assert!(other.contains_block(&misplaced));
-    drop((first_pin, second_pin));
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while worker.contains_block(&misplaced) || other.contains_block(&misplaced) {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("both namespaces should retry after their deadlines");
+
+    tokio::time::sleep_until(first_scan_finished + Duration::from_millis(1010)).await;
+    drive_scheduler_until(|| !worker.contains_block(&misplaced)).await;
+    assert!(tokio::time::Instant::now() < second_scan_released + Duration::from_secs(1));
+    assert_eq!(first.ownership_retry_count(), 0);
+    assert_eq!(second.ownership_retry_count(), 1);
+    assert!(other.contains_block(&misplaced));
+
+    tokio::time::sleep_until(second_scan_released + Duration::from_millis(995)).await;
+    assert!(other.contains_block(&misplaced));
+    assert_eq!(second.ownership_retry_count(), 1);
+    tokio::time::sleep_until(second_scan_finished + Duration::from_millis(1010)).await;
+    drive_scheduler_until(|| !other.contains_block(&misplaced)).await;
+    assert_eq!(second.ownership_retry_count(), 0);
+    let current = worker.membership_snapshot().unwrap();
+    assert!(Arc::ptr_eq(&current, &membership));
     service.shutdown().await;
 }
 

@@ -323,6 +323,13 @@ impl OwnershipGc {
             }
         }
         let pass = self.pass.as_mut().unwrap().small.as_mut().unwrap();
+        // Retry enumeration leaves each address registered. Re-admission can
+        // remove it while we wait, so only the initial scan may register one.
+        let defer = |candidate: &SmallGcCandidate| {
+            if pass.retry_cursor.is_none() {
+                small.defer_ownership(candidate, limit);
+            }
+        };
         for _ in 0..64 {
             if !worker.membership_is_current(view) {
                 return;
@@ -338,7 +345,7 @@ impl OwnershipGc {
                 match candidate.ticket.observe_gc(GcCheck::Ownership(limit.epoch)) {
                     Some(revision) => pass.attempt = Some((candidate, revision, false)),
                     None => {
-                        small.defer_ownership(&candidate, limit);
+                        defer(&candidate);
                         continue;
                     }
                 }
@@ -347,7 +354,7 @@ impl OwnershipGc {
             if !*paid {
                 if !candidate.ticket.gc_is_current(*revision) {
                     let (candidate, _, _) = pass.attempt.take().unwrap();
-                    small.defer_ownership(&candidate, limit);
+                    defer(&candidate);
                     continue;
                 }
                 if let Some(budget) = &worker.background_budget {
@@ -366,7 +373,7 @@ impl OwnershipGc {
                 .unlink_small_gc(candidate.clone(), *revision, Some(renewed))
                 .await;
             let (candidate, _, _) = pass.attempt.take().unwrap();
-            small.defer_ownership(&candidate, limit);
+            defer(&candidate);
             if started.elapsed() >= Duration::from_millis(10) {
                 return;
             }
@@ -668,6 +675,116 @@ mod tests {
                 .unwrap(),
             b"packed"[..]
         );
+    }
+
+    #[tokio::test]
+    async fn packed_ownership_retry_does_not_reregister_after_immutable_put() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut worker, fixture) = namespace_runtime(root.path(), false);
+        let budget = crate::background::BackgroundBudget::new(&WorkerConfig {
+            background_delete_max_per_sec: 1,
+            background_io_max_mb_per_sec: 0,
+            ..Default::default()
+        });
+        Arc::get_mut(&mut worker).unwrap().background_budget = Some(budget.clone());
+        let id = packed_placed("b", 0);
+        let payload = Bytes::from_static(b"packed");
+        let put = talon_transport::data::CachedBlockPutRequest {
+            block: id.clone(),
+            object_len: payload.len() as u64,
+            body_len: payload.len() as u64,
+        };
+        worker
+            .admit_cached_block(&put, payload.clone())
+            .await
+            .unwrap();
+        let small = worker.small.as_ref().unwrap();
+        assert!(small.contains(&id));
+        let pin = worker.lru.pin_guard(CacheUnit::Whole(id.clone())).unwrap();
+        let mut gc = fixture.gc(&worker);
+        let generation = worker.membership_snapshot().unwrap().generation;
+        gc.run_round(&worker).await;
+        assert_eq!(small.ownership_retry_count(), 1);
+        gc.run_round(&worker).await;
+        assert_eq!(
+            small.ownership_retry_count(),
+            1,
+            "a current pinned retry remains indexed"
+        );
+        drop(pin);
+
+        tokio::time::pause();
+        // Finish the ordinary retry slice before polling the packed attempt.
+        gc.run_slice(&worker).await;
+        {
+            let round = gc.run_round(&worker);
+            tokio::pin!(round);
+            assert!(futures::poll!(&mut round).is_pending());
+            assert_eq!(
+                budget.charged_deletes(),
+                1,
+                "retry reached deletion credit after observation"
+            );
+            assert_eq!(worker.page_gc_metrics.ownership_attempted.get(), 0);
+            worker
+                .admit_cached_block(&put, payload.clone())
+                .await
+                .unwrap();
+            assert_eq!(small.ownership_retry_count(), 0);
+            tokio::time::advance(Duration::from_secs(2)).await;
+            round.await;
+        }
+
+        assert_eq!(small.ownership_retry_count(), 0);
+        assert_eq!(worker.page_gc_metrics.ownership_attempted.get(), 1);
+        assert_eq!(small.read(&id).await.unwrap(), Some(payload));
+        assert_eq!(gc.completed_generation, generation);
+        assert!(gc.pass.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn packed_ownership_unlink_defers_while_catalog_writer_is_held() {
+        let root = tempfile::tempdir().unwrap();
+        let (worker, fixture) = namespace_runtime(root.path(), false);
+        let id = packed_placed("b", 0);
+        let small = worker.small.as_ref().unwrap();
+        small.put(&id, Bytes::from_static(b"packed")).await.unwrap();
+        fixture.publish(&worker);
+        let membership = worker.membership_snapshot().unwrap();
+        let limit = membership.scan_limits[&worker.cache_identity]
+            .small
+            .unwrap();
+        let (_, mut candidates) =
+            small.ownership_candidates(&mut OwnershipCursor::default(), 0, limit, 64, |_| false);
+        let candidate = candidates.pop().unwrap();
+        let revision = candidate
+            .ticket
+            .observe_gc(GcCheck::Ownership(limit.epoch))
+            .unwrap();
+        let state = worker.page_lifecycle.block(&id);
+        let gc_permits = worker.page_gc_io.available_permits();
+        let budget = worker.background_budget.as_ref().unwrap();
+        let io_permits = budget.available_io();
+        let handle = tokio::runtime::Handle::current();
+        small.under_catalog_writer(|| {
+            use futures::FutureExt;
+            handle.block_on(async {
+                assert!(worker.membership_is_current(&membership));
+                worker
+                    .unlink_small_gc(candidate.clone(), revision, Some(membership.clone()))
+                    .await;
+                assert!(worker.membership_is_current(&membership));
+                assert!(state.gate.lock().now_or_never().is_some());
+                assert_eq!(worker.page_gc_io.available_permits(), gc_permits);
+                assert_eq!(budget.available_io(), io_permits);
+            });
+        });
+        assert!(small.contains(&id));
+        // The same watch and membership can authorize once the writer releases.
+        worker
+            .unlink_small_gc(candidate, revision, Some(membership))
+            .await;
+        assert!(!small.contains(&id));
     }
 
     #[tokio::test]

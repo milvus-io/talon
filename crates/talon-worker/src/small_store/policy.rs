@@ -38,13 +38,22 @@ impl SmallAccess {
     }
 
     pub(super) fn slot(&self, catalog: &Catalog) -> Option<usize> {
+        self.slot_for_unlink(catalog, false)
+    }
+
+    pub(super) fn slot_for_unlink(&self, catalog: &Catalog, nonblocking: bool) -> Option<usize> {
         if self.retired.load(Ordering::Acquire) {
             return None;
         }
         let slot = if self.epoch.load(Ordering::Acquire) == catalog.lookup.epoch() {
             self.position.load(Ordering::Relaxed)
         } else {
-            let slot = catalog.at(*self.address.lock().unwrap())?;
+            let address = if nonblocking {
+                *crate::runtime::uncontended(self.address.try_lock())?
+            } else {
+                *self.address.lock().unwrap()
+            };
+            let slot = catalog.at(address)?;
             // The catalog read lock keeps the epoch fixed; concurrent refreshes publish the same slot.
             self.position.store(slot, Ordering::Relaxed);
             self.epoch.store(catalog.lookup.epoch(), Ordering::Release);
