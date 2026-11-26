@@ -10,6 +10,7 @@ use talon_backend::{
     BackendRouter, BrokerConfig, DefaultBackendResolver, HttpClient, HttpRequest, HttpResponse,
     NoopObserver,
 };
+use talon_core::backend::BackgroundRoute;
 use talon_core::{Backend, BackendStore, ObjectId};
 
 #[derive(Default)]
@@ -619,13 +620,32 @@ async fn configured_iam_endpoint_uses_worker_addressing_and_reuses_credentials()
         )
         .await
         .unwrap();
+        let active_endpoint = resolver.broker_endpoint().unwrap();
         let router = BackendRouter::new(backend, Arc::new(resolver));
         assert!(!router.ready_for_background());
         assert!(http.requests.lock().unwrap().is_empty());
         let object = ObjectId::new(backend, "bucket", "key");
-        router.head(&object).await.unwrap();
+        assert!(matches!(
+            router.background_route(backend, "bucket"),
+            BackgroundRoute::Skip
+        ));
         router.head(&object).await.unwrap();
         assert!(router.ready_for_background());
+        assert!(matches!(
+            router.background_route(backend, "cold"),
+            BackgroundRoute::Skip
+        ));
+        let BackgroundRoute::Bound(store) = router.background_route(backend, "bucket") else {
+            panic!("warm bucket should reuse the active binding");
+        };
+        store.head(&object).await.unwrap();
+        active_endpoint.store(Arc::new(
+            "https://next-broker.example/exchange".to_owned().into(),
+        ));
+        assert!(matches!(
+            router.background_route(backend, "bucket"),
+            BackgroundRoute::Skip
+        ));
         let requests = http.requests.lock().unwrap();
         assert_eq!(requests.len(), 3);
         assert_eq!(requests[0].url, endpoint);

@@ -499,11 +499,28 @@ impl CredentialsFetch for BrokerFetch<AzureSas> {
     }
 }
 
+struct BrokerSnapshot<T> {
+    value: Arc<T>,
+    refresh_due: tokio::time::Instant,
+    expires_at: Option<SystemTime>,
+}
+
+impl<T> BrokerSnapshot<T> {
+    fn new(value: T, expires_at: Option<SystemTime>, policy: &RefreshPolicy) -> Self {
+        Self {
+            value: Arc::new(value),
+            refresh_due: tokio::time::Instant::now()
+                + policy.request_delay(SystemTime::now(), expires_at),
+            expires_at,
+        }
+    }
+}
+
 /// Broker snapshots refresh only when an outgoing request needs them.
 /// The async mutex is held through the exchange and released on cancellation.
 pub(crate) struct BrokerCredentials<F: CredentialsFetch> {
     fetcher: F,
-    snapshot: RwLock<(Arc<F::Value>, tokio::time::Instant)>,
+    snapshot: RwLock<BrokerSnapshot<F::Value>>,
     refresh: tokio::sync::Mutex<()>,
     policy: RefreshPolicy,
     observer: Arc<dyn CredentialsObserver>,
@@ -532,10 +549,10 @@ impl<F: CredentialsFetch> BrokerCredentials<F> {
             }
         };
         observer.refresh_succeeded(expiry);
-        let due = tokio::time::Instant::now() + policy.request_delay(SystemTime::now(), expiry);
+        let snapshot = BrokerSnapshot::new(value, expiry, &policy);
         Ok(Arc::new(Self {
             fetcher,
-            snapshot: RwLock::new((Arc::new(value), due)),
+            snapshot: RwLock::new(snapshot),
             refresh: tokio::sync::Mutex::new(()),
             policy,
             observer,
@@ -543,24 +560,30 @@ impl<F: CredentialsFetch> BrokerCredentials<F> {
     }
 
     fn current(&self) -> Arc<F::Value> {
-        Arc::clone(&self.snapshot.read().unwrap().0)
+        Arc::clone(&self.snapshot.read().unwrap().value)
+    }
+
+    fn cached_credentials_available(&self) -> bool {
+        self.snapshot
+            .read()
+            .unwrap()
+            .expires_at
+            .map_or(true, |expiry| expiry > SystemTime::now())
     }
 
     async fn prepare(&self) -> Result<(), String> {
-        if tokio::time::Instant::now() < self.snapshot.read().unwrap().1 {
+        if tokio::time::Instant::now() < self.snapshot.read().unwrap().refresh_due {
             return Ok(());
         }
         // Wait for the in-flight refresh before signing, matching milvus-storage.
         // Recheck the deadline under the lock so waiters reuse a successful refresh.
         let _guard = self.refresh.lock().await;
-        if tokio::time::Instant::now() < self.snapshot.read().unwrap().1 {
+        if tokio::time::Instant::now() < self.snapshot.read().unwrap().refresh_due {
             return Ok(());
         }
         match self.fetcher.fetch().await {
             Ok((value, expiry)) => {
-                let due = tokio::time::Instant::now()
-                    + self.policy.request_delay(SystemTime::now(), expiry);
-                *self.snapshot.write().unwrap() = (Arc::new(value), due);
+                *self.snapshot.write().unwrap() = BrokerSnapshot::new(value, expiry, &self.policy);
                 self.observer.refresh_succeeded(expiry);
             }
             Err(error) => {
@@ -580,6 +603,9 @@ impl<F: CredentialsFetch<Value = S3Credentials>> ProvideS3Credentials for Broker
     fn current(&self) -> Arc<S3Credentials> {
         self.current()
     }
+    fn ready_for_background(&self) -> bool {
+        self.cached_credentials_available()
+    }
     async fn prepare(&self) -> Result<(), String> {
         self.prepare().await
     }
@@ -589,6 +615,9 @@ impl<F: CredentialsFetch<Value = GcpBearerToken>> ProvideBearerToken for BrokerC
     fn current(&self) -> Option<Arc<String>> {
         Some(Arc::clone(&self.current().token))
     }
+    fn ready_for_background(&self) -> bool {
+        self.cached_credentials_available()
+    }
     async fn prepare(&self) -> Result<(), String> {
         self.prepare().await
     }
@@ -597,6 +626,9 @@ impl<F: CredentialsFetch<Value = GcpBearerToken>> ProvideBearerToken for BrokerC
 impl<F: CredentialsFetch<Value = AzureSas>> ProvideSasToken for BrokerCredentials<F> {
     fn current(&self) -> Arc<AzureSas> {
         self.current()
+    }
+    fn ready_for_background(&self) -> bool {
+        self.cached_credentials_available()
     }
     async fn prepare(&self) -> Result<(), String> {
         self.prepare().await
@@ -855,9 +887,13 @@ mod tests {
         )
         .await
         .unwrap();
+        assert!(!provider.cached_credentials_available());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
         provider.prepare().await.unwrap();
+        assert!(!provider.cached_credentials_available());
         assert_eq!(&*provider.current(), "token-0");
         provider.prepare().await.unwrap();
+        assert!(provider.cached_credentials_available());
         assert_eq!(&*provider.current(), "token-2");
         assert_eq!(calls.load(Ordering::SeqCst), 3);
     }

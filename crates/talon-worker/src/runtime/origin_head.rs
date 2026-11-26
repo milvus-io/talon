@@ -129,12 +129,13 @@ impl OriginHeads {
 }
 
 impl super::WorkerRuntime {
-    pub(super) async fn background_head(&self, object: &ObjectId) -> Result<ObjectStat> {
-        let backend = self
-            .backend()
-            .map_err(|error| Error::Backend(error.to_string()))?;
+    pub(super) async fn background_head(
+        &self,
+        backend: Arc<dyn BackendStore>,
+        object: &ObjectId,
+    ) -> Result<ObjectStat> {
         match &self.background_heads {
-            Some(heads) => heads.head(backend.clone(), object.clone()).await,
+            Some(heads) => heads.head(backend, object.clone()).await,
             None => backend.head(object).await,
         }
     }
