@@ -10,6 +10,7 @@ use talon_backend::{
     BackendRouter, BrokerConfig, DefaultBackendResolver, HttpClient, HttpRequest, HttpResponse,
     NoopObserver,
 };
+use talon_core::backend::BackgroundRoute;
 use talon_core::{Backend, BackendStore, ObjectId};
 
 #[derive(Default)]
@@ -619,13 +620,32 @@ async fn configured_iam_endpoint_uses_worker_addressing_and_reuses_credentials()
         )
         .await
         .unwrap();
+        let active_endpoint = resolver.broker_endpoint().unwrap();
         let router = BackendRouter::new(backend, Arc::new(resolver));
         assert!(!router.ready_for_background());
         assert!(http.requests.lock().unwrap().is_empty());
         let object = ObjectId::new(backend, "bucket", "key");
-        router.head(&object).await.unwrap();
+        assert!(matches!(
+            router.background_route(backend, "bucket"),
+            BackgroundRoute::Skip
+        ));
         router.head(&object).await.unwrap();
         assert!(router.ready_for_background());
+        assert!(matches!(
+            router.background_route(backend, "cold"),
+            BackgroundRoute::Skip
+        ));
+        let BackgroundRoute::Bound(store) = router.background_route(backend, "bucket") else {
+            panic!("warm bucket should reuse the active binding");
+        };
+        store.head(&object).await.unwrap();
+        active_endpoint.store(Arc::new(
+            "https://next-broker.example/exchange".to_owned().into(),
+        ));
+        assert!(matches!(
+            router.background_route(backend, "bucket"),
+            BackgroundRoute::Skip
+        ));
         let requests = http.requests.lock().unwrap();
         assert_eq!(requests.len(), 3);
         assert_eq!(requests[0].url, endpoint);
@@ -973,6 +993,64 @@ async fn dynamic_keys_separate_roles_urls_and_azure_accounts() {
             .unwrap();
         assert_ne!(third.scope, fourth.scope);
         assert!(!Arc::ptr_eq(&third.store, &fourth.store));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn requests_inheriting_worker_broker_url_also_inherit_its_timeout() {
+    for (url, request_timeout, worker_timeout, expected_timeout) in [
+        ("", None, Some(10_000), 10_000),
+        ("", Some(2_000), Some(10_000), 2_000),
+        ("", None, None, 3_000),
+        (
+            "https://request-broker.example/exchange",
+            None,
+            Some(10_000),
+            3_000,
+        ),
+    ] {
+        let http = Arc::new(Http {
+            gate: Some(Arc::new(tokio::sync::Semaphore::new(0))),
+            ..Default::default()
+        });
+        let resolver = DefaultBackendResolver::from_configs(
+            Backend::S3,
+            BackendResolverConfig {
+                credential_endpoint: Some(
+                    "https://worker-broker.example/exchange".to_owned().into(),
+                ),
+                defaults: talon_core::BucketConfig {
+                    credential_broker_timeout_ms: worker_timeout,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            http.clone(),
+            http.clone(),
+            Arc::new(NoopObserver),
+        )
+        .await
+        .unwrap();
+        let router = BackendRouter::new(Backend::S3, Arc::new(resolver));
+        let mut broker = aws();
+        broker.url = url.into();
+        broker.origin.as_mut().unwrap().request_timeout_ms = request_timeout;
+
+        let start = tokio::time::Instant::now();
+        let error = router
+            .bind_request(Backend::S3, "bucket", &broker)
+            .await
+            .err()
+            .expect("hanging Broker should time out");
+        assert!(error.to_string().contains("broker request timed out"));
+        let attempts = talon_core::BROKER_INITIAL_ATTEMPTS;
+        assert_eq!(http.requests.lock().unwrap().len(), attempts as usize);
+        assert_eq!(
+            start.elapsed(),
+            Duration::from_millis(
+                u64::from(attempts) * expected_timeout + talon_core::BROKER_INITIAL_BACKOFF_MS
+            )
+        );
     }
 }
 

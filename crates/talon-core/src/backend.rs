@@ -51,6 +51,16 @@ pub struct ResolvedBackend {
     pub store: Arc<dyn BackendStore>,
 }
 
+/// The origin available to background maintenance for a credential scope.
+pub enum BackgroundRoute {
+    /// Use the current backend for this scope.
+    Current,
+    /// Use an existing binding for the target bucket.
+    Bound(Arc<dyn BackendStore>),
+    /// Defer checks for this scope until credentials are available.
+    Skip,
+}
+
 /// Metadata about a source object.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectStat {
@@ -95,6 +105,15 @@ pub trait BackendStore: Send + Sync {
     /// Whether maintenance may access this origin without initializing credentials.
     fn ready_for_background(&self) -> bool {
         true
+    }
+
+    /// Select an available background route using local state only.
+    fn background_route(&self, _backend: Backend, _bucket: &str) -> BackgroundRoute {
+        if self.ready_for_background() {
+            BackgroundRoute::Current
+        } else {
+            BackgroundRoute::Skip
+        }
     }
 
     /// Bind request credentials before any cache access. Stores without a

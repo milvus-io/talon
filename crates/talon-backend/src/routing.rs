@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{future::BoxFuture, FutureExt};
 use sha2::{Digest, Sha256};
-use talon_core::backend::AccessScope;
+use talon_core::backend::{AccessScope, BackgroundRoute};
 use talon_core::config::{BucketConfig, Sensitive};
 use talon_core::{
     Backend, BackendStore, Error, ListPage, ObjectId, ObjectStat, OriginOptions, ResolvedBackend,
@@ -30,7 +30,7 @@ use crate::{
     S3Credentials,
 };
 
-const MAX_DYNAMIC_BACKENDS: usize = 4096;
+const MAX_DYNAMIC_BACKENDS: usize = 65_535;
 
 /// The backend family, bucket, and optional request-owned credential configuration.
 #[derive(Debug, Clone, Copy)]
@@ -45,6 +45,15 @@ pub struct RouteRequest<'a> {
 pub trait BackendResolver: Send + Sync {
     fn ready_for_background(&self) -> bool {
         true
+    }
+
+    /// Select a route using cached bindings only. Lazy resolvers override this.
+    fn background_route(&self, _backend: Backend, _bucket: &str) -> BackgroundRoute {
+        if self.ready_for_background() {
+            BackgroundRoute::Current
+        } else {
+            BackgroundRoute::Skip
+        }
     }
 
     /// Check local route eligibility before cache access, without performing I/O.
@@ -123,10 +132,22 @@ struct PendingBackend {
     ready: Notify,
 }
 
-#[derive(Default)]
 struct DynamicBackends {
     stores: HashMap<ConfigKey, Arc<dyn BackendStore>>,
     pending: HashMap<ConfigKey, Arc<PendingBackend>>,
+    capacity: usize,
+    evict_idle_on_full: bool,
+}
+
+impl Default for DynamicBackends {
+    fn default() -> Self {
+        Self {
+            stores: HashMap::new(),
+            pending: HashMap::new(),
+            capacity: MAX_DYNAMIC_BACKENDS,
+            evict_idle_on_full: false,
+        }
+    }
 }
 
 /// The active URL for a default Broker route enabled at startup.
@@ -137,6 +158,36 @@ struct IamBrokerRoutes {
     defaults: BucketConfig,
     buckets: Option<HashMap<String, BucketConfig>>,
     backends: Arc<RwLock<DynamicBackends>>,
+}
+
+impl IamBrokerRoutes {
+    fn prepare(&self, backend: Backend, bucket: &str) -> Result<RouteBuildConfig> {
+        // Bucket entries supply the origin settings. The Broker's Pod IAM
+        // identity supplies the credentials for this default route.
+        let origin = self
+            .buckets
+            .as_ref()
+            .and_then(|buckets| buckets.get(bucket))
+            .unwrap_or(&self.defaults);
+        let mut config = BucketConfig {
+            name: bucket.to_owned(),
+            credentials_source: "broker".into(),
+            s3_region: origin.s3_region.clone(),
+            s3_endpoint: origin.s3_endpoint.clone(),
+            s3_path_style: origin.s3_path_style,
+            gcs_endpoint: origin.gcs_endpoint.clone(),
+            azure_account: origin.azure_account.clone(),
+            azure_endpoint: origin.azure_endpoint.clone(),
+            credential_broker_url: Some(self.endpoint.load().as_ref().clone()),
+            credential_broker_timeout_ms: origin
+                .credential_broker_timeout_ms
+                .or(self.defaults.credential_broker_timeout_ms),
+            ..Default::default()
+        };
+        config.credential_broker_request =
+            Some(broker::build_iam_request_body(backend, &config).into());
+        RouteBuildConfig::new(backend, config).map_err(Error::Backend)
+    }
 }
 
 /// Static routes and normalized request configurations for one cloud family.
@@ -231,7 +282,10 @@ impl DefaultBackendResolver {
                         .map(|bucket| (bucket.name.clone(), bucket))
                         .collect()
                 }),
-                backends: Arc::default(),
+                backends: Arc::new(RwLock::new(DynamicBackends {
+                    evict_idle_on_full: true,
+                    ..Default::default()
+                })),
             });
             return Ok(resolver);
         }
@@ -270,11 +324,8 @@ impl DefaultBackendResolver {
         let Some(broker) = request.broker else {
             return Ok(None);
         };
-        let worker_endpoint = self
-            .iam_broker
-            .as_ref()
-            .filter(|_| broker.url.is_empty())
-            .map(|iam| iam.endpoint.load_full());
+        let worker_broker = self.iam_broker.as_ref().filter(|_| broker.url.is_empty());
+        let worker_endpoint = worker_broker.map(|iam| iam.endpoint.load_full());
         let worker_url = worker_endpoint
             .as_deref()
             .map(|endpoint| endpoint.expose().as_str());
@@ -291,6 +342,11 @@ impl DefaultBackendResolver {
             request: broker.request.clone(),
             origin: broker.origin.clone(),
         };
+        if let (Some(iam), Some(origin)) = (worker_broker, &mut broker.origin) {
+            origin.request_timeout_ms = origin
+                .request_timeout_ms
+                .or(iam.defaults.credential_broker_timeout_ms);
+        }
         if !broker.request.is_object() {
             return Err(Error::Backend(
                 "broker request must be a JSON object".into(),
@@ -348,13 +404,25 @@ impl DefaultBackendResolver {
             if let Some(pending) = dynamic.pending.get(&key) {
                 pending.clone()
             } else {
-                if dynamic.stores.len() + dynamic.pending.len() >= MAX_DYNAMIC_BACKENDS {
+                let full = dynamic.stores.len() + dynamic.pending.len() >= dynamic.capacity;
+                let evicted = if full && dynamic.evict_idle_on_full {
+                    // Check and remove under the same lock used to clone bindings.
+                    let idle = dynamic.stores.iter().find_map(|(key, store)| {
+                        (Arc::strong_count(store) == 1).then(|| key.clone())
+                    });
+                    idle.and_then(|key| dynamic.stores.remove(&key))
+                } else {
+                    None
+                };
+                if full && evicted.is_none() {
                     return Err(Error::Backend(
                         "dynamic backend configuration limit reached".into(),
                     ));
                 }
                 let pending = Arc::new(PendingBackend::default());
                 dynamic.pending.insert(key.clone(), pending.clone());
+                drop(dynamic);
+                drop(evicted);
                 let registry = backends.clone();
                 let slot = pending.clone();
                 let origin_http = self.origin_http.clone();
@@ -419,16 +487,56 @@ impl DefaultBackendResolver {
 #[async_trait]
 impl BackendResolver for DefaultBackendResolver {
     fn ready_for_background(&self) -> bool {
-        !self.static_routes.is_empty()
-            || self
-                .iam_broker
-                .as_ref()
-                .is_some_and(|iam| !iam.backends.read().unwrap().stores.is_empty())
+        self.static_routes
+            .values()
+            .any(|store| store.ready_for_background())
+            || self.iam_broker.as_ref().is_some_and(|iam| {
+                iam.backends
+                    .read()
+                    .unwrap()
+                    .stores
+                    .values()
+                    .any(|store| store.ready_for_background())
+            })
             || match &self.legacy {
-                Some(LegacyBackend::Ready(_)) => true,
-                Some(LegacyBackend::Lazy { store, .. }) => store.get().is_some(),
+                Some(LegacyBackend::Ready(store)) => store.ready_for_background(),
+                Some(LegacyBackend::Lazy { store, .. }) => store
+                    .get()
+                    .is_some_and(|store| store.ready_for_background()),
                 None => false,
             }
+    }
+
+    fn background_route(&self, backend: Backend, bucket: &str) -> BackgroundRoute {
+        if let Some(iam) = &self.iam_broker {
+            let Ok(prepared) = iam.prepare(backend, bucket) else {
+                return BackgroundRoute::Skip;
+            };
+            let store = iam
+                .backends
+                .read()
+                .unwrap()
+                .stores
+                .get(&prepared.key())
+                .cloned();
+            return match store {
+                Some(store) if store.ready_for_background() => BackgroundRoute::Bound(store),
+                _ => BackgroundRoute::Skip,
+            };
+        }
+        let store = self
+            .static_routes
+            .get(bucket)
+            .or_else(|| match &self.legacy {
+                Some(LegacyBackend::Ready(store)) => Some(store),
+                Some(LegacyBackend::Lazy { store, .. }) => store.get(),
+                None => None,
+            });
+        if store.is_some_and(|store| store.ready_for_background()) {
+            BackgroundRoute::Current
+        } else {
+            BackgroundRoute::Skip
+        }
     }
 
     fn validate(&self, request: &RouteRequest<'_>) -> Result<()> {
@@ -487,31 +595,7 @@ impl BackendResolver for DefaultBackendResolver {
         }
         self.validate(request)?;
         if let Some(iam) = &self.iam_broker {
-            // Bucket entries supply the origin settings. The Broker's Pod IAM
-            // identity supplies the credentials for this default route.
-            let origin = iam
-                .buckets
-                .as_ref()
-                .and_then(|buckets| buckets.get(request.bucket))
-                .unwrap_or(&iam.defaults);
-            let mut config = BucketConfig {
-                name: request.bucket.to_owned(),
-                credentials_source: "broker".into(),
-                s3_region: origin.s3_region.clone(),
-                s3_endpoint: origin.s3_endpoint.clone(),
-                s3_path_style: origin.s3_path_style,
-                gcs_endpoint: origin.gcs_endpoint.clone(),
-                azure_account: origin.azure_account.clone(),
-                azure_endpoint: origin.azure_endpoint.clone(),
-                credential_broker_url: Some(iam.endpoint.load().as_ref().clone()),
-                credential_broker_timeout_ms: origin
-                    .credential_broker_timeout_ms
-                    .or(iam.defaults.credential_broker_timeout_ms),
-                ..Default::default()
-            };
-            config.credential_broker_request =
-                Some(broker::build_iam_request_body(self.backend, &config).into());
-            let prepared = RouteBuildConfig::new(self.backend, config).map_err(Error::Backend)?;
+            let prepared = iam.prepare(self.backend, request.bucket)?;
             return self.resolve_broker(prepared, &iam.backends).await;
         }
         // Bucket stores are ready at startup. Implicit global IAM discovery
@@ -540,6 +624,10 @@ struct BoundBackend {
 
 #[async_trait]
 impl BackendResolver for BoundBackend {
+    fn ready_for_background(&self) -> bool {
+        self.store.ready_for_background()
+    }
+
     fn validate(&self, request: &RouteRequest<'_>) -> Result<()> {
         if request.backend != self.backend
             || request.bucket != self.bucket
@@ -781,6 +869,14 @@ impl BackendStore for BackendRouter {
         self.resolver.ready_for_background()
     }
 
+    fn background_route(&self, backend: Backend, bucket: &str) -> BackgroundRoute {
+        if backend == self.backend {
+            self.resolver.background_route(backend, bucket)
+        } else {
+            BackgroundRoute::Skip
+        }
+    }
+
     async fn bind_request(
         &self,
         backend: Backend,
@@ -891,6 +987,82 @@ impl BackendStore for BackendRouter {
 #[cfg(test)]
 mod identity_tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn full_default_iam_registry_rebinds_evicted_buckets() {
+        #[derive(Default)]
+        struct BrokerHttp(AtomicUsize);
+
+        #[async_trait]
+        impl HttpClient for BrokerHttp {
+            async fn execute(
+                &self,
+                request: crate::HttpRequest,
+            ) -> std::result::Result<crate::HttpResponse, String> {
+                assert_eq!(request.method, crate::Method::Post);
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Ok(crate::HttpResponse {
+                    status: 200,
+                    headers: vec![],
+                    body: Bytes::from_static(br#"{"success":true,"credentials":{"tempAk":"access","tempSk":"secret","sessionToken":"token","expiredAt":"2099-01-01T00:00:00Z"}}"#),
+                })
+            }
+        }
+
+        let http = Arc::new(BrokerHttp::default());
+        let backend = Backend::S3;
+        let resolver = DefaultBackendResolver::from_configs(
+            backend,
+            BackendResolverConfig {
+                credential_endpoint: Some("https://broker.example/exchange".to_owned().into()),
+                defaults: BucketConfig {
+                    s3_region: Some("us-west-2".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            http.clone(),
+            http.clone(),
+            Arc::new(crate::NoopObserver),
+        )
+        .await
+        .unwrap();
+        resolver
+            .iam_broker
+            .as_ref()
+            .unwrap()
+            .backends
+            .write()
+            .unwrap()
+            .capacity = 2;
+        let request = |bucket| RouteRequest {
+            backend,
+            bucket,
+            broker: None,
+        };
+        let held = resolver.resolve(&request("held")).await.unwrap();
+        let idle_scope = resolver.resolve(&request("idle")).await.unwrap().scope;
+        let new = resolver.resolve(&request("new")).await.unwrap();
+        let reused = resolver.resolve(&request("held")).await.unwrap();
+        assert!(Arc::ptr_eq(&held.store, &reused.store));
+        assert!(matches!(
+            resolver.background_route(backend, "idle"),
+            BackgroundRoute::Skip
+        ));
+        assert_eq!(http.0.load(Ordering::Relaxed), 3);
+
+        let error = resolver.resolve(&request("idle")).await.err().unwrap();
+        assert!(error
+            .to_string()
+            .contains("dynamic backend configuration limit reached"));
+        assert_eq!(http.0.load(Ordering::Relaxed), 3);
+
+        drop(new);
+        let rebound = resolver.resolve(&request("idle")).await.unwrap();
+        assert_eq!(rebound.scope, idle_scope);
+        assert_eq!(http.0.load(Ordering::Relaxed), 4);
+    }
 
     #[test]
     fn cached_and_pending_bindings_do_not_block_other_readers() {
