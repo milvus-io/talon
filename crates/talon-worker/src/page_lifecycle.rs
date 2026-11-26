@@ -18,16 +18,16 @@ pub(crate) fn disk_shard(id: &BlockId) -> usize {
 }
 const DIRECTORY_SHARDS: usize = 256;
 
-/// Active mutations share a gate for the exact block identity. The pool
-/// retains no gates or key references after the last operation releases one.
+/// Active mutations share a gate for the exact block identity. Idle entries
+/// are removed even if the last operation drops its gate under contention.
 struct MutationGates {
-    blocks: Mutex<HashMap<BlockKey, Weak<PageMutationGate>>>,
+    blocks: tokio::sync::Mutex<HashMap<BlockKey, Weak<PageMutationGate>>>,
     directories: Vec<Arc<tokio::sync::RwLock<()>>>,
 }
 
 impl MutationGates {
-    fn gate(self: &Arc<Self>, id: &BlockKey, stripe: usize) -> Arc<PageMutationGate> {
-        let mut active = self.blocks.lock().unwrap();
+    async fn gate(self: &Arc<Self>, id: &BlockKey, stripe: usize) -> Arc<PageMutationGate> {
+        let mut active = self.blocks.lock().await;
         if let Some(gate) = active.get(id).and_then(Weak::upgrade) {
             return gate;
         }
@@ -39,6 +39,14 @@ impl MutationGates {
         });
         active.insert(id.clone(), Arc::downgrade(&gate));
         gate
+    }
+
+    fn remove_idle(active: &mut HashMap<BlockKey, Weak<PageMutationGate>>, id: &BlockKey) {
+        // A new operation may have replaced the expired weak entry while
+        // cleanup waited. A live gate must remain registered.
+        if active.get(id).is_some_and(|gate| gate.strong_count() == 0) {
+            active.remove(id);
+        }
     }
 }
 
@@ -53,14 +61,23 @@ struct PageMutationGate {
 
 impl Drop for PageMutationGate {
     fn drop(&mut self) {
-        if let Some(owner) = self.owner.upgrade() {
-            let mut active = owner.blocks.lock().unwrap();
-            if active
-                .get(&self.id)
-                .is_some_and(|gate| std::ptr::eq(gate.as_ptr(), self))
-            {
-                active.remove(&self.id);
-            }
+        let Some(owner) = self.owner.upgrade() else {
+            return;
+        };
+        if let Ok(mut active) = owner.blocks.try_lock() {
+            MutationGates::remove_idle(&mut active, &self.id);
+            return;
+        }
+        // Cancellation and completion can both drop the last gate while a
+        // timed GC attempt still owns I/O permits. Never wait in that drop.
+        let id = self.id.clone();
+        let cleanup = async move {
+            MutationGates::remove_idle(&mut *owner.blocks.lock().await, &id);
+        };
+        if talon_uring::on_ring() {
+            drop(talon_uring::spawn_local(cleanup));
+        } else {
+            tokio::spawn(cleanup);
         }
     }
 }
@@ -503,15 +520,16 @@ pub(crate) struct PagedMutation {
 }
 
 impl PagedMutation {
-    fn gate(&self) -> Arc<PageMutationGate> {
+    async fn gate(&self) -> Arc<PageMutationGate> {
         let mut hash = DefaultHasher::new();
         self.id.hash(&mut hash);
         self.gates
             .gate(&self.id, hash.finish() as usize % DIRECTORY_SHARDS)
+            .await
     }
 
     pub async fn lock(&self) -> PageMutationGuard {
-        let gate = self.gate();
+        let gate = self.gate().await;
         let directory = gate.directory.clone().read_owned().await;
         let block = futures::future::Either::Right(gate.block.clone().write_owned().await);
         PageMutationGuard {
@@ -522,7 +540,7 @@ impl PagedMutation {
     }
 
     pub async fn lock_page_fill(&self) -> PageMutationGuard {
-        let gate = self.gate();
+        let gate = self.gate().await;
         let directory = gate.directory.clone().read_owned().await;
         let block = futures::future::Either::Left(gate.block.clone().read_owned().await);
         PageMutationGuard {
@@ -1335,7 +1353,7 @@ impl PageLifecycle {
             #[cfg(test)]
             checkpoint_inventory_work: Default::default(),
             gates: Arc::new(MutationGates {
-                blocks: Mutex::default(),
+                blocks: tokio::sync::Mutex::default(),
                 directories: (0..DIRECTORY_SHARDS).map(|_| Arc::default()).collect(),
             }),
         }
@@ -1352,6 +1370,12 @@ impl PageLifecycle {
 
     pub fn directory_gate(&self, digest: u64) -> Arc<tokio::sync::RwLock<()>> {
         self.gates.directories[digest as usize % DIRECTORY_SHARDS].clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn under_mutation_registry(&self, f: impl FnOnce()) {
+        let _registry = self.gates.blocks.blocking_lock();
+        f();
     }
 
     pub fn block(&self, id: &BlockId) -> PagedMutation {
@@ -1884,6 +1908,74 @@ mod tests {
             131_072,
             Version::new("v1"),
         )
+    }
+
+    async fn check_mutation_gate_cleanup_under_registry_contention() {
+        let life = PageLifecycle::new();
+        let state = life.block(&id());
+        let mut hash = DefaultHasher::new();
+        state.id.hash(&mut hash);
+        let directory = life.directory_gate(hash.finish()).write_owned().await;
+        let mut pending = Box::pin(state.lock());
+        assert!(futures::poll!(&mut pending).is_pending());
+        let registry = life.gates.blocks.lock().await;
+        let old = registry[&state.id].clone();
+        assert_eq!(old.strong_count(), 1);
+
+        // Schedule replacement ahead of the cleanup of the cancelled waiter.
+        let mut replacement = Box::pin(state.lock());
+        assert!(futures::poll!(&mut replacement).is_pending());
+        drop(pending);
+        assert_eq!(old.strong_count(), 0);
+        drop(directory);
+        drop(registry);
+        let replacement = replacement.await;
+        while Arc::strong_count(&life.gates) > 2 {
+            talon_uring::sleep(std::time::Duration::from_millis(1)).await;
+        }
+
+        // Cleanup of the cancelled gate must leave the live replacement in
+        // place. Completion of that mutation must also drop without waiting.
+        let registry = life.gates.blocks.lock().await;
+        assert!(Weak::ptr_eq(
+            &registry[&state.id],
+            &Arc::downgrade(&replacement._gate),
+        ));
+        drop(replacement);
+        assert_eq!(registry[&state.id].strong_count(), 0);
+        drop(registry);
+        while !life.gates.blocks.lock().await.is_empty() {
+            talon_uring::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn mutation_gate_cleanup_under_registry_contention() {
+        talon_uring::timeout(
+            std::time::Duration::from_secs(2),
+            check_mutation_gate_cleanup_under_registry_contention(),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires native io_uring"]
+    fn native_mutation_gate_cleanup_under_registry_contention() {
+        monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+            .enable_timer()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let ring = talon_uring::LocalRing::enter();
+                talon_uring::timeout(
+                    std::time::Duration::from_secs(2),
+                    check_mutation_gate_cleanup_under_registry_contention(),
+                )
+                .await
+                .unwrap();
+                ring.drain().await;
+            });
     }
 
     fn sample(life: &PageLifecycle, id: &BlockId, membership: u64, full: bool) -> PageSnapshot {

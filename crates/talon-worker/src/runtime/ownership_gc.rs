@@ -1014,6 +1014,81 @@ mod tests {
         assert!(!small.contains(&id));
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn packed_ownership_expires_while_shared_mutation_registry_is_held() {
+        let root = tempfile::tempdir().unwrap();
+        let (worker, fixture) = namespace_runtime(root.path(), true);
+        let id = packed_placed("b", 0);
+        let small = worker.small.as_ref().unwrap();
+        small.put(&id, Bytes::from_static(b"packed")).await.unwrap();
+        let mut gc = fixture.gc(&worker);
+        let gc_permits = worker.page_gc_io.available_permits();
+        let budget = worker.background_budget.as_ref().unwrap();
+        let io_permits = budget.available_io();
+        let (held, ready) = tokio::sync::oneshot::channel();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let lifecycle = worker.page_lifecycle.clone();
+        let holder = tokio::task::spawn_blocking(move || {
+            lifecycle.under_mutation_registry(|| {
+                held.send(()).unwrap();
+                let _ = wait.blocking_recv();
+            });
+        });
+        ready.await.unwrap();
+
+        let expires = Instant::now() + Duration::from_millis(500);
+        {
+            let mut membership = worker.membership.lock().unwrap();
+            Arc::make_mut(membership.as_mut().unwrap()).valid_until = expires;
+        }
+        let finished = {
+            let round = gc.run_round(&worker);
+            tokio::pin!(round);
+            let borrowed = async {
+                while worker.page_gc_io.available_permits() == gc_permits
+                    || budget.available_io() == io_permits
+                {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            };
+            tokio::select! {
+                result = tokio::time::timeout_at(expires.into(), borrowed) => result.unwrap(),
+                _ = &mut round => panic!("ownership returned before reaching the shared registry"),
+            }
+            let result =
+                tokio::time::timeout_at((expires + Duration::from_secs(1)).into(), round).await;
+            (
+                result.is_ok(),
+                worker.membership_snapshot().is_none(),
+                worker.page_gc_io.available_permits(),
+                budget.available_io(),
+            )
+        };
+        assert!(small.contains(&id), "unlink must not run under contention");
+        release.send(()).unwrap();
+        holder.await.unwrap();
+        worker.page_mutations.drain().await;
+        assert_eq!(
+            finished,
+            (true, true, gc_permits, io_permits),
+            "expired ownership callback and both permits must finish before the registry unlocks"
+        );
+        assert_eq!(small.ownership_retry_count(), 1);
+        assert_eq!(worker.page_gc_metrics.ownership_attempted.get(), 1);
+
+        fixture.publish(&worker);
+        gc.run_round(&worker).await;
+        // Renewal lets the interrupted discovery round finish. The next
+        // scheduled round uses the indexed retry after the usual delay.
+        assert_eq!(gc.next_delay(&worker), Some(Duration::from_secs(1)));
+        assert!(small.contains(&id));
+        assert_eq!(worker.page_gc_metrics.ownership_attempted.get(), 1);
+        gc.run_round(&worker).await;
+        assert_eq!(small.ownership_retry_count(), 0);
+        assert_eq!(worker.page_gc_metrics.ownership_attempted.get(), 2);
+        assert!(!small.contains(&id));
+    }
+
     #[tokio::test]
     async fn packed_ownership_can_reclaim_a_late_exact_range_without_retiring_pages() {
         let root = tempfile::tempdir().unwrap();
