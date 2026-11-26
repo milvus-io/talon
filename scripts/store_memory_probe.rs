@@ -163,7 +163,7 @@ fn scenario(count: usize, pages: u32, tracked: bool, tti: bool) {
     after_owner.report("fixed_index_owner_per_scope", 1, before_owner);
     let lru = measure("capacity_policy", count, || {
         let units = index.restore_policy_units(tracked);
-        Lru::from_recovered(index.clone(), units, count, tracked, tracked)
+        Lru::from_recovered(index.clone(), units, count, tracked)
     });
     let before_lifecycle = Snapshot::now();
     let lifecycle = measure("fixed_lifecycle_per_scope", 1, || {

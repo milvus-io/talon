@@ -241,13 +241,17 @@ impl NamespaceRuntimes {
             config.l1_capacity_bytes,
             config.l1_page_size_bytes,
             self.metrics.clone(),
-            config.stale_gc_enabled,
             true,
-            !config.stale_gc_enabled && !config.ownership_gc_enabled,
+            true,
         )
         .with_backend_kind(config.backend.as_deref().unwrap_or("azure").parse()?)
         .with_rate_limiter(self.limiter.clone())
         .with_paged_miss_run_concurrency(config.paged_miss_run_concurrency);
+        if config.ownership_gc_enabled {
+            if let Some(small) = &worker.small {
+                small.init_ownership();
+            }
+        }
         worker.namespace = namespace.normalized();
         worker.dynamic_settings = self.dynamic_settings.clone();
         worker.page_mutations = Arc::new(Mutations::new(self.uring));
@@ -1183,8 +1187,6 @@ mod tests {
             l2_page_size_bytes: 0,
             small_object_threshold_bytes: 128 << 10,
             small_object_segment_bytes: 2 << 20,
-            stale_gc_enabled: false,
-            ownership_gc_enabled: false,
             ..Default::default()
         };
         config.validate().unwrap();

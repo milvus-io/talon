@@ -1,16 +1,18 @@
 use super::catalog::{Address, Catalog};
 use super::lookup::{POLICY, REFERENCED, VISIBLE};
 use crate::eviction::{AccessHandle, PolicyEntry, PolicyState};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
 pub(crate) struct SmallAccess {
-    catalog: Weak<RwLock<Catalog>>,
+    pub(super) catalog: Weak<RwLock<Catalog>>,
     tickets: Weak<super::tickets::Tickets>,
     pub(super) address: Mutex<Address>,
     position: AtomicUsize,
     epoch: AtomicU64,
     pub(crate) state: Mutex<PolicyState>,
+    pub(super) gc_revision: AtomicU64,
     retired: AtomicBool,
 }
 
@@ -35,14 +37,23 @@ impl SmallAccess {
         self.retired.store(true, Ordering::Release);
     }
 
-    fn slot(&self, catalog: &Catalog) -> Option<usize> {
+    pub(super) fn slot(&self, catalog: &Catalog) -> Option<usize> {
+        self.slot_for_unlink(catalog, false)
+    }
+
+    pub(super) fn slot_for_unlink(&self, catalog: &Catalog, nonblocking: bool) -> Option<usize> {
         if self.retired.load(Ordering::Acquire) {
             return None;
         }
         let slot = if self.epoch.load(Ordering::Acquire) == catalog.lookup.epoch() {
             self.position.load(Ordering::Relaxed)
         } else {
-            let slot = catalog.at(*self.address.lock().unwrap())?;
+            let address = if nonblocking {
+                *crate::runtime::uncontended(self.address.try_lock())?
+            } else {
+                *self.address.lock().unwrap()
+            };
+            let slot = catalog.at(address)?;
             // The catalog read lock keeps the epoch fixed; concurrent refreshes publish the same slot.
             self.position.store(slot, Ordering::Relaxed);
             self.epoch.store(catalog.lookup.epoch(), Ordering::Release);
@@ -170,6 +181,7 @@ impl Catalog {
                 revision: self.next_revision(),
                 pins: 0,
             }),
+            gc_revision: AtomicU64::new(0),
             retired: AtomicBool::new(false),
         });
         self.access
@@ -178,16 +190,24 @@ impl Catalog {
             .unwrap_or_else(|| AccessHandle::for_small(ticket))
     }
 
-    pub(super) fn enable_compact(&mut self, stream: usize) {
-        if !self.compact_streams.insert(stream) {
+    pub(super) fn enable_compact(&mut self, streams: impl IntoIterator<Item = usize>) {
+        let mut recovered = HashSet::new();
+        for stream in streams {
+            if self.compact_streams.insert(stream) {
+                self.compact_totals.insert(stream, (0, 0));
+                if self.live.get(&stream).copied().unwrap_or(0) != 0 {
+                    recovered.insert(stream);
+                }
+            }
+        }
+        if recovered.is_empty() {
             return;
         }
-        if self.live.get(&stream).copied().unwrap_or(0) == 0 {
-            self.compact_totals.insert(stream, (0, 0));
-            return;
-        }
-        let mut total = (0_u64, 0_usize);
         for slot in 0..self.lookup.capacity() {
+            #[cfg(test)]
+            {
+                self.compact_recovery_slots += 1;
+            }
             let Some((handle, flags)) = self.lookup.entry(slot) else {
                 continue;
             };
@@ -195,18 +215,19 @@ impl Catalog {
                 continue;
             }
             let (address, record) = self.metadata(handle).unwrap();
-            if self.segment(address.0).unwrap().slot != stream {
+            let stream = self.segment(address.0).unwrap().slot;
+            if !recovered.contains(&stream) {
                 continue;
             }
             assert!(
                 !self.policy.contains_key(&address),
                 "generic policy already installed"
             );
+            let total = self.compact_totals.get_mut(&stream).unwrap();
             total.0 += record.stored_len();
             total.1 += 1;
             self.lookup.set_flags(slot, flags | POLICY);
         }
-        self.compact_totals.insert(stream, total);
     }
 
     pub(super) fn compact_admit(&mut self, slot: usize, bytes: u64, clock: bool) -> AccessHandle {
@@ -228,6 +249,11 @@ impl Catalog {
             self.charges.insert(address, bytes);
         }
         self.lookup.set_flags(slot, flags | POLICY);
+        if flags & VISIBLE != 0 {
+            if let Some(ownership) = &mut self.ownership {
+                ownership.admit(address, self.shared.ownership.admit(), None);
+            }
+        }
         let mut entry = self.compact_entry(slot);
         let revision = self.next_revision();
         let ticket = entry.access.small().unwrap();
@@ -254,7 +280,11 @@ impl Catalog {
         let ticket = entry.access.small().cloned().unwrap();
         let address = *ticket.address.lock().unwrap();
         let mut state = ticket.state.lock().unwrap();
+        let pins = state.pins;
         let result = update(&mut state);
+        if state.pins > pins {
+            ticket.gc_revision.store(0, Ordering::Relaxed);
+        }
         if state.pins == 0 {
             self.pins.remove(&address);
         } else {
@@ -281,6 +311,9 @@ impl Catalog {
         total.0 -= entry.bytes;
         total.1 -= 1;
         entry.access.retire();
+        if let Some(ownership) = &mut self.ownership {
+            ownership.remove(address);
+        }
         self.tickets.remove(&address);
         self.pins.remove(&address);
         self.charges.remove(&address);

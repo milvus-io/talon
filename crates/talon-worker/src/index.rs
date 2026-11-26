@@ -965,7 +965,6 @@ impl BlockIndex {
             self.restore_policy_units(true),
             self.len(),
             true,
-            true,
         )
     }
 
@@ -1493,7 +1492,7 @@ mod tests {
         let index = Arc::new(BlockIndex::new());
         let mut units = Vec::new();
         store.restore_policy_units(&index, &mut units, false);
-        let lru = Arc::new(Lru::from_recovered(index.clone(), units, 0, false, false));
+        let lru = Arc::new(Lru::from_recovered(index.clone(), units, 0, false));
         store.bind_policy(lru.clone());
         let id = block(0);
         let unit = CacheUnit::Whole(id.clone());
@@ -1615,7 +1614,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_and_idle_scans_preserve_concurrent_directory_readers() {
+    fn idle_scan_preserves_concurrent_directory_readers() {
         let index = Arc::new(BlockIndex::new());
         let id = block(1);
         index.commit(whole_meta(id.clone(), 4096));
@@ -1624,14 +1623,9 @@ mod tests {
         access.clock().store(100, Ordering::Relaxed);
 
         with_directory_reader(&index, || {
-            let candidates = lru.stale_gc_candidates(&mut (0, 0), 200, 50, 100, 100);
+            let candidates = lru.idle_candidates(&mut (0, 0), 200, 50, 100, 100);
             assert_eq!(candidates.len(), 1);
             assert!(lru.stale_candidate_is_current(&candidates[0]));
-            lru.stale_verified(&id.object, 200);
-            assert!(lru
-                .stale_gc_candidates(&mut (0, 0), 200, 50, 100, 100)
-                .is_empty());
-            assert_eq!(lru.idle_candidates(&mut (0, 0), 200, 50, 100, 100).len(), 1);
             access.touch();
             assert!(!lru.stale_candidate_is_current(&candidates[0]));
         });

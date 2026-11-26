@@ -3,7 +3,6 @@
 
 use super::catalog::{Address, Catalog};
 use super::journal::Model;
-use super::lookup::{POLICY, VISIBLE};
 use crate::eviction::access_millis;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{
@@ -13,6 +12,8 @@ use std::sync::atomic::{
 use std::sync::Mutex;
 
 const DIRTY: u64 = 1 << 63;
+// A hit clears this bit even when its millisecond timestamp is unchanged.
+const GC_WATCH: u64 = 1 << 62;
 const GROUP_ROWS: usize = u64::BITS as usize;
 type DirtyGroup = (u64, usize);
 
@@ -64,10 +65,18 @@ impl Recency {
     }
 
     pub fn time(&self, value: u64) -> u64 {
-        match value & !DIRTY {
+        match value & !(DIRTY | GC_WATCH) {
             0 => self.started,
             time => time,
         }
+    }
+
+    pub fn watch_gc(value: &AtomicU64) -> bool {
+        value.fetch_or(GC_WATCH, Relaxed) & GC_WATCH == 0
+    }
+
+    pub fn gc_unchanged(value: &AtomicU64) -> bool {
+        value.load(Relaxed) & GC_WATCH != 0
     }
 
     pub fn restore(&self, value: &AtomicU64, time: u64) -> bool {
@@ -293,12 +302,7 @@ impl Catalog {
                 }
                 limit -= 1;
                 *cursor = (id, offset + 1);
-                let record = records.metadata(row).unwrap();
-                let handle = self.handle(id, row);
-                let visible = self.lookup.find(record.hash, |found, flags| {
-                    found == handle && flags & (VISIBLE | POLICY) == VISIBLE | POLICY
-                });
-                if visible.is_some() && !visit(id, row) {
+                if self.visible_policy_slot(id, row).is_some() && !visit(id, row) {
                     return false;
                 }
             }
@@ -307,8 +311,8 @@ impl Catalog {
         true
     }
 
-    /// Visit bounded slices of segment rows before the exclusive end address.
-    /// The offset remains meaningful if deletion compacts the row array.
+    /// Charge one step per row, and charge a segment transition when no rows
+    /// were visited. Offsets remain meaningful if deletion compacts the rows.
     pub(super) fn visit_recency(
         &self,
         cursor: &mut Address,
@@ -320,6 +324,9 @@ impl Catalog {
             return true;
         }
         for (&id, segment) in self.model.segments.range(cursor.0..=end.0) {
+            if limit == 0 {
+                return false;
+            }
             let records = &segment.records;
             let start = if id == cursor.0 {
                 records.position(cursor.1)
@@ -337,22 +344,14 @@ impl Catalog {
                 }
                 limit -= 1;
                 *cursor = (id, records.offset_at(row) + 1);
-                let Some(record) = records.metadata(row) else {
-                    continue;
-                };
-                let handle = self.handle(id, row);
-                let Some(slot) = self.lookup.find(record.hash, |found, flags| {
-                    found == handle && flags & (VISIBLE | POLICY) == VISIBLE | POLICY
-                }) else {
+                let Some(slot) = self.visible_policy_slot(id, row) else {
                     continue;
                 };
                 if !visit(slot, id, row) {
                     return false;
                 }
             }
-            if id == end.0 {
-                break;
-            }
+            limit -= usize::from(start == stop);
             *cursor = (id + 1, 0);
         }
         true

@@ -21,7 +21,7 @@ async fn clocks_are_allocated_only_when_enabled_and_restore_persisted_ages() {
         let index = Arc::new(crate::BlockIndex::new());
         let mut units = Vec::new();
         store.restore_policy_units(&index, &mut units, false);
-        let policy = Arc::new(Lru::from_recovered(index, units, store.len(), false, false));
+        let policy = Arc::new(Lru::from_recovered(index, units, store.len(), false));
         store.bind_policy(policy.clone());
         (store, policy)
     }
@@ -85,13 +85,7 @@ fn open_with_policy(root: &Path) -> (Arc<SmallObjectStore>, Arc<Lru>) {
     let mut units = Vec::new();
     let index = Arc::new(crate::BlockIndex::new());
     store.restore_policy_units(&index, &mut units, true);
-    let policy = Arc::new(crate::Lru::from_recovered(
-        index,
-        units,
-        store.len(),
-        true,
-        true,
-    ));
+    let policy = Arc::new(crate::Lru::from_recovered(index, units, store.len(), true));
     store.bind_policy(policy.clone());
     store.enable_access_tracking().unwrap();
     (store, policy)
@@ -120,7 +114,7 @@ fn open_compact(root: &Path) -> (Arc<SmallObjectStore>, Arc<Lru>) {
     store.restore_policy_units(&index, &mut units, false);
     assert!(units.is_empty());
     store.init_recency();
-    let policy = Arc::new(Lru::from_recovered(index, units, store.len(), false, true));
+    let policy = Arc::new(Lru::from_recovered(index, units, store.len(), true));
     store.bind_policy(policy.clone());
     store.enable_access_tracking().unwrap();
     (store, policy)

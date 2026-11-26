@@ -13,6 +13,8 @@ pub(crate) use access::DirtyAccess;
 pub(crate) mod directory;
 mod disk_io;
 mod flush;
+mod gc;
+pub(crate) use gc::{OwnershipCursor, OwnershipLimit, SmallGcCandidate, SmallStaleCursor};
 mod format;
 mod journal;
 mod key_codec;
@@ -39,6 +41,17 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 use talon_core::{BlockHandle, BlockId};
+
+fn read_for_unlink<T>(
+    lock: &RwLock<T>,
+    nonblocking: bool,
+) -> Option<std::sync::RwLockReadGuard<'_, T>> {
+    if nonblocking {
+        crate::runtime::uncontended(lock.try_read())
+    } else {
+        Some(lock.read().unwrap())
+    }
+}
 
 const CHECKSUM_BYTES: u64 = size_of::<u64>() as u64;
 
@@ -190,6 +203,11 @@ impl SegmentFile {
 }
 
 impl Location {
+    #[cfg(test)]
+    pub(crate) fn segment(&self) -> u64 {
+        self.segment
+    }
+
     pub(crate) fn len(&self) -> u64 {
         self.len
     }
@@ -267,6 +285,10 @@ struct SegmentStore {
     append_pause: Mutex<Option<Arc<tests::AppendPause>>>,
     #[cfg(test)]
     flush_pause: Mutex<Option<Arc<tests::AppendPause>>>,
+    #[cfg(test)]
+    relocation_pause: Mutex<Option<Arc<tests::AppendPause>>>,
+    #[cfg(test)]
+    fail_delete_after_journal: std::sync::atomic::AtomicBool,
     slot: usize,
     journal: Arc<journal::Journal>,
     threshold: u64,
@@ -359,6 +381,10 @@ impl SegmentStore {
             append_pause: Mutex::new(None),
             #[cfg(test)]
             flush_pause: Mutex::new(None),
+            #[cfg(test)]
+            relocation_pause: Mutex::new(None),
+            #[cfg(test)]
+            fail_delete_after_journal: std::sync::atomic::AtomicBool::new(false),
             slot,
             journal: journal.clone(),
             threshold,
@@ -398,6 +424,15 @@ impl SegmentStore {
     pub fn contains(&self, id: &(impl SmallStoreKey + ?Sized)) -> bool {
         format::validate_key(&id.view()).is_ok()
             && self.entries.read().unwrap().contains_key(&id.view())
+    }
+
+    // The outer option distinguishes lock contention from an absent entry.
+    fn unlink_location(
+        &self,
+        id: &dyn SmallIdentity,
+        nonblocking: bool,
+    ) -> Option<Option<Location>> {
+        read_for_unlink(&self.entries, nonblocking)?.get_for_unlink(id, nonblocking)
     }
 
     #[cfg(test)]
@@ -648,6 +683,15 @@ impl SegmentStore {
     }
 
     #[cfg(test)]
+    async fn pause_relocation(&self) {
+        let pause = self.relocation_pause.lock().unwrap().take();
+        if let Some(pause) = pause {
+            pause.entered.notify_one();
+            pause.resume.notified().await;
+        }
+    }
+
+    #[cfg(test)]
     pub async fn delete(self: &Arc<Self>, id: &(impl SmallStoreKey + ?Sized)) -> io::Result<()> {
         let store = self.clone();
         let id = id.cache_unit();
@@ -657,21 +701,27 @@ impl SegmentStore {
     }
 
     async fn delete_inner(&self, id: &(impl SmallStoreKey + ?Sized)) -> io::Result<()> {
-        self.delete_inner_if(id, |_| true).await.map(|_| ())
+        self.delete_inner_if(id, None, |_| true).await.map(|_| ())
     }
 
     async fn delete_inner_if(
         &self,
         id: &(impl SmallStoreKey + ?Sized),
+        deadline: Option<Instant>,
         eligible: impl FnOnce(&Location) -> bool,
     ) -> io::Result<bool> {
         format::validate_key(&id.view())?;
         // A tombstone must be either included in the sealing fsync or synced
         // after publication. Serialize logical publication with seal/relocation.
-        let _publication = self.publication.lock().await;
-        let mut state = self.state.lock().await;
+        use crate::runtime::before_deadline;
+        let Some(_publication) = before_deadline(deadline, self.publication.lock()).await else {
+            return Ok(false);
+        };
+        let Some(mut state) = before_deadline(deadline, self.state.lock()).await else {
+            return Ok(false);
+        };
         self.healthy(&state)?;
-        let Some(loc) = self.entries.read().unwrap().get(&id.view()) else {
+        let Some(Some(loc)) = self.unlink_location(&id.view(), deadline.is_some()) else {
             return Ok(false);
         };
         if !eligible(&loc) {
@@ -690,7 +740,15 @@ impl SegmentStore {
                 .await?;
             segment.metadata += 21;
             #[cfg(test)]
-            tests::crash("delete_sync");
+            {
+                tests::crash("delete_sync");
+                if self
+                    .fail_delete_after_journal
+                    .swap(false, std::sync::atomic::Ordering::Relaxed)
+                {
+                    return Err(io::Error::other("injected failure after journal Delete"));
+                }
+            }
             let removed = charge(&id.view(), loc.len);
             segment.live -= removed;
             segment.live_data_bytes -= loc.stored_len();
@@ -847,10 +905,9 @@ impl SegmentStore {
                     let bytes = loc.clone().retain().await?.read_stored().await?;
                     // Keep the storage weight and checksum format of an existing
                     // admission when relocating it.
-                    let mut replacement = self
+                    let replacement = self
                         .append(&mut state, new, key, bytes, loc.checksum)
                         .await?;
-                    replacement.access = loc.access.clone();
                     moved.push((key.clone(), replacement));
                 }
                 let s = state.segments.get_mut(&new).unwrap();
@@ -880,21 +937,21 @@ impl SegmentStore {
                 )
                 .await?;
             #[cfg(test)]
-            tests::crash("compact_manifest");
+            {
+                tests::crash("compact_manifest");
+                self.pause_relocation().await;
+            }
             if let Some(budget) = &budget {
                 budget.delete().await;
             }
             let readers = self.readers.write().await;
-            {
-                let mut directory = self.entries.write().unwrap();
-                for (key, loc) in moved {
-                    directory.insert(key, loc);
-                }
-            }
+            self.entries
+                .write()
+                .unwrap()
+                .replace_segment(old, replacement, moved);
             if state.active == Some(old) {
                 state.active = None;
             }
-            self.entries.write().unwrap().retire_segment(old);
             drop(readers);
             drop(access_relocation);
             let segment = state.segments.remove(&old).unwrap();

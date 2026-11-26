@@ -1,4 +1,5 @@
 use super::{checksum_len, format, journal::Record, key_codec, keys::Keys};
+use crate::block_key::ObjectRef;
 use crate::small_store::key::SmallIdentity;
 use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
@@ -217,6 +218,22 @@ impl Records {
                 checksum: meta.checksum,
             },
         ))
+    }
+
+    pub fn object<'a>(&'a self, row: usize, scratch: &'a mut [Vec<u8>; 3]) -> ObjectRef<'a> {
+        let [scratch, bucket, path] = scratch;
+        let (prefix, suffix) = self.keys.get(row).expect("small-object key");
+        let key = if prefix.is_empty() {
+            suffix
+        } else if suffix.is_empty() {
+            prefix
+        } else {
+            scratch.clear();
+            scratch.extend_from_slice(prefix);
+            scratch.extend_from_slice(suffix);
+            scratch
+        };
+        key_codec::object(key, bucket, path)
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (u64, Record)> + '_ {

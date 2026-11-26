@@ -1,11 +1,14 @@
 use super::journal::{Event, Model, SegmentMeta};
-use super::lookup::{Lookup, VISIBLE};
+use super::lookup::{Lookup, POLICY, VISIBLE};
 use super::{Location, SegmentFile};
 use crate::eviction::{AccessHandle, PolicyEntry};
 use crate::small_store::key::{SmallIdentity, SmallKey};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{
+    AtomicU64, AtomicUsize,
+    Ordering::{Relaxed, Release},
+};
 use std::sync::{Arc, RwLock, Weak};
 
 pub(super) type Address = (u64, u64);
@@ -30,29 +33,48 @@ pub(super) struct Catalog {
     pub policy: HashMap<Address, PolicyEntry>,
     pub access: HashMap<Address, AccessHandle>,
     pub(super) recency: Option<super::recency::Recency>,
+    pub(super) ownership: Option<super::gc::Ownership>,
     pub live: HashMap<usize, usize>,
     pub compact_streams: HashSet<usize>,
     pub compact_totals: HashMap<usize, (u64, usize)>,
+    #[cfg(test)]
+    pub compact_recovery_slots: usize,
     pub tickets: Arc<super::tickets::Tickets>,
     pub pins: HashMap<Address, Arc<super::policy::SmallAccess>>,
     pub charges: HashMap<Address, u64>,
     pub revision: AtomicU64,
     pub retired: HashMap<SmallKey, Retired>,
+    pub retired_addresses: BTreeMap<Address, SmallKey>,
     retired_segments: BTreeMap<u64, Arc<SegmentMeta>>,
+    // Streams reserve physical IDs before publication. GC orders segments by
+    // first publication, and a replacement inherits its source's position.
+    pub published: BTreeMap<u64, u64>,
+    publication_positions: HashMap<u64, u64>,
+    pub shared: Arc<CatalogState>,
     active: bool,
 }
 
+#[derive(Default)]
+pub(super) struct CatalogState {
+    pub live_count: AtomicUsize,
+    pub last_publication: AtomicU64,
+    pub ownership: super::gc::OwnershipEpoch,
+}
+
 #[derive(Clone)]
-pub(super) struct LiveModel(pub Arc<RwLock<Catalog>>);
+pub(super) struct LiveModel(pub Arc<RwLock<Catalog>>, pub Arc<CatalogState>);
 
 impl Default for LiveModel {
     fn default() -> Self {
-        Self(Arc::new_cyclic(|owner| {
+        let shared = Arc::new(CatalogState::default());
+        let catalog = Arc::new_cyclic(|owner| {
             RwLock::new(Catalog {
                 owner: owner.clone(),
+                shared: shared.clone(),
                 ..Default::default()
             })
-        }))
+        });
+        Self(catalog, shared)
     }
 }
 
@@ -192,6 +214,14 @@ impl Catalog {
         self.lookup.find(record.hash, |found, _| found == handle)
     }
 
+    pub(super) fn visible_policy_slot(&self, segment: u64, row: usize) -> Option<usize> {
+        let record = self.segment(segment)?.records.metadata(row)?;
+        let handle = self.handle(segment, row);
+        self.lookup.find(record.hash, |found, flags| {
+            found == handle && flags & (VISIBLE | POLICY) == VISIBLE | POLICY
+        })
+    }
+
     fn lookup_location(
         &self,
         id: &dyn SmallIdentity,
@@ -212,14 +242,22 @@ impl Catalog {
     }
 
     pub fn location(&self, slot: usize) -> Option<Location> {
+        let resolved = self.resolve_record(slot)?;
+        self.resolve_location(slot, resolved)
+    }
+
+    pub fn location_for_move(&self, slot: usize) -> Option<Location> {
+        self.payload_location(self.resolve_record(slot)?, None)
+    }
+
+    fn resolve_record(&self, slot: usize) -> Option<ResolvedRecord> {
         let (address, record) = self.metadata(self.lookup.handle(slot))?;
-        let resolved = ResolvedRecord {
+        Some(ResolvedRecord {
             address,
             len: record.len,
             checksum: record.checksum,
             stream: self.segment(address.0)?.slot,
-        };
-        self.resolve_location(slot, resolved)
+        })
     }
 
     fn compact_policy(&self, slot: usize, stream: usize) -> bool {
@@ -372,6 +410,12 @@ impl Catalog {
         self.unindex_rows(segment, 0, usize::MAX);
         self.retired_segments.remove(&segment);
         self.files.remove(&segment);
+        if let Some(position) = self.publication_positions.remove(&segment) {
+            self.published.remove(&position);
+        }
+        if let Some(ownership) = &mut self.ownership {
+            ownership.remove_segment(segment);
+        }
         if let Some(recency) = &mut self.recency {
             recency.remove_segment(segment);
         }
@@ -379,6 +423,35 @@ impl Catalog {
             self.free_chunks.extend(chunks);
         }
         self.trim_index();
+    }
+
+    pub fn replace_published_segment(&mut self, old: u64, new: u64) {
+        if let Some(ownership) = &mut self.ownership {
+            ownership.relocate_segment(old, new);
+        }
+        if let Some(position) = self.publication_positions.remove(&old) {
+            if let Some(previous) = self.publication_positions.insert(new, position) {
+                self.published.remove(&previous);
+            }
+            self.published.insert(position, new);
+        } else {
+            self.publish_segment(new);
+        }
+    }
+
+    pub fn publish_segment(&mut self, segment: u64) {
+        self.publication_positions
+            .entry(segment)
+            .or_insert_with(|| {
+                let last = &self.shared.last_publication;
+                let position = last
+                    .load(Relaxed)
+                    .checked_add(1)
+                    .expect("small segment publication sequence exhausted");
+                self.published.insert(position, segment);
+                last.store(position, Release);
+                position
+            });
     }
 
     fn trim_index(&mut self) {
@@ -414,6 +487,10 @@ impl Catalog {
                 if let Some(slot) = self.at(address) {
                     if let Some(location) = self.location(slot) {
                         let key = self.record(self.lookup.handle(slot)).unwrap().1.key;
+                        let live = self.lookup.flags(slot) & VISIBLE != 0;
+                        if live && self.ownership.is_some() {
+                            self.retired_addresses.insert(address, key.clone());
+                        }
                         let policy = self.policy.remove(&address).or_else(|| {
                             let access = location.access.as_ref()?;
                             let state = *access.small()?.state.lock().unwrap();
@@ -428,7 +505,7 @@ impl Catalog {
                                 slot: self.segment(address.0).unwrap().slot,
                                 key,
                                 location,
-                                live: self.lookup.flags(slot) & VISIBLE != 0,
+                                live,
                                 policy,
                             },
                         );

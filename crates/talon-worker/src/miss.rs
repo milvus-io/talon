@@ -78,6 +78,19 @@ impl InFlightLoads {
         Self::default()
     }
 
+    #[cfg(test)]
+    pub(crate) fn under_registry_lock<T: Send>(&self, work: impl FnOnce() -> T + Send) -> T {
+        std::thread::scope(|scope| {
+            let (send, receive) = std::sync::mpsc::channel();
+            let result = {
+                let _registry = self.inner.lock().unwrap();
+                scope.spawn(move || send.send(work()).ok());
+                receive.recv_timeout(std::time::Duration::from_secs(2))
+            };
+            result.expect("operation waited for packed identity registry")
+        })
+    }
+
     /// Try to admit a load for `key`.
     ///
     /// Returns [`Admission::Started`] exactly once per key until the matching
@@ -109,14 +122,27 @@ impl InFlightLoads {
         self.admit_traced(key).0
     }
 
+    /// Defer if either the registry or the key is busy.
+    pub(crate) fn try_admit_owned(self: &Arc<Self>, key: LoadKey) -> Option<InFlightGuard> {
+        let mut entries = crate::runtime::uncontended(self.inner.try_lock())?;
+        self.admit_in(&mut entries, key).0
+    }
+
     /// Snapshot the flight while deciding admission, so waiters cannot link a later load.
     pub fn admit_traced(
         self: &Arc<Self>,
         key: LoadKey,
     ) -> (Option<InFlightGuard>, talon_telemetry::Flight) {
+        self.admit_in(&mut self.inner.lock().unwrap(), key)
+    }
+
+    fn admit_in(
+        self: &Arc<Self>,
+        entries: &mut HashMap<LoadKey, FlightEntry>,
+        key: LoadKey,
+    ) -> (Option<InFlightGuard>, talon_telemetry::Flight) {
         use std::collections::hash_map::Entry;
-        let mut g = self.inner.lock().unwrap();
-        match g.entry(key.clone()) {
+        match entries.entry(key.clone()) {
             Entry::Occupied(entry) => (None, entry.get().trace.clone()),
             Entry::Vacant(slot) => {
                 slot.insert(FlightEntry::new());

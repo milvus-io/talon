@@ -40,27 +40,27 @@ fills coalesce. LOAD never populates L1.
 `SmallObjectStore` as peer stores. Whole-block storage has no small-object engine,
 routing, or maintenance responsibilities. Runtime initialization validates the
 cache-root routing metadata before recovery, passes the shared root lease to
-each store, and binds recovered small-object access tokens to the runtime LRU.
+each store, and binds the recovered Small Store to the runtime LRU. Packed
+entries keep their restored access ages in the catalog rows.
 The runtime coordinates store selection, capacity accounting, GC, and shutdown
 checkpoints.
 
 `SmallObjectStore` owns its residency directory. READ and LOAD choose the store
 from the complete object size. A packed hit resolves its segment extent from
-this directory. Ordinary whole and paged entries remain in `BlockIndex`. Small
-objects register directly with the shared LRU as whole-object eviction units,
-retaining capacity, idle, and ownership policies without a second residency
-entry. Relocation preserves any existing access token.
-`GetCachedRange` remains an ordinary whole/paged-store operation: an object
-resident only in small storage returns `CacheMiss`, without origin access.
-Packed keys do not participate in cross-version supersession. Page TTI applies
-to the whole small object using its shared access timestamp, including when
-paged L2 is disabled. When stale-version and ownership GC are disabled, Small
-Store maintains an 8-byte access timestamp alongside each index row and uses its
-compact capacity policy. A read validates the key and range, then updates the
-row's timestamp and second-chance bit under the existing lookup read lock.
-A bit in the timestamp marks changes for checkpointing. Idle scans visit segment
-rows in bounded batches. The legacy per-object policy
-also supports the block-level scans used by stale-version and ownership GC.
+this directory. Ordinary whole and paged entries remain in `BlockIndex`. The
+shared LRU includes Small Store charges and asks the compact catalog for
+capacity victims. Packed keys are independent across versions.
+`GetCachedRange` remains an ordinary whole/paged-store operation. A packed-only
+object returns `CacheMiss` without origin access.
+
+Small Store maintains an 8-byte recency word alongside each published row,
+including with both default GC tasks enabled. A read validates the key and range,
+then updates the row's timestamp and second-chance bit under the existing lookup
+read lock. The recency word also tracks pending access checkpoints and whether a
+read invalidated a GC observation. Idle eviction applies to packed whole objects
+and exact ranges, including when paged L2 is disabled. Idle eviction and stale GC
+scan segment rows in bounded batches with independent cursors.
+
 The access-checkpoint interval flushes only dirty keys to `small/access.log`;
 graceful shutdown performs the same flush.
 
@@ -76,13 +76,9 @@ at compaction; until then recovery ignores them. Each delta contains the full
 encoded cache-unit key and a Unix-millisecond access time, with length and checksum
 framing (20 bytes plus the encoded key). There is no persistent item-ID map.
 
-The pending queue is capped at 262,144 tokens and an estimated 64 MiB of retained
-metadata; overflow requests a full checkpoint. It is keyed by token identity,
-so a late reader cannot replace a new admission's notification for the same key.
-A flush resets markers before sampling. Concurrent hits remain pending, and
-write failures request a full retry from live clocks. Consequently, high-cardinality
-traffic, overflow or repeated I/O failure can still incur full checkpoint cost.
-A flush can hold one detached pending batch and the next collecting batch.
+The compact checkpoint walks dirty bitmap groups. A flush resets markers before
+sampling so concurrent hits are either included or remain pending for a later
+checkpoint. Write failures request a new base snapshot from live recency.
 
 Snapshot publication uses temporary-file sync, rename and directory sync, then
 publishes an empty log for the same generation. A crash between these steps
@@ -229,17 +225,13 @@ buffers are shared between the small-store writer state and engine locators. Rec
 requires O(live objects + log records since snapshot) CPU/memory work; this is
 not constant-time startup or a disk-only index.
 
-Before serving, the worker attaches access tokens directly to ordinary index
-entries and small-store locators, then bulk-builds their shared LRU membership
-and block indexes. Only ordinary
-whole/paged entries enter the cross-version index; packed keys are independent.
-The object-existence check table is built only when stale GC is enabled. Large namespaces use at most three CPU threads (bounded by available
-parallelism, including the initializing thread); small namespaces stay serial.
-Ordered eviction and ownership queues are collected in bulk. Paged lifecycle
-initialization skips whole objects without cloning a full cache snapshot. These
-steps preserve resident byte charges, block-wide idle clocks, and eviction
-semantics. Persisted small-object access ages are restored after policy tokens
-are attached.
+Before serving, the worker attaches access tokens to ordinary index entries and
+bulk-builds their shared LRU membership and block indexes. Packed rows contribute
+their resident charges through one shared lookup traversal that accumulates the
+totals for each append stream. Recovery restores persisted
+Small Store ages directly to those rows. Large ordinary caches use at most
+three CPU threads (including the initializing thread), and small namespaces stay
+serial. Paged lifecycle initialization skips whole objects.
 
 Small-store startup constructs locators while validating each recoverable payload's
 length. It reserves each ring's key directory from the recovered record counts
@@ -407,9 +399,9 @@ accommodate those temporary allocations, normal large-object writes, and
 filesystem overhead; this cache budget is not a filesystem-wide reservation.
 The eviction policy weights a small item by its payload bytes plus the checksum
 trailer when present. Segment rollovers still account for record metadata.
-Under pressure, small objects, ordinary blocks, and pages share each namespace's
-second-chance eviction queue. Segment placement does not determine which objects
-are cold. Capacity reclamation has two phases:
+Under pressure, each namespace selects victims from its compact packed pool and
+ordinary block/page queue under one capacity target. Both use second chances.
+Capacity reclamation has two phases:
 
 1. Select victims in bounded batches. Whole blocks/pages release their files;
    small objects append tombstones. Carry the small-store reclaim estimate across
@@ -481,7 +473,13 @@ TTI, pinning, ownership cleanup and exact-key invalidation still apply. Ordinary
 whole/paged entries retain their existing version policy, including when mixed
 with packed objects in the same namespace.
 
-Origin-existence checks remain a separate optional background policy. Namespace
-startup constructs their reference-counted check table only when `stale_gc_enabled`
-is true; disabling it skips both recovery-time and subsequent admission bookkeeping.
-The full key and persisted record formats are unchanged.
+[Stale GC](async-eviction.md#stale-object-checks) checks only packed entries idle
+for more than 24 hours. A successful HEAD adds a temporary entry keyed by
+backend object, shared across offsets and versions. HEAD results leave access
+times and TTI eligibility unchanged.
+[Ownership GC](ownership-gc.md) traverses the compact catalog by logical
+segment publication. It can examine later appends and re-admissions within a
+captured segment. Hourly supplements use one latest admission epoch per
+segment. Compaction preserves that epoch, recency and active access tokens,
+and publishes replacement locators at the original scan position. Both GC
+tasks revalidate the exact packed unit before tombstone authorization.

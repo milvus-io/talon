@@ -15,13 +15,14 @@ mod ownership_gc;
 mod stale_gc;
 pub use background::WorkerBackground;
 mod page_maintenance;
+pub(crate) use page_maintenance::{before_deadline, uncontended};
 #[cfg(test)]
 mod page_tti_tests;
 #[cfg(test)]
 mod small_tests;
 use crate::page_gc::{Mutations, PageGcConfig, PageGcMetrics};
 use crate::page_lifecycle::{AccessClock, PageLifecycle, ScanCursor};
-use crate::small_store::{IdleRecencyCursor, SmallObjectStore};
+use crate::small_store::{IdleRecencyCursor, OwnershipLimit, SmallObjectStore};
 
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
@@ -172,8 +173,15 @@ struct MembershipSnapshot {
     members: Vec<talon_transport::ZonedNodeInfo>,
     valid_until: Instant,
     generation: u64,
+    validity_epoch: u64,
     // Each namespace has an independent admission revision sequence.
-    scan_limits: Arc<HashMap<namespaces::CacheIdentity, u64>>,
+    scan_limits: Arc<HashMap<namespaces::CacheIdentity, OwnershipLimits>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct OwnershipLimits {
+    block: u64,
+    small: Option<OwnershipLimit>,
 }
 
 impl WorkerRuntime {
@@ -231,7 +239,6 @@ impl WorkerRuntime {
             l1_page_size_bytes,
             metrics,
             true,
-            true,
             false,
         )
     }
@@ -248,16 +255,19 @@ impl WorkerRuntime {
         l1_capacity_bytes: u64,
         l1_page_size_bytes: u64,
         metrics: WorkerMetrics,
-        track_checks: bool,
         track_blocks: bool,
         compact_small_recency: bool,
     ) -> Self {
         let lru_started = Instant::now();
         index.prepare_runtime_recovery();
         let mut units = index.restore_policy_units(track_blocks);
-        let blocks = index.len() + small.as_ref().map_or(0, |small| small.len());
+        let mut blocks = index.len();
         if let Some(small) = &small {
-            small.restore_policy_units(&index, &mut units, track_blocks && !compact_small_recency);
+            let track_small_blocks = track_blocks && !compact_small_recency;
+            if track_small_blocks {
+                blocks += small.len();
+            }
+            small.restore_policy_units(&index, &mut units, track_small_blocks);
             if compact_small_recency {
                 small.init_recency();
             }
@@ -266,7 +276,6 @@ impl WorkerRuntime {
             index.clone(),
             units,
             blocks,
-            track_checks,
             track_blocks,
         ));
         let lru_ms = lru_started.elapsed().as_secs_f64() * 1000.0;
@@ -377,10 +386,14 @@ impl WorkerRuntime {
         match snapshot {
             Ok(Some((members, valid_until))) => {
                 let changed = held.as_ref().map_or(true, |old| old.members != members);
-                let wake = changed
-                    || held
-                        .as_ref()
-                        .is_some_and(|old| Instant::now() >= old.valid_until);
+                let restored = held
+                    .as_ref()
+                    .is_some_and(|old| Instant::now() >= old.valid_until);
+                let validity_epoch = held.as_ref().map_or(1, |old| {
+                    old.validity_epoch
+                        .checked_add(u64::from(restored))
+                        .expect("membership validity epoch exhausted")
+                });
                 let (generation, scan_limits) = if changed {
                     (
                         held.as_ref().map_or(1, |old| {
@@ -395,14 +408,14 @@ impl WorkerRuntime {
                                 .map(|worker| {
                                     (
                                         worker.cache_identity.clone(),
-                                        worker.lru.block_scan_ceiling(),
+                                        worker.capture_ownership_limits(),
                                     )
                                 })
                                 .collect()
                         } else {
                             HashMap::from([(
                                 self.cache_identity.clone(),
-                                self.lru.block_scan_ceiling(),
+                                self.capture_ownership_limits(),
                             )])
                         }),
                     )
@@ -414,10 +427,11 @@ impl WorkerRuntime {
                     members,
                     valid_until,
                     generation,
+                    validity_epoch,
                     scan_limits,
                 }));
                 drop(held);
-                if wake {
+                if changed || restored {
                     self.membership_changed.send_replace(());
                 }
                 Ok(())
@@ -429,6 +443,36 @@ impl WorkerRuntime {
                 result.map(|_| ())
             }
         }
+    }
+
+    fn capture_ownership_limits(&self) -> OwnershipLimits {
+        OwnershipLimits {
+            block: self.lru.block_scan_ceiling(),
+            small: self
+                .small
+                .as_ref()
+                .and_then(|small| small.ownership_limit(true)),
+        }
+    }
+
+    fn capture_supplemental_limits(
+        &self,
+        expected: &MembershipSnapshot,
+    ) -> Option<OwnershipLimits> {
+        // Keep the generation check and consumption of the admission marker
+        // atomic with respect to publication of a new event boundary.
+        let held = self.membership.lock().unwrap();
+        let current = held.as_ref()?;
+        if current.generation != expected.generation || Instant::now() >= current.valid_until {
+            return None;
+        }
+        Some(OwnershipLimits {
+            block: self.lru.ownership_admission_ceiling(),
+            small: self
+                .small
+                .as_ref()
+                .and_then(|small| small.ownership_limit(false)),
+        })
     }
 
     fn membership_snapshot(&self) -> Option<Arc<MembershipSnapshot>> {
@@ -2180,6 +2224,7 @@ impl WorkerRuntime {
 
     /// Management scans include each store's own residency directory. This is
     /// never a substitute for the locator lookup used by the read path.
+    #[cfg(test)]
     fn contains_block(&self, block: &BlockId) -> bool {
         self.small
             .as_ref()

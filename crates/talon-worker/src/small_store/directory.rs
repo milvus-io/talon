@@ -3,20 +3,22 @@ use super::lookup::{POLICY, REFERENCED, VISIBLE};
 use super::Location;
 use crate::eviction::{AccessHandle, PolicyEntry, PolicyState};
 use crate::small_store::key::{SmallIdentity, SmallKey};
+use std::sync::atomic::Ordering::Relaxed;
 
 #[derive(Default)]
 pub(crate) struct Directory {
     pub(super) catalog: LiveModel,
     slot: usize,
-    staged: Option<super::catalog::Address>,
+    staged: Option<(super::catalog::Address, u64)>,
     clock: usize,
     #[cfg(test)]
     before_relocation_publish: Option<Box<dyn FnOnce() + Send + Sync>>,
 }
 
 impl Directory {
+    #[cfg(test)]
     pub(crate) fn enable_compact(&mut self) {
-        self.catalog.0.write().unwrap().enable_compact(self.slot);
+        self.catalog.0.write().unwrap().enable_compact([self.slot]);
     }
 
     pub(crate) fn compact_totals(&self) -> (u64, usize) {
@@ -53,7 +55,9 @@ impl Directory {
         let slot = self
             .pending(&catalog, id)
             .or_else(|| self.find(&catalog, id, VISIBLE))?;
-        catalog.enable_compact(self.slot);
+        if !catalog.compact_streams.contains(&self.slot) {
+            catalog.enable_compact([self.slot]);
+        }
         Some(catalog.compact_admit(slot, bytes, clock))
     }
 
@@ -135,30 +139,26 @@ impl Directory {
             .expect("journaled small object");
         let flags = catalog.lookup.flags(slot);
         catalog.files.insert(location.segment, location.file);
+        catalog.publish_segment(location.segment);
         catalog.lookup.set_flags(slot, flags | VISIBLE);
         *catalog.live.entry(self.slot).or_default() += 1;
+        catalog.shared.live_count.fetch_add(1, Relaxed);
         Ok(())
     }
 
     pub(super) fn segment_entries(&self, segment: u64) -> Vec<(SmallKey, Location)> {
         let catalog = self.catalog.0.read().unwrap();
-        let entries: Vec<_> = catalog
-            .segment(segment)
-            .map(|meta| {
-                meta.records
-                    .iter()
-                    .map(|(offset, record)| (offset, record.key))
-                    .collect()
-            })
-            .unwrap_or_default();
-        entries
-            .into_iter()
+        let Some(meta) = catalog.segment(segment) else {
+            return Vec::new();
+        };
+        meta.records
+            .iter()
             .filter_map(|(offset, key)| {
                 let slot = catalog.at((segment, offset))?;
                 if catalog.lookup.flags(slot) & VISIBLE == 0 {
                     return None;
                 }
-                Some((key, catalog.location(slot)?))
+                Some((key.key, catalog.location_for_move(slot)?))
             })
             .collect()
     }
@@ -186,7 +186,7 @@ impl Directory {
         })
     }
     fn pending(&self, catalog: &Catalog, id: &dyn SmallIdentity) -> Option<usize> {
-        let slot = catalog.at(self.staged?)?;
+        let slot = catalog.at(self.staged?.0)?;
         catalog
             .matches(catalog.lookup.handle(slot), &super::key_codec::encode(id))
             .then_some(slot)
@@ -215,8 +215,18 @@ impl Directory {
         catalog.retired.get(id).map(|entry| entry.key.clone())
     }
     pub fn get(&self, id: &dyn SmallIdentity) -> Option<Location> {
-        let catalog = self.catalog.0.read().unwrap();
-        if let Some(slot) = self.find(&catalog, id, VISIBLE) {
+        self.get_in(&self.catalog.0.read().unwrap(), id)
+    }
+    pub(super) fn get_for_unlink(
+        &self,
+        id: &dyn SmallIdentity,
+        nonblocking: bool,
+    ) -> Option<Option<Location>> {
+        let catalog = super::read_for_unlink(&self.catalog.0, nonblocking)?;
+        Some(self.get_in(&catalog, id))
+    }
+    fn get_in(&self, catalog: &Catalog, id: &dyn SmallIdentity) -> Option<Location> {
+        if let Some(slot) = self.find(catalog, id, VISIBLE) {
             return catalog.location(slot);
         }
         catalog
@@ -263,31 +273,62 @@ impl Directory {
     pub fn insert(&mut self, key: SmallKey, location: Location) -> Option<Location> {
         let model = self.catalog.clone();
         let mut catalog = model.0.write().unwrap();
-        let old = self.stage_in(&mut catalog, key.clone(), location);
+        self.relocate_row(&mut catalog, key, location)
+    }
+
+    pub(super) fn replace_segment(
+        &mut self,
+        old: u64,
+        replacement: Option<u64>,
+        moved: Vec<(SmallKey, Location)>,
+    ) {
+        let model = self.catalog.clone();
+        let mut catalog = model.0.write().unwrap();
+        for (key, location) in moved {
+            self.relocate_row(&mut catalog, key, location);
+        }
+        if let Some(new) = replacement {
+            catalog.replace_published_segment(old, new);
+        }
+        catalog.retire_segment(old);
+    }
+
+    fn relocate_row(
+        &mut self,
+        catalog: &mut Catalog,
+        key: SmallKey,
+        location: Location,
+    ) -> Option<Location> {
+        let address = (location.segment, location.offset);
+        let old = self.stage_in(catalog, key.clone(), location, true);
+        if let (Some(old), Some(ownership)) = (&old, &mut catalog.ownership) {
+            ownership.relocate_retry((old.segment, old.offset), address);
+        }
         #[cfg(test)]
         if let Some(pause) = self.before_relocation_publish.take() {
             pause();
         }
-        self.publish_in(&mut catalog, &key);
+        self.publish_in(catalog, &key, old.is_none());
         old
     }
     pub fn stage(&mut self, key: SmallKey, location: Location) -> Option<Location> {
         let model = self.catalog.clone();
         let mut catalog = model.0.write().unwrap();
-        self.stage_in(&mut catalog, key, location)
+        self.stage_in(&mut catalog, key, location, false)
     }
     fn stage_in(
         &mut self,
         catalog: &mut Catalog,
         key: SmallKey,
         location: Location,
+        relocating: bool,
     ) -> Option<Location> {
         catalog.activate().expect("validated small catalog");
         catalog
             .files
             .insert(location.segment, location.file.clone());
         let address = (location.segment, location.offset);
-        self.staged = Some(address);
+        self.staged = Some((address, location.stored_len()));
         #[cfg(test)]
         if catalog.at(address).is_none() {
             catalog
@@ -305,7 +346,7 @@ impl Directory {
         }
         let slot = catalog.at(address).expect("journaled small object");
         let old_slot = self.find(catalog, &key, VISIBLE);
-        let old = old_slot.and_then(|slot| catalog.location(slot));
+        let old = old_slot.and_then(|slot| catalog.location_for_move(slot));
         if let Some(old_slot) = old_slot.filter(|old| *old != slot) {
             let old_address = catalog.metadata(catalog.lookup.handle(old_slot)).unwrap().0;
             let flags = catalog.lookup.flags(old_slot);
@@ -313,6 +354,9 @@ impl Directory {
                 .lookup
                 .set_flags(old_slot, flags & !(VISIBLE | POLICY | REFERENCED));
             *catalog.live.entry(self.slot).or_default() -= 1;
+            if !relocating {
+                catalog.shared.live_count.fetch_sub(1, Relaxed);
+            }
             catalog.relocate_recency(old_address, slot);
             catalog.relocate_policy(old_address, address, slot);
             if let Some(policy) = catalog.policy.remove(&old_address) {
@@ -339,15 +383,29 @@ impl Directory {
     pub fn publish(&mut self, id: &dyn SmallIdentity) {
         let model = self.catalog.clone();
         let mut catalog = model.0.write().unwrap();
-        self.publish_in(&mut catalog, id);
+        self.publish_in(&mut catalog, id, true);
     }
-    fn publish_in(&mut self, catalog: &mut Catalog, id: &dyn SmallIdentity) {
+    fn publish_in(&mut self, catalog: &mut Catalog, id: &dyn SmallIdentity, admit: bool) {
         let slot = self.pending(catalog, id).expect("staged small object");
         let flags = catalog.lookup.flags(slot);
         if flags & VISIBLE == 0 {
             *catalog.live.entry(self.slot).or_default() += 1;
+            if admit {
+                catalog.shared.live_count.fetch_add(1, Relaxed);
+            }
         }
         catalog.lookup.set_flags(slot, flags | VISIBLE);
+        if admit {
+            let (address, stored_len) = self.staged.expect("published small address");
+            catalog.publish_segment(address.0);
+            if let Some(ownership) = &mut catalog.ownership {
+                // A tail append can bound this pass without tracking holes or
+                // translating offsets when the segment moves.
+                let cutoff = (catalog.model.segments[&address.0].bytes == address.1 + stored_len)
+                    .then_some(address.1);
+                ownership.admit(address, catalog.shared.ownership.admit(), cutoff);
+            }
+        }
         self.staged = None;
     }
     pub fn attach_access(&mut self, id: &dyn SmallIdentity, access: AccessHandle) {
@@ -373,6 +431,7 @@ impl Directory {
             let flags = catalog.lookup.flags(slot) & !VISIBLE;
             catalog.lookup.set_flags(slot, flags);
             *catalog.live.entry(self.slot).or_default() -= 1;
+            catalog.shared.live_count.fetch_sub(1, Relaxed);
             return location;
         }
         let retired = catalog.retired.get_mut(id)?;
@@ -381,10 +440,15 @@ impl Directory {
         }
         retired.live = false;
         let location = retired.location.clone();
-        if retired.policy.is_none() {
+        let remove = retired.policy.is_none();
+        catalog
+            .retired_addresses
+            .remove(&(location.segment, location.offset));
+        if remove {
             catalog.retired.remove(id);
         }
         *catalog.live.entry(self.slot).or_default() -= 1;
+        catalog.shared.live_count.fetch_sub(1, Relaxed);
         Some(location)
     }
     pub fn policy_get(&self, id: &dyn SmallIdentity) -> Option<PolicyEntry> {
@@ -484,9 +548,6 @@ impl Directory {
             catalog.retired.remove(id);
         }
         Some(policy)
-    }
-    pub fn retire_segment(&mut self, segment: u64) {
-        self.catalog.0.write().unwrap().retire_segment(segment);
     }
 }
 
@@ -948,13 +1009,7 @@ mod tests {
         let directory = Arc::new(RwLock::new(Directory::default()));
         let index = Arc::new(BlockIndex::new());
         index.register_small_directory(&directory);
-        let lru = Arc::new(Lru::from_recovered(
-            index.clone(),
-            Vec::new(),
-            0,
-            false,
-            false,
-        ));
+        let lru = Arc::new(Lru::from_recovered(index.clone(), Vec::new(), 0, false));
         let (entered, paused) = mpsc::channel();
         let (resume, resumed) = mpsc::channel();
         *lru.before_small_publish.lock().unwrap() = Some(Box::new(move || {

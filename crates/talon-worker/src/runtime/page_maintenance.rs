@@ -460,6 +460,66 @@ impl WorkerRuntime {
             .await;
     }
 
+    pub(super) async fn unlink_small_gc(
+        &self,
+        candidate: crate::small_store::SmallGcCandidate,
+        revision: u64,
+        membership: Option<Arc<super::MembershipSnapshot>>,
+    ) {
+        let runtime = self.clone();
+        self.page_mutations
+            .run(async move {
+                let deadline = membership.as_ref().map(|view| view.valid_until);
+                let Some(permit) =
+                    before_deadline(deadline, runtime.page_gc_io.clone().acquire_owned()).await
+                else {
+                    return;
+                };
+                let _permit = permit.expect("page GC semaphore closed");
+                let Some(_background_io) = before_deadline(deadline, runtime.background_io()).await
+                else {
+                    return;
+                };
+                let block = candidate.unit.block().clone();
+                let whole = matches!(candidate.unit, CacheUnit::Whole(_));
+                let state = runtime.page_lifecycle.block(&block);
+                if let Some(_gate) = before_deadline(deadline, state.gate.lock()).await {
+                    let validator = runtime.clone();
+                    let small = runtime.small.as_ref().unwrap();
+                    match small
+                        .delete_gc(candidate, revision, deadline, move || {
+                            membership.as_ref().map_or(true, |view| {
+                                uncontended(validator.membership.try_lock()).is_some_and(|held| {
+                                    let now = Instant::now();
+                                    now < view.valid_until
+                                        && held.as_ref().is_some_and(|current| {
+                                            current.generation == view.generation
+                                                && now < current.valid_until
+                                        })
+                                })
+                            })
+                        })
+                        .await
+                    {
+                        Ok(true) => {
+                            if whole {
+                                runtime.invalidate_l1(&block);
+                            }
+                            runtime.metrics.record_eviction();
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            runtime.page_gc_metrics.delete_errors.inc();
+                            tracing::warn!(%block, %error, "small object GC unlink failed");
+                        }
+                    }
+                }
+                drop(state);
+                runtime.page_lifecycle.retire_empty(&block);
+            })
+            .await;
+    }
+
     async fn unlink_stale_block_inner(
         &self,
         candidate: crate::eviction::StaleBlockCandidate,
@@ -492,12 +552,18 @@ impl WorkerRuntime {
                 let id = &candidate.block;
                 let bytes = runtime.index.get(id).map_or(0, |meta| meta.resident_bytes());
                 let pages = claim.len();
-                if let Err(error) = runtime.delete_whole(id).await {
+                let compact = runtime.small.as_ref().is_some_and(|small| small.has_recency());
+                let whole = if compact {
+                    runtime.store.delete(id).await
+                } else {
+                    runtime.delete_whole(id).await
+                };
+                if let Err(error) = whole {
                     runtime.page_gc_metrics.delete_errors.inc();
                     tracing::warn!(block = %id, %error, "stale block unlink failed; retaining accounting");
                     return;
                 }
-                if let Some(small) = &runtime.small {
+                if let Some(small) = runtime.small.as_ref().filter(|_| !compact) {
                     if let Err(error) = small.delete(&CacheUnit::ExactRange(id.clone())).await {
                         tracing::warn!(block = %id, %error, "exact range unlink failed");
                         return;
@@ -512,7 +578,7 @@ impl WorkerRuntime {
                 }
                 runtime.invalidate_l1(id);
                 runtime.index.remove(id);
-                runtime.lru.remove_block(id);
+                runtime.lru.remove_tracked_block(id);
                 claim.finish(runtime.page_clock.now());
                 runtime.metrics.record_eviction();
                 if pages > 0 {
@@ -833,7 +899,7 @@ impl WorkerRuntime {
     }
 }
 
-async fn before_deadline<F: std::future::Future>(
+pub(crate) async fn before_deadline<F: std::future::Future>(
     deadline: Option<Instant>,
     work: F,
 ) -> Option<F::Output> {
@@ -842,6 +908,13 @@ async fn before_deadline<F: std::future::Future>(
             .await
             .ok(),
         None => Some(work.await),
+    }
+}
+
+pub(crate) fn uncontended<T>(result: std::sync::TryLockResult<T>) -> Option<T> {
+    match result {
+        Err(std::sync::TryLockError::WouldBlock) => None,
+        acquired => Some(acquired.unwrap()),
     }
 }
 
@@ -924,7 +997,7 @@ mod tests {
 
     async fn evict(worker: &WorkerRuntime, config: &WorkerConfig, stale: bool) {
         if stale {
-            let candidates = worker.lru.stale_gc_candidates(
+            let candidates = worker.lru.idle_candidates(
                 &mut (0, 0),
                 crate::eviction::access_millis() + 1,
                 0,

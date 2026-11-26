@@ -147,12 +147,12 @@ impl SmallObjectStore {
     }
 
     pub(super) fn streams(&self) -> Vec<Arc<SegmentStore>> {
-        self.streams
-            .read()
-            .unwrap()
-            .values()
-            .filter_map(|s| s.get().cloned())
-            .collect()
+        self.stream_snapshot(false).unwrap()
+    }
+
+    fn stream_snapshot(&self, nonblocking: bool) -> Option<Vec<Arc<SegmentStore>>> {
+        let streams = read_for_unlink(&self.streams, nonblocking)?;
+        Some(streams.values().filter_map(|s| s.get().cloned()).collect())
     }
 
     async fn writer(&self, slot: usize) -> io::Result<Arc<SegmentStore>> {
@@ -186,12 +186,27 @@ impl SmallObjectStore {
         self.streams().into_iter().find(|s| s.contains(id))
     }
 
-    async fn mutation(&self, id: &(impl SmallStoreKey + ?Sized)) -> InFlightGuard {
-        let key = if id.exact_range() {
+    fn try_owner(&self, id: &impl SmallStoreKey) -> Option<Arc<SegmentStore>> {
+        let id = id.view();
+        format::validate_key(&id).ok()?;
+        for stream in self.stream_snapshot(true)? {
+            if stream.unlink_location(&id, true)?.is_some() {
+                return Some(stream);
+            }
+        }
+        None
+    }
+
+    fn mutation_key(id: &(impl SmallStoreKey + ?Sized)) -> LoadKey {
+        if id.exact_range() {
             LoadKey::ExactRange(id.block().clone())
         } else {
             LoadKey::Whole(id.block().clone())
-        };
+        }
+    }
+
+    async fn mutation(&self, id: &(impl SmallStoreKey + ?Sized)) -> InFlightGuard {
+        let key = Self::mutation_key(id);
         loop {
             if let Some(guard) = self.mutations.admit_owned(key.clone()) {
                 return guard;
@@ -331,27 +346,78 @@ impl SmallObjectStore {
             .await
     }
 
+    #[cfg(test)]
+    pub(crate) fn under_mutation_registry<T: Send>(&self, work: impl FnOnce() -> T + Send) -> T {
+        self.mutations.under_registry_lock(work)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_delete_after_journal(&self, id: &BlockId) {
+        self.owner(id)
+            .unwrap()
+            .fail_delete_after_journal
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub(crate) async fn delete_idle(
         self: &Arc<Self>,
         id: CacheUnit,
         ticket: Arc<super::policy::SmallAccess>,
         expiry: impl FnOnce() -> (u64, u64) + Send + 'static,
     ) -> io::Result<bool> {
+        self.delete_if_current(id, ticket, None, move |current| {
+            let (now, age) = expiry();
+            current.is_idle_at(now, age)
+        })
+        .await
+    }
+
+    pub(crate) async fn delete_gc(
+        self: &Arc<Self>,
+        candidate: super::SmallGcCandidate,
+        revision: u64,
+        deadline: Option<Instant>,
+        authorized: impl FnOnce() -> bool + Send + 'static,
+    ) -> io::Result<bool> {
+        self.delete_if_current(candidate.unit, candidate.ticket, deadline, move |current| {
+            current.gc_is_current_for_unlink(revision, deadline.is_some()) && authorized()
+        })
+        .await
+    }
+
+    async fn delete_if_current(
+        self: &Arc<Self>,
+        id: CacheUnit,
+        ticket: Arc<super::policy::SmallAccess>,
+        deadline: Option<Instant>,
+        eligible: impl FnOnce(&super::policy::SmallAccess) -> bool + Send + 'static,
+    ) -> io::Result<bool> {
         let store = self.clone();
         self.tasks
             .run(async move {
-                let _guard = store.mutation(&id).await;
-                let Some(stream) = store.owner(&id) else {
+                let guard = if deadline.is_some() {
+                    store.mutations.try_admit_owned(Self::mutation_key(&id))
+                } else {
+                    Some(store.mutation(&id).await)
+                };
+                let Some(_guard) = guard else {
+                    return Ok(false);
+                };
+                let owner = if deadline.is_some() {
+                    store.try_owner(&id)
+                } else {
+                    store.owner(&id)
+                };
+                let Some(stream) = owner else {
                     return Ok(false);
                 };
                 let removed = stream
-                    .delete_inner_if(&id, |loc| {
-                        let (now, age) = expiry();
+                    .delete_inner_if(&id, deadline, |loc| {
                         loc.access
                             .as_ref()
                             .and_then(AccessHandle::small)
                             .is_some_and(|current| {
-                                Arc::ptr_eq(current, &ticket) && current.is_idle_at(now, age)
+                                Arc::ptr_eq(current, &ticket) && eligible(current)
                             })
                     })
                     .await?;
@@ -387,6 +453,15 @@ impl SmallObjectStore {
         track_clock: bool,
     ) {
         self.bind_index(index);
+        if !track_clock {
+            let streams = self.streams.read().unwrap();
+            self.journal.model.0.write().unwrap().enable_compact(
+                streams
+                    .iter()
+                    .filter_map(|(&slot, stream)| stream.get().map(|_| slot)),
+            );
+            return;
+        }
         let shared_access = units
             .iter()
             .filter(|unit| {
@@ -396,10 +471,6 @@ impl SmallObjectStore {
             .map(|unit| (unit.unit.block.materialize(), unit.access.clone()))
             .collect();
         for stream in self.streams() {
-            if !track_clock {
-                stream.entries.write().unwrap().enable_compact();
-                continue;
-            }
             stream
                 .restore_policy_units(units, &shared_access, track_clock)
                 .expect("validated small object identity");
@@ -438,13 +509,11 @@ impl SmallObjectStore {
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.streams
-            .read()
-            .unwrap()
-            .values()
-            .filter_map(|s| s.get())
-            .map(|s| s.entries.read().unwrap().len())
-            .sum()
+        self.journal
+            .model
+            .1
+            .live_count
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     #[cfg(test)]
@@ -583,6 +652,84 @@ mod tests {
             })
     }
 
+    #[tokio::test]
+    async fn ownership_event_excludes_segments_first_published_after_capture() {
+        let root = tempfile::tempdir().unwrap();
+        let store = open(root.path());
+        let index = Arc::new(crate::BlockIndex::new());
+        store.restore_policy_units(&index, &mut Vec::new(), false);
+        store.init_recency();
+        store.bind_policy(Arc::new(crate::Lru::from_recovered(
+            index,
+            Vec::new(),
+            0,
+            true,
+        )));
+        store.init_ownership();
+
+        let delayed = store.writer(1).await.unwrap();
+        let ready = store.writer(2).await.unwrap();
+        let pause = Arc::new(super::super::tests::AppendPause::default());
+        *delayed.append_pause.lock().unwrap() = Some(pause.clone());
+        let first_write = {
+            let stream = delayed.clone();
+            let policy = store.policy().cloned();
+            tokio::spawn(async move {
+                stream
+                    .put_inner(&id("late-0"), Bytes::from_static(b"L"), policy)
+                    .await
+                    .unwrap();
+            })
+        };
+        pause.entered.notified().await;
+        let before = id("before");
+        ready
+            .put_inner(&before, Bytes::from_static(b"B"), store.policy().cloned())
+            .await
+            .unwrap();
+        let event = store.ownership_limit(true).unwrap();
+        pause.resume.notify_one();
+        first_write.await.unwrap();
+        let late_segment = store
+            .lookup_entry(&id("late-0"))
+            .unwrap()
+            .unwrap()
+            .segment();
+        assert!(late_segment < store.lookup_entry(&before).unwrap().unwrap().segment());
+        for n in 1..130 {
+            let block = id(&format!("late-{n}"));
+            delayed
+                .put_inner(&block, Bytes::from_static(b"L"), store.policy().cloned())
+                .await
+                .unwrap();
+            assert_eq!(
+                store.lookup_entry(&block).unwrap().unwrap().segment(),
+                late_segment
+            );
+        }
+
+        let (done, rows) =
+            store.ownership_candidates(&mut Default::default(), 0, event, 64, |_| false);
+        assert!(
+            done,
+            "post-event publication consumed the event scan budget"
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].unit.block(), &before);
+
+        let supplement = store.ownership_limit(false).unwrap();
+        let (done, rows) = store.ownership_candidates(
+            &mut Default::default(),
+            event.epoch,
+            supplement,
+            256,
+            |_| false,
+        );
+        assert!(done);
+        assert_eq!(rows.len(), 130);
+        assert!(rows.iter().all(|row| row.unit.block() != &before));
+    }
+
     #[test]
     fn relocation_budget_covers_payload_and_actual_journal_bytes() {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -635,6 +782,52 @@ mod tests {
                 assert_eq!(budget.charged_bytes(), payload_io + log_bytes() - before);
             }
         });
+    }
+
+    #[tokio::test]
+    async fn compact_recovery_classifies_all_streams_in_one_lookup_pass() {
+        let root = tempfile::tempdir().unwrap();
+        let mut fixtures = Vec::new();
+        {
+            let store = open(root.path());
+            for slot in 0..4 {
+                let stream = store.writer(slot).await.unwrap();
+                let mut expected = (0, 0);
+                for n in 0..=slot {
+                    let block = id(&format!("stream-{slot}-row-{n}"));
+                    let payload = Bytes::from(vec![slot as u8; 17 + n]);
+                    stream
+                        .put_inner(&block, payload.clone(), None)
+                        .await
+                        .unwrap();
+                    expected.0 += payload.len() as u64 + CHECKSUM_BYTES;
+                    expected.1 += 1;
+                    fixtures.push((slot, block, payload, expected));
+                }
+            }
+            store.maintain(true).await.unwrap();
+        }
+        let reopened = open(root.path());
+        let index = Arc::new(crate::BlockIndex::new());
+        let mut generic = Vec::new();
+        reopened.restore_policy_units(&index, &mut generic, false);
+        assert!(generic.is_empty());
+        reopened.assert_no_resident_policy_allocations();
+        {
+            let catalog = reopened.journal.model.0.read().unwrap();
+            assert_eq!(catalog.compact_recovery_slots, catalog.lookup.capacity());
+            for slot in 0..4 {
+                let expected = fixtures
+                    .iter()
+                    .rfind(|(stream, ..)| *stream == slot)
+                    .unwrap()
+                    .3;
+                assert_eq!(catalog.compact_totals[&slot], expected);
+            }
+        }
+        for (_, block, payload, _) in fixtures {
+            assert_eq!(reopened.read(&block).await.unwrap(), Some(payload));
+        }
     }
 
     #[test]
@@ -1001,7 +1194,7 @@ mod recovery_tests {
             let index = Arc::new(crate::BlockIndex::new());
             let mut units = Vec::new();
             store.restore_policy_units(&index, &mut units, false);
-            let policy = Arc::new(crate::Lru::from_recovered(index, units, 0, false, false));
+            let policy = Arc::new(crate::Lru::from_recovered(index, units, 0, false));
             store.bind_policy(policy.clone());
             for n in 0..6 {
                 store
@@ -1047,7 +1240,7 @@ mod recovery_tests {
         let mut units = Vec::new();
         store.restore_policy_units(&index, &mut units, false);
         assert!(units.is_empty());
-        let policy = Arc::new(crate::Lru::from_recovered(index, units, 0, false, false));
+        let policy = Arc::new(crate::Lru::from_recovered(index, units, 0, false));
         store.bind_policy(policy.clone());
         assert_eq!(policy.len(), 3);
         for n in 0..6 {
@@ -1087,7 +1280,7 @@ mod recovery_tests {
         let mut units = Vec::new();
         store.restore_policy_units(&index, &mut units, false);
         assert!(units.is_empty());
-        let policy = Arc::new(crate::Lru::from_recovered(index, units, 0, false, false));
+        let policy = Arc::new(crate::Lru::from_recovered(index, units, 0, false));
         store.bind_policy(policy.clone());
         assert_eq!(policy.len(), 1);
         assert_eq!(policy.total_bytes(), 4 + CHECKSUM_BYTES);
@@ -1191,7 +1384,6 @@ mod recovery_tests {
                 units,
                 1,
                 tracking,
-                tracking,
             ));
             store.bind_policy(policy.clone());
             store.enable_access_tracking().unwrap();
@@ -1239,13 +1431,7 @@ mod recovery_tests {
         for unit in &units {
             serial.insert_with_policy(unit.unit.materialize(), unit.bytes, true);
         }
-        let policy = Arc::new(crate::Lru::from_recovered(
-            index,
-            units,
-            store.len(),
-            true,
-            true,
-        ));
+        let policy = Arc::new(crate::Lru::from_recovered(index, units, store.len(), true));
         store.bind_policy(policy.clone());
         assert_eq!(policy.len(), 2050);
         assert_eq!(policy.total_bytes(), serial.total_bytes());
