@@ -30,7 +30,7 @@ async fn crash_child() {
     }
     if let Ok(mode) = std::env::var("TALON_SMALL_TEST_STALE_COPY") {
         let pause = Arc::new(AppendPause::default());
-        *store.copied_pause.lock().unwrap() = Some(pause.clone());
+        *store.reconcile_pause.lock().unwrap() = Some(pause.clone());
         let (compaction, staged_path) = tokio::join!(store.maintain(false), async {
             pause.entered.notified().await;
             let staged_path = store.path(staged_compaction_id(&store).await, "data");
@@ -157,7 +157,7 @@ async fn empty_reclaim_candidate_can_gain_live_rows_and_roll_during_copy() {
     }
     let old = store.state.lock().await.active.unwrap();
     let pause = Arc::new(AppendPause::default());
-    *store.copied_pause.lock().unwrap() = Some(pause.clone());
+    *store.reconcile_pause.lock().unwrap() = Some(pause.clone());
     let compaction = store.maintain(false);
     let foreground = async {
         pause.entered.notified().await;
@@ -203,38 +203,43 @@ async fn empty_reclaim_candidate_can_gain_live_rows_and_roll_during_copy() {
 }
 
 #[tokio::test]
-async fn compaction_pays_for_late_deletes_before_publication() {
+async fn compaction_drains_each_delete_wave_before_publication() {
     let dir = tempfile::tempdir().unwrap();
     let store = open(dir.path());
+    const WAVES: usize = 8;
+    const COPIED: usize = 64;
     put(&store, &id("garbage"), &vec![1; 96 << 10])
         .await
         .unwrap();
-    for key in ["first", "second", "survivor"] {
-        put(&store, &id(key), key.as_bytes()).await.unwrap();
+    for n in 0..COPIED {
+        put(&store, &id(&n.to_string()), &n.to_le_bytes())
+            .await
+            .unwrap();
     }
     store.checkpoint().await.unwrap();
     store.delete(&id("garbage")).await.unwrap();
-    let segment_of = |key| {
+    let survivor = id(&WAVES.to_string());
+    let segment_of = |key: &BlockId| {
         store
             .entries
             .read()
             .unwrap()
-            .get(&id(key).view())
+            .get(&key.view())
             .unwrap()
             .segment
     };
-    let old = segment_of("survivor");
+    let old = segment_of(&survivor);
     let budget = crate::background::BackgroundBudget::new(&talon_core::WorkerConfig {
         background_io_concurrency: 1,
         background_io_max_mb_per_sec: 0,
         background_delete_max_per_sec: 0,
         ..Default::default()
     });
-    let pause = Arc::new(AppendPause::default());
-    *store.copied_pause.lock().unwrap() = Some(pause.clone());
-    let compaction = store.compact(false, Some(&budget));
-    tokio::pin!(compaction);
-    tokio::time::timeout(Duration::from_secs(5), async {
+    let mut pause = Arc::new(AppendPause::default());
+    *store.reconcile_pause.lock().unwrap() = Some(pause.clone());
+    let mut compaction = Box::pin(store.maintain_inner(false, false, Some(budget.clone())));
+    let limit = Duration::from_secs(5);
+    tokio::time::timeout(limit, async {
         tokio::select! {
             () = pause.entered.notified() => (),
             result = &mut compaction => panic!("compaction completed before pause: {result:?}"),
@@ -242,57 +247,173 @@ async fn compaction_pays_for_late_deletes_before_publication() {
     })
     .await
     .unwrap();
+
     let staged = staged_compaction_id(&store).await;
-    store.delete(&id("first")).await.unwrap();
-    let initial_bytes = budget.charged_bytes();
-    tokio::time::pause();
+    let mut expected_bytes = budget.charged_bytes();
     budget.update(&talon_core::dynamic_config::WorkerDynamicConfig {
         background_io_max_mb_per_sec: Some(1),
         ..Default::default()
     });
-    let queued_bytes = 60_000_000;
-    let ahead = budget.bytes(queued_bytes);
-    tokio::pin!(ahead);
-    assert!(futures::poll!(&mut ahead).is_pending());
+    const QUEUED_BYTES: usize = 200_000;
+    for wave in 0..WAVES {
+        let key = id(&wave.to_string());
+        let offset = store
+            .entries
+            .read()
+            .unwrap()
+            .get(&key.view())
+            .unwrap()
+            .offset;
+        store.delete(&key).await.unwrap();
+        store.delete(&key).await.unwrap();
+        if wave == 0 {
+            // A later deletion of the same key has a different physical address.
+            put(&store, &key, b"new version").await.unwrap();
+            store.delete(&key).await.unwrap();
+        }
+        assert_eq!(
+            store
+                .state
+                .lock()
+                .await
+                .compaction_deletes
+                .as_ref()
+                .unwrap()
+                .offsets,
+            [offset]
+        );
+        let next = Arc::new(AppendPause::default());
+        *store.reconcile_pause.lock().unwrap() = Some(next.clone());
+        // Reaching the credit wait while another thread owns the Catalog
+        // rules out a visibility scan on every retry, even with many survivors.
+        let catalog = store.journal.model.clone();
+        let (locked, ready) = std::sync::mpsc::sync_channel(0);
+        let (release, released) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _catalog = catalog.0.write().unwrap();
+            locked.send(()).unwrap();
+            released.recv_timeout(Duration::from_secs(5))
+        });
+        ready.recv_timeout(limit).unwrap();
+        let ahead = budget.bytes(QUEUED_BYTES);
+        tokio::pin!(ahead);
+        assert!(futures::poll!(&mut ahead).is_pending());
+        pause.resume.notify_one();
+        let polled = futures::poll!(&mut compaction);
+        let _ = release.send(());
+        holder
+            .join()
+            .unwrap()
+            .expect("retry waited for the Catalog");
+        assert!(polled.is_pending());
+        expected_bytes += QUEUED_BYTES as u64 + 49;
+        assert_eq!(budget.charged_bytes(), expected_bytes);
+        assert_eq!(budget.available_io(), 1);
+        assert!(store.publication.try_lock().is_ok());
+        assert!(store
+            .state
+            .try_lock()
+            .unwrap()
+            .compaction_deletes
+            .as_ref()
+            .unwrap()
+            .offsets
+            .is_empty());
+
+        assert_eq!(segment_of(&survivor), old);
+        assert_eq!(
+            store.journal.model.0.read().unwrap().model.segments[&staged]
+                .records
+                .len(),
+            COPIED - wave,
+            "staging must retain the current row until its tombstone is paid for"
+        );
+        put(
+            &store,
+            &id(&format!("foreground-{wave}")),
+            b"foreground append",
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(limit, async {
+            tokio::select! {
+                () = next.entered.notified() => (),
+                result = &mut compaction => panic!("compaction completed before retry: {result:?}"),
+            }
+        })
+        .await
+        .unwrap();
+        pause = next;
+    }
+
     pause.resume.notify_one();
-    assert!(futures::poll!(&mut compaction).is_pending());
-    assert_eq!(
-        budget.charged_bytes(),
-        initial_bytes + queued_bytes as u64 + 49
-    );
-    assert_eq!(budget.available_io(), 1);
-    assert_eq!(segment_of("survivor"), old);
-    assert_eq!(
-        store.journal.model.0.read().unwrap().model.segments[&staged]
-            .records
-            .len(),
-        3,
-        "staging must retain all copied rows until the tombstone is paid for"
-    );
-    assert!(store.publication.try_lock().is_ok());
-    assert!(store.state.try_lock().is_ok());
-    store.delete(&id("second")).await.unwrap();
-    put(&store, &id("new"), b"foreground append").await.unwrap();
-    tokio::time::advance(Duration::from_secs(61)).await;
-    tokio::time::resume();
-    assert!(tokio::time::timeout(Duration::from_secs(5), compaction)
+    assert!(tokio::time::timeout(limit, &mut compaction)
         .await
         .unwrap()
         .unwrap());
+    drop(compaction);
+    assert_eq!(budget.charged_bytes(), expected_bytes);
+    assert_ne!(segment_of(&survivor), old);
+    assert!(store.state.lock().await.compaction_deletes.is_none());
+    store.checkpoint().await.unwrap();
+    store.tasks.drain().await;
+    async fn verify(store: &SegmentStore) {
+        for n in 0..COPIED {
+            let expected = (n >= WAVES).then(|| Bytes::copy_from_slice(&n.to_le_bytes()));
+            assert_eq!(store.read(&id(&n.to_string())).await.unwrap(), expected);
+        }
+        for wave in 0..WAVES {
+            assert_eq!(
+                store
+                    .read(&id(&format!("foreground-{wave}")))
+                    .await
+                    .unwrap(),
+                Some(Bytes::from_static(b"foreground append"))
+            );
+        }
+    }
+    verify(&store).await;
+    drop(store);
+    verify(&open(dir.path())).await;
+}
+
+#[tokio::test]
+async fn failed_source_delete_stops_compaction_and_clears_tracking() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    put(&store, &id("garbage"), &vec![1; 96 << 10])
+        .await
+        .unwrap();
+    put(&store, &id("deleted"), b"delete me").await.unwrap();
+    put(&store, &id("survivor"), b"keep me").await.unwrap();
+    store.checkpoint().await.unwrap();
+    store.delete(&id("garbage")).await.unwrap();
+    let pause = Arc::new(AppendPause::default());
+    *store.reconcile_pause.lock().unwrap() = Some(pause.clone());
+    let (compaction, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(store.maintain(false), async {
+            pause.entered.notified().await;
+            store
+                .fail_delete_after_journal
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            let error = store.delete(&id("deleted")).await.unwrap_err();
+            assert_eq!(error.to_string(), "injected failure after journal Delete");
+            pause.resume.notify_one();
+        })
+    })
+    .await
+    .unwrap();
     assert_eq!(
-        budget.charged_bytes(),
-        initial_bytes + queued_bytes as u64 + 98
+        compaction.unwrap_err().to_string(),
+        "small object store needs restart after failed mutation"
     );
-    assert_ne!(segment_of("survivor"), old);
-    assert!(!store.contains(&id("first")));
-    assert!(!store.contains(&id("second")));
+    assert!(store.state.lock().await.compaction_deletes.is_none());
+    drop(store);
+    let reopened = open(dir.path());
+    assert_eq!(reopened.read(&id("deleted")).await.unwrap(), None);
     assert_eq!(
-        store.read(&id("survivor")).await.unwrap().unwrap(),
-        b"survivor"[..]
-    );
-    assert_eq!(
-        store.read(&id("new")).await.unwrap().unwrap(),
-        b"foreground append"[..]
+        reopened.read(&id("survivor")).await.unwrap().unwrap(),
+        b"keep me"[..]
     );
 }
 

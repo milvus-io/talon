@@ -276,31 +276,12 @@ impl Directory {
         self.relocate_row(&mut catalog, key, location)
     }
 
-    pub(super) fn retain_visible(
-        &self,
-        old: u64,
-        records: &mut Vec<super::CopiedRecord>,
-    ) -> Vec<super::CopiedRecord> {
-        let catalog = self.catalog.0.read().unwrap();
-        let mut stale = Vec::new();
-        records.retain(|record| {
-            let visible = catalog
-                .at((old, record.old_offset))
-                .is_some_and(|slot| catalog.lookup.flags(slot) & VISIBLE != 0);
-            if !visible {
-                stale.push(*record);
-            }
-            visible
-        });
-        stale
-    }
-
     pub(super) fn replace_segment(&mut self, old: u64, replacement: Option<&super::StagedSegment>) {
         let mut catalog = self.catalog.0.write().unwrap();
         if let Some(new) = replacement {
             catalog.files.insert(new.id, new.segment.file.clone());
-            for record in &new.records {
-                let old_address = (old, record.old_offset);
+            for (&old_offset, record) in &new.records {
+                let old_address = (old, old_offset);
                 let new_address = (new.id, record.new_offset);
                 let old_slot = catalog.at(old_address).expect("reconciled source record");
                 let new_slot = catalog.at(new_address).expect("staged replacement record");

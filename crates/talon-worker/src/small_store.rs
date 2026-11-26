@@ -263,6 +263,7 @@ impl Segment {
 }
 struct State {
     segments: BTreeMap<u64, Segment>,
+    compaction_deletes: Option<CompactionDeletes>,
     active: Option<u64>,
     standby: Option<u64>,
     sealing: Option<u64>,
@@ -274,9 +275,12 @@ struct State {
     last_flush: Instant,
 }
 
-#[derive(Clone, Copy)]
+struct CompactionDeletes {
+    source: u64,
+    offsets: Vec<u64>,
+}
+
 struct CopiedRecord {
-    old_offset: u64,
     new_offset: u64,
     charge: u64,
     stored_len: u64,
@@ -285,7 +289,7 @@ struct CopiedRecord {
 struct StagedSegment {
     id: u64,
     segment: Segment,
-    records: Vec<CopiedRecord>,
+    records: HashMap<u64, CopiedRecord>,
 }
 
 #[derive(Default)]
@@ -307,7 +311,7 @@ struct SegmentStore {
     #[cfg(test)]
     flush_pause: Mutex<Option<Arc<tests::AppendPause>>>,
     #[cfg(test)]
-    copied_pause: Mutex<Option<Arc<tests::AppendPause>>>,
+    reconcile_pause: Mutex<Option<Arc<tests::AppendPause>>>,
     #[cfg(test)]
     relocation_pause: Mutex<Option<Arc<tests::AppendPause>>>,
     #[cfg(test)]
@@ -406,7 +410,7 @@ impl SegmentStore {
             #[cfg(test)]
             flush_pause: Mutex::new(None),
             #[cfg(test)]
-            copied_pause: Mutex::new(None),
+            reconcile_pause: Mutex::new(None),
             #[cfg(test)]
             relocation_pause: Mutex::new(None),
             #[cfg(test)]
@@ -417,6 +421,7 @@ impl SegmentStore {
             segment_size,
             state: tokio::sync::Mutex::new(State {
                 segments: BTreeMap::new(),
+                compaction_deletes: None,
                 active: None,
                 standby: None,
                 sealing: None,
@@ -789,6 +794,13 @@ impl SegmentStore {
             state.written += 21;
             self.refresh_stats(&state);
             self.entries.write().unwrap().remove(&id.view());
+            if let Some(deletes) = state
+                .compaction_deletes
+                .as_mut()
+                .filter(|deletes| deletes.source == loc.segment)
+            {
+                deletes.offsets.push(loc.offset);
+            }
             Ok(())
         }
         .await;
@@ -883,7 +895,9 @@ impl SegmentStore {
         if result.is_err() {
             // Keep any uncommitted files and their charges until recovery. A
             // failed durable acknowledgement can leave either version on disk.
-            self.state.lock().await.poisoned = true;
+            let mut state = self.state.lock().await;
+            state.compaction_deletes = None;
+            state.poisoned = true;
         }
         result
     }
@@ -894,7 +908,7 @@ impl SegmentStore {
         budget: Option<&crate::background::BackgroundBudget>,
     ) -> io::Result<bool> {
         let (old, entries, cost) = {
-            let state = self.state.lock().await;
+            let mut state = self.state.lock().await;
             self.healthy(&state)?;
             let Some(old) = reclaim_candidate(&state, pressure) else {
                 return Ok(false);
@@ -905,6 +919,15 @@ impl SegmentStore {
                 + 36 * source.records as u64
                 + 49;
             let entries = self.entries.read().unwrap().segment_entries(old);
+            debug_assert_eq!(entries.len(), source.records);
+            // Register under the same lock as the snapshot. A nonempty source
+            // is sealed, so its live addresses can only disappear via Delete.
+            if !entries.is_empty() {
+                state.compaction_deletes = Some(CompactionDeletes {
+                    source: old,
+                    offsets: Vec::new(),
+                });
+            }
             (old, entries, cost)
         };
         if let Some(budget) = budget {
@@ -933,53 +956,44 @@ impl SegmentStore {
             Some(self.copy_segment(entries).await?)
         };
         #[cfg(test)]
-        {
-            tests::crash("compact_copy");
-            Self::pause_compaction(&self.copied_pause).await;
-        }
+        tests::crash("compact_copy");
 
         let mut source = loop {
+            #[cfg(test)]
+            Self::pause_compaction(&self.reconcile_pause).await;
             let publication = self.publication.lock().await;
             let mut state = self.state.lock().await;
             self.healthy(&state)?;
-            let source = &state.segments[&old];
             // An empty active source may have accepted appends and sealed
             // during the unlocked phase. This pass has no copy of those rows.
-            if staged.is_none()
-                && (source.live != 0 || source.records != 0 || !reclaimable(&state, old))
-            {
+            if staged.is_none() && (state.segments[&old].live != 0 || !reclaimable(&state, old)) {
                 return Ok(false);
             }
-            let Some(copy) = staged
+            let Some(deletes) = state
+                .compaction_deletes
                 .as_mut()
-                .filter(|s| s.records.len() != source.records)
+                .filter(|deletes| !deletes.offsets.is_empty())
             else {
+                state.compaction_deletes = None;
                 break self
                     .publish_compaction(&mut state, old, &mut staged)
                     .await?;
             };
-            // A sealed source can only lose rows. Remove the confirmed stale
-            // copies before retrying, so only the final Replace needs the locks.
-            let stale = self
-                .entries
-                .read()
-                .unwrap()
-                .retain_visible(old, &mut copy.records);
-            debug_assert!(!stale.is_empty());
-            debug_assert_eq!(copy.records.len(), source.records);
+            let deleted = std::mem::take(&mut deletes.offsets);
             drop(state);
             drop(publication);
+            let copy = staged.as_mut().expect("registered compaction copy");
             if let Some(budget) = budget {
                 drop(io);
-                let frames = if copy.records.is_empty() {
+                let frames = if copy.records.len() == deleted.len() {
                     1
                 } else {
-                    stale.len()
+                    deleted.len()
                 };
                 budget.bytes(49 * frames).await;
                 io = acquire_io().await;
             }
-            self.reconcile_copy(copy, stale).await?;
+            self.reconcile_copy(copy, deleted).await?;
         };
         drop(io);
 
@@ -1009,7 +1023,7 @@ impl SegmentStore {
         let id = self.journal.allocate()?;
         let mut segment = self.create_segment(id).await?;
         self.cached_stats.lock().unwrap().staging_allocated = segment.allocated;
-        let mut records = Vec::with_capacity(entries.len());
+        let mut records = HashMap::with_capacity(entries.len());
         // Retain one source descriptor through the copy, including across
         // concurrent deletes. The compaction mutex keeps its pathname alive.
         let source = entries[0].1.file.open().await?;
@@ -1053,12 +1067,14 @@ impl SegmentStore {
             segment.live += charge;
             segment.live_data_bytes += stored_len;
             segment.records += 1;
-            records.push(CopiedRecord {
+            records.insert(
                 old_offset,
-                new_offset,
-                charge,
-                stored_len,
-            });
+                CopiedRecord {
+                    new_offset,
+                    charge,
+                    stored_len,
+                },
+            );
         }
         disk_io::sync(data.clone()).await?;
         self.sync_data_directory(id).await?;
@@ -1074,12 +1090,9 @@ impl SegmentStore {
         })
     }
 
-    async fn reconcile_copy(
-        &self,
-        copy: &mut StagedSegment,
-        stale: Vec<CopiedRecord>,
-    ) -> io::Result<()> {
-        if copy.records.is_empty() {
+    async fn reconcile_copy(&self, copy: &mut StagedSegment, deleted: Vec<u64>) -> io::Result<()> {
+        if copy.records.len() == deleted.len() {
+            copy.records.clear();
             return self
                 .journal
                 .append(
@@ -1091,7 +1104,11 @@ impl SegmentStore {
                 )
                 .await;
         }
-        for record in stale {
+        for offset in deleted {
+            let record = copy
+                .records
+                .remove(&offset)
+                .expect("deleted source address");
             self.journal
                 .append(
                     journal::Event::Delete {

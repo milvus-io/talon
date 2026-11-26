@@ -1165,12 +1165,16 @@ mod recovery_tests {
                 .put(&id(1), Bytes::from_static(b"survivor"))
                 .await
                 .unwrap();
+            stream
+                .put(&id(3), Bytes::from_static(b"late delete"))
+                .await
+                .unwrap();
             stream.checkpoint().await.unwrap();
             store.delete(&id(0)).await.unwrap();
             let old = store.lookup_entry(&id(1)).unwrap().unwrap();
             let before = stream.stats().unwrap();
             let pause = Arc::new(super::super::tests::AppendPause::default());
-            *stream.copied_pause.lock().unwrap() = Some(pause.clone());
+            *stream.reconcile_pause.lock().unwrap() = Some(pause.clone());
             let compaction = tokio::spawn({
                 let stream = stream.clone();
                 async move { stream.maintain(false).await }
@@ -1180,6 +1184,9 @@ mod recovery_tests {
             assert!(staged.allocated_bytes > before.allocated_bytes);
             assert_eq!(staged.live_bytes, before.live_bytes);
             assert_eq!(staged.segments, before.segments);
+            compaction.abort();
+            assert!(compaction.await.unwrap_err().is_cancelled());
+            store.delete(&id(3)).await.unwrap();
             let held = old.file.fd.lock().await;
             let reader = tokio::spawn({
                 let store = store.clone();
@@ -1193,17 +1200,16 @@ mod recovery_tests {
                 tokio::task::yield_now().await;
             }
             assert!(old.file.path.is_file());
-            assert!(!compaction.is_finished());
             stream
                 .put(&id(2), Bytes::from_static(b"foreground append"))
                 .await
                 .unwrap();
-            compaction.abort();
-            let _ = compaction.await;
             drop(held);
             assert_eq!(reader.await.unwrap().unwrap().unwrap(), b"survivor"[..]);
             stream.tasks.drain().await;
+            assert!(stream.state.lock().await.compaction_deletes.is_none());
             assert!(!old.file.path.exists());
+            assert!(!store.contains(&id(3)));
             assert_eq!(store.read(&id(1)).await.unwrap().unwrap(), b"survivor"[..]);
         })
         .await

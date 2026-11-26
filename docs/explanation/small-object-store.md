@@ -371,10 +371,11 @@ physical disk space. A maintenance call processes at most one eligible segment p
    metadata log and unlinked.
 2. A sealed segment with less than half its logical record bytes live is relocated.
 3. Relocation copies and syncs a staged segment while foreground appends and
-   deletes proceed. It checks which source addresses still exist, then pays for
-   and writes any stale destination tombstones outside the publication lock.
-   It repeats the check before committing replacement. If every copied address
-   is stale, it discards the staged segment.
+   deletes proceed. The stream records each committed deletion from the source
+   by offset, starting at the copy snapshot. Relocation drains the new offsets
+   and pays for and writes their destination tombstones outside the publication
+   lock. When the queue is empty under the lock, it publishes the surviving
+   rows. If every copied address is stale, it discards the staged segment.
 4. Once the new locators are visible, the collector waits for readers still
    opening the old file, pays the delete budget, and unlinks the old path.
 
