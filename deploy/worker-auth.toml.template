@@ -1,7 +1,7 @@
 # Static per-bucket credentials for one S3 worker.
 # Replace names/credentials and keep only the buckets this worker should serve.
 # All buckets share the backend family; connection settings may inherit defaults.
-# Credentials belong to each bucket. Do not also set top-level credential fields.
+# Set credentials_source in each [[buckets]] entry for per-bucket credentials.
 # TALON_WORKER_BUCKETS (JSON) replaces the entire list when supplied.
 
 cluster_id = "default"
@@ -13,6 +13,16 @@ cache_dirs = ["./talon-cache"]
 backend = "s3"
 s3_region = "us-west-2"
 s3_path_style = false
+
+# For a single worker-wide credential source, omit [[buckets]] and set it here.
+# credentials_source = "iam"
+
+# Default Broker URL for requests without their own Broker URL.
+# Requests without Broker parameters use Broker Pod IAM when this is set.
+# The bucket entries then supply the allowlist and source storage settings.
+# [broker]
+# endpoint = "https://broker.example/v1/credentials/assume-role"
+# timeout_ms = 3000
 
 [[buckets]]
 name = "bucket-a"
@@ -34,8 +44,8 @@ credentials_source = "broker"
 # Optional for AWS (defaults from s3_region); required for OSS/COS/OBS.
 s3_endpoint = "https://s3.us-west-2.amazonaws.com"
 # Optional per-attempt credential fetch timeout; omitted defaults to 3000 ms.
-# Does not change storage I/O timeouts. Valid in each bucket or at top level for
-# a worker without [[buckets]]. Top-level env override: TALON_CREDENTIAL_BROKER_TIMEOUT_MS.
+# For the worker-wide timeout use timeout_ms in [broker] or
+# TALON_CREDENTIAL_BROKER_TIMEOUT_MS.
 credential_broker_timeout_ms = 3000
 credential_broker_url = "http://<broker-host>:8080/v1/credentials/assume-role"
 credential_broker_request.csp = "aws"

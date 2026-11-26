@@ -147,7 +147,7 @@ public final class Placement {
             MessageDigest hash = MessageDigest.getInstance("SHA-256");
             ByteArrayOutputStream encoded = new ByteArrayOutputStream();
             encoded.writeBytes(BLOCK_DOMAIN);
-            encoded.write(backendTag(block.object().backend()));
+            encoded.write(Messages.backendTag(block.object().backend()));
             field(encoded, block.object().bucket());
             field(encoded, block.object().key());
             encoded.writeBytes(littleEndianLong(block.offset()));
@@ -196,18 +196,4 @@ public final class Placement {
                 .putInt(value)
                 .array();
     }
-
-    private static int backendTag(ObjectId.Backend backend) {
-        switch (backend) {
-            case S3:
-                return 0;
-            case GCS:
-                return 1;
-            case AZURE:
-                return 2;
-            default:
-                throw new AssertionError("unhandled backend " + backend);
-        }
-    }
-
 }

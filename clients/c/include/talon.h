@@ -132,6 +132,7 @@ typedef struct talon_request_options {
     /* Per-request namespace. NULL selects "default" independently of tracing. */
     const char *namespace_name;
     /* Optional UTF-8 Broker JSON: {url, request, origin:{endpoint}}.
+     * An omitted or empty url uses the worker's credential endpoint when configured.
      * S3 providers also require origin.region. NULL + 0 uses worker configuration.
      * Otherwise, supply 1..16384 bytes; length excludes any trailing NUL.
      * The buffer need not be NUL-terminated. */

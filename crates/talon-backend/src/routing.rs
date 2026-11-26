@@ -12,7 +12,7 @@ use bytes::Bytes;
 use futures::{future::BoxFuture, FutureExt};
 use sha2::{Digest, Sha256};
 use talon_core::backend::AccessScope;
-use talon_core::config::BucketConfig;
+use talon_core::config::{BucketConfig, Sensitive};
 use talon_core::{
     Backend, BackendStore, Error, ListPage, ObjectId, ObjectStat, OriginOptions, ResolvedBackend,
     Result, Version,
@@ -74,6 +74,25 @@ pub type LegacyBackendFactory = Arc<
         + Sync,
 >;
 
+/// Startup configuration for a worker's backend resolver.
+#[derive(Default)]
+pub struct BackendResolverConfig {
+    pub buckets: Vec<BucketConfig>,
+    pub defaults: BucketConfig,
+    pub credential_endpoint: Option<Sensitive<String>>,
+    pub legacy_factory: Option<LegacyBackendFactory>,
+    pub initialize_legacy_on_startup: bool,
+}
+
+impl From<Vec<BucketConfig>> for BackendResolverConfig {
+    fn from(buckets: Vec<BucketConfig>) -> Self {
+        Self {
+            buckets,
+            ..Self::default()
+        }
+    }
+}
+
 enum LegacyBackend {
     Ready(Arc<dyn BackendStore>),
     Lazy {
@@ -109,6 +128,13 @@ struct DynamicBackends {
     pending: HashMap<ConfigKey, Arc<PendingBackend>>,
 }
 
+struct IamBrokerRoutes {
+    endpoint: Sensitive<String>,
+    defaults: BucketConfig,
+    buckets: Option<HashMap<String, BucketConfig>>,
+    backends: Arc<RwLock<DynamicBackends>>,
+}
+
 /// Static routes and normalized request configurations for one cloud family.
 pub struct DefaultBackendResolver {
     backend: Backend,
@@ -116,6 +142,7 @@ pub struct DefaultBackendResolver {
     dynamic: Arc<RwLock<DynamicBackends>>,
     defaults: DynamicBackendDefaults,
     legacy: Option<LegacyBackend>,
+    iam_broker: Option<IamBrokerRoutes>,
     origin_http: Arc<dyn HttpClient>,
     exchange_http: Arc<dyn HttpClient>,
     observer: Arc<dyn CredentialsObserver>,
@@ -135,6 +162,7 @@ impl DefaultBackendResolver {
             dynamic: Arc::new(RwLock::new(DynamicBackends::default())),
             defaults: DynamicBackendDefaults::default(),
             legacy: None,
+            iam_broker: None,
             origin_http,
             exchange_http,
             observer,
@@ -159,26 +187,62 @@ impl DefaultBackendResolver {
         self
     }
 
-    /// Validate every explicit route before the first credential acquisition.
+    /// Resolve the startup configuration and initialize the selected static backends.
     pub async fn from_configs(
         backend: Backend,
-        configs: Vec<BucketConfig>,
+        configs: impl Into<BackendResolverConfig>,
         origin_http: Arc<dyn HttpClient>,
         exchange_http: Arc<dyn HttpClient>,
         observer: Arc<dyn CredentialsObserver>,
     ) -> std::result::Result<Self, String> {
-        if configs.is_empty() {
-            return Err("backend router requires at least one bucket".into());
-        }
-        let mut names = HashSet::with_capacity(configs.len());
-        let mut prepared = Vec::with_capacity(configs.len());
-        for config in configs {
+        let configs = configs.into();
+        let mut names = HashSet::with_capacity(configs.buckets.len());
+        for config in &configs.buckets {
             if !names.insert(config.name.clone()) {
                 return Err(format!("duplicate bucket {:?}", config.name));
             }
-            prepared.push(RouteBuildConfig::new(backend, config)?);
         }
-        let mut resolver = Self::new(backend, origin_http, exchange_http, observer);
+        let mut resolver = Self::new(backend, origin_http, exchange_http, observer)
+            .with_dynamic_defaults(DynamicBackendDefaults {
+                s3_path_style: configs.defaults.s3_path_style,
+            });
+        if let Some(endpoint) = configs.credential_endpoint {
+            for config in &configs.buckets {
+                config
+                    .validate_addressing(backend)
+                    .map_err(|error| error.to_string())?;
+            }
+            resolver.iam_broker = Some(IamBrokerRoutes {
+                endpoint,
+                defaults: configs.defaults,
+                buckets: (!configs.buckets.is_empty()).then(|| {
+                    configs
+                        .buckets
+                        .into_iter()
+                        .map(|bucket| (bucket.name.clone(), bucket))
+                        .collect()
+                }),
+                backends: Arc::default(),
+            });
+            return Ok(resolver);
+        }
+        if configs.buckets.is_empty() {
+            if let Some(factory) = configs.legacy_factory {
+                resolver = if configs.initialize_legacy_on_startup {
+                    resolver.with_legacy_backend(factory().await?)
+                } else {
+                    resolver.with_legacy_factory(factory)
+                };
+            }
+            return Ok(resolver);
+        }
+
+        // Validate every static route before the first credential acquisition.
+        let prepared = configs
+            .buckets
+            .into_iter()
+            .map(|config| RouteBuildConfig::new(backend, config))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         for config in prepared {
             let name = config.bucket.clone();
             let store = config
@@ -193,13 +257,27 @@ impl DefaultBackendResolver {
         Ok(resolver)
     }
 
-    fn prepare_dynamic(&self, request: &RouteRequest<'_>) -> Result<RouteBuildConfig> {
+    fn prepare_dynamic(&self, request: &RouteRequest<'_>) -> Result<Option<RouteBuildConfig>> {
+        let Some(broker) = request.broker else {
+            return Ok(None);
+        };
+        let worker_url = self
+            .iam_broker
+            .as_ref()
+            .map(|iam| iam.endpoint.expose().as_str());
+        let Some(url) = broker.url_with_default(worker_url) else {
+            return Ok(None);
+        };
         if request.backend != self.backend {
             return Err(Error::Backend(
                 "backend is not configured in this router".into(),
             ));
         }
-        let mut broker = request.broker.expect("dynamic request").clone();
+        let mut broker = BrokerConfig {
+            url: url.to_owned(),
+            request: broker.request.clone(),
+            origin: broker.origin.clone(),
+        };
         if !broker.request.is_object() {
             return Err(Error::Backend(
                 "broker request must be a JSON object".into(),
@@ -218,19 +296,22 @@ impl DefaultBackendResolver {
         let (origin, reserved_origin) =
             BackendBuildConfig::dynamic(self.backend, broker, &self.defaults)
                 .map_err(Error::Backend)?;
-        Ok(RouteBuildConfig {
+        Ok(Some(RouteBuildConfig {
             bucket: request.bucket.to_owned(),
             origin,
             reserved_origin,
-        })
+        }))
     }
 
-    async fn resolve_dynamic(&self, request: &RouteRequest<'_>) -> Result<ResolvedBackend> {
-        let prepared = self.prepare_dynamic(request)?;
+    async fn resolve_broker(
+        &self,
+        prepared: RouteBuildConfig,
+        backends: &Arc<RwLock<DynamicBackends>>,
+    ) -> Result<ResolvedBackend> {
         let key = prepared.key();
         let scope = key.access_scope()?;
         let pending = {
-            let dynamic = self.dynamic.read().unwrap();
+            let dynamic = backends.read().unwrap();
             if let Some(store) = dynamic.stores.get(&key) {
                 return Ok(ResolvedBackend {
                     scope: Some(scope),
@@ -244,7 +325,7 @@ impl DefaultBackendResolver {
         } else {
             // Another caller may have registered or completed this key since
             // the read lock was released. Recheck before reserving capacity.
-            let mut dynamic = self.dynamic.write().unwrap();
+            let mut dynamic = backends.write().unwrap();
             if let Some(store) = dynamic.stores.get(&key) {
                 return Ok(ResolvedBackend {
                     scope: Some(scope),
@@ -261,13 +342,13 @@ impl DefaultBackendResolver {
                 }
                 let pending = Arc::new(PendingBackend::default());
                 dynamic.pending.insert(key.clone(), pending.clone());
-                let registry = self.dynamic.clone();
+                let registry = backends.clone();
                 let slot = pending.clone();
                 let origin_http = self.origin_http.clone();
                 let exchange_http = self.exchange_http.clone();
                 let observer = self.observer.clone();
                 let backend = self.backend;
-                let bucket = request.bucket.to_owned();
+                let bucket = prepared.bucket.clone();
                 // The registry owns bounded construction, independent of the
                 // initiating RPC. Cancellation cannot strand an occupied slot.
                 tokio::spawn(async move {
@@ -326,6 +407,10 @@ impl DefaultBackendResolver {
 impl BackendResolver for DefaultBackendResolver {
     fn ready_for_background(&self) -> bool {
         !self.static_routes.is_empty()
+            || self
+                .iam_broker
+                .as_ref()
+                .is_some_and(|iam| !iam.backends.read().unwrap().stores.is_empty())
             || match &self.legacy {
                 Some(LegacyBackend::Ready(_)) => true,
                 Some(LegacyBackend::Lazy { store, .. }) => store.get().is_some(),
@@ -339,8 +424,20 @@ impl BackendResolver for DefaultBackendResolver {
                 "backend is not configured in this router".into(),
             ));
         }
-        if request.broker.is_some() {
-            return self.prepare_dynamic(request).map(|_| ());
+        if self.prepare_dynamic(request)?.is_some() {
+            return Ok(());
+        }
+        if let Some(iam) = &self.iam_broker {
+            if iam
+                .buckets
+                .as_ref()
+                .is_some_and(|buckets| !buckets.contains_key(request.bucket))
+            {
+                return Err(Error::Backend(
+                    "bucket is not configured in this router".into(),
+                ));
+            }
+            return validate_bucket_name(request.bucket).map_err(Error::Backend);
         }
         if self.static_routes.contains_key(request.bucket) || self.legacy.is_some() {
             Ok(())
@@ -363,11 +460,49 @@ impl BackendResolver for DefaultBackendResolver {
         Ok(())
     }
 
+    // Request Broker URL?
+    // +-- yes -> Request URL + request Broker parameters
+    // `-- no  -> Worker credential_endpoint?
+    //            +-- no  -> Existing Worker credentials
+    //            `-- yes -> Request Broker parameters?
+    //                       +-- yes -> Worker URL + request parameters (credentialType)
+    //                       `-- no  -> Worker URL + generated Pod IAM parameters (csp from backend)
     async fn resolve(&self, request: &RouteRequest<'_>) -> Result<ResolvedBackend> {
-        if request.broker.is_some() {
-            return self.resolve_dynamic(request).await;
+        // Bind request parameters to a cache scope using the effective Broker URL.
+        if let Some(prepared) = self.prepare_dynamic(request)? {
+            return self.resolve_broker(prepared, &self.dynamic).await;
         }
         self.validate(request)?;
+        if let Some(iam) = &self.iam_broker {
+            // Bucket entries supply the origin settings. The Broker's Pod IAM
+            // identity supplies the credentials for this default route.
+            let origin = iam
+                .buckets
+                .as_ref()
+                .and_then(|buckets| buckets.get(request.bucket))
+                .unwrap_or(&iam.defaults);
+            let mut config = BucketConfig {
+                name: request.bucket.to_owned(),
+                credentials_source: "broker".into(),
+                s3_region: origin.s3_region.clone(),
+                s3_endpoint: origin.s3_endpoint.clone(),
+                s3_path_style: origin.s3_path_style,
+                gcs_endpoint: origin.gcs_endpoint.clone(),
+                azure_account: origin.azure_account.clone(),
+                azure_endpoint: origin.azure_endpoint.clone(),
+                credential_broker_url: Some(iam.endpoint.clone()),
+                credential_broker_timeout_ms: origin
+                    .credential_broker_timeout_ms
+                    .or(iam.defaults.credential_broker_timeout_ms),
+                ..Default::default()
+            };
+            config.credential_broker_request =
+                Some(broker::build_iam_request_body(self.backend, &config).into());
+            let prepared = RouteBuildConfig::new(self.backend, config).map_err(Error::Backend)?;
+            return self.resolve_broker(prepared, &iam.backends).await;
+        }
+        // Bucket stores are ready at startup. Implicit global IAM discovery
+        // starts on the first request that needs the legacy backend.
         let store = if let Some(store) = self.static_routes.get(request.bucket) {
             store.clone()
         } else {
@@ -464,22 +599,24 @@ impl RouteBuildConfig {
         };
         let validation = OriginValidation::Routed;
         let origin = match backend {
-            Backend::S3 => BackendBuildConfig::S3(S3Origin::prepare(S3OriginInput {
-                region: config.s3_region.expect("validated S3 region"),
-                endpoint: config.s3_endpoint,
-                path_style: config.s3_path_style.unwrap_or(false),
-                use_ssl: None,
-                validation,
-                keys: config
-                    .s3_access_key_id
-                    .zip(config.s3_secret_access_key)
-                    .map(|(access_key_id, secret)| S3Credentials {
-                        access_key_id,
-                        secret_access_key: secret.expose().clone(),
-                        session_token: config.s3_session_token.map(|v| v.expose().clone()),
-                    }),
-                credentials: options,
-            })?),
+            Backend::S3 | Backend::Ali | Backend::Tc => {
+                BackendBuildConfig::S3(S3Origin::prepare(S3OriginInput {
+                    region: config.s3_region.expect("validated S3 region"),
+                    endpoint: config.s3_endpoint,
+                    path_style: config.s3_path_style.unwrap_or(false),
+                    use_ssl: None,
+                    validation,
+                    keys: config
+                        .s3_access_key_id
+                        .zip(config.s3_secret_access_key)
+                        .map(|(access_key_id, secret)| S3Credentials {
+                            access_key_id,
+                            secret_access_key: secret.expose().clone(),
+                            session_token: config.s3_session_token.map(|v| v.expose().clone()),
+                        }),
+                    credentials: options,
+                })?)
+            }
             Backend::Gcs => BackendBuildConfig::Gcs(GcsOrigin::prepare(GcsOriginInput {
                 endpoint: config.gcs_endpoint,
                 use_ssl: None,
@@ -774,7 +911,7 @@ mod identity_tests {
             bucket: "bucket",
             broker: Some(&broker),
         };
-        let key = resolver.prepare_dynamic(&request).unwrap().key();
+        let key = resolver.prepare_dynamic(&request).unwrap().unwrap().key();
         for cached in [true, false] {
             {
                 let mut dynamic = resolver.dynamic.write().unwrap();
@@ -836,7 +973,7 @@ mod identity_tests {
                 Arc::new(crate::NoopObserver),
             );
             let endpoint = match backend {
-                Backend::S3 => "s3.us-west-2.amazonaws.com",
+                Backend::S3 | Backend::Ali | Backend::Tc => "s3.us-west-2.amazonaws.com",
                 Backend::Gcs => "storage.googleapis.com",
                 Backend::Azure => "account.blob.core.windows.net",
             };
@@ -856,6 +993,7 @@ mod identity_tests {
                         bucket: "bucket",
                         broker: Some(broker),
                     })
+                    .unwrap()
                     .unwrap()
                     .key()
                     .0

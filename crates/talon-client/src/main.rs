@@ -46,7 +46,8 @@ struct Args {
         talon_core::NamespaceContext::new(name).map(|_| name.to_owned())
     })]
     namespace: String,
-    /// Request property KEY=JSON; credential_broker requires url, request and origin.endpoint.
+    /// Request property KEY=JSON. credential_broker requires request and origin.endpoint.
+    /// An omitted or empty url uses the worker's credential endpoint when configured.
     /// S3 providers also require origin.region for request signing.
     #[arg(long = "request-option", global = true)]
     request_options: Vec<String>,

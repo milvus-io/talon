@@ -9,6 +9,7 @@ use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use serde_json::Value;
+use talon_core::{Backend, BucketConfig};
 
 use crate::credentials::{
     CredentialsFetch, CredentialsObserver, ProvideBearerToken, ProvideS3Credentials,
@@ -89,6 +90,24 @@ const ENV_REQUEST_TIMEOUT_MS: &str = "TALON_CREDENTIAL_BROKER_TIMEOUT_MS";
 const MAX_IAM_REGION_LEN: usize = 63;
 const AZURE_ACCOUNT_NAME_LENGTH: std::ops::RangeInclusive<usize> = 3..=24;
 const AZURE_CONTAINER_NAME_LENGTH: std::ops::RangeInclusive<usize> = 3..=63;
+
+/// Build the IAM request body from the worker's storage settings.
+pub(crate) fn build_iam_request_body(backend: Backend, bucket: &BucketConfig) -> Value {
+    let s3_request = |csp| serde_json::json!({(FIELD_CSP): csp, (FIELD_REGION): bucket.s3_region});
+    let mut request = match backend {
+        Backend::S3 => s3_request(CSP_AWS),
+        Backend::Ali => s3_request(CSP_ALI),
+        Backend::Tc => s3_request(CSP_TC),
+        Backend::Gcs => serde_json::json!({(FIELD_CSP): CSP_GCP}),
+        Backend::Azure => serde_json::json!({
+            (FIELD_CSP): CSP_AZURE,
+            (FIELD_AZURE_ACCOUNT_NAME): bucket.azure_account,
+            (FIELD_BUCKET): bucket.name,
+        }),
+    };
+    request[FIELD_CREDENTIAL_TYPE] = CREDENTIAL_TYPE_IAM.into();
+    request
+}
 
 /// Validated exchange state; origin options are consumed by origin preparation.
 #[derive(Clone, PartialEq, Eq)]

@@ -123,6 +123,51 @@ credentials' hard expiry so an alert can fire before it passes.
 
 ## Cloud Credential Broker
 
+Set `endpoint` in the Worker TOML's `[broker]` table or use
+`TALON_WORKER_CREDENTIAL_ENDPOINT` to configure the Broker URL for requests
+without their own Broker URL. Supply the full URL of the independent Broker's
+`assume-role` API.
+
+```toml
+backend = "s3"
+
+[broker]
+endpoint = "https://broker.example/v1/credentials/assume-role"
+timeout_ms = 3000
+s3_region = "us-west-2"
+```
+
+The top-level `credential_endpoint` and `credential_broker_timeout_ms` settings
+are accepted as aliases. A value in `[broker]` takes precedence over its alias
+within the file. The endpoint and timeout environment variables override these
+file settings.
+
+The Worker uses `credential_broker.url` when supplied. A descriptor with Broker
+parameters can omit `url` or set it to an empty string to use the configured
+endpoint. The request's `credentialType` selects the credential mode. With no
+Broker URL available, the Worker uses its existing credential configuration.
+
+With a configured endpoint and no request Broker parameters, the Worker sends
+`credentialType = "iam"` and selects `csp` from the top-level `backend` setting.
+
+| Worker `backend` | Broker `csp` | Object URI scheme | Storage protocol |
+|---|---|---|---|
+| `s3` or `aws` | `aws` | `s3://` | S3 |
+| `ali` | `ali` | `ali://` | S3 (OSS) |
+| `tc` | `tc` | `tc://` | S3 (COS) |
+| `gcs` or `gcp` | `gcp` | `gcs://` | GCS |
+| `azure` or `az` | `azure` | `az://` | Azure Blob |
+
+Set `s3_region` for S3 and `azure_account` for Azure. The Azure IAM request
+also includes the requested container. OSS and COS require an explicit
+`s3_endpoint`. That endpoint can be a custom hostname or private address.
+For each connection field, an explicit bucket value takes precedence, then
+`[broker]`, then the Worker top level. The supported `[broker]` origin fields
+are `s3_region`, `s3_endpoint`, `s3_path_style`, `gcs_endpoint`, `azure_account`,
+and `azure_endpoint`.
+
+### Explicit Broker credentials
+
 The worker supports Broker credentials for S3, GCS and Azure. The S3/Azure
 gateway supports the same respective credential modes. Select Broker explicitly:
 
