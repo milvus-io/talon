@@ -209,7 +209,7 @@ fn start_worker(
     let config = root.path().join("worker.toml");
     let threshold = if small { 1 << 20 } else { 0 };
     let auth = if iam_endpoint {
-        format!("[broker]\nendpoint = \"http://{address}/worker-broker\"\ntimeout_ms = 3000\ns3_region = \"ap-beijing\"")
+        format!("[broker]\nbroker_endpoint = \"http://{address}/worker-broker\"\ntimeout_ms = 3000\ns3_region = \"ap-beijing\"")
     } else {
         format!(
             r#"

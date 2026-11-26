@@ -258,7 +258,7 @@ impl BucketConfig {
 #[serde(deny_unknown_fields)]
 pub struct BrokerConfig {
     /// Default Broker URL for requests without their own URL.
-    pub endpoint: Option<Sensitive<String>>,
+    pub broker_endpoint: Option<Sensitive<String>>,
     /// Per-attempt credential exchange timeout in milliseconds.
     pub timeout_ms: Option<u64>,
     pub s3_region: Option<String>,
@@ -1104,9 +1104,9 @@ impl Patch for WorkerConfigPatch {
                 ..BrokerConfig::default()
             }),
             credential_endpoint: broker
-                .endpoint
+                .broker_endpoint
                 .or(self.credential_endpoint)
-                .or(base_broker.endpoint)
+                .or(base_broker.broker_endpoint)
                 .or(base.credential_endpoint),
             credential_broker_url: self.credential_broker_url.or(base.credential_broker_url),
             credential_broker_timeout_ms: broker
@@ -1515,7 +1515,7 @@ pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
     },
     ConfigVar {
         env: worker_env::CREDENTIAL_ENDPOINT,
-        key: "broker.endpoint",
+        key: "broker.broker_endpoint",
         default: None,
         cli: false,
         secret: false,
@@ -2119,7 +2119,8 @@ impl WorkerConfig {
             self.resolved_broker()?;
             crate::request::validate_broker_url(endpoint.expose()).map_err(|_| {
                 Error::Other(
-                    "credential_endpoint must be a full HTTP(S) URL without userinfo or fragment"
+                    "[broker].broker_endpoint (credential_endpoint) must be a full HTTP(S) URL \
+                     without userinfo or fragment"
                         .into(),
                 )
             })?;
@@ -3402,7 +3403,7 @@ s3_endpoint = "https://storage.example"
 s3_path_style = false
 
 [broker]
-endpoint = "https://broker.example/exchange"
+broker_endpoint = "https://broker.example/exchange"
 timeout_ms = 17
 s3_region = "ap-beijing"
 s3_path_style = true
@@ -3454,7 +3455,7 @@ azure_account = "workeraccount"
 azure_endpoint = "https://storage.example"
 
 [broker]
-endpoint = "https://broker.example/exchange"
+broker_endpoint = "https://broker.example/exchange"
 azure_account = "brokeraccount"
 
 [[buckets]]
@@ -3746,7 +3747,7 @@ tenant = "example"
         for input in [
             format!("credential_endpoint = '{file_url}'\ncredential_broker_timeout_ms = 17"),
             format!(
-                "credential_endpoint = 'https://legacy-broker.example/exchange'\ncredential_broker_timeout_ms = 12\n[broker]\nendpoint = '{file_url}'\ntimeout_ms = 17"
+                "credential_endpoint = 'https://legacy-broker.example/exchange'\ncredential_broker_timeout_ms = 12\n[broker]\nbroker_endpoint = '{file_url}'\ntimeout_ms = 17"
             ),
         ] {
             let file = WorkerConfigPatch::from_toml(&input).unwrap();
@@ -3766,18 +3767,18 @@ tenant = "example"
                 .is_none());
         }
 
-        assert!(
-            WorkerConfigPatch::from_toml("[[broker]]\nendpoint = 'https://broker.example/'")
-                .is_err()
-        );
+        assert!(WorkerConfigPatch::from_toml(
+            "[[broker]]\nbroker_endpoint = 'https://broker.example/'"
+        )
+        .is_err());
         let invalid = WorkerConfigPatch::from_toml(
-            "[broker]\nendpoint = 'https://private-marker@broker.example/exchange'",
+            "[broker]\nbroker_endpoint = 'https://private-marker@broker.example/exchange'",
         )
         .unwrap();
         let error = WorkerConfig::resolve(invalid, Default::default(), Default::default())
             .unwrap_err()
             .to_string();
-        assert!(error.contains("credential_endpoint"));
+        assert!(error.contains("[broker].broker_endpoint"));
         assert!(!error.contains("private-marker"));
     }
 

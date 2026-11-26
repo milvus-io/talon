@@ -806,7 +806,7 @@ Azure SAS token; env-only, never from a config file or logged.
 - **CLI flag:** not settable via CLI (config file or environment only)
 - **Secret:** read only from the environment; never written to a config file or logged
 
-### `broker.endpoint`
+### `broker.broker_endpoint`
 
 Full HTTP(S) Broker URL for requests without their own Broker URL. Requests without Broker parameters use Pod IAM. Accepts the top-level credential_endpoint alias. Requires a worker restart to change.
 

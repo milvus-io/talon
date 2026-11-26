@@ -27,7 +27,7 @@ s3_path_style = false
 # Requests without Broker parameters use Broker Pod IAM when this is set.
 # The bucket entries then supply the allowlist and source storage settings.
 # [broker]
-# endpoint = "https://broker.example/v1/credentials/assume-role"
+# broker_endpoint = "https://broker.example/v1/credentials/assume-role"
 # Timeout in milliseconds for one Broker attempt. Initial Pod IAM acquisition
 # can make up to four attempts with backoff between them.
 # timeout_ms = 3000

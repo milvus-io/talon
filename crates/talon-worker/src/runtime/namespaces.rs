@@ -1138,7 +1138,7 @@ mod tests {
 "paged_miss_run_concurrency" = 2
 "namespaces" = { "a" = { "page_tti_hours" = 1 } }
 [broker]
-endpoint = "https://broker.example/exchange?token=private-marker"
+broker_endpoint = "https://broker.example/exchange?token=private-marker"
 timeout_ms = 17
 azure_account = "brokeraccount"
 "#,

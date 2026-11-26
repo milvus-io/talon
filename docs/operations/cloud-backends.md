@@ -123,7 +123,7 @@ credentials' hard expiry so an alert can fire before it passes.
 
 ## Cloud Credential Broker
 
-Set `endpoint` in the Worker TOML's `[broker]` table or use
+Set `broker_endpoint` in the Worker TOML's `[broker]` table or use
 `TALON_WORKER_CREDENTIAL_ENDPOINT` to configure the Broker URL for requests
 without their own Broker URL. Supply the full URL of the independent Broker's
 `assume-role` API.
@@ -132,7 +132,7 @@ without their own Broker URL. Supply the full URL of the independent Broker's
 backend = "s3"
 
 [broker]
-endpoint = "https://broker.example/v1/credentials/assume-role"
+broker_endpoint = "https://broker.example/v1/credentials/assume-role"
 timeout_ms = 3000
 s3_region = "us-west-2"
 ```

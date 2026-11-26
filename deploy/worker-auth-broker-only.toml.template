@@ -17,7 +17,7 @@ cache_dirs = ["./talon-cache"]
 backend = "s3"
 
 [broker]
-endpoint = "https://broker.example/v1/credentials/assume-role"
+broker_endpoint = "https://broker.example/v1/credentials/assume-role"
 # Timeout in milliseconds for one Broker attempt. Initial Pod IAM acquisition
 # can make up to four attempts with backoff between them.
 timeout_ms = 3000
