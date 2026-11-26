@@ -11,6 +11,7 @@ use axum::{
     response::{IntoResponse, Response},
     Router,
 };
+use sha2::{Digest, Sha256};
 use talon_core::{Backend, ObjectId, Version};
 use talon_transport::{codec, data, ControlMessage, DataErrorCode, Flags, FrameHeader, HEADER_LEN};
 use tokio::{
@@ -46,12 +47,13 @@ async fn origin(State(state): State<Fixture>, request: Request) -> Response {
     if path == "/metadata/identity/oauth2/token" {
         return axum::Json(serde_json::json!({"access_token":"iam-token","expires_on":"4102444800","token_type":"Bearer","resource":"https://storage.azure.com/"})).into_response();
     }
-    if matches!(path.as_str(), "/broker" | "/worker-broker") && request.method() == Method::POST {
+    let worker_broker = matches!(path.as_str(), "/worker-broker" | "/worker-broker-b");
+    if (path == "/broker" || worker_broker) && request.method() == Method::POST {
         let body = axum::body::to_bytes(request.into_body(), 4096)
             .await
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let worker_iam = path == "/worker-broker" && body["credentialType"] == "iam";
+        let worker_iam = worker_broker && body["credentialType"] == "iam";
         let generated_iam = worker_iam && body.get("bucket").is_none();
         if worker_iam {
             let expected = if generated_iam {
@@ -73,6 +75,12 @@ async fn origin(State(state): State<Fixture>, request: Request) -> Response {
             }
         }
         let (csp, ak, sk, token) = match (state.backend, path.as_str(), worker_iam) {
+            (Backend::Tc, "/worker-broker-b", true) => (
+                "tc",
+                "RELOADED_B",
+                "secret-reloaded",
+                "reloaded-broker-session",
+            ),
             (Backend::Tc, "/worker-broker", true) => (
                 if generated_iam { "tc" } else { "aws" },
                 "IAM_B",
@@ -96,10 +104,10 @@ async fn origin(State(state): State<Fixture>, request: Request) -> Response {
     } else {
         "/"
     };
-    let Some(bucket) = path
-        .strip_prefix(prefix)
-        .and_then(|p| p.strip_suffix("/same-key"))
-    else {
+    let Some(bucket) = path.strip_prefix(prefix).and_then(|p| {
+        p.strip_suffix("/same-key")
+            .or_else(|| p.strip_suffix("/reloaded-key"))
+    }) else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let auth = request
@@ -111,7 +119,11 @@ async fn origin(State(state): State<Fixture>, request: Request) -> Response {
         .headers()
         .get("x-amz-security-token")
         .and_then(|v| v.to_str().ok());
-    let iam_broker = auth.contains("Credential=IAM_B/") && token == Some("iam-broker-session");
+    let iam_broker = if path.ends_with("/reloaded-key") {
+        auth.contains("Credential=RELOADED_B/") && token == Some("reloaded-broker-session")
+    } else {
+        auth.contains("Credential=IAM_B/") && token == Some("iam-broker-session")
+    };
     let assumed_role = auth.contains("Credential=ASSUME_B/") && token == Some("assume-session");
     let valid = match (state.backend, bucket) {
         (Backend::S3, "bucket-a") => auth.contains("Credential=STATIC_A/") && token.is_none(),
@@ -252,10 +264,13 @@ cache_dirs = [{}]
     )
     .unwrap();
     let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_talon-worker"));
+    command.env_clear();
+    if iam_endpoint {
+        command.env("TALON_WORKER_CONFIG", &config);
+    } else {
+        command.arg("--config").arg(&config);
+    }
     command
-        .arg("--config")
-        .arg(&config)
-        .env_clear()
         .env("TALON_ZONE", "test-zone")
         .env("RUST_LOG", "off")
         .env("TALON_WORKER_FORCE_TOKIO_DATA_PLANE", "1")
@@ -412,6 +427,47 @@ async fn worker_routing(backend: Backend, small: bool, iam_endpoint: bool) {
                 "/worker-broker", "/bucket-b/same-key", "/bucket-b/same-key",
                 "/worker-broker", "/bucket-b/same-key", "/bucket-b/same-key",
                 "/worker-broker", "/bucket-b/same-key", "/bucket-b/same-key",
+            ]);
+
+            // Finish all business requests before replacing the watched file.
+            let calls_before_reload = state.calls.lock().unwrap().len();
+            let config = root.path().join("worker.toml");
+            let updated = std::fs::read_to_string(&config).unwrap()
+                .replace("/worker-broker\"", "/worker-broker-b\"");
+            let next_config = config.with_extension("next");
+            std::fs::write(&next_config, &updated).unwrap();
+            std::fs::rename(next_config, config).unwrap();
+            let hash = format!("{:x}", Sha256::digest(updated.as_bytes()));
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let mut status = TcpStream::connect(admin).await.unwrap();
+                    status.write_all(b"GET /api/v1/config HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").await.unwrap();
+                    let mut response = String::new();
+                    status.read_to_string(&mut response).await.unwrap();
+                    assert!(response.starts_with("HTTP/1.1 200 OK"));
+                    let (_, body) = response.split_once("\r\n\r\n").unwrap();
+                    let config: serde_json::Value = serde_json::from_str(body).unwrap();
+                    assert!(config["last_error"].is_null(), "{config}");
+                    if config["observed_hash"] == hash {
+                        assert_eq!(config["applied_hash"], hash);
+                        assert_eq!(config["restart_required"], false);
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }).await.expect("Worker did not apply the new Broker endpoint");
+            assert_eq!(state.calls.lock().unwrap().len(), calls_before_reload);
+
+            let cold = data::encode_request(2, &data::RangeRequest {
+                object: ObjectId::new(backend, "bucket-b", "reloaded-key"),
+                offset: 0,
+                len: 8,
+            }).unwrap();
+            let (header, body) = exchange(&mut stream, &cold).await;
+            assert!(!header.flags.contains(Flags::ERROR), "read after reload failed: {:?}", data::decode_error_payload(&body));
+            assert_eq!(body, b"worker-b");
+            assert_eq!(&state.calls.lock().unwrap()[calls_before_reload..], [
+                "/worker-broker-b", "/bucket-b/reloaded-key", "/bucket-b/reloaded-key",
             ]);
             return;
         }

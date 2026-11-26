@@ -705,8 +705,64 @@ async fn explicit_broker_bypasses_configured_iam_even_when_iam_exchange_fails() 
 }
 
 #[tokio::test]
+async fn configured_iam_route_switches_broker_url_while_an_exchange_is_in_flight() {
+    let old = "https://broker-a.example/exchange";
+    let new = "https://broker-b.example/exchange";
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let http = Arc::new(Http {
+        gate: Some(gate.clone()),
+        ..Default::default()
+    });
+    let resolver = DefaultBackendResolver::from_configs(
+        Backend::S3,
+        BackendResolverConfig {
+            credential_endpoint: Some(old.to_owned().into()),
+            defaults: talon_core::BucketConfig {
+                s3_region: Some("us-west-2".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        http.clone(),
+        http.clone(),
+        Arc::new(NoopObserver),
+    )
+    .await
+    .unwrap();
+    let endpoint = resolver.broker_endpoint().unwrap();
+    let router = Arc::new(BackendRouter::new(Backend::S3, Arc::new(resolver)));
+    let object = ObjectId::new(Backend::S3, "bucket", "key");
+    let first = tokio::spawn({
+        let router = router.clone();
+        let object = object.clone();
+        async move { router.head(&object).await.unwrap() }
+    });
+    let wait_for_exchanges = |count| {
+        let requests = &http.requests;
+        tokio::time::timeout(Duration::from_secs(2), async move {
+            while requests.lock().unwrap().len() < count {
+                tokio::task::yield_now().await;
+            }
+        })
+    };
+    wait_for_exchanges(1).await.unwrap();
+    endpoint.store(Arc::new(new.to_owned().into()));
+    let (second, ()) = tokio::join!(router.head(&object), async {
+        wait_for_exchanges(2).await.unwrap();
+        gate.add_permits(2);
+    });
+    second.unwrap();
+    first.await.unwrap();
+
+    let requests = http.requests.lock().unwrap();
+    assert_eq!(requests[0].url, old);
+    assert_eq!(requests[1].url, new);
+}
+
+#[tokio::test]
 async fn oss_and_cos_target_roles_use_request_or_worker_broker_url() {
     let worker_url = "https://worker-broker.example/exchange";
+    let reloaded_url = "https://reloaded-broker.example/exchange";
     let request_url = "https://request-broker.example/exchange";
     for (backend, csp, region, role_arn) in [
         (
@@ -735,7 +791,9 @@ async fn oss_and_cos_target_roles_use_request_or_worker_broker_url() {
         )
         .await
         .unwrap();
+        let endpoint = resolver.broker_endpoint().unwrap();
         let router = BackendRouter::new(backend, Arc::new(resolver));
+        endpoint.store(Arc::new(reloaded_url.to_owned().into()));
         let object = ObjectId::new(backend, "bucket", "key");
         let target_role = json!({
             "csp": csp, "region": region, "roleArn": role_arn,
@@ -773,7 +831,7 @@ async fn oss_and_cos_target_roles_use_request_or_worker_broker_url() {
         assert_eq!(requests.len(), 4);
         let mut expected = target_role;
         expected["bucket"] = "bucket".into();
-        for (exchange, url) in requests.chunks_exact(2).zip([worker_url, request_url]) {
+        for (exchange, url) in requests.chunks_exact(2).zip([reloaded_url, request_url]) {
             assert_eq!(exchange[0].url, url);
             assert_eq!(
                 serde_json::from_slice::<serde_json::Value>(&exchange[0].body).unwrap(),

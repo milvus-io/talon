@@ -916,6 +916,7 @@ async fn run_worker(
     .with_dynamic_defaults(talon_backend::DynamicBackendDefaults {
         s3_path_style: cfg.s3_path_style,
     });
+    let broker_endpoint = resolver.broker_endpoint();
     let backend: Arc<dyn BackendStore> = Arc::new(talon_backend::BackendRouter::new(
         backend_type,
         Arc::new(resolver),
@@ -934,7 +935,8 @@ async fn run_worker(
     let worker = Arc::new(runtime);
     observability.attach_namespace_runtime(&worker);
     let mut state =
-        talon_worker::dynamic_config::DynamicConfig::new(startup_config, config_env, config_cli);
+        talon_worker::dynamic_config::DynamicConfig::new(startup_config, config_env, config_cli)
+            .with_broker_endpoint(broker_endpoint);
     observability.set_config_reload_status(state.status());
     let config_reload = if let Some(path) = std::env::var_os("TALON_WORKER_CONFIG") {
         let path = PathBuf::from(path);
