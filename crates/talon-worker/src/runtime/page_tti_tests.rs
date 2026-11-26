@@ -1498,7 +1498,8 @@ fn maintenance_rate_waits_release_blocking_threads_and_survive_caller_cancellati
                                         .starts_with(crate::page_access_shard::TEMP_PREFIX)
                                 })
                         } else {
-                            worker.page_mutations.active_count() > 0 && budget.charged_deletes() == 2
+                            worker.page_mutations.active_count() > 0
+                                && budget.charged_deletes() == 2
                         };
                         if waiting {
                             break;
