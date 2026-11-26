@@ -808,7 +808,7 @@ Azure SAS token; env-only, never from a config file or logged.
 
 ### `broker.broker_endpoint`
 
-Full HTTP(S) Broker URL for requests without their own Broker URL. Requests without Broker parameters use Pod IAM. Accepts the top-level credential_endpoint alias. Requires a worker restart to change.
+Full HTTP(S) Broker URL for requests without their own Broker URL. Requests without Broker parameters use Pod IAM. Accepts the top-level credential_endpoint alias. A watched Worker config can replace an existing URL. Enabling or disabling the default Broker requires a restart.
 
 - **Environment variable:** `TALON_WORKER_CREDENTIAL_ENDPOINT`
 - **Default:** none

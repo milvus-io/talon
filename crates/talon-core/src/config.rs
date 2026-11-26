@@ -1519,7 +1519,7 @@ pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
         default: None,
         cli: false,
         secret: false,
-        help: "Full HTTP(S) Broker URL for requests without their own Broker URL. Requests without Broker parameters use Pod IAM. Accepts the top-level credential_endpoint alias. Requires a worker restart to change.",
+        help: "Full HTTP(S) Broker URL for requests without their own Broker URL. Requests without Broker parameters use Pod IAM. Accepts the top-level credential_endpoint alias. A watched Worker config can replace an existing URL. Enabling or disabling the default Broker requires a restart.",
     },
     ConfigVar {
         env: worker_env::CREDENTIAL_BROKER_TIMEOUT_MS,

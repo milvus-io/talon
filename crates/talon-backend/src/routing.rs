@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{future::BoxFuture, FutureExt};
@@ -128,8 +129,11 @@ struct DynamicBackends {
     pending: HashMap<ConfigKey, Arc<PendingBackend>>,
 }
 
+/// The active URL for a default Broker route enabled at startup.
+pub type SharedBrokerEndpoint = Arc<ArcSwap<Sensitive<String>>>;
+
 struct IamBrokerRoutes {
-    endpoint: Sensitive<String>,
+    endpoint: SharedBrokerEndpoint,
     defaults: BucketConfig,
     buckets: Option<HashMap<String, BucketConfig>>,
     backends: Arc<RwLock<DynamicBackends>>,
@@ -174,6 +178,11 @@ impl DefaultBackendResolver {
         self
     }
 
+    /// Share the active URL with the Worker configuration reloader.
+    pub fn broker_endpoint(&self) -> Option<SharedBrokerEndpoint> {
+        self.iam_broker.as_ref().map(|iam| iam.endpoint.clone())
+    }
+
     pub fn with_legacy_backend(mut self, store: Arc<dyn BackendStore>) -> Self {
         self.legacy = Some(LegacyBackend::Ready(store));
         self
@@ -213,7 +222,7 @@ impl DefaultBackendResolver {
                     .map_err(|error| error.to_string())?;
             }
             resolver.iam_broker = Some(IamBrokerRoutes {
-                endpoint,
+                endpoint: Arc::new(ArcSwap::from_pointee(endpoint)),
                 defaults: configs.defaults,
                 buckets: (!configs.buckets.is_empty()).then(|| {
                     configs
@@ -261,10 +270,14 @@ impl DefaultBackendResolver {
         let Some(broker) = request.broker else {
             return Ok(None);
         };
-        let worker_url = self
+        let worker_endpoint = self
             .iam_broker
             .as_ref()
-            .map(|iam| iam.endpoint.expose().as_str());
+            .filter(|_| broker.url.is_empty())
+            .map(|iam| iam.endpoint.load_full());
+        let worker_url = worker_endpoint
+            .as_deref()
+            .map(|endpoint| endpoint.expose().as_str());
         let Some(url) = broker.url_with_default(worker_url) else {
             return Ok(None);
         };
@@ -490,7 +503,7 @@ impl BackendResolver for DefaultBackendResolver {
                 gcs_endpoint: origin.gcs_endpoint.clone(),
                 azure_account: origin.azure_account.clone(),
                 azure_endpoint: origin.azure_endpoint.clone(),
-                credential_broker_url: Some(iam.endpoint.clone()),
+                credential_broker_url: Some(iam.endpoint.load().as_ref().clone()),
                 credential_broker_timeout_ms: origin
                     .credential_broker_timeout_ms
                     .or(iam.defaults.credential_broker_timeout_ms),
