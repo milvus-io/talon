@@ -274,6 +274,7 @@ struct State {
     last_flush: Instant,
 }
 
+#[derive(Clone, Copy)]
 struct CopiedRecord {
     old_offset: u64,
     new_offset: u64,

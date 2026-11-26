@@ -282,13 +282,17 @@ impl Directory {
         records: &mut Vec<super::CopiedRecord>,
     ) -> Vec<super::CopiedRecord> {
         let catalog = self.catalog.0.read().unwrap();
-        records
-            .extract_if(.., |record| {
-                !catalog
-                    .at((old, record.old_offset))
-                    .is_some_and(|slot| catalog.lookup.flags(slot) & VISIBLE != 0)
-            })
-            .collect()
+        let mut stale = Vec::new();
+        records.retain(|record| {
+            let visible = catalog
+                .at((old, record.old_offset))
+                .is_some_and(|slot| catalog.lookup.flags(slot) & VISIBLE != 0);
+            if !visible {
+                stale.push(*record);
+            }
+            visible
+        });
+        stale
     }
 
     pub(super) fn replace_segment(&mut self, old: u64, replacement: Option<&super::StagedSegment>) {
