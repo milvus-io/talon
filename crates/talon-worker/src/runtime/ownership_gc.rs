@@ -959,7 +959,7 @@ mod tests {
                     .unlink_small_gc(candidate.clone(), revision, Some(membership.clone()))
                     .await;
                 assert!(worker.membership_is_current(&membership));
-                assert!(state.gate.lock().now_or_never().is_some());
+                assert!(state.lock().now_or_never().is_some());
                 assert_eq!(worker.page_gc_io.available_permits(), gc_permits);
                 assert_eq!(budget.available_io(), io_permits);
             });
@@ -1002,7 +1002,7 @@ mod tests {
                     .unlink_small_gc(candidate.clone(), revision, Some(membership.clone()))
                     .await;
                 assert!(worker.membership_is_current(&membership));
-                assert!(state.gate.lock().now_or_never().is_some());
+                assert!(state.lock().now_or_never().is_some());
                 assert_eq!(worker.page_gc_io.available_permits(), gc_permits);
                 assert_eq!(budget.available_io(), io_permits);
             });

@@ -128,7 +128,7 @@ async fn two_protected_namespaces_respect_retry_deadlines() {
     // Delay completion of the second scan to stagger the two retry deadlines.
     fill(&other, &blocker).await;
     let state = other.page_lifecycle.block(&blocker);
-    let gate = state.gate.lock().await;
+    let gate = state.lock().await;
     let first_pin = worker
         .lru
         .pin_guard(crate::CacheUnit::Whole(misplaced.clone()))
