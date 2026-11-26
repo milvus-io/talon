@@ -146,9 +146,11 @@ async fn two_protected_namespaces_respect_retry_deadlines() {
     tokio::time::pause();
     let started = tokio::time::Instant::now();
     let service = WorkerBackground::start(worker.clone(), &config);
+    // The second namespace has registered both its pinned row and the first
+    // attempt blocked on the gate.
     drive_scheduler_until(|| {
         first.ownership_retry_count() == 1
-            && second.ownership_retry_count() == 1
+            && second.ownership_retry_count() == 2
             && other.page_mutations.active_count() == 1
     })
     .await;

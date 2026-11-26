@@ -328,26 +328,22 @@ impl OwnershipGc {
                 return;
             }
             if pass.attempt.is_none() {
-                let Some(candidate) = pass.pending.pop_front() else {
+                let Some(mut candidate) = pass.pending.pop_front() else {
                     if pass.scan_done {
                         let retries = small.has_ownership_retries(pass.limit);
                         self.finish_round(view, retries);
                     }
                     return;
                 };
-                match candidate.observe_ownership(limit.epoch) {
-                    Some(revision) => pass.attempt = Some((candidate, revision, false)),
-                    None => {
-                        small.defer_ownership(&candidate, limit);
-                        continue;
-                    }
-                }
+                let Some(revision) = candidate.observe_ownership(limit.epoch) else {
+                    continue;
+                };
+                pass.attempt = Some((candidate, revision, false));
             }
             let (candidate, revision, paid) = pass.attempt.as_mut().unwrap();
             if !*paid {
                 if !candidate.ticket.gc_is_current(*revision) {
-                    let (candidate, _, _) = pass.attempt.take().unwrap();
-                    small.defer_ownership(&candidate, limit);
+                    pass.attempt = None;
                     continue;
                 }
                 if let Some(budget) = &worker.background_budget {
@@ -365,8 +361,7 @@ impl OwnershipGc {
             worker
                 .unlink_small_gc(candidate.clone(), *revision, Some(renewed))
                 .await;
-            let (candidate, _, _) = pass.attempt.take().unwrap();
-            small.defer_ownership(&candidate, limit);
+            pass.attempt = None;
             if started.elapsed() >= Duration::from_millis(10) {
                 return;
             }
@@ -671,6 +666,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn packed_ownership_first_attempt_is_revoked_by_immutable_put() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut worker, fixture) = namespace_runtime(root.path(), false);
+        let budget = crate::background::BackgroundBudget::new(&WorkerConfig {
+            background_delete_max_per_sec: 1,
+            background_io_max_mb_per_sec: 0,
+            ..Default::default()
+        });
+        Arc::get_mut(&mut worker).unwrap().background_budget = Some(budget.clone());
+        let payload = Bytes::from_static(b"packed");
+        let put = talon_transport::data::CachedBlockPutRequest {
+            block: packed_placed("b", 0),
+            object_len: payload.len() as u64,
+            body_len: payload.len() as u64,
+        };
+        worker
+            .admit_cached_block(&put, payload.clone())
+            .await
+            .unwrap();
+        let small = worker.small.as_ref().unwrap();
+        let mut gc = fixture.gc(&worker);
+        let generation = worker.membership_snapshot().unwrap().generation;
+        tokio::time::pause();
+        gc.run_slice(&worker).await;
+        {
+            let round = gc.run_round(&worker);
+            tokio::pin!(round);
+            assert!(futures::poll!(&mut round).is_pending());
+            assert_eq!(budget.charged_deletes(), 1);
+            assert_eq!(worker.page_gc_metrics.ownership_attempted.get(), 0);
+            worker
+                .admit_cached_block(&put, payload.clone())
+                .await
+                .unwrap();
+            tokio::time::advance(Duration::from_secs(2)).await;
+            round.await;
+        }
+
+        assert_eq!(worker.page_gc_metrics.ownership_attempted.get(), 1);
+        assert_eq!(
+            small.ownership_retry_count(),
+            0,
+            "the PUT revoked this work"
+        );
+        assert_eq!(gc.completed_generation, generation);
+        assert!(gc.pass.is_none());
+        assert_eq!(
+            small.read(&put.block).await.unwrap().as_ref(),
+            Some(&payload)
+        );
+    }
+
+    #[tokio::test]
     async fn packed_ownership_retry_does_not_reregister_after_immutable_put() {
         let root = tempfile::tempdir().unwrap();
         let (mut worker, fixture) = namespace_runtime(root.path(), false);
@@ -760,9 +808,10 @@ mod tests {
         let limit = membership.scan_limits[&worker.cache_identity]
             .small
             .unwrap();
+        drop(small.take_superseded_retries(limit));
         let (_, mut candidates) =
             small.ownership_candidates(&mut OwnershipCursor::default(), 0, limit, 64, |_| false);
-        let candidate = candidates.pop().unwrap();
+        let mut candidate = candidates.pop().unwrap();
         let revision = candidate.observe_ownership(limit.epoch).unwrap();
         let state = worker.page_lifecycle.block(&id);
         let gc_permits = worker.page_gc_io.available_permits();
@@ -784,6 +833,48 @@ mod tests {
         });
         assert!(small.contains(&id));
         // The same watch and membership can authorize once the writer releases.
+        worker
+            .unlink_small_gc(candidate, revision, Some(membership))
+            .await;
+        assert!(!small.contains(&id));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn packed_ownership_unlink_defers_while_identity_registry_is_held() {
+        let root = tempfile::tempdir().unwrap();
+        let (worker, fixture) = namespace_runtime(root.path(), false);
+        let id = packed_placed("b", 0);
+        let small = worker.small.as_ref().unwrap();
+        small.put(&id, Bytes::from_static(b"packed")).await.unwrap();
+        fixture.publish(&worker);
+        let membership = worker.membership_snapshot().unwrap();
+        let limit = membership.scan_limits[&worker.cache_identity]
+            .small
+            .unwrap();
+        drop(small.take_superseded_retries(limit));
+        let (_, mut candidates) =
+            small.ownership_candidates(&mut OwnershipCursor::default(), 0, limit, 64, |_| false);
+        let mut candidate = candidates.pop().unwrap();
+        let revision = candidate.observe_ownership(limit.epoch).unwrap();
+        let state = worker.page_lifecycle.block(&id);
+        let gc_permits = worker.page_gc_io.available_permits();
+        let budget = worker.background_budget.as_ref().unwrap();
+        let io_permits = budget.available_io();
+        let handle = tokio::runtime::Handle::current();
+        small.under_mutation_registry(|| {
+            use futures::FutureExt;
+            handle.block_on(async {
+                assert!(worker.membership_is_current(&membership));
+                worker
+                    .unlink_small_gc(candidate.clone(), revision, Some(membership.clone()))
+                    .await;
+                assert!(worker.membership_is_current(&membership));
+                assert!(state.gate.lock().now_or_never().is_some());
+                assert_eq!(worker.page_gc_io.available_permits(), gc_permits);
+                assert_eq!(budget.available_io(), io_permits);
+            });
+        });
+        assert!(small.contains(&id));
         worker
             .unlink_small_gc(candidate, revision, Some(membership))
             .await;
@@ -997,7 +1088,7 @@ mod tests {
         let old = view.scan_limits[&worker.cache_identity].small.unwrap();
         let (_, candidates) =
             small.ownership_candidates(&mut OwnershipCursor::default(), 0, old, 64, |_| false);
-        let old_candidate = candidates
+        let mut old_candidate = candidates
             .into_iter()
             .find(|candidate| candidate.unit.block() == &id)
             .unwrap();
@@ -1009,7 +1100,7 @@ mod tests {
         let detached = small.take_superseded_retries(new).unwrap();
         assert!(worker.membership.try_lock().is_ok());
         assert!(small.take_superseded_retries(old).is_none());
-        small.defer_ownership(&old_candidate, old);
+        assert!(old_candidate.observe_ownership(old.epoch).is_none());
         assert_eq!(small.ownership_retry_count(), 0);
         drop(detached);
         drop(pin);

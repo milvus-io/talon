@@ -197,12 +197,16 @@ impl SmallObjectStore {
         None
     }
 
-    async fn mutation(&self, id: &(impl SmallStoreKey + ?Sized)) -> InFlightGuard {
-        let key = if id.exact_range() {
+    fn mutation_key(id: &(impl SmallStoreKey + ?Sized)) -> LoadKey {
+        if id.exact_range() {
             LoadKey::ExactRange(id.block().clone())
         } else {
             LoadKey::Whole(id.block().clone())
-        };
+        }
+    }
+
+    async fn mutation(&self, id: &(impl SmallStoreKey + ?Sized)) -> InFlightGuard {
+        let key = Self::mutation_key(id);
         loop {
             if let Some(guard) = self.mutations.admit_owned(key.clone()) {
                 return guard;
@@ -343,6 +347,11 @@ impl SmallObjectStore {
     }
 
     #[cfg(test)]
+    pub(crate) fn under_mutation_registry<T: Send>(&self, work: impl FnOnce() -> T + Send) -> T {
+        self.mutations.under_registry_lock(work)
+    }
+
+    #[cfg(test)]
     pub(crate) fn fail_next_delete_after_journal(&self, id: &BlockId) {
         self.owner(id)
             .unwrap()
@@ -386,9 +395,12 @@ impl SmallObjectStore {
         let store = self.clone();
         self.tasks
             .run(async move {
-                let Some(_guard) =
-                    crate::runtime::before_deadline(deadline, store.mutation(&id)).await
-                else {
+                let guard = if deadline.is_some() {
+                    store.mutations.try_admit_owned(Self::mutation_key(&id))
+                } else {
+                    Some(store.mutation(&id).await)
+                };
+                let Some(_guard) = guard else {
                     return Ok(false);
                 };
                 let owner = if deadline.is_some() {
