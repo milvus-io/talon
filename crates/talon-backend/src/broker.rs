@@ -29,7 +29,7 @@ pub(crate) const FIELD_REGION: &str = "region";
 pub(crate) const FIELD_BUCKET: &str = "bucket";
 const FIELD_DURATION_SECONDS: &str = "durationSeconds";
 
-// AWS target-role parameters; ignored when the Broker uses its own IAM identity.
+// S3 target-role parameters; ignored when the Broker uses its own IAM identity.
 const FIELD_ROLE_ARN: &str = "roleArn";
 const FIELD_EXTERNAL_ID: &str = "externalId";
 
@@ -87,7 +87,7 @@ const MIN_STS_DURATION_SECONDS: i64 = 900;
 const ENV_REQUEST_TIMEOUT_MS: &str = "TALON_CREDENTIAL_BROKER_TIMEOUT_MS";
 
 // Provider-specific identifier lengths checked before credential acquisition.
-const MAX_IAM_REGION_LEN: usize = 63;
+const MAX_BROKER_REGION_LEN: usize = 63;
 const AZURE_ACCOUNT_NAME_LENGTH: std::ops::RangeInclusive<usize> = 3..=24;
 const AZURE_CONTAINER_NAME_LENGTH: std::ops::RangeInclusive<usize> = 3..=63;
 
@@ -294,16 +294,7 @@ pub(crate) fn normalize_config(
         let min_duration = match requested_csp.as_str() {
             CSP_AWS | CSP_ALI | CSP_TC | CSP_HWC => {
                 let region = required_string(&request, FIELD_REGION)?;
-                if region.len() > MAX_IAM_REGION_LEN
-                    || !region.as_bytes()[0].is_ascii_lowercase()
-                    || !region.contains('-')
-                    || !region.split('-').all(|part| {
-                        !part.is_empty()
-                            && part
-                                .bytes()
-                                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
-                    })
-                {
+                if !valid_broker_region(region) {
                     return Err("broker IAM requires a valid region".into());
                 }
                 if matches!(requested_csp.as_str(), CSP_AWS | CSP_ALI) {
@@ -351,25 +342,35 @@ pub(crate) fn normalize_config(
         }
         duration
     } else {
-        if requested_csp != expected_csp {
-            return Err("broker request csp does not match selected backend".into());
+        let csp = requested_csp.as_str();
+        // OSS and COS share S3 validation and keep their CSP in the request.
+        match (expected_csp, csp) {
+            (CSP_AWS, CSP_ALI | CSP_TC) => {}
+            (backend, requested) if backend == requested => {}
+            _ => return Err("broker request csp does not match selected backend".into()),
         }
+        let duration = match (csp, raw_duration) {
+            (CSP_ALI | CSP_TC, value) if value < 0 => {
+                return Err("broker target role durationSeconds must not be negative".into());
+            }
+            (_, value) if value <= 0 => DEFAULT_DURATION_SECONDS,
+            (_, value) => value,
+        };
         // All spellings of the target-identity mode retain the legacy cache key.
         request
             .as_object_mut()
             .unwrap()
             .remove(FIELD_CREDENTIAL_TYPE);
-        let duration = if raw_duration <= 0 {
-            DEFAULT_DURATION_SECONDS
-        } else {
-            raw_duration
-        };
-        match requested_csp.as_str() {
-            CSP_AWS => {
-                required_string(&request, FIELD_REGION)?;
+        match csp {
+            CSP_AWS | CSP_ALI | CSP_TC => {
+                let region = required_string(&request, FIELD_REGION)?;
+                if csp != CSP_AWS && !valid_broker_region(region) {
+                    return Err("broker target role requires a valid region".into());
+                }
                 required_string(&request, FIELD_ROLE_ARN)?;
                 if !(MIN_STS_DURATION_SECONDS..=MAX_DURATION_SECONDS).contains(&duration) {
-                    return Err(format!("broker AWS durationSeconds must be in {MIN_STS_DURATION_SECONDS}..{MAX_DURATION_SECONDS}"));
+                    let provider = csp.to_ascii_uppercase();
+                    return Err(format!("broker {provider} durationSeconds must be in {MIN_STS_DURATION_SECONDS}..{MAX_DURATION_SECONDS}"));
                 }
             }
             CSP_GCP => {
@@ -408,6 +409,21 @@ pub(crate) fn normalize_config(
                 .unwrap_or(talon_core::BROKER_REQUEST_TIMEOUT_MS),
         ),
     })
+}
+
+fn valid_broker_region(region: &str) -> bool {
+    region.len() <= MAX_BROKER_REGION_LEN
+        && region
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_lowercase)
+        && region.contains('-')
+        && region.split('-').all(|part| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        })
 }
 
 fn required_string<'a>(value: &'a Value, field: &str) -> Result<&'a str, String> {
@@ -1243,13 +1259,50 @@ mod tests {
             normalize_config(&config, "aws", None).is_err(),
             "missing target identity must never select Pod IAM implicitly"
         );
-        for csp in ["ali", "tc", "hwc"] {
-            let mut config = baseline.clone();
-            config.request["csp"] = csp.into();
-            assert!(
-                normalize_config(&config, "aws", None).is_err(),
-                "legacy Broker mode only supports AWS S3 credentials"
-            );
+        let mut obs = baseline;
+        obs.request["csp"] = "hwc".into();
+        assert!(normalize_config(&obs, "aws", None).is_err());
+    }
+
+    #[test]
+    fn broker_oss_and_cos_target_roles_validate_required_fields_and_duration() {
+        for (csp, region, role_arn) in [
+            (
+                "ali",
+                "cn-hangzhou",
+                "acs:ram::1234567890123456:role/example",
+            ),
+            (
+                "tc",
+                "ap-beijing",
+                "qcs::cam::uin/123456789012:roleName/example",
+            ),
+        ] {
+            let mut config = options(serde_json::json!({
+                "csp": csp, "region": region, "roleArn": role_arn,
+            }))
+            .broker
+            .unwrap();
+            assert!(normalize_config(&config, "gcp", None).is_err());
+            for (duration, valid) in [
+                (-1, false),
+                (0, true),
+                (899, false),
+                (900, true),
+                (3600, true),
+                (3601, false),
+            ] {
+                config.request["durationSeconds"] = duration.into();
+                assert_eq!(normalize_config(&config, "aws", None).is_ok(), valid);
+            }
+            config.request["durationSeconds"] = 900.into();
+            for field in ["region", "roleArn"] {
+                let mut invalid = config.clone();
+                invalid.request.as_object_mut().unwrap().remove(field);
+                assert!(normalize_config(&invalid, "aws", None).is_err());
+            }
+            config.request["region"] = "not/a/region".into();
+            assert!(normalize_config(&config, "aws", None).is_err());
         }
     }
 

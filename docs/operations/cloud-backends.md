@@ -168,7 +168,7 @@ and `azure_endpoint`.
 
 ### Explicit Broker credentials
 
-The worker supports Broker credentials for S3, GCS and Azure. The S3/Azure
+The worker supports Broker credentials for S3, OSS, COS, GCS and Azure. The S3/Azure
 gateway supports the same respective credential modes. Select Broker explicitly:
 
 ```sh
@@ -185,7 +185,7 @@ Required request fields and resulting authentication are:
 
 | Backend | Required request JSON fields | Credential mapping |
 |---|---|---|
-| S3 | `csp: "aws"`, `region`, `roleArn` | `tempAk` / `tempSk` sign SigV4; `sessionToken` sets the signed session header |
+| S3, OSS, COS | `csp` set to `aws`, `ali`, or `tc`, plus `region` and `roleArn` | `tempAk` and `tempSk` sign SigV4, and `sessionToken` sets the signed session header |
 | GCS | `csp: "gcp"`, `gcpServiceAccountEmail` | `sessionToken` is an OAuth bearer token |
 | Azure | `csp: "azure"`, `region`, `bucket`, `azureClientId`, `azureTenantId`, `azureAccountName` | `tempAk` must match the configured account; `sessionToken` is a SAS query |
 
@@ -199,8 +199,16 @@ For example, GCS and Azure request JSON can use these placeholder identities:
 {"csp":"azure","region":"eastus","bucket":"example-container","azureClientId":"00000000-0000-0000-0000-000000000001","azureTenantId":"00000000-0000-0000-0000-000000000002","azureAccountName":"exampleaccount","cluster":"example-cluster"}
 ```
 
-`durationSeconds` omitted or nonpositive becomes 3600. AWS requires an effective
-value from 900 through 3600. Additional server-supported fields, including
+For OSS and COS, provide an explicit origin endpoint and signing region. Use
+`credentialType = "stsAssumeRole"` or omit it to select target-role credentials.
+Example role identifiers are `acs:ram::1234567890123456:role/talon-reader` for
+OSS and `qcs::cam::uin/123456789012:roleName/talon-reader` for COS. Include
+`externalId` if required by the target role.
+
+An omitted or zero `durationSeconds` defaults to 3600. AWS, GCS, and Azure also
+use the default for negative values. OSS and COS require a nonnegative value.
+AWS, OSS, and COS require an effective duration from 900 through 3600 seconds.
+Additional server-supported fields, including
 `cluster`, are forwarded unchanged. Azure request/response accounts must both
 match `TALON_WORKER_AZURE_ACCOUNT` or `TALON_GATEWAY_AZURE_ACCOUNT`. Its `bucket`
 is the single container for which the Broker issues the SAS; configure the

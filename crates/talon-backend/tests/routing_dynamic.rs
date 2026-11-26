@@ -705,6 +705,91 @@ async fn explicit_broker_bypasses_configured_iam_even_when_iam_exchange_fails() 
 }
 
 #[tokio::test]
+async fn oss_and_cos_target_roles_use_request_or_worker_broker_url() {
+    let worker_url = "https://worker-broker.example/exchange";
+    let request_url = "https://request-broker.example/exchange";
+    for (backend, csp, region, role_arn) in [
+        (
+            Backend::Ali,
+            "ali",
+            "cn-hangzhou",
+            "acs:ram::1234567890123456:role/example",
+        ),
+        (
+            Backend::Tc,
+            "tc",
+            "ap-beijing",
+            "qcs::cam::uin/123456789012:roleName/example",
+        ),
+    ] {
+        let http = Arc::new(Http::default());
+        let resolver = DefaultBackendResolver::from_configs(
+            backend,
+            BackendResolverConfig {
+                credential_endpoint: Some(worker_url.to_owned().into()),
+                ..Default::default()
+            },
+            http.clone(),
+            http.clone(),
+            Arc::new(NoopObserver),
+        )
+        .await
+        .unwrap();
+        let router = BackendRouter::new(backend, Arc::new(resolver));
+        let object = ObjectId::new(backend, "bucket", "key");
+        let target_role = json!({
+            "csp": csp, "region": region, "roleArn": role_arn,
+            "externalId": "example-external-id", "durationSeconds": 900,
+        });
+        let mut broker = BrokerConfig {
+            url: String::new(),
+            request: target_role.clone(),
+            origin: Some(talon_core::OriginOptions {
+                region: Some(region.into()),
+                ..origin_options("https://private-origin.example")
+            }),
+        };
+        let inherited = router
+            .bind_request(backend, "bucket", &broker)
+            .await
+            .unwrap();
+        inherited.store.head(&object).await.unwrap();
+
+        broker.request["credentialType"] = "stsAssumeRole".into();
+        let same_mode = router
+            .bind_request(backend, "bucket", &broker)
+            .await
+            .unwrap();
+        assert_eq!(same_mode.scope, inherited.scope);
+
+        broker.url = request_url.into();
+        let explicit = router
+            .bind_request(backend, "bucket", &broker)
+            .await
+            .unwrap();
+        explicit.store.head(&object).await.unwrap();
+
+        let requests = http.requests.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        let mut expected = target_role;
+        expected["bucket"] = "bucket".into();
+        for (exchange, url) in requests.chunks_exact(2).zip([worker_url, request_url]) {
+            assert_eq!(exchange[0].url, url);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&exchange[0].body).unwrap(),
+                expected
+            );
+            assert_eq!(exchange[1].url, "https://bucket.private-origin.example/key");
+            assert_eq!(exchange[1].header("x-amz-security-token"), Some("token"));
+            assert!(exchange[1]
+                .header("authorization")
+                .unwrap()
+                .contains("Credential=access/"));
+        }
+    }
+}
+
+#[tokio::test]
 async fn pod_iam_s3_compatible_routes_require_an_explicit_origin_endpoint() {
     for (csp, region, endpoint) in [
         ("ali", "cn-hangzhou", "s3.oss-cn-hangzhou.aliyuncs.com"),
