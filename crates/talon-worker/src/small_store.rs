@@ -296,7 +296,19 @@ struct StagedSegment {
 struct PhysicalStats {
     published: SmallStoreStats,
     staging_allocated: u64,
+    // Already included in published or staging allocation.
+    pending_unlink: u64,
     retired: Vec<(Weak<OwnedFd>, u64)>,
+}
+
+impl PhysicalStats {
+    fn snapshot(&mut self) -> SmallStoreStats {
+        let mut stats = self.published;
+        self.retired.retain(|(fd, _)| fd.strong_count() > 0);
+        stats.retired_bytes = self.retired.iter().map(|(_, bytes)| bytes).sum();
+        stats.allocated_bytes += self.staging_allocated + stats.retired_bytes;
+        stats
+    }
 }
 
 /// One independently appended and sealed stream within a namespace/credential scope.
@@ -314,6 +326,8 @@ struct SegmentStore {
     reconcile_pause: Mutex<Option<Arc<tests::AppendPause>>>,
     #[cfg(test)]
     relocation_pause: Mutex<Option<Arc<tests::AppendPause>>>,
+    #[cfg(test)]
+    unlink_pause: Mutex<Option<Arc<tests::AppendPause>>>,
     #[cfg(test)]
     fail_delete_after_journal: std::sync::atomic::AtomicBool,
     slot: usize,
@@ -413,6 +427,8 @@ impl SegmentStore {
             reconcile_pause: Mutex::new(None),
             #[cfg(test)]
             relocation_pause: Mutex::new(None),
+            #[cfg(test)]
+            unlink_pause: Mutex::new(None),
             #[cfg(test)]
             fail_delete_after_journal: std::sync::atomic::AtomicBool::new(false),
             slot,
@@ -813,12 +829,7 @@ impl SegmentStore {
     }
 
     pub fn stats(&self) -> io::Result<SmallStoreStats> {
-        let mut cached = self.cached_stats.lock().unwrap();
-        let mut stats = cached.published;
-        cached.retired.retain(|(fd, _)| fd.strong_count() > 0);
-        stats.retired_bytes = cached.retired.iter().map(|(_, bytes)| bytes).sum();
-        stats.allocated_bytes += cached.staging_allocated + stats.retired_bytes;
-        Ok(stats)
+        Ok(self.cached_stats.lock().unwrap().snapshot())
     }
 
     fn restore_policy_units(
@@ -893,11 +904,12 @@ impl SegmentStore {
         }
         let result = self.compact(pressure, budget.as_deref()).await;
         if result.is_err() {
-            // Keep any uncommitted files and their charges until recovery. A
-            // failed durable acknowledgement can leave either version on disk.
+            // Keep unresolved allocations charged until recovery. Failed
+            // compaction no longer promises to unlink its files.
             let mut state = self.state.lock().await;
             state.compaction_deletes = None;
             state.poisoned = true;
+            self.cached_stats.lock().unwrap().pending_unlink = 0;
         }
         result
     }
@@ -1001,7 +1013,10 @@ impl SegmentStore {
         // the path goes away. Readers starting after this barrier see new locators.
         drop(self.readers.write().await);
         #[cfg(test)]
-        tests::crash("compact_before_unlink");
+        {
+            tests::crash("compact_before_unlink");
+            Self::pause_compaction(&self.unlink_pause).await;
+        }
         source.close_writers();
         let readers = source.file.fd.lock().await.clone();
         self.unlink_compacted_segment(old, budget).await?;
@@ -1009,12 +1024,15 @@ impl SegmentStore {
             let mut state = self.state.lock().await;
             state.allocated -= source.allocated;
             let mut cached = self.cached_stats.lock().unwrap();
+            cached.pending_unlink -= source.allocated;
             cached.retired.push((readers, source.allocated));
             cached.published = Self::snapshot_stats(&state);
         }
         if let Some(discarded) = staged {
             self.unlink_compacted_segment(discarded.id, budget).await?;
-            self.cached_stats.lock().unwrap().staging_allocated = 0;
+            let mut cached = self.cached_stats.lock().unwrap();
+            cached.pending_unlink = 0;
+            cached.staging_allocated = 0;
         }
         Ok(true)
     }
@@ -1173,6 +1191,7 @@ impl SegmentStore {
             state.segments.insert(new.id, new.segment);
             cached.staging_allocated = 0;
         }
+        cached.pending_unlink = source.allocated + cached.staging_allocated;
         cached.published = Self::snapshot_stats(state);
         Ok(source)
     }

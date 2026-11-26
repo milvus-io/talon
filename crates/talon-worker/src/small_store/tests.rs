@@ -417,7 +417,7 @@ async fn failed_source_delete_stops_compaction_and_clears_tracking() {
     );
 }
 
-async fn staged_compaction_id(store: &SegmentStore) -> u64 {
+pub(super) async fn staged_compaction_id(store: &SegmentStore) -> u64 {
     let state = store.state.lock().await;
     let catalog = store.journal.model.0.read().unwrap();
     *catalog
@@ -1310,9 +1310,9 @@ async fn failed_manifest_publication_poison_wakes_rotation_waiter() {
 }
 
 #[derive(Default)]
-pub(super) struct AppendPause {
-    pub(super) entered: tokio::sync::Notify,
-    pub(super) resume: tokio::sync::Notify,
+pub(crate) struct AppendPause {
+    pub(crate) entered: tokio::sync::Notify,
+    pub(crate) resume: tokio::sync::Notify,
 }
 
 #[tokio::test]

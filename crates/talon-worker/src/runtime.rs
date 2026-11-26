@@ -2769,14 +2769,7 @@ impl WorkerRuntime {
                 if total <= capacity {
                     break;
                 }
-                let other_credit = Self::other_small_reclaim_credit(&workers, worker).await;
-                let total: u64 = workers.iter().map(|worker| worker.resident_bytes()).sum();
-                if total <= capacity {
-                    break;
-                }
-                let target = worker
-                    .resident_bytes()
-                    .saturating_sub((total - capacity).saturating_sub(other_credit));
+                let target = Self::namespace_eviction_target(&workers, worker, capacity).await;
                 worker.evict_to_target(target).await;
             }
         } else {
@@ -2801,11 +2794,10 @@ impl WorkerRuntime {
         // Finish victim selection before relocation. Previously one compaction
         // per bounded batch could repeatedly copy the same surviving payloads.
         while attempted.len() < budget && self.resident_bytes() > target {
-            let credit = self.small_reclaim_credit().await;
             let missing = self
-                .resident_bytes()
-                .saturating_sub(target)
-                .saturating_sub(credit);
+                .resident_bytes_after_small_reclaim()
+                .await
+                .saturating_sub(target);
             if missing == 0 {
                 break;
             }
@@ -2845,22 +2837,30 @@ impl WorkerRuntime {
         }
     }
 
-    async fn other_small_reclaim_credit(workers: &[Arc<Self>], namespace: &Self) -> u64 {
-        let mut credit = 0;
+    async fn namespace_eviction_target(
+        workers: &[Arc<Self>],
+        namespace: &Self,
+        capacity: u64,
+    ) -> u64 {
+        let mut target = capacity;
         for worker in workers {
             if !std::ptr::eq(worker.as_ref(), namespace) {
-                credit += worker.small_reclaim_credit().await;
+                target = target.saturating_sub(worker.resident_bytes_after_small_reclaim().await);
             }
         }
-        credit
+        target
     }
 
-    async fn small_reclaim_credit(&self) -> u64 {
+    async fn resident_bytes_after_small_reclaim(&self) -> u64 {
+        let indexed = self.index.resident_bytes();
         match self.small.as_ref() {
             Some(small) => {
-                small.reclaimable_bytes().await + small.stats().map_or(0, |s| s.retired_bytes)
+                let usage = small.capacity_usage().await;
+                indexed
+                    .saturating_add(usage.allocated_bytes)
+                    .saturating_sub(usage.reclaim_credit)
             }
-            None => 0,
+            None => indexed,
         }
     }
 
@@ -2897,7 +2897,11 @@ impl WorkerRuntime {
             .as_ref()
             .and_then(|s| s.stats().ok())
             .is_some_and(|s| {
-                let excess = self.resident_bytes().saturating_sub(target);
+                let excess = self
+                    .index
+                    .resident_bytes()
+                    .saturating_add(s.allocated_bytes)
+                    .saturating_sub(target);
                 excess > 0 && s.retired_bytes >= excess
             })
     }
