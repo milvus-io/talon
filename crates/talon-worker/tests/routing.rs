@@ -46,16 +46,47 @@ async fn origin(State(state): State<Fixture>, request: Request) -> Response {
     if path == "/metadata/identity/oauth2/token" {
         return axum::Json(serde_json::json!({"access_token":"iam-token","expires_on":"4102444800","token_type":"Bearer","resource":"https://storage.azure.com/"})).into_response();
     }
-    if path == "/broker" && request.method() == Method::POST {
+    if matches!(path.as_str(), "/broker" | "/worker-broker") && request.method() == Method::POST {
         let body = axum::body::to_bytes(request.into_body(), 4096)
             .await
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["bucket"], "bucket-b");
-        let (csp, ak, sk, token) = match state.backend {
-            Backend::S3 => ("aws", "BROKER_B", "secret-b", "broker-session"),
-            Backend::Gcs => ("gcp", "", "", "broker-token"),
-            Backend::Azure => ("azure", "fixtureaccount", "", "sv=2026&sig=broker-token"),
+        let worker_iam = path == "/worker-broker" && body["credentialType"] == "iam";
+        let generated_iam = worker_iam && body.get("bucket").is_none();
+        if worker_iam {
+            let expected = if generated_iam {
+                serde_json::json!({
+                    "credentialType": "iam", "csp": "tc", "region": "ap-beijing", "durationSeconds": 3600
+                })
+            } else {
+                serde_json::json!({
+                    "credentialType": "iam", "csp": "aws", "region": "us-west-2", "bucket": "bucket-b", "durationSeconds": 1800
+                })
+            };
+            assert_eq!(body, expected);
+        } else {
+            assert_eq!(body["bucket"], "bucket-b");
+            if path == "/worker-broker" {
+                assert_eq!(body["roleArn"], "fixture-role-b");
+                assert_eq!(body["externalId"], "fixture-external-id");
+                assert!(body.get("credentialType").is_none());
+            }
+        }
+        let (csp, ak, sk, token) = match (state.backend, path.as_str(), worker_iam) {
+            (Backend::Tc, "/worker-broker", true) => (
+                if generated_iam { "tc" } else { "aws" },
+                "IAM_B",
+                "secret-iam",
+                "iam-broker-session",
+            ),
+            (Backend::Tc, "/worker-broker", false) => {
+                ("aws", "ASSUME_B", "secret-assume", "assume-session")
+            }
+            (Backend::S3 | Backend::Ali | Backend::Tc, _, _) => {
+                ("aws", "BROKER_B", "secret-b", "broker-session")
+            }
+            (Backend::Gcs, _, _) => ("gcp", "", "", "broker-token"),
+            (Backend::Azure, _, _) => ("azure", "fixtureaccount", "", "sv=2026&sig=broker-token"),
         };
         assert_eq!(body["csp"], csp);
         return axum::Json(serde_json::json!({"success":true,"credentials":{"tempAk":ak,"tempSk":sk,"sessionToken":token,"expiredAt":"2099-01-01T00:00:00Z"}})).into_response();
@@ -80,10 +111,14 @@ async fn origin(State(state): State<Fixture>, request: Request) -> Response {
         .headers()
         .get("x-amz-security-token")
         .and_then(|v| v.to_str().ok());
+    let iam_broker = auth.contains("Credential=IAM_B/") && token == Some("iam-broker-session");
+    let assumed_role = auth.contains("Credential=ASSUME_B/") && token == Some("assume-session");
     let valid = match (state.backend, bucket) {
         (Backend::S3, "bucket-a") => auth.contains("Credential=STATIC_A/") && token.is_none(),
-        (Backend::S3, "bucket-b") => {
-            auth.contains("Credential=BROKER_B/") && token == Some("broker-session")
+        (Backend::S3 | Backend::Tc, "bucket-b") => {
+            iam_broker
+                || assumed_role
+                || (auth.contains("Credential=BROKER_B/") && token == Some("broker-session"))
         }
         (Backend::S3, "bucket-c") => {
             auth.contains("Credential=IAM_C/") && token == Some("iam-session")
@@ -121,7 +156,14 @@ async fn origin(State(state): State<Fixture>, request: Request) -> Response {
                 ("content-range", "bytes 0-7/8"),
                 ("etag", "\"same-version\""),
             ],
-            bucket.to_owned(),
+            if iam_broker {
+                "worker-b"
+            } else if assumed_role {
+                "assume-b"
+            } else {
+                bucket
+            }
+            .to_owned(),
         )
             .into_response();
     }
@@ -141,6 +183,7 @@ async fn exchange(stream: &mut TcpStream, request: &[u8]) -> (FrameHeader, Vec<u
 fn start_worker(
     backend: Backend,
     small: bool,
+    iam_endpoint: bool,
     address: SocketAddr,
     coord_addr: SocketAddr,
     root: &tempfile::TempDir,
@@ -149,8 +192,13 @@ fn start_worker(
     let listen = reservation.local_addr().unwrap();
     let admin_reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let admin = admin_reservation.local_addr().unwrap();
+    let region = if iam_endpoint {
+        "ap-shanghai"
+    } else {
+        "us-west-2"
+    };
     let (storage, keys, broker_fields) = match backend {
-        Backend::S3 => (format!("backend = \"s3\"\ns3_region = \"us-west-2\"\ns3_endpoint = \"http://{address}\"\ns3_path_style = true"), "s3_access_key_id = \"STATIC_A\"\ns3_secret_access_key = \"secret-a\"", "csp = \"aws\"\nregion = \"us-west-2\"\nroleArn = \"fixture-role-b\""),
+        Backend::S3 | Backend::Ali | Backend::Tc => (format!("backend = \"{backend}\"\ns3_region = \"{region}\"\ns3_endpoint = \"http://{address}\"\ns3_path_style = true"), "s3_access_key_id = \"STATIC_A\"\ns3_secret_access_key = \"secret-a\"", "csp = \"aws\"\nregion = \"us-west-2\"\nroleArn = \"fixture-role-b\""),
         Backend::Gcs => (format!("backend = \"gcs\"\ngcs_endpoint = \"http://{address}\""), "gcs_access_key_id = \"HMAC_A\"\ngcs_secret_access_key = \"secret-a\"", "csp = \"gcp\"\ngcpServiceAccountEmail = \"b@example.iam.gserviceaccount.com\""),
         Backend::Azure => (format!("backend = \"azure\"\nazure_account = \"fixtureaccount\"\nazure_endpoint = \"http://{address}\""), "azure_shared_key = \"c2VjcmV0LWE=\"", "csp = \"azure\"\nregion = \"westus3\"\nazureClientId = \"client-b\"\nazureTenantId = \"tenant\"\nazureAccountName = \"fixtureaccount\""),
     };
@@ -160,19 +208,11 @@ fn start_worker(
         .collect::<String>();
     let config = root.path().join("worker.toml");
     let threshold = if small { 1 << 20 } else { 0 };
-    std::fs::write(
-        &config,
+    let auth = if iam_endpoint {
+        format!("[broker]\nbroker_endpoint = \"http://{address}/worker-broker\"\ntimeout_ms = 3000\ns3_region = \"ap-beijing\"")
+    } else {
         format!(
             r#"
-{storage}
-listen = "{listen}"
-admin_listen = "{admin}"
-coordinator = "{coord_addr}"
-heartbeat_interval_ms = 100
-ownership_gc_enabled = false
-small_object_threshold_bytes = {threshold}
-cache_dirs = [{}]
-
 [[buckets]]
 name = "bucket-a"
 credentials_source = "aksk"
@@ -189,6 +229,23 @@ credential_broker_request.durationSeconds = 3600
 [[buckets]]
 name = "bucket-c"
 credentials_source = "iam"
+"#
+        )
+    };
+    std::fs::write(
+        &config,
+        format!(
+            r#"
+{storage}
+listen = "{listen}"
+admin_listen = "{admin}"
+coordinator = "{coord_addr}"
+heartbeat_interval_ms = 100
+ownership_gc_enabled = false
+small_object_threshold_bytes = {threshold}
+cache_dirs = [{}]
+
+{auth}
 "#,
             serde_json::to_string(&root.path().join("cache")).unwrap()
         ),
@@ -224,7 +281,7 @@ credentials_source = "iam"
     (command.spawn().unwrap(), listen, admin)
 }
 
-async fn three_bucket_worker(backend: Backend, small: bool) {
+async fn worker_routing(backend: Backend, small: bool, iam_endpoint: bool) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let state = Fixture {
@@ -268,7 +325,7 @@ async fn three_bucket_worker(backend: Backend, small: bool) {
     });
     let root = tempfile::tempdir().unwrap();
     let (mut child, mut listen, mut admin) =
-        start_worker(backend, small, address, coord_addr, &root);
+        start_worker(backend, small, iam_endpoint, address, coord_addr, &root);
     tokio::time::timeout(Duration::from_secs(20), async {
         let mut stream = loop {
             if child.try_wait().unwrap().is_some() {
@@ -284,7 +341,7 @@ async fn three_bucket_worker(backend: Backend, small: bool) {
                 if error.trim() == format!("Error: {address_in_use}") {
                     state.calls.lock().unwrap().clear();
                     (child, listen, admin) =
-                        start_worker(backend, small, address, coord_addr, &root);
+                        start_worker(backend, small, iam_endpoint, address, coord_addr, &root);
                     continue;
                 }
                 panic!("worker failed to start: {error}");
@@ -297,9 +354,70 @@ async fn three_bucket_worker(backend: Backend, small: bool) {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
+        if iam_endpoint {
+            assert!(state.calls.lock().unwrap().is_empty());
+            let plain = data::encode_request(
+                1,
+                &data::RangeRequest {
+                    object: ObjectId::new(backend, "bucket-b", "same-key"),
+                    offset: 0,
+                    len: 8,
+                },
+            )
+            .unwrap();
+            let with_broker = |url, request| {
+                let mut frame = plain.clone();
+                talon_transport::envelope::encode_credential_broker(
+                    &mut frame,
+                    &talon_core::BrokerConfig {
+                        url,
+                        request,
+                        origin: Some(talon_core::OriginOptions {
+                            endpoint: Some(format!("http://{address}")),
+                            region: Some("us-west-2".into()),
+                            ..Default::default()
+                        }),
+                    },
+                )
+                .unwrap();
+                frame
+            };
+            let role = serde_json::json!({
+                "csp":"aws", "region":"us-west-2", "roleArn":"fixture-role-b",
+                "externalId":"fixture-external-id"
+            });
+            let explicit = with_broker(format!("http://{address}/broker"), role.clone());
+            let worker_role = with_broker(String::new(), role);
+            let worker_iam = with_broker(String::new(), serde_json::json!({
+                "csp":"aws", "region":"us-west-2", "credentialType":"iam", "durationSeconds":1800
+            }));
+            for (request, expected) in [
+                (&explicit, b"bucket-b"),
+                (&worker_role, b"assume-b"),
+                (&worker_iam, b"worker-b"),
+                (&plain, b"worker-b"),
+                (&worker_role, b"assume-b"),
+                (&plain, b"worker-b"),
+            ] {
+                let (header, body) = exchange(&mut stream, request).await;
+                assert!(
+                    !header.flags.contains(Flags::ERROR),
+                    "read failed: {:?}",
+                    data::decode_error_payload(&body)
+                );
+                assert_eq!(body, expected);
+            }
+            assert_eq!(*state.calls.lock().unwrap(), [
+                "/broker", "/bucket-b/same-key", "/bucket-b/same-key",
+                "/worker-broker", "/bucket-b/same-key", "/bucket-b/same-key",
+                "/worker-broker", "/bucket-b/same-key", "/bucket-b/same-key",
+                "/worker-broker", "/bucket-b/same-key", "/bucket-b/same-key",
+            ]);
+            return;
+        }
         for bucket in ["bucket-a", "bucket-b", "bucket-c"] {
             let object = ObjectId::new(backend, bucket, "same-key");
-            let request = data::encode_request(
+            let mut request = data::encode_request(
                 1,
                 &data::RangeRequest {
                     object: object.clone(),
@@ -308,6 +426,23 @@ async fn three_bucket_worker(backend: Backend, small: bool) {
                 },
             )
             .unwrap();
+            if backend == Backend::S3 && bucket == "bucket-a" {
+                talon_transport::envelope::encode_credential_broker(
+                    &mut request,
+                    &talon_core::BrokerConfig {
+                        url: String::new(),
+                        request: serde_json::json!({
+                            "csp":"aws", "region":"us-west-2", "roleArn":"unused-role"
+                        }),
+                        origin: Some(talon_core::OriginOptions {
+                            endpoint: Some("unused.example".into()),
+                            region: Some("us-west-2".into()),
+                            ..Default::default()
+                        }),
+                    },
+                )
+                .unwrap();
+            }
             loop {
                 let (header, body) = exchange(&mut stream, &request).await;
                 if header.flags.contains(Flags::ERROR) {
@@ -419,6 +554,9 @@ async fn three_bucket_worker(backend: Backend, small: bool) {
     child.wait().await.unwrap();
     server.abort();
     control.abort();
+    if iam_endpoint {
+        return;
+    }
     let calls = state.calls.lock().unwrap();
     for bucket in ["bucket-a", "bucket-b", "bucket-c"] {
         assert_eq!(
@@ -437,18 +575,23 @@ async fn three_bucket_worker(backend: Backend, small: bool) {
 #[tokio::test]
 async fn s3_worker_routes_mixed_bucket_credentials() {
     for small in [false, true] {
-        three_bucket_worker(Backend::S3, small).await;
+        worker_routing(Backend::S3, small, false).await;
     }
 }
 #[tokio::test]
 async fn gcs_worker_routes_mixed_bucket_credentials() {
     for small in [false, true] {
-        three_bucket_worker(Backend::Gcs, small).await;
+        worker_routing(Backend::Gcs, small, false).await;
     }
 }
 #[tokio::test]
 async fn azure_worker_routes_mixed_bucket_credentials() {
     for small in [false, true] {
-        three_bucket_worker(Backend::Azure, small).await;
+        worker_routing(Backend::Azure, small, false).await;
     }
+}
+
+#[tokio::test]
+async fn worker_routes_request_and_default_broker_credentials() {
+    worker_routing(Backend::Tc, false, true).await;
 }

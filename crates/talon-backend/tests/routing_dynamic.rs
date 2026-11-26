@@ -5,6 +5,7 @@ use std::time::SystemTime;
 
 use async_trait::async_trait;
 use serde_json::json;
+use talon_backend::routing::BackendResolverConfig;
 use talon_backend::{
     BackendRouter, BrokerConfig, DefaultBackendResolver, HttpClient, HttpRequest, HttpResponse,
     NoopObserver,
@@ -455,7 +456,9 @@ async fn pod_iam_bindings_reuse_configuration_without_sharing_assumed_role_scope
             origin: Some(talon_core::OriginOptions {
                 region: (backend == Backend::S3).then(|| "us-west-2".into()),
                 ..origin_options(match backend {
-                    Backend::S3 => "https://s3.us-west-2.amazonaws.com",
+                    Backend::S3 | Backend::Ali | Backend::Tc => {
+                        "https://s3.us-west-2.amazonaws.com"
+                    }
                     Backend::Gcs => "https://storage.googleapis.com",
                     Backend::Azure => "https://account.blob.core.windows.net",
                 })
@@ -544,6 +547,246 @@ credential_broker_request.credentialType = "iam"
     let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
     assert_eq!(body["credentialType"], "iam");
     assert_eq!(requests[1].header("authorization"), Some("Bearer token"));
+}
+
+#[tokio::test]
+async fn configured_iam_endpoint_uses_worker_addressing_and_reuses_credentials() {
+    for (backend, s3_region, s3_endpoint, body, url) in [
+        (
+            Backend::S3,
+            Some("us-west-2"),
+            None,
+            json!({"credentialType":"iam","csp":"aws","region":"us-west-2","durationSeconds":3600}),
+            "https://bucket.s3.us-west-2.amazonaws.com/key",
+        ),
+        (
+            Backend::S3,
+            Some("us-west-2"),
+            Some("https://cos.ap-beijing.myqcloud.com"),
+            json!({"credentialType":"iam","csp":"aws","region":"us-west-2","durationSeconds":3600}),
+            "https://bucket.cos.ap-beijing.myqcloud.com/key",
+        ),
+        (
+            Backend::Ali,
+            Some("cn-hangzhou"),
+            Some("https://storage.private.example"),
+            json!({"credentialType":"iam","csp":"ali","region":"cn-hangzhou","durationSeconds":3600}),
+            "https://bucket.storage.private.example/key",
+        ),
+        (
+            Backend::Tc,
+            Some("ap-beijing"),
+            Some("https://storage.private.example"),
+            json!({"credentialType":"iam","csp":"tc","region":"ap-beijing","durationSeconds":3600}),
+            "https://bucket.storage.private.example/key",
+        ),
+        (
+            Backend::Gcs,
+            None,
+            None,
+            json!({"credentialType":"iam","csp":"gcp","durationSeconds":3600}),
+            "https://storage.googleapis.com/bucket/key",
+        ),
+        (
+            Backend::Azure,
+            None,
+            None,
+            json!({"credentialType":"iam","csp":"azure","azureAccountName":"account","bucket":"bucket","durationSeconds":3600}),
+            "https://account.blob.core.windows.net/bucket/key?sv=2024-01-01&sig=token",
+        ),
+    ] {
+        let http = Arc::new(Http::default());
+        let endpoint = "https://iam-broker.example/v1/credentials/assume-role";
+        let resolver = DefaultBackendResolver::from_configs(
+            backend,
+            BackendResolverConfig {
+                credential_endpoint: Some(endpoint.to_owned().into()),
+                defaults: talon_core::BucketConfig {
+                    s3_region: s3_region.map(str::to_owned),
+                    s3_endpoint: s3_endpoint.map(str::to_owned),
+                    azure_account: Some("account".into()),
+                    ..Default::default()
+                },
+                legacy_factory: Some(Arc::new(|| {
+                    Box::pin(async { Err("legacy backend should not be initialized".into()) })
+                })),
+                initialize_legacy_on_startup: true,
+                ..Default::default()
+            },
+            http.clone(),
+            http.clone(),
+            Arc::new(NoopObserver),
+        )
+        .await
+        .unwrap();
+        let router = BackendRouter::new(backend, Arc::new(resolver));
+        assert!(!router.ready_for_background());
+        assert!(http.requests.lock().unwrap().is_empty());
+        let object = ObjectId::new(backend, "bucket", "key");
+        router.head(&object).await.unwrap();
+        router.head(&object).await.unwrap();
+        assert!(router.ready_for_background());
+        let requests = http.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0].url, endpoint);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&requests[0].body).unwrap(),
+            body
+        );
+        assert_eq!(requests[1].url, url);
+        match backend {
+            Backend::S3 | Backend::Ali | Backend::Tc => {
+                assert_eq!(requests[1].header("x-amz-security-token"), Some("token"));
+                assert!(requests[1]
+                    .header("authorization")
+                    .unwrap()
+                    .contains("Credential=access/"));
+            }
+            Backend::Gcs => assert_eq!(requests[1].header("authorization"), Some("Bearer token")),
+            Backend::Azure => assert!(requests[1].header("authorization").is_none()),
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn explicit_broker_bypasses_configured_iam_even_when_iam_exchange_fails() {
+    let http = Arc::new(Http::default());
+    let endpoint = "https://iam-broker.example/exchange";
+    let resolver = DefaultBackendResolver::from_configs(
+        Backend::S3,
+        BackendResolverConfig {
+            credential_endpoint: Some(endpoint.to_owned().into()),
+            buckets: vec![talon_core::BucketConfig {
+                name: "bucket".into(),
+                s3_region: Some("us-east-1".into()),
+                s3_endpoint: Some("https://configured-origin.example".into()),
+                s3_path_style: Some(true),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        http.clone(),
+        http.clone(),
+        Arc::new(NoopObserver),
+    )
+    .await
+    .unwrap();
+    let router = BackendRouter::new(Backend::S3, Arc::new(resolver));
+    let object = ObjectId::new(Backend::S3, "bucket", "key");
+    http.failures_remaining.store(4, Ordering::SeqCst);
+    assert!(router.head(&object).await.is_err());
+    assert!(router
+        .head(&ObjectId::new(Backend::S3, "other", "key"))
+        .await
+        .is_err());
+    assert!(!router.ready_for_background());
+
+    let explicit = aws();
+    let bound = router
+        .bind_request(Backend::S3, "bucket", &explicit)
+        .await
+        .unwrap();
+    assert!(bound.scope.is_some());
+    bound.store.head(&object).await.unwrap();
+    assert!(!router.ready_for_background());
+    router.head(&object).await.unwrap();
+
+    let requests = http.requests.lock().unwrap();
+    assert_eq!(requests.len(), 8);
+    assert!(requests[..4].iter().all(|request| request.url == endpoint));
+    assert_eq!(requests[4].url, explicit.url);
+    let sent: serde_json::Value = serde_json::from_slice(&requests[4].body).unwrap();
+    assert_eq!(sent["roleArn"], explicit.request["roleArn"]);
+    assert_eq!(requests[6].url, endpoint);
+    assert_eq!(
+        requests[7].url,
+        "https://configured-origin.example/bucket/key"
+    );
+}
+
+#[tokio::test]
+async fn oss_and_cos_target_roles_use_request_or_worker_broker_url() {
+    let worker_url = "https://worker-broker.example/exchange";
+    let request_url = "https://request-broker.example/exchange";
+    for (backend, csp, region, role_arn) in [
+        (
+            Backend::Ali,
+            "ali",
+            "cn-hangzhou",
+            "acs:ram::1234567890123456:role/example",
+        ),
+        (
+            Backend::Tc,
+            "tc",
+            "ap-beijing",
+            "qcs::cam::uin/123456789012:roleName/example",
+        ),
+    ] {
+        let http = Arc::new(Http::default());
+        let resolver = DefaultBackendResolver::from_configs(
+            backend,
+            BackendResolverConfig {
+                credential_endpoint: Some(worker_url.to_owned().into()),
+                ..Default::default()
+            },
+            http.clone(),
+            http.clone(),
+            Arc::new(NoopObserver),
+        )
+        .await
+        .unwrap();
+        let router = BackendRouter::new(backend, Arc::new(resolver));
+        let object = ObjectId::new(backend, "bucket", "key");
+        let target_role = json!({
+            "csp": csp, "region": region, "roleArn": role_arn,
+            "externalId": "example-external-id", "durationSeconds": 900,
+        });
+        let mut broker = BrokerConfig {
+            url: String::new(),
+            request: target_role.clone(),
+            origin: Some(talon_core::OriginOptions {
+                region: Some(region.into()),
+                ..origin_options("https://private-origin.example")
+            }),
+        };
+        let inherited = router
+            .bind_request(backend, "bucket", &broker)
+            .await
+            .unwrap();
+        inherited.store.head(&object).await.unwrap();
+
+        broker.request["credentialType"] = "stsAssumeRole".into();
+        let same_mode = router
+            .bind_request(backend, "bucket", &broker)
+            .await
+            .unwrap();
+        assert_eq!(same_mode.scope, inherited.scope);
+
+        broker.url = request_url.into();
+        let explicit = router
+            .bind_request(backend, "bucket", &broker)
+            .await
+            .unwrap();
+        explicit.store.head(&object).await.unwrap();
+
+        let requests = http.requests.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        let mut expected = target_role;
+        expected["bucket"] = "bucket".into();
+        for (exchange, url) in requests.chunks_exact(2).zip([worker_url, request_url]) {
+            assert_eq!(exchange[0].url, url);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&exchange[0].body).unwrap(),
+                expected
+            );
+            assert_eq!(exchange[1].url, "https://bucket.private-origin.example/key");
+            assert_eq!(exchange[1].header("x-amz-security-token"), Some("token"));
+            assert!(exchange[1]
+                .header("authorization")
+                .unwrap()
+                .contains("Credential=access/"));
+        }
+    }
 }
 
 #[tokio::test]
@@ -926,9 +1169,18 @@ async fn legacy_factory_is_lazy_and_keeps_legacy_paths_while_dynamic_requests_by
         ));
         Box::pin(async move { Ok(store) })
     });
-    let resolver =
-        DefaultBackendResolver::new(Backend::S3, http.clone(), http, Arc::new(NoopObserver))
-            .with_legacy_factory(factory);
+    let resolver = DefaultBackendResolver::from_configs(
+        Backend::S3,
+        BackendResolverConfig {
+            legacy_factory: Some(factory.clone()),
+            ..Default::default()
+        },
+        http.clone(),
+        http.clone(),
+        Arc::new(NoopObserver),
+    )
+    .await
+    .unwrap();
     let router = BackendRouter::new(Backend::S3, Arc::new(resolver));
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert!(!router.ready_for_background());
@@ -943,6 +1195,22 @@ async fn legacy_factory_is_lazy_and_keeps_legacy_paths_while_dynamic_requests_by
     router.head(&legacy).await.unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert!(router.ready_for_background());
+
+    let eager = DefaultBackendResolver::from_configs(
+        Backend::S3,
+        BackendResolverConfig {
+            legacy_factory: Some(factory),
+            initialize_legacy_on_startup: true,
+            ..Default::default()
+        },
+        http.clone(),
+        http,
+        Arc::new(NoopObserver),
+    )
+    .await
+    .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert!(BackendRouter::new(Backend::S3, Arc::new(eager)).ready_for_background());
 }
 
 struct RotatingExchange(AtomicUsize);

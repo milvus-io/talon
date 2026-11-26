@@ -30,6 +30,7 @@ use talon_backend::origin::{
     AzureCredentialInput, AzureOrigin, AzureOriginInput, GcsCredentialInput, GcsOrigin,
     GcsOriginInput, OriginValidation, S3Origin, S3OriginInput,
 };
+use talon_backend::routing::BackendResolverConfig;
 use talon_backend::{
     AzureBackend, BrokerConfig, CredentialMode, CredentialOptions, GcsBackend, GcsHmacCredentials,
     ReqwestClient, S3Backend, S3Credentials,
@@ -238,6 +239,8 @@ impl Args {
             gcs_access_key_id: None,
             gcs_secret_access_key: None,
             azure_shared_key: None,
+            broker: None,
+            credential_endpoint: None,
             credential_broker_url: None,
             credential_broker_request: None,
             credential_broker_timeout_ms: None,
@@ -360,6 +363,15 @@ async fn build_s3_backend(
     exchange_http: Arc<dyn talon_backend::http::HttpClient>,
     observer: Arc<dyn talon_backend::CredentialsObserver>,
 ) -> anyhow::Result<S3Backend> {
+    let backend = cfg.resolved_backend()?;
+    if backend.requires_s3_endpoint()
+        && cfg
+            .s3_endpoint
+            .as_deref()
+            .map_or(true, |endpoint| endpoint.trim().is_empty())
+    {
+        anyhow::bail!("s3_endpoint is required for backend {backend}");
+    }
     let region = cfg
         .s3_region
         .clone()
@@ -609,11 +621,7 @@ async fn run_worker(
     let index = Arc::new(BlockIndex::new());
     let inflight = Arc::new(InFlightLoads::new());
     let backend_kind = cfg.backend.as_deref().unwrap_or("azure");
-    let _configured_backend: Backend = backend_kind.parse().map_err(|error| {
-        anyhow::anyhow!(
-            "unknown TALON_WORKER_BACKEND {backend_kind:?}; expected azure, s3, or gcs: {error}"
-        )
-    })?;
+    let backend_type = cfg.resolved_backend()?;
     let node = NodeInfo {
         id: NodeId::new(
             cfg.node_id
@@ -819,7 +827,14 @@ async fn run_worker(
     // Select the object-store backend from config (default: azure). Each backend
     // reads its endpoint and credentials from resolved configuration. IAM and
     // Broker credentials refresh through their providers and update metrics.
-    let buckets = cfg.resolved_buckets()?;
+    let (broker_defaults, buckets) = if cfg.credential_endpoint.is_some() {
+        cfg.resolved_broker()?
+    } else {
+        (
+            Default::default(),
+            cfg.resolved_buckets()?.unwrap_or_default(),
+        )
+    };
     // FIXME: Expose expiry per credential instance. Every worker can now own
     // several request-specific providers. A single
     // expiry cannot describe them; outcome counters remain meaningful.
@@ -829,79 +844,75 @@ async fn run_worker(
             observability: Arc::clone(&observability),
             report_expiry: false,
         });
-    if buckets.is_some() && (azure_sas_from_env().is_some() || gcs_bearer_from_env().is_some()) {
+    if cfg.credential_endpoint.is_none()
+        && !buckets.is_empty()
+        && (azure_sas_from_env().is_some() || gcs_bearer_from_env().is_some())
+    {
         anyhow::bail!("buckets cannot be combined with global fixed SAS or bearer credentials");
     }
     // Request-owned Broker URLs are unknown at startup. Always keep acquisition
     // separate from origin-transfer retries and their shorter deadlines.
     // Discovery and refresh run on Tokio, outside the native origin ring.
     let exchange_http: Arc<dyn talon_backend::HttpClient> = Arc::new(ReqwestClient::new());
-    let backend_type: Backend = backend_kind.parse()?;
-    let resolver = if let Some(buckets) = buckets {
-        talon_backend::DefaultBackendResolver::from_configs(
-            backend_type,
+    let explicitly_configured = cfg.credentials_source.is_some()
+        || cfg.s3_access_key_id.is_some()
+        || cfg.s3_secret_access_key.is_some()
+        || cfg.s3_session_token.is_some()
+        || cfg.gcs_access_key_id.is_some()
+        || cfg.gcs_secret_access_key.is_some()
+        || cfg.azure_shared_key.is_some()
+        || cfg.credential_broker_url.is_some()
+        || cfg.credential_broker_request.is_some()
+        || cfg.credential_broker_timeout_ms.is_some()
+        || azure_sas_from_env().is_some()
+        || gcs_bearer_from_env().is_some();
+
+    // Keep the resolved buckets in the resolver and avoid cloning their secrets
+    // into the legacy factory or namespace runtimes.
+    cfg.buckets = None;
+    let legacy_config = Arc::new(cfg.clone());
+    let legacy_http = http.clone();
+    let legacy_exchange = exchange_http.clone();
+    let legacy_observer = credentials_observer.clone();
+    let factory: talon_backend::LegacyBackendFactory = Arc::new(move || {
+        let config = legacy_config.clone();
+        let http = legacy_http.clone();
+        let exchange = legacy_exchange.clone();
+        let observer = legacy_observer.clone();
+        Box::pin(async move {
+            let result: anyhow::Result<Arc<dyn BackendStore>> = async {
+                Ok(match backend_type {
+                    Backend::Azure => {
+                        Arc::new(build_azure_backend(&config, http, exchange, observer).await?)
+                            as Arc<dyn BackendStore>
+                    }
+                    Backend::S3 | Backend::Ali | Backend::Tc => {
+                        Arc::new(build_s3_backend(&config, http, exchange, observer).await?)
+                    }
+                    Backend::Gcs => {
+                        Arc::new(build_gcs_backend(&config, http, exchange, observer).await?)
+                    }
+                })
+            }
+            .await;
+            result.map_err(|error| error.to_string())
+        })
+    });
+    let resolver = talon_backend::DefaultBackendResolver::from_configs(
+        backend_type,
+        BackendResolverConfig {
             buckets,
-            http.clone(),
-            exchange_http.clone(),
-            credentials_observer.clone(),
-        )
-        .await
-        .map_err(anyhow::Error::msg)?
-    } else {
-        let explicitly_configured = cfg.credentials_source.is_some()
-            || cfg.s3_access_key_id.is_some()
-            || cfg.s3_secret_access_key.is_some()
-            || cfg.s3_session_token.is_some()
-            || cfg.gcs_access_key_id.is_some()
-            || cfg.gcs_secret_access_key.is_some()
-            || cfg.azure_shared_key.is_some()
-            || cfg.credential_broker_url.is_some()
-            || cfg.credential_broker_request.is_some()
-            || cfg.credential_broker_timeout_ms.is_some()
-            || azure_sas_from_env().is_some()
-            || gcs_bearer_from_env().is_some();
-        let legacy_config = Arc::new(cfg.clone());
-        let legacy_http = http.clone();
-        let legacy_exchange = exchange_http.clone();
-        let legacy_observer = credentials_observer.clone();
-        let factory: talon_backend::LegacyBackendFactory = Arc::new(move || {
-            let config = legacy_config.clone();
-            let http = legacy_http.clone();
-            let exchange = legacy_exchange.clone();
-            let observer = legacy_observer.clone();
-            Box::pin(async move {
-                let result: anyhow::Result<Arc<dyn BackendStore>> = async {
-                    Ok(match backend_type {
-                        Backend::Azure => {
-                            Arc::new(build_azure_backend(&config, http, exchange, observer).await?)
-                                as Arc<dyn BackendStore>
-                        }
-                        Backend::S3 => {
-                            Arc::new(build_s3_backend(&config, http, exchange, observer).await?)
-                        }
-                        Backend::Gcs => {
-                            Arc::new(build_gcs_backend(&config, http, exchange, observer).await?)
-                        }
-                    })
-                }
-                .await;
-                result.map_err(|error| error.to_string())
-            })
-        });
-        let resolver = talon_backend::DefaultBackendResolver::new(
-            backend_type,
-            http,
-            exchange_http,
-            credentials_observer,
-        );
-        if explicitly_configured {
-            resolver.with_legacy_backend(factory().await.map_err(anyhow::Error::msg)?)
-        } else {
-            // Preserve implicit IAM for legacy requests, while dynamic-only
-            // workers start without IMDS, a global region, or an Azure account.
-            resolver.with_legacy_factory(factory)
-        }
-    }
+            defaults: broker_defaults,
+            credential_endpoint: cfg.credential_endpoint.clone(),
+            legacy_factory: Some(factory),
+            initialize_legacy_on_startup: explicitly_configured,
+        },
+        http,
+        exchange_http,
+        credentials_observer,
+    )
+    .await
+    .map_err(anyhow::Error::msg)?
     .with_dynamic_defaults(talon_backend::DynamicBackendDefaults {
         s3_path_style: cfg.s3_path_style,
     });
@@ -909,9 +920,6 @@ async fn run_worker(
         backend_type,
         Arc::new(resolver),
     ));
-    // The router owns initialized providers. Namespace cache runtimes only
-    // need cache policy; avoid cloning all bucket secrets into each namespace.
-    cfg.buckets = None;
     tracing::info!(backend = backend_kind, "object-store backend ready");
 
     let recovery_started = Instant::now();

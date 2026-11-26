@@ -391,7 +391,7 @@ impl BackendBuildConfig {
         };
         let validation = OriginValidation::Routed;
         let prepared = match backend {
-            Backend::S3 => {
+            Backend::S3 | Backend::Ali | Backend::Tc => {
                 let region = origin
                     .region
                     .take()

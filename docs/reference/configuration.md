@@ -628,7 +628,7 @@ Worker-wide LOAD payload byte budget through cache commit; excludes L1 and trans
 
 ### `backend`
 
-Object-store backend: azure (default), s3, or gcs.
+Object-store backend and default Broker IAM cloud. Accepts `aws` or `s3`, `gcs` or `gcp`, `az`, `azure` or `blob`, `oss` or `ali`, and `cos` or `tc`.
 
 - **Environment variable:** `TALON_WORKER_BACKEND`
 - **Default:** `azure`
@@ -732,7 +732,7 @@ Worker-global connection budget per data-plane thread. Total capacity is this va
 
 ### `s3_region`
 
-S3 region (required when backend=s3).
+Storage region for S3 and S3-compatible backends.
 
 - **Environment variable:** `TALON_WORKER_S3_REGION`
 - **Default:** none
@@ -806,9 +806,17 @@ Azure SAS token; env-only, never from a config file or logged.
 - **CLI flag:** not settable via CLI (config file or environment only)
 - **Secret:** read only from the environment; never written to a config file or logged
 
-### `credential_broker_timeout_ms`
+### `broker.broker_endpoint`
 
-Positive per-attempt Broker credential request timeout in ms; does not change storage I/O timeouts.
+Full HTTP(S) Broker URL for requests without their own Broker URL. Requests without Broker parameters use Pod IAM. Accepts the top-level credential_endpoint alias. Requires a worker restart to change.
+
+- **Environment variable:** `TALON_WORKER_CREDENTIAL_ENDPOINT`
+- **Default:** none
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `broker.timeout_ms`
+
+Positive per-attempt Broker credential exchange timeout in ms. Accepts the top-level credential_broker_timeout_ms alias. Storage I/O timeouts are configured separately.
 
 - **Environment variable:** `TALON_CREDENTIAL_BROKER_TIMEOUT_MS`
 - **Default:** `3000`

@@ -3,9 +3,9 @@ use talon_cache_client::{BlockReadError, CoordinatorError};
 /// Structured failures from parsing an object URI.
 #[derive(Debug, thiserror::Error)]
 pub enum UriError {
-    #[error("expected a scheme://bucket/key URI, got {uri:?} (schemes: s3, gcs, az)")]
+    #[error("expected a scheme://bucket/key URI, got {uri:?} (schemes: s3, gcs, az, ali, tc)")]
     MissingScheme { uri: String },
-    #[error("unknown backend scheme {scheme:?}; expected s3, gcs, or az")]
+    #[error("unknown backend scheme {scheme:?}. Expected s3, gcs, az, ali, or tc")]
     UnknownScheme { scheme: String },
     #[error("URI is missing an object key: {uri:?} (expected {scheme}://bucket/key)")]
     MissingKey { uri: String, scheme: String },

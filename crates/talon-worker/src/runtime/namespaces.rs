@@ -244,7 +244,7 @@ impl NamespaceRuntimes {
             true,
             true,
         )
-        .with_backend_kind(config.backend.as_deref().unwrap_or("azure").parse()?)
+        .with_backend_kind(config.resolved_backend()?)
         .with_rate_limiter(self.limiter.clone())
         .with_paged_miss_run_concurrency(config.paged_miss_run_concurrency);
         if config.ownership_gc_enabled {
@@ -667,7 +667,14 @@ impl WorkerRuntime {
             code: DataErrorCode::InvalidRequest,
             message: error.to_string(),
         })?;
-        if let Some(broker) = broker {
+        let registry = broker.as_ref().and_then(|_| self.registry());
+        let worker_url = registry
+            .as_ref()
+            .and_then(|registry| registry.config.credential_endpoint.as_ref())
+            .map(|endpoint| endpoint.expose().as_str());
+        if let Some(broker) =
+            broker.filter(|broker| broker.config().url_with_default(worker_url).is_some())
+        {
             let (backend, bucket, objects) =
                 request_target(header, payload).map_err(|error| DataPlaneError {
                     code: DataErrorCode::InvalidRequest,
@@ -675,8 +682,7 @@ impl WorkerRuntime {
                 })?;
             let result = async {
                 self.ensure_configured_backend(backend)?;
-                let registry = self
-                    .registry()
+                let registry = registry
                     .ok_or_else(|| anyhow::anyhow!("runtime has no credential scope registry"))?;
                 let resolved = registry
                     .backend
@@ -1250,6 +1256,10 @@ mod tests {
             r#""listen" = "127.0.0.1:9001"
 "paged_miss_run_concurrency" = 2
 "namespaces" = { "a" = { "page_tti_hours" = 1 } }
+[broker]
+broker_endpoint = "https://broker.example/exchange?token=private-marker"
+timeout_ms = 17
+azure_account = "brokeraccount"
 "#,
             &root
         ));
@@ -1259,8 +1269,17 @@ mod tests {
         assert!(status.restart_required);
         assert_eq!(
             status.pending_restart_fields,
-            vec!["advertise_addr", "listen"]
+            vec![
+                "advertise_addr",
+                "broker",
+                "credential_broker_timeout_ms",
+                "credential_endpoint",
+                "listen"
+            ]
         );
+        assert!(!serde_json::to_string(&status)
+            .unwrap()
+            .contains("private-marker"));
         assert_eq!(
             status.effective_config.as_ref().unwrap()["listen"],
             startup.listen

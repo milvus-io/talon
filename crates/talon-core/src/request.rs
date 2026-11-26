@@ -188,6 +188,8 @@ impl OriginOptions {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BrokerConfig {
+    /// An empty request URL delegates endpoint selection to the worker.
+    #[serde(default)]
     pub url: String,
     pub request: serde_json::Value,
     #[serde(
@@ -204,6 +206,20 @@ impl std::fmt::Debug for BrokerConfig {
     }
 }
 
+pub(crate) fn validate_broker_url(url: &str) -> Result<(), String> {
+    let endpoint =
+        url::Url::parse(url).map_err(|_| "credential_broker URL must be a full HTTP(S) URL")?;
+    if !matches!(endpoint.scheme(), "http" | "https")
+        || endpoint.host_str().is_none()
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.fragment().is_some()
+    {
+        return Err("credential_broker URL must be HTTP(S) without userinfo or fragment".into());
+    }
+    Ok(())
+}
+
 impl BrokerConfig {
     /// Parse a bounded request descriptor without including caller-controlled JSON or
     /// URL values in errors. Cloud-specific validation happens at the backend.
@@ -211,33 +227,44 @@ impl BrokerConfig {
         Ok(ValidatedBrokerConfig::from_json(value)?.config)
     }
 
-    /// Validate provider-independent values without serializing the descriptor.
-    pub fn validate(&self) -> Result<(), String> {
+    fn validate_fields(&self) -> Result<(), String> {
         if !self.request.is_object() {
             return Err("credential_broker request must be a JSON object".into());
         }
         if let Some(origin) = &self.origin {
             origin.validate()?;
         }
-        let endpoint = url::Url::parse(&self.url)
-            .map_err(|_| "credential_broker URL must be a full HTTP(S) URL")?;
-        if !matches!(endpoint.scheme(), "http" | "https")
-            || endpoint.host_str().is_none()
-            || !endpoint.username().is_empty()
-            || endpoint.password().is_some()
-            || endpoint.fragment().is_some()
-        {
-            return Err(
-                "credential_broker URL must be HTTP(S) without userinfo or fragment".into(),
-            );
-        }
         Ok(())
     }
 
-    /// Request-scoped credentials must choose their own origin endpoint and S3 signing region.
-    /// Static configurations may instead obtain these values from worker settings.
+    /// Validate provider-independent values for a complete Broker configuration.
+    pub fn validate(&self) -> Result<(), String> {
+        self.validate_fields()?;
+        validate_broker_url(&self.url)
+    }
+
+    /// Select the URL for request-scoped credentials, or use the worker's ordinary route.
+    pub fn url_with_default<'a>(&'a self, default: Option<&'a str>) -> Option<&'a str> {
+        if !self.url.is_empty() {
+            Some(&self.url)
+        } else if self
+            .request
+            .as_object()
+            .is_some_and(|fields| fields.is_empty())
+        {
+            None
+        } else {
+            default
+        }
+    }
+
+    /// Requests may inherit the Broker URL while supplying their own origin
+    /// endpoint and S3 signing region.
     pub fn validate_request(&self) -> Result<(), String> {
-        self.validate()?;
+        self.validate_fields()?;
+        if !self.url.is_empty() {
+            validate_broker_url(&self.url)?;
+        }
         if self
             .origin
             .as_ref()
@@ -276,7 +303,7 @@ impl ValidatedBrokerConfig {
             return Err("credential_broker exceeds the request size limit".into());
         }
         let config: BrokerConfig = serde_json::from_str(value)
-            .map_err(|_| "credential_broker must contain a URL and a request object")?;
+            .map_err(|_| "credential_broker must contain a request object with an optional URL")?;
         Self::try_from(config)
     }
 
@@ -463,6 +490,28 @@ mod tests {
                 let error = BrokerConfig::from_json(&json).unwrap_err();
                 assert!(!error.contains("sentinel"));
             }
+        }
+    }
+
+    #[test]
+    fn request_parameters_can_use_the_workers_broker_url() {
+        let worker_url = Some("https://worker-broker.example/exchange");
+        for url in [None, Some("")] {
+            let mut descriptor = serde_json::json!({
+                "request": {"csp": "gcp", "credentialType": "iam"},
+                "origin": {"endpoint": "storage.example"}
+            });
+            if let Some(url) = url {
+                descriptor["url"] = url.into();
+            }
+            let mut broker = BrokerConfig::from_json(&descriptor.to_string()).unwrap();
+            assert!(broker.url.is_empty());
+            assert_eq!(broker.request, descriptor["request"]);
+            assert_eq!(broker.url_with_default(worker_url), worker_url);
+            assert_eq!(broker.url_with_default(None), None);
+            assert!(broker.validate().is_err());
+            broker.request = serde_json::json!({});
+            assert_eq!(broker.url_with_default(worker_url), None);
         }
     }
 

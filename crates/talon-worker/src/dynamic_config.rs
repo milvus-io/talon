@@ -115,13 +115,20 @@ impl DynamicConfig {
                         serde_json::to_value(limits).map_err(|e| e.to_string())?;
                 }
                 next.validate()?;
-                let pending: Vec<String> = desired_view
+                let mut pending: Vec<String> = desired_view
                     .as_object()
                     .unwrap()
                     .iter()
                     .filter(|(key, value)| effective.get(*key) != Some(*value))
                     .map(|(key, _)| key.clone())
                     .collect();
+                if desired.broker_origin != startup.broker_origin {
+                    pending.push("broker".into());
+                }
+                if desired.credential_endpoint != startup.credential_endpoint {
+                    pending.push("credential_endpoint".into());
+                }
+                pending.sort_unstable();
                 (next, Some((effective, desired_view, pending)))
             } else {
                 (WorkerDynamicConfig::parse(text)?, None)
