@@ -1,7 +1,7 @@
 //! Event-driven reclamation of cache blocks outside current placement.
 use super::{MembershipSnapshot, OwnershipLimits, WorkerRuntime};
 use crate::eviction::StaleBlockCandidate;
-use crate::small_store::{GcCheck, OwnershipCursor, OwnershipLimit, SmallGcCandidate};
+use crate::small_store::{OwnershipCursor, OwnershipLimit, SmallGcCandidate};
 use std::{
     collections::{BTreeSet, VecDeque},
     sync::Arc,
@@ -323,13 +323,6 @@ impl OwnershipGc {
             }
         }
         let pass = self.pass.as_mut().unwrap().small.as_mut().unwrap();
-        // Retry enumeration leaves each address registered. Re-admission can
-        // remove it while we wait, so only the initial scan may register one.
-        let defer = |candidate: &SmallGcCandidate| {
-            if pass.retry_cursor.is_none() {
-                small.defer_ownership(candidate, limit);
-            }
-        };
         for _ in 0..64 {
             if !worker.membership_is_current(view) {
                 return;
@@ -342,10 +335,10 @@ impl OwnershipGc {
                     }
                     return;
                 };
-                match candidate.ticket.observe_gc(GcCheck::Ownership(limit.epoch)) {
+                match candidate.observe_ownership(limit.epoch) {
                     Some(revision) => pass.attempt = Some((candidate, revision, false)),
                     None => {
-                        defer(&candidate);
+                        small.defer_ownership(&candidate, limit);
                         continue;
                     }
                 }
@@ -354,7 +347,7 @@ impl OwnershipGc {
             if !*paid {
                 if !candidate.ticket.gc_is_current(*revision) {
                     let (candidate, _, _) = pass.attempt.take().unwrap();
-                    defer(&candidate);
+                    small.defer_ownership(&candidate, limit);
                     continue;
                 }
                 if let Some(budget) = &worker.background_budget {
@@ -373,7 +366,7 @@ impl OwnershipGc {
                 .unlink_small_gc(candidate.clone(), *revision, Some(renewed))
                 .await;
             let (candidate, _, _) = pass.attempt.take().unwrap();
-            defer(&candidate);
+            small.defer_ownership(&candidate, limit);
             if started.elapsed() >= Duration::from_millis(10) {
                 return;
             }
@@ -687,31 +680,36 @@ mod tests {
             ..Default::default()
         });
         Arc::get_mut(&mut worker).unwrap().background_budget = Some(budget.clone());
-        let id = packed_placed("b", 0);
         let payload = Bytes::from_static(b"packed");
-        let put = talon_transport::data::CachedBlockPutRequest {
-            block: id.clone(),
+        let puts = [0, 1].map(|n| talon_transport::data::CachedBlockPutRequest {
+            block: packed_placed("b", n),
             object_len: payload.len() as u64,
             body_len: payload.len() as u64,
-        };
-        worker
-            .admit_cached_block(&put, payload.clone())
-            .await
-            .unwrap();
+        });
         let small = worker.small.as_ref().unwrap();
-        assert!(small.contains(&id));
-        let pin = worker.lru.pin_guard(CacheUnit::Whole(id.clone())).unwrap();
+        for put in &puts {
+            worker
+                .admit_cached_block(put, payload.clone())
+                .await
+                .unwrap();
+        }
+        let pins = puts.each_ref().map(|put| {
+            worker
+                .lru
+                .pin_guard(CacheUnit::Whole(put.block.clone()))
+                .unwrap()
+        });
         let mut gc = fixture.gc(&worker);
         let generation = worker.membership_snapshot().unwrap().generation;
         gc.run_round(&worker).await;
-        assert_eq!(small.ownership_retry_count(), 1);
+        assert_eq!(small.ownership_retry_count(), 2);
         gc.run_round(&worker).await;
         assert_eq!(
             small.ownership_retry_count(),
-            1,
-            "a current pinned retry remains indexed"
+            2,
+            "current pinned retries remain indexed"
         );
-        drop(pin);
+        drop(pins);
 
         tokio::time::pause();
         // Finish the ordinary retry slice before polling the packed attempt.
@@ -726,18 +724,26 @@ mod tests {
                 "retry reached deletion credit after observation"
             );
             assert_eq!(worker.page_gc_metrics.ownership_attempted.get(), 0);
-            worker
-                .admit_cached_block(&put, payload.clone())
-                .await
-                .unwrap();
+            // Re-admit the observed retry and the queued, unobserved retry.
+            for put in &puts {
+                worker
+                    .admit_cached_block(put, payload.clone())
+                    .await
+                    .unwrap();
+            }
             assert_eq!(small.ownership_retry_count(), 0);
             tokio::time::advance(Duration::from_secs(2)).await;
             round.await;
         }
 
         assert_eq!(small.ownership_retry_count(), 0);
+        for put in &puts {
+            assert_eq!(
+                small.read(&put.block).await.unwrap().as_ref(),
+                Some(&payload)
+            );
+        }
         assert_eq!(worker.page_gc_metrics.ownership_attempted.get(), 1);
-        assert_eq!(small.read(&id).await.unwrap(), Some(payload));
         assert_eq!(gc.completed_generation, generation);
         assert!(gc.pass.is_none());
     }
@@ -757,10 +763,7 @@ mod tests {
         let (_, mut candidates) =
             small.ownership_candidates(&mut OwnershipCursor::default(), 0, limit, 64, |_| false);
         let candidate = candidates.pop().unwrap();
-        let revision = candidate
-            .ticket
-            .observe_gc(GcCheck::Ownership(limit.epoch))
-            .unwrap();
+        let revision = candidate.observe_ownership(limit.epoch).unwrap();
         let state = worker.page_lifecycle.block(&id);
         let gc_permits = worker.page_gc_io.available_permits();
         let budget = worker.background_budget.as_ref().unwrap();
@@ -992,8 +995,12 @@ mod tests {
             .await
             .unwrap();
         let old = view.scan_limits[&worker.cache_identity].small.unwrap();
-        let (_, mut retries) = small.ownership_retry_candidates(&mut 0, old, 1);
-        let old_candidate = retries.pop().unwrap();
+        let (_, candidates) =
+            small.ownership_candidates(&mut OwnershipCursor::default(), 0, old, 64, |_| false);
+        let old_candidate = candidates
+            .into_iter()
+            .find(|candidate| candidate.unit.block() == &id)
+            .unwrap();
         let new = small
             .under_catalog_writer(|| worker.capture_supplemental_limits(&view))
             .unwrap()

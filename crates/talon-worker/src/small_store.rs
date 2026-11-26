@@ -14,7 +14,7 @@ pub(crate) mod directory;
 mod disk_io;
 mod flush;
 mod gc;
-pub(crate) use gc::{GcCheck, OwnershipCursor, OwnershipLimit, SmallGcCandidate, SmallStaleCursor};
+pub(crate) use gc::{OwnershipCursor, OwnershipLimit, SmallGcCandidate, SmallStaleCursor};
 mod format;
 mod journal;
 mod key_codec;

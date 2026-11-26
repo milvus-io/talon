@@ -127,8 +127,8 @@ impl Ownership {
     }
 }
 
-pub(crate) enum GcCheck {
-    Ownership(u64),
+enum GcCheck {
+    Ownership { epoch: u64, retry_id: Option<u64> },
     Idle { now: u64, age: u64 },
 }
 
@@ -136,6 +136,16 @@ pub(crate) enum GcCheck {
 pub(crate) struct SmallGcCandidate {
     pub unit: CacheUnit,
     pub ticket: Arc<SmallAccess>,
+    retry_id: Option<u64>,
+}
+
+impl SmallGcCandidate {
+    pub(crate) fn observe_ownership(&self, epoch: u64) -> Option<u64> {
+        self.ticket.observe_gc(GcCheck::Ownership {
+            epoch,
+            retry_id: self.retry_id,
+        })
+    }
 }
 
 impl Catalog {
@@ -145,6 +155,7 @@ impl Catalog {
         SmallGcCandidate {
             unit,
             ticket: access.small().unwrap().clone(),
+            retry_id: None,
         }
     }
     fn ownership_candidate_at(&self, address: Address) -> Option<SmallGcCandidate> {
@@ -169,7 +180,11 @@ impl Catalog {
                 .access
                 .small()?
                 .clone();
-            return Some(SmallGcCandidate { unit, ticket });
+            return Some(SmallGcCandidate {
+                unit,
+                ticket,
+                retry_id: None,
+            });
         }
         let slot = self.at(address)?;
         if self.lookup.flags(slot) & (VISIBLE | POLICY) != VISIBLE | POLICY {
@@ -184,7 +199,7 @@ impl Catalog {
 impl SmallAccess {
     /// Arm the watch under the catalog lock. Consecutive observations share
     /// the same revision until a hit or a re-admission clears the watch.
-    pub(crate) fn observe_gc(&self, check: GcCheck) -> Option<u64> {
+    fn observe_gc(&self, check: GcCheck) -> Option<u64> {
         let catalog = self.catalog.upgrade()?;
         let catalog = catalog.write().unwrap();
         let slot = self.slot(&catalog)?;
@@ -234,7 +249,14 @@ impl SmallAccess {
 
     fn gc_eligible(&self, catalog: &Catalog, slot: usize, check: GcCheck) -> bool {
         match check {
-            GcCheck::Ownership(epoch) => catalog.shared.ownership.current() == epoch,
+            GcCheck::Ownership { epoch, retry_id } => {
+                catalog.shared.ownership.current() == epoch
+                    && retry_id.map_or(true, |id| {
+                        let retries = &catalog.ownership.as_ref().unwrap().retries;
+                        retries.epoch == epoch
+                            && retries.addresses.get(&id) == Some(&*self.address.lock().unwrap())
+                    })
+            }
             GcCheck::Idle { now, age } => {
                 catalog.recency_at(slot).is_some_and(|(recency, value)| {
                     now.saturating_sub(recency.time(value.load(Relaxed))) > age
@@ -331,6 +353,11 @@ impl SmallObjectStore {
     }
 
     pub(crate) fn defer_ownership(&self, candidate: &SmallGcCandidate, limit: OwnershipLimit) {
+        // Re-admission can revoke a retry while it is queued or waiting for
+        // deletion. Only initial discovery can register new retry work.
+        if candidate.retry_id.is_some() {
+            return;
+        }
         let mut catalog = self.journal.model.0.write().unwrap();
         if !self.ownership_is_current(limit)
             || catalog.ownership.as_ref().unwrap().retries.epoch != limit.epoch
@@ -384,7 +411,8 @@ impl SmallObjectStore {
         let mut retries = retries.addresses.range(*cursor..);
         for (&id, &address) in retries.by_ref().take(budget) {
             *cursor = id + 1;
-            if let Some(candidate) = catalog.ownership_candidate_at(address) {
+            if let Some(mut candidate) = catalog.ownership_candidate_at(address) {
+                candidate.retry_id = Some(id);
                 candidates.push(candidate);
             }
         }
@@ -624,7 +652,7 @@ mod tests {
         };
         let candidate = scan(0, limit).pop().unwrap();
         let ticket = &candidate.ticket;
-        let initial = ticket.observe_gc(GcCheck::Ownership(limit.epoch)).unwrap();
+        let initial = candidate.observe_ownership(limit.epoch).unwrap();
         store
             .put(&block(2), Bytes::from_static(b"late"))
             .await
@@ -637,11 +665,7 @@ mod tests {
         assert!(scan(0, limit).is_empty());
         assert_eq!(scan(limit.epoch, supplement).len(), 2);
 
-        let observe = || {
-            ticket
-                .observe_gc(GcCheck::Ownership(supplement.epoch))
-                .unwrap()
-        };
+        let observe = || candidate.observe_ownership(supplement.epoch).unwrap();
         store.put(&id, Bytes::from_static(b"packed")).await.unwrap();
         assert!(!ticket.gc_is_current(initial));
         let after_admission = observe();
@@ -673,10 +697,7 @@ mod tests {
         let (_, mut rows) =
             store.ownership_candidates(&mut Default::default(), 0, limit, 8, |_| false);
         let candidate = rows.pop().unwrap();
-        let revision = candidate
-            .ticket
-            .observe_gc(GcCheck::Ownership(limit.epoch))
-            .unwrap();
+        let revision = candidate.observe_ownership(limit.epoch).unwrap();
         let streams = store.streams();
         let _publication = streams[0].publication.lock().await;
         use std::time::{Duration, Instant};
