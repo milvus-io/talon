@@ -203,8 +203,7 @@ impl StaleGc {
         if self.positive_heads.prune(clock()) {
             return Some(Duration::ZERO);
         }
-        // A recovered scope or an expired credential can leave the origin
-        // unavailable. Defer the whole scope before scanning candidates.
+        // A recovered credential scope waits for a foreground request to bind it.
         if !worker.backend.get()?.ready_for_background() {
             return None;
         }
@@ -1189,7 +1188,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_gc_skips_scopes_without_cached_credentials() {
+    async fn stale_gc_skips_scopes_without_a_binding() {
         let root = tempfile::tempdir().unwrap();
         let origin = Arc::new(Origin {
             unavailable: AtomicBool::new(true),

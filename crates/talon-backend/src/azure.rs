@@ -799,14 +799,6 @@ impl AzureBackend {
 
 #[async_trait]
 impl BackendStore for AzureBackend {
-    fn ready_for_background(&self) -> bool {
-        match &self.credentials {
-            Some(AzureCredentials::BrokerSas(provider)) => provider.ready_for_background(),
-            Some(AzureCredentials::Bearer(provider)) => provider.ready_for_background(),
-            _ => true,
-        }
-    }
-
     async fn fetch_range(&self, obj: &ObjectId, offset: u64, len: u64) -> Result<bytes::Bytes> {
         self.fetch_range_if_match(obj, offset, len, None).await
     }

@@ -438,13 +438,6 @@ impl GcsBackend {
 
 #[async_trait]
 impl BackendStore for GcsBackend {
-    fn ready_for_background(&self) -> bool {
-        match &self.authentication {
-            GcsCredentials::Bearer(provider) => provider.ready_for_background(),
-            GcsCredentials::Hmac(_) => true,
-        }
-    }
-
     async fn fetch_range(&self, obj: &ObjectId, offset: u64, len: u64) -> Result<bytes::Bytes> {
         self.fetch_range_if_match(obj, offset, len, None).await
     }

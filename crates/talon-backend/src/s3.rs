@@ -791,10 +791,6 @@ fn etag_to_version(etag: &str) -> Version {
 
 #[async_trait]
 impl BackendStore for S3Backend {
-    fn ready_for_background(&self) -> bool {
-        self.credentials.ready_for_background()
-    }
-
     async fn fetch_range(&self, obj: &ObjectId, offset: u64, len: u64) -> Result<bytes::Bytes> {
         self.fetch_range_if_match(obj, offset, len, None).await
     }
