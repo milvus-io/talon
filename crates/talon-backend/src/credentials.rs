@@ -21,11 +21,6 @@ pub trait ProvideS3Credentials: Send + Sync {
     /// Cheap point-in-time snapshot used to build and sign exactly one request.
     fn current(&self) -> Arc<S3Credentials>;
 
-    /// Check cached credential readiness without refreshing.
-    fn ready_for_background(&self) -> bool {
-        true
-    }
-
     /// Refresh request-driven credentials before signing an outgoing request.
     async fn prepare(&self) -> Result<(), String> {
         Ok(())
@@ -38,11 +33,6 @@ pub trait ProvideBearerToken: Send + Sync {
     /// Current token, or `None` when the endpoint needs no authentication
     /// (emulators).
     fn current(&self) -> Option<Arc<String>>;
-
-    /// Check cached credential readiness without refreshing.
-    fn ready_for_background(&self) -> bool {
-        true
-    }
 
     /// Prepare the snapshot for an outgoing request. Background-refresh and
     /// static providers need no work; SDK providers await their own valid-token
@@ -57,11 +47,6 @@ pub trait ProvideBearerToken: Send + Sync {
 pub trait ProvideSasToken: Send + Sync {
     /// Cheap point-in-time query credential; never performs HTTP.
     fn current(&self) -> Arc<crate::AzureSas>;
-
-    /// Check cached credential readiness without refreshing.
-    fn ready_for_background(&self) -> bool {
-        true
-    }
 
     /// Refresh request-driven credentials before generating an outgoing URL.
     async fn prepare(&self) -> Result<(), String> {

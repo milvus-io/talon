@@ -487,22 +487,14 @@ impl DefaultBackendResolver {
 #[async_trait]
 impl BackendResolver for DefaultBackendResolver {
     fn ready_for_background(&self) -> bool {
-        self.static_routes
-            .values()
-            .any(|store| store.ready_for_background())
-            || self.iam_broker.as_ref().is_some_and(|iam| {
-                iam.backends
-                    .read()
-                    .unwrap()
-                    .stores
-                    .values()
-                    .any(|store| store.ready_for_background())
-            })
+        !self.static_routes.is_empty()
+            || self
+                .iam_broker
+                .as_ref()
+                .is_some_and(|iam| !iam.backends.read().unwrap().stores.is_empty())
             || match &self.legacy {
-                Some(LegacyBackend::Ready(store)) => store.ready_for_background(),
-                Some(LegacyBackend::Lazy { store, .. }) => store
-                    .get()
-                    .is_some_and(|store| store.ready_for_background()),
+                Some(LegacyBackend::Ready(_)) => true,
+                Some(LegacyBackend::Lazy { store, .. }) => store.get().is_some(),
                 None => false,
             }
     }
@@ -512,17 +504,14 @@ impl BackendResolver for DefaultBackendResolver {
             let Ok(prepared) = iam.prepare(backend, bucket) else {
                 return BackgroundRoute::Skip;
             };
-            let store = iam
+            return iam
                 .backends
                 .read()
                 .unwrap()
                 .stores
                 .get(&prepared.key())
-                .cloned();
-            return match store {
-                Some(store) if store.ready_for_background() => BackgroundRoute::Bound(store),
-                _ => BackgroundRoute::Skip,
-            };
+                .cloned()
+                .map_or(BackgroundRoute::Skip, BackgroundRoute::Bound);
         }
         let store = self
             .static_routes
@@ -532,7 +521,7 @@ impl BackendResolver for DefaultBackendResolver {
                 Some(LegacyBackend::Lazy { store, .. }) => store.get(),
                 None => None,
             });
-        if store.is_some_and(|store| store.ready_for_background()) {
+        if store.is_some() {
             BackgroundRoute::Current
         } else {
             BackgroundRoute::Skip
@@ -624,10 +613,6 @@ struct BoundBackend {
 
 #[async_trait]
 impl BackendResolver for BoundBackend {
-    fn ready_for_background(&self) -> bool {
-        self.store.ready_for_background()
-    }
-
     fn validate(&self, request: &RouteRequest<'_>) -> Result<()> {
         if request.backend != self.backend
             || request.bucket != self.bucket

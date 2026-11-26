@@ -57,7 +57,7 @@ pub enum BackgroundRoute {
     Current,
     /// Use an existing binding for the target bucket.
     Bound(Arc<dyn BackendStore>),
-    /// Defer checks for this scope until credentials are available.
+    /// Defer checks for this scope until it has a binding.
     Skip,
 }
 
