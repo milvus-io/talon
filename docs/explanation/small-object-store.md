@@ -369,17 +369,20 @@ physical disk space. A maintenance call processes at most one eligible segment p
 
 1. An empty segment is durably retired in the metadata log and unlinked.
 2. A sealed segment with less than half its logical record bytes live is relocated.
-3. Relocation writes a new payload segment and logs its object mappings, syncs
-   payload and directory ancestry, durably commits the segment replacement,
-   updates locators, and then unlinks the old payload file.
+3. Relocation copies and syncs a staged segment while foreground appends and
+   deletes proceed. During publication it checks which source addresses still
+   exist and tombstones stale destination rows before committing replacement.
+   If every copied address is stale, it discards the staged segment.
+4. Once the new locators are visible, the collector waits for readers still
+   opening the old file, pays the delete budget, and unlinks the old path.
 
 An interruption before replacement commit leaves an orphan replacement. An
 interruption afterwards leaves an orphan old file. Recovery applies the atomic
 replacement record and removes unreferenced engine files; it never merges both
 copies.
 The collector enumerates only the selected segment's live records, not the
-entire object directory. Background relocation pays the shared byte budget
-before acquiring the mutation lock and rechecks the selected segment afterward.
+entire object directory. It charges staged allocation during copying. The old
+allocation stays charged through unlink and while any reader retains its fd.
 
 No published payload extent is overwritten, truncated, punched, or reused.
 An in-flight response retains its old inode across replacement/unlink. This is

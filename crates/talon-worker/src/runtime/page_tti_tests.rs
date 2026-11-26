@@ -1627,7 +1627,7 @@ rate_limits = {{ enabled = false }}
             .scan(&mut cursor, 4096, r.page_clock.now(), Some(3_600_000), 64);
     let candidate = candidates.into_iter().next().expect("idle candidate");
     let permit = r
-        .page_gc_io
+        .background_io_slots()
         .clone()
         .acquire_many_owned(r.page_gc_config.io_concurrency as u32)
         .await

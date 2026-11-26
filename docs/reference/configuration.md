@@ -404,7 +404,8 @@ Maximum concurrently running background maintenance tasks.
 
 ### `background_io_concurrency`
 
-Shared local disk I/O concurrency for background maintenance.
+Shared local disk I/O concurrency for background maintenance, including page
+and Small Store GC. Page GC pays deletion charges before taking an I/O slot.
 
 - **Environment variable:** `TALON_WORKER_BACKGROUND_IO_CONCURRENCY`
 - **Default:** `4`
@@ -604,7 +605,8 @@ Maximum deletion candidates per watermark eviction or stale GC batch; does not l
 
 ### `page_gc_io_concurrency`
 
-Maximum concurrent page GC deletion tasks.
+Maximum concurrent deletion tasks within a page GC batch. This also sizes the
+fallback I/O semaphore for runtimes without a shared background budget.
 
 - **Environment variable:** `TALON_WORKER_PAGE_GC_IO_CONCURRENCY`
 - **Default:** `4`

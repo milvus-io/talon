@@ -274,6 +274,26 @@ struct State {
     last_flush: Instant,
 }
 
+struct CopiedRecord {
+    old_offset: u64,
+    new_offset: u64,
+    charge: u64,
+    stored_len: u64,
+}
+
+struct StagedSegment {
+    id: u64,
+    segment: Segment,
+    records: Vec<CopiedRecord>,
+}
+
+#[derive(Default)]
+struct PhysicalStats {
+    published: SmallStoreStats,
+    staging_allocated: u64,
+    retired: Vec<(Weak<OwnedFd>, u64)>,
+}
+
 /// One independently appended and sealed stream within a namespace/credential scope.
 /// The compact identity is shared with the journal and eviction policy.
 /// Locators own access tokens shared with the eviction policy;
@@ -286,6 +306,8 @@ struct SegmentStore {
     #[cfg(test)]
     flush_pause: Mutex<Option<Arc<tests::AppendPause>>>,
     #[cfg(test)]
+    copied_pause: Mutex<Option<Arc<tests::AppendPause>>>,
+    #[cfg(test)]
     relocation_pause: Mutex<Option<Arc<tests::AppendPause>>>,
     #[cfg(test)]
     fail_delete_after_journal: std::sync::atomic::AtomicBool,
@@ -296,16 +318,17 @@ struct SegmentStore {
     state: tokio::sync::Mutex<State>,
     // Serializes durable publication, deletion and compaction, never append.
     publication: tokio::sync::Mutex<()>,
+    // Owns the source and staged file from selection through physical removal.
+    compaction: tokio::sync::Mutex<()>,
     pipeline_changed: tokio::sync::Notify,
     appends_drained: tokio::sync::Notify,
     append_slots: tokio::sync::Semaphore,
     entries: Arc<RwLock<directory::Directory>>,
     // Async opens run outside the directory lock, but must finish before GC
-    // replaces locators and unlinks their source paths.
+    // unlinks their source paths.
     readers: Arc<tokio::sync::RwLock<()>>,
     tasks: Arc<crate::page_gc::Mutations>,
-    cached_stats: RwLock<SmallStoreStats>,
-    retired: Mutex<Vec<(Weak<OwnedFd>, u64)>>,
+    cached_stats: Mutex<PhysicalStats>,
     // Keep the exclusive cache-root lease through detached blocking work.
     _root_lock: Option<Arc<crate::page_access_store::CacheRootLock>>,
 }
@@ -382,6 +405,8 @@ impl SegmentStore {
             #[cfg(test)]
             flush_pause: Mutex::new(None),
             #[cfg(test)]
+            copied_pause: Mutex::new(None),
+            #[cfg(test)]
             relocation_pause: Mutex::new(None),
             #[cfg(test)]
             fail_delete_after_journal: std::sync::atomic::AtomicBool::new(false),
@@ -402,6 +427,7 @@ impl SegmentStore {
                 last_flush: Instant::now(),
             }),
             publication: tokio::sync::Mutex::new(()),
+            compaction: tokio::sync::Mutex::new(()),
             pipeline_changed: tokio::sync::Notify::new(),
             appends_drained: tokio::sync::Notify::new(),
             append_slots: tokio::sync::Semaphore::new(32),
@@ -411,8 +437,7 @@ impl SegmentStore {
             ))),
             readers: journal.readers.clone(),
             tasks: Arc::new(crate::page_gc::Mutations::new(true)),
-            cached_stats: RwLock::new(SmallStoreStats::default()),
-            retired: Mutex::new(Vec::new()),
+            cached_stats: Mutex::default(),
             _root_lock: root_lock,
         }
     }
@@ -683,8 +708,8 @@ impl SegmentStore {
     }
 
     #[cfg(test)]
-    async fn pause_relocation(&self) {
-        let pause = self.relocation_pause.lock().unwrap().take();
+    async fn pause_compaction(hook: &Mutex<Option<Arc<tests::AppendPause>>>) {
+        let pause = hook.lock().unwrap().take();
         if let Some(pause) = pause {
             pause.entered.notify_one();
             pause.resume.notified().await;
@@ -701,32 +726,34 @@ impl SegmentStore {
     }
 
     async fn delete_inner(&self, id: &(impl SmallStoreKey + ?Sized)) -> io::Result<()> {
-        self.delete_inner_if(id, None, |_| true).await.map(|_| ())
+        self.delete_inner_if(id, None, |_| Some(()))
+            .await
+            .map(|_| ())
     }
 
-    async fn delete_inner_if(
+    async fn delete_inner_if<G>(
         &self,
         id: &(impl SmallStoreKey + ?Sized),
         deadline: Option<Instant>,
-        eligible: impl FnOnce(&Location) -> bool,
-    ) -> io::Result<bool> {
+        authorize: impl FnOnce(&Location) -> Option<G>,
+    ) -> io::Result<Option<G>> {
         format::validate_key(&id.view())?;
         // A tombstone must be either included in the sealing fsync or synced
         // after publication. Serialize logical publication with seal/relocation.
         use crate::runtime::before_deadline;
         let Some(_publication) = before_deadline(deadline, self.publication.lock()).await else {
-            return Ok(false);
+            return Ok(None);
         };
         let Some(mut state) = before_deadline(deadline, self.state.lock()).await else {
-            return Ok(false);
+            return Ok(None);
         };
         self.healthy(&state)?;
         let Some(Some(loc)) = self.unlink_location(&id.view(), deadline.is_some()) else {
-            return Ok(false);
+            return Ok(None);
         };
-        if !eligible(&loc) {
-            return Ok(false);
-        }
+        let Some(guard) = authorize(&loc) else {
+            return Ok(None);
+        };
         let result = async {
             let segment = state.segments.get_mut(&loc.segment).unwrap();
             self.journal
@@ -761,21 +788,23 @@ impl SegmentStore {
             state.written += 21;
             self.refresh_stats(&state);
             self.entries.write().unwrap().remove(&id.view());
-            Ok(true)
+            Ok(())
         }
         .await;
         if result.is_err() {
             state.poisoned = true;
         }
-        result
+        drop(state);
+        drop(_publication);
+        result.map(|()| Some(guard))
     }
 
     pub fn stats(&self) -> io::Result<SmallStoreStats> {
-        let mut stats = *self.cached_stats.read().unwrap();
-        let mut retired = self.retired.lock().unwrap();
-        retired.retain(|(fd, _)| fd.strong_count() > 0);
-        stats.retired_bytes = retired.iter().map(|(_, bytes)| bytes).sum();
-        stats.allocated_bytes += stats.retired_bytes;
+        let mut cached = self.cached_stats.lock().unwrap();
+        let mut stats = cached.published;
+        cached.retired.retain(|(fd, _)| fd.strong_count() > 0);
+        stats.retired_bytes = cached.retired.iter().map(|(_, bytes)| bytes).sum();
+        stats.allocated_bytes += cached.staging_allocated + stats.retired_bytes;
         Ok(stats)
     }
 
@@ -827,17 +856,7 @@ impl SegmentStore {
         pressure: bool,
         budget: Option<Arc<crate::background::BackgroundBudget>>,
     ) -> io::Result<bool> {
-        let tracks_access = self.journal.model.0.read().unwrap().recency.is_some();
-        // Always take the relocation gate before competing with the snapshot for disk I/O.
-        let access_relocation = if tracks_access {
-            Some(self.journal.access_relocation.read().await)
-        } else {
-            None
-        };
-        let _io = match &budget {
-            Some(budget) => Some(budget.io().await),
-            None => None,
-        };
+        let _compaction = self.compaction.lock().await;
         let pressure_seal = if pressure {
             let state = self.state.lock().await;
             state
@@ -847,134 +866,284 @@ impl SegmentStore {
         } else {
             false
         };
-        if checkpoint || pressure_seal {
-            self.checkpoint().await?;
-        } else if self.flush_due().await {
-            self.flush().await?;
-        }
-        let _publication = self.publication.lock().await;
-        // Pay before taking the mutation lock. A segment selected here cannot
-        // gain new live bytes once sealed. Recheck identity and eligibility
-        // after payment, since another collector may have retired it.
-        let paid_candidate = if let Some(budget) = &budget {
-            let candidate = {
-                let state = self.state.lock().await;
-                reclaim_candidate(&state, pressure).map(|id| {
-                    let s = &state.segments[&id];
-                    (
-                        id,
-                        s.live_data_bytes.saturating_mul(2)
-                            + (s.live - s.live_data_bytes)
-                            + 36 * s.records as u64
-                            + 49,
-                    )
-                })
+        let flush = !checkpoint && !pressure_seal && self.flush_due().await;
+        if checkpoint || pressure_seal || flush {
+            let _io = match &budget {
+                Some(budget) => Some(budget.io().await),
+                None => None,
             };
-            if let Some((_, cost)) = candidate {
-                budget.bytes(cost as usize).await;
+            if flush {
+                self.flush().await?;
+            } else {
+                self.checkpoint().await?;
             }
-            Some(candidate.map(|(id, _)| id))
+        }
+        let result = self.compact(pressure, budget.as_deref()).await;
+        if result.is_err() {
+            // Keep any uncommitted files and their charges until recovery. A
+            // failed durable acknowledgement can leave either version on disk.
+            self.state.lock().await.poisoned = true;
+        }
+        result
+    }
+
+    async fn compact(
+        &self,
+        pressure: bool,
+        budget: Option<&crate::background::BackgroundBudget>,
+    ) -> io::Result<bool> {
+        let (old, entries, cost) = {
+            let state = self.state.lock().await;
+            self.healthy(&state)?;
+            let Some(old) = reclaim_candidate(&state, pressure) else {
+                return Ok(false);
+            };
+            let source = &state.segments[&old];
+            let cost = source.live_data_bytes.saturating_mul(2)
+                + (source.live - source.live_data_bytes)
+                + 36 * source.records as u64
+                + 49;
+            let entries = self.entries.read().unwrap().segment_entries(old);
+            (old, entries, cost)
+        };
+        if let Some(budget) = budget {
+            budget.bytes(cost as usize).await;
+        }
+
+        // Full access checkpoints take this gate before I/O. Preserve that
+        // ordering so a snapshot and relocation cannot wait on each other.
+        let tracks_access = self.journal.model.0.read().unwrap().recency.is_some();
+        let access_relocation = if tracks_access {
+            Some(self.journal.access_relocation.read().await)
         } else {
             None
         };
-        let mut state = self.state.lock().await;
-        self.healthy(&state)?;
-        let result = async {
-            let candidate = match paid_candidate {
-                Some(id) => id.filter(|id| reclaimable(&state, *id)),
-                None => reclaim_candidate(&state, pressure),
-            };
-            let Some(old) = candidate else {
-                return Ok(false);
-            };
-            let entries: Vec<_> = {
-                let directory = self.entries.read().unwrap();
-                directory.segment_entries(old)
-            };
-            let replacement = if entries.is_empty() {
-                None
-            } else {
-                Some(self.create(&mut state).await?)
-            };
-            let mut moved = Vec::with_capacity(entries.len());
-            if let Some(new) = replacement {
-                // Reuse one source descriptor for the whole copy, then release
-                // it before retired-reader accounting at unlink.
-                let _source = state.segments[&old].data().await?;
-                for (key, loc) in &entries {
-                    let bytes = loc.clone().retain().await?.read_stored().await?;
-                    // Keep the storage weight and checksum format of an existing
-                    // admission when relocating it.
-                    let replacement = self
-                        .append(&mut state, new, key, bytes, loc.checksum)
-                        .await?;
-                    moved.push((key.clone(), replacement));
-                }
-                let s = state.segments.get_mut(&new).unwrap();
-                disk_io::sync(s.data().await?).await?;
-                self.sync_data_directory(new).await?;
-                let allocated = s.allocated().await?;
-                let previous = s.allocated;
-                s.allocated = allocated;
-                s.sealed = true;
-                s.durable_end = s.bytes;
-                s.close_writers();
-                state.allocated = state
-                    .allocated
-                    .saturating_sub(previous)
-                    .saturating_add(allocated);
-                self.refresh_stats(&state);
-            }
-            #[cfg(test)]
+        let io = match budget {
+            Some(budget) => Some(budget.io().await),
+            None => None,
+        };
+        let mut staged = if entries.is_empty() {
+            None
+        } else {
+            Some(self.copy_segment(entries).await?)
+        };
+        #[cfg(test)]
+        {
             tests::crash("compact_copy");
+            Self::pause_compaction(&self.copied_pause).await;
+        }
+
+        let Some((mut source, reconcile_bytes)) = self.publish_compaction(old, &mut staged).await?
+        else {
+            return Ok(false);
+        };
+        drop(io);
+        drop(access_relocation);
+
+        // A reader which resolved the old address must retain its fd before
+        // the path goes away. Readers starting after this barrier see new locators.
+        drop(self.readers.write().await);
+        #[cfg(test)]
+        tests::crash("compact_before_unlink");
+        if let Some(budget) = budget.filter(|_| reconcile_bytes > 0) {
+            // Charge the extra journal frames discovered during publication.
+            budget.bytes(reconcile_bytes).await;
+        }
+        source.close_writers();
+        let readers = source.file.fd.lock().await.clone();
+        self.unlink_compacted_segment(old, budget).await?;
+        {
+            let mut state = self.state.lock().await;
+            state.allocated -= source.allocated;
+            let mut cached = self.cached_stats.lock().unwrap();
+            cached.retired.push((readers, source.allocated));
+            cached.published = Self::snapshot_stats(&state);
+        }
+        if let Some(discarded) = staged {
+            self.unlink_compacted_segment(discarded.id, budget).await?;
+            self.cached_stats.lock().unwrap().staging_allocated = 0;
+        }
+        Ok(true)
+    }
+
+    async fn copy_segment(&self, entries: Vec<(SmallKey, Location)>) -> io::Result<StagedSegment> {
+        let id = self.journal.allocate()?;
+        let mut segment = self.create_segment(id).await?;
+        self.cached_stats.lock().unwrap().staging_allocated = segment.allocated;
+        let mut records = Vec::with_capacity(entries.len());
+        // Retain one source descriptor through the copy, including across
+        // concurrent deletes. The compaction mutex keeps its pathname alive.
+        let source = entries[0].1.file.open().await?;
+        let data = segment.data().await?;
+        for (key, location) in entries {
+            let old_offset = location.offset;
+            let new_offset = segment.bytes;
+            let len = location.len;
+            let checksum = location.checksum;
+            let stored_len = location.stored_len();
+            let charge = charge(&key, len);
+            let bytes = ReadLocation {
+                fd: source.clone(),
+                location,
+            }
+            .read_stored()
+            .await?;
+            let write = disk_io::write(data.clone(), bytes, new_offset).await;
+            segment.allocated = disk_io::allocated(data.clone()).await?;
+            self.cached_stats.lock().unwrap().staging_allocated = segment.allocated;
+            write?;
+            #[cfg(test)]
+            tests::crash("append_payload");
+            // A checkpoint may snapshot these Inserts. They remain invisible
+            // and recover with durable_end=0 until Replace commits the file.
             self.journal
                 .append(
-                    journal::Event::Replace {
-                        old,
-                        new: replacement,
+                    journal::Event::Insert {
+                        slot: self.slot,
+                        segment: id,
+                        offset: new_offset,
+                        record: journal::Record { key, len, checksum },
                     },
-                    true,
+                    false,
                 )
                 .await?;
             #[cfg(test)]
-            {
-                tests::crash("compact_manifest");
-                self.pause_relocation().await;
-            }
-            if let Some(budget) = &budget {
-                budget.delete().await;
-            }
-            let readers = self.readers.write().await;
-            self.entries
-                .write()
+            tests::crash("append_index");
+            segment.bytes += stored_len;
+            segment.metadata += charge - stored_len;
+            segment.live += charge;
+            segment.live_data_bytes += stored_len;
+            segment.records += 1;
+            records.push(CopiedRecord {
+                old_offset,
+                new_offset,
+                charge,
+                stored_len,
+            });
+        }
+        disk_io::sync(data.clone()).await?;
+        self.sync_data_directory(id).await?;
+        segment.allocated = disk_io::allocated(data).await?;
+        self.cached_stats.lock().unwrap().staging_allocated = segment.allocated;
+        segment.sealed = true;
+        segment.durable_end = segment.bytes;
+        segment.close_writers();
+        Ok(StagedSegment {
+            id,
+            segment,
+            records,
+        })
+    }
+
+    async fn publish_compaction(
+        &self,
+        old: u64,
+        staged: &mut Option<StagedSegment>,
+    ) -> io::Result<Option<(Segment, usize)>> {
+        let _publication = self.publication.lock().await;
+        let mut state = self.state.lock().await;
+        self.healthy(&state)?;
+        if !reclaimable(&state, old) {
+            // Only an empty active segment can have changed eligibility.
+            debug_assert!(staged.is_none());
+            return Ok(None);
+        }
+        let mut replacement = None;
+        let mut reconcile_bytes = 0;
+        if let Some(staged) = staged {
+            let stale = self
+                .entries
+                .read()
                 .unwrap()
-                .replace_segment(old, replacement, moved);
-            if state.active == Some(old) {
-                state.active = None;
+                .retain_visible(old, &mut staged.records);
+            if staged.records.is_empty() {
+                reconcile_bytes = 49;
+                self.journal
+                    .append(
+                        journal::Event::Replace {
+                            old: staged.id,
+                            new: None,
+                        },
+                        false,
+                    )
+                    .await?;
+            } else {
+                reconcile_bytes = 49 * stale.len();
+                for record in stale {
+                    self.journal
+                        .append(
+                            journal::Event::Delete {
+                                segment: staged.id,
+                                offset: record.new_offset,
+                            },
+                            false,
+                        )
+                        .await?;
+                    staged.segment.metadata += 21;
+                    staged.segment.live -= record.charge;
+                    staged.segment.live_data_bytes -= record.stored_len;
+                    staged.segment.records -= 1;
+                }
+                replacement = Some(staged.id);
             }
-            drop(readers);
-            drop(access_relocation);
-            let segment = state.segments.remove(&old).unwrap();
-            let allocated = segment.allocated().await?;
-            disk_io::remove(self.path(old, "data")).await?;
-            disk_io::sync_dir(self.path(old, "data").parent().unwrap().to_owned()).await?;
-            let readers = segment.file.fd.lock().await.clone();
-            self.retired.lock().unwrap().push((readers, allocated));
-            state.allocated = state.allocated.saturating_sub(segment.allocated);
-            // Relocation keeps the published live charge unchanged. Its extra
-            // destination allocation must count as physical overhead while copying.
-            if replacement.is_none() {
-                state.live -= segment.live;
+        }
+        #[cfg(test)]
+        tests::crash("compact_reconciled");
+        self.journal
+            .append(
+                journal::Event::Replace {
+                    old,
+                    new: replacement,
+                },
+                true,
+            )
+            .await?;
+        #[cfg(test)]
+        {
+            tests::crash("compact_manifest");
+            Self::pause_compaction(&self.relocation_pause).await;
+        }
+        if state.active == Some(old) {
+            state.active = None;
+        }
+        let source = state.segments.remove(&old).unwrap();
+        state.live -= source.live;
+        state.written -= source.bytes + source.metadata;
+        {
+            let mut entries = self.entries.write().unwrap();
+            entries.replace_segment(old, staged.as_ref().filter(|_| replacement.is_some()));
+        }
+        // The source's physical allocation stays charged until unlink.
+        let mut cached = self.cached_stats.lock().unwrap();
+        if replacement.is_some() {
+            let new = staged.take().unwrap();
+            debug_assert_eq!(source.live, new.segment.live);
+            state.live += new.segment.live;
+            state.written += new.segment.bytes + new.segment.metadata;
+            state.allocated += new.segment.allocated;
+            state.segments.insert(new.id, new.segment);
+            cached.staging_allocated = 0;
+        }
+        cached.published = Self::snapshot_stats(&state);
+        Ok(Some((source, reconcile_bytes)))
+    }
+
+    async fn unlink_compacted_segment(
+        &self,
+        id: u64,
+        budget: Option<&crate::background::BackgroundBudget>,
+    ) -> io::Result<()> {
+        let _io = match budget {
+            Some(budget) => {
+                budget.delete().await;
+                Some(budget.io().await)
             }
-            state.written -= segment.bytes + segment.metadata;
-            self.refresh_stats(&state);
-            Ok(true)
-        }
-        .await;
-        if result.is_err() {
-            state.poisoned = true;
-        }
-        result
+            None => None,
+        };
+        let path = self.path(id, "data");
+        let dir = path.parent().unwrap().to_owned();
+        disk_io::remove(path).await?;
+        disk_io::sync_dir(dir).await
     }
 
     fn healthy(&self, state: &State) -> io::Result<()> {
@@ -1026,60 +1195,6 @@ impl SegmentStore {
             records: 0,
             sealed: false,
         })
-    }
-    async fn append(
-        &self,
-        state: &mut State,
-        id: u64,
-        key: &SmallKey,
-        value: Bytes,
-        legacy_checksum: Option<u64>,
-    ) -> io::Result<Location> {
-        let segment = state.segments.get_mut(&id).unwrap();
-        let offset = segment.bytes;
-        let stored_len = value.len() as u64;
-        let len = stored_len - checksum_len(legacy_checksum);
-        let charge = charge(key, len);
-        disk_io::write(segment.data().await?, value, offset).await?;
-        #[cfg(test)]
-        tests::crash("append_payload");
-        self.journal
-            .append(
-                journal::Event::Insert {
-                    slot: self.slot,
-                    segment: id,
-                    offset,
-                    record: journal::Record {
-                        key: key.clone(),
-                        len,
-                        checksum: legacy_checksum,
-                    },
-                },
-                false,
-            )
-            .await?;
-        let frame_len = charge - stored_len;
-        #[cfg(test)]
-        tests::crash("append_index");
-        segment.bytes += stored_len;
-        segment.metadata += frame_len;
-        segment.live += charge;
-        segment.live_data_bytes += stored_len;
-        segment.records += 1;
-        let allocated = segment.allocated().await?;
-        state.allocated += allocated.saturating_sub(segment.allocated);
-        segment.allocated = allocated;
-        state.written += charge;
-        let loc = Location {
-            file: segment.file.clone(),
-            segment: id,
-            offset,
-            len,
-            checksum: legacy_checksum,
-            access: None,
-        };
-        self.refresh_stats(state);
-        Ok(loc)
     }
     fn start_pipeline(self: &Arc<Self>, state: &mut State) {
         if state.pipeline_running {
@@ -1277,19 +1392,15 @@ impl SegmentStore {
         Ok(())
     }
     fn refresh_recovered_stats(&mut self) {
-        let state = self.state.get_mut();
-        *self.cached_stats.get_mut().unwrap() = SmallStoreStats {
-            live_bytes: state.live,
-            allocated_bytes: state.allocated,
-            retired_bytes: 0,
-            dead_bytes: state
-                .written
-                .saturating_sub(state.live + 8 * state.segments.len() as u64),
-            segments: state.segments.len(),
-        };
+        self.cached_stats.get_mut().unwrap().published = Self::snapshot_stats(self.state.get_mut());
     }
+
     fn refresh_stats(&self, state: &State) {
-        *self.cached_stats.write().unwrap() = SmallStoreStats {
+        self.cached_stats.lock().unwrap().published = Self::snapshot_stats(state);
+    }
+
+    fn snapshot_stats(state: &State) -> SmallStoreStats {
+        SmallStoreStats {
             live_bytes: state.live,
             allocated_bytes: state.allocated,
             dead_bytes: state
@@ -1297,7 +1408,7 @@ impl SegmentStore {
                 .saturating_sub(state.live + 8 * state.segments.len() as u64),
             segments: state.segments.len(),
             retired_bytes: 0,
-        };
+        }
     }
 }
 

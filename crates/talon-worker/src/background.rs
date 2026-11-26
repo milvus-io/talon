@@ -376,6 +376,9 @@ impl BackgroundBudget {
             .await
             .expect("background budget remains open")
     }
+    pub(crate) fn io_slots(&self) -> &Arc<Semaphore> {
+        &self.io
+    }
     pub async fn delete(&self) {
         self.delete_units(1).await;
     }

@@ -395,14 +395,6 @@ impl SmallObjectStore {
         let store = self.clone();
         self.tasks
             .run(async move {
-                let guard = if deadline.is_some() {
-                    store.mutations.try_admit_owned(Self::mutation_key(&id))
-                } else {
-                    Some(store.mutation(&id).await)
-                };
-                let Some(_guard) = guard else {
-                    return Ok(false);
-                };
                 let owner = if deadline.is_some() {
                     store.try_owner(&id)
                 } else {
@@ -411,20 +403,33 @@ impl SmallObjectStore {
                 let Some(stream) = owner else {
                     return Ok(false);
                 };
-                let removed = stream
+                let guard = stream
                     .delete_inner_if(&id, deadline, |loc| {
-                        loc.access
+                        let current = loc
+                            .access
                             .as_ref()
                             .and_then(AccessHandle::small)
                             .is_some_and(|current| {
                                 Arc::ptr_eq(current, &ticket) && eligible(current)
-                            })
+                            });
+                        if !current || deadline.is_some_and(|at| Instant::now() >= at) {
+                            return None;
+                        }
+                        // A put or unconditional delete can hold this key while
+                        // waiting for stream state. Defer on contention.
+                        let key = Self::mutation_key(&id);
+                        if deadline.is_some() {
+                            store.mutations.try_admit_owned(key)
+                        } else {
+                            store.mutations.admit_owned(key)
+                        }
                     })
                     .await?;
-                if removed {
+                if let Some(_guard) = guard {
                     store.policy().expect("compact small policy").remove(&id);
+                    return Ok(true);
                 }
-                Ok(removed)
+                Ok(false)
             })
             .await
     }
@@ -1144,6 +1149,65 @@ mod recovery_tests {
         store.maintain(true).await.unwrap();
         assert!(!store.contains(&id(0)));
         assert_eq!(retained.read().await.unwrap(), Bytes::from_static(b"data"));
+    }
+
+    #[tokio::test]
+    async fn compaction_publishes_before_waiting_for_old_open_and_survives_cancellation() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Arc::new(open(dir.path()).unwrap());
+            let stream = store.writer(1).await.unwrap();
+            stream
+                .put(&id(0), Bytes::from(vec![0; 8192]))
+                .await
+                .unwrap();
+            stream
+                .put(&id(1), Bytes::from_static(b"survivor"))
+                .await
+                .unwrap();
+            stream.checkpoint().await.unwrap();
+            store.delete(&id(0)).await.unwrap();
+            let old = store.lookup_entry(&id(1)).unwrap().unwrap();
+            let before = stream.stats().unwrap();
+            let pause = Arc::new(super::super::tests::AppendPause::default());
+            *stream.copied_pause.lock().unwrap() = Some(pause.clone());
+            let compaction = tokio::spawn({
+                let stream = stream.clone();
+                async move { stream.maintain(false).await }
+            });
+            pause.entered.notified().await;
+            let staged = stream.stats().unwrap();
+            assert!(staged.allocated_bytes > before.allocated_bytes);
+            assert_eq!(staged.live_bytes, before.live_bytes);
+            assert_eq!(staged.segments, before.segments);
+            let held = old.file.fd.lock().await;
+            let reader = tokio::spawn({
+                let store = store.clone();
+                async move { store.read(&id(1)).await }
+            });
+            while stream.readers.try_write().is_ok() {
+                tokio::task::yield_now().await;
+            }
+            pause.resume.notify_one();
+            while store.lookup_entry(&id(1)).unwrap().unwrap().segment == old.segment {
+                tokio::task::yield_now().await;
+            }
+            assert!(old.file.path.is_file());
+            assert!(!compaction.is_finished());
+            stream
+                .put(&id(2), Bytes::from_static(b"foreground append"))
+                .await
+                .unwrap();
+            compaction.abort();
+            let _ = compaction.await;
+            drop(held);
+            assert_eq!(reader.await.unwrap().unwrap().unwrap(), b"survivor"[..]);
+            stream.tasks.drain().await;
+            assert!(!old.file.path.exists());
+            assert_eq!(store.read(&id(1)).await.unwrap().unwrap(), b"survivor"[..]);
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

@@ -24,7 +24,28 @@ async fn crash_child() {
     }
     store.maintain(true).await.unwrap();
     for n in 0..9 {
-        store.delete(&id(&n.to_string())).await.unwrap();
+        if n != 8 || std::env::var_os("TALON_SMALL_TEST_STALE_COPY").is_none() {
+            store.delete(&id(&n.to_string())).await.unwrap();
+        }
+    }
+    if let Ok(mode) = std::env::var("TALON_SMALL_TEST_STALE_COPY") {
+        let pause = Arc::new(AppendPause::default());
+        *store.copied_pause.lock().unwrap() = Some(pause.clone());
+        let (compaction, ()) = tokio::join!(store.maintain(false), async {
+            pause.entered.notified().await;
+            store.delete(&id("8")).await.unwrap();
+            put(&store, &id("8"), b"re-admitted").await.unwrap();
+            if mode == "all" {
+                store.delete(&id("9")).await.unwrap();
+            }
+            // Checkpoint the new admission together with a staged segment that
+            // contains the same key at a different address.
+            store.checkpoint().await.unwrap();
+            store.journal.checkpoint().await.unwrap();
+            pause.resume.notify_one();
+        });
+        compaction.unwrap();
+        return;
     }
     store.maintain(false).await.unwrap();
 }
@@ -40,6 +61,7 @@ async fn process_loss_at_each_publication_boundary() {
         "delete_sync",
         "compact_copy",
         "compact_manifest",
+        "compact_before_unlink",
     ] {
         let dir = tempfile::tempdir().unwrap();
         let status = std::process::Command::new(std::env::current_exe().unwrap())
@@ -68,6 +90,46 @@ async fn process_loss_at_each_publication_boundary() {
                 for n in 0..9 {
                     assert!(!store.contains(&id(&n.to_string())), "{point}");
                 }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn recovery_preserves_readmission_across_partial_and_all_stale_compaction() {
+    for mode in ["partial", "all"] {
+        for point in [
+            "compact_reconciled",
+            "compact_manifest",
+            "compact_before_unlink",
+            "done",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "small_store::tests::crash_child"])
+                .env("TALON_SMALL_TEST_ROOT", dir.path())
+                .env("TALON_SMALL_TEST_CRASH", point)
+                .env("TALON_SMALL_TEST_STALE_COPY", mode)
+                .stdout(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert_eq!(
+                status.code(),
+                Some(if point == "done" { 0 } else { 71 }),
+                "{mode} {point}"
+            );
+            let store = open(dir.path());
+            assert_eq!(
+                store.read(&id("8")).await.unwrap().unwrap(),
+                b"re-admitted"[..]
+            );
+            assert_eq!(
+                store.read(&id("9")).await.unwrap(),
+                (mode == "partial").then(|| Bytes::from(vec![9; 4096])),
+                "{mode} {point}"
+            );
+            for n in 0..8 {
+                assert!(!store.contains(&id(&n.to_string())), "{mode} {point} {n}");
             }
         }
     }

@@ -2215,7 +2215,7 @@ rate_limits = {{ enabled = false }}
         .pop()
         .unwrap();
     let permit = worker
-        .page_gc_io
+        .background_io_slots()
         .clone()
         .acquire_many_owned(worker.page_gc_config.io_concurrency as u32)
         .await

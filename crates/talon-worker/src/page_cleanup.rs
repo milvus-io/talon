@@ -1,6 +1,7 @@
 //! Bounded, repeatable disk discovery of checkpoint leftovers, independent of TTI.
 use crate::page_gc::CleanupReport;
 use crate::page_lifecycle::PageLifecycle;
+use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -105,15 +106,20 @@ impl CleanupCursor {
 
     /// Pay outside the stripe, then re-list under the lock: a fill may have
     /// created live pages while we waited. Never recursively remove directories.
-    async fn finish_directory(
+    async fn finish_directory<F>(
         &self,
         dir: &DirectoryScan,
         lifecycle: &PageLifecycle,
         budget: usize,
         report: &mut CleanupReport,
         resources: Option<&crate::background::BackgroundBudget>,
-    ) -> io::Result<bool> {
+        acquire_io: &(impl Fn() -> F + Sync),
+    ) -> io::Result<bool>
+    where
+        F: Future<Output = Option<tokio::sync::OwnedSemaphorePermit>> + Send,
+    {
         let gate = lifecycle.directory_gate(dir.digest);
+        let io = acquire_io().await;
         let guard = gate.write().await;
         let metadata = match Self::metadata_only(&dir.path).await {
             Ok(Some(metadata)) => metadata,
@@ -123,9 +129,11 @@ impl CleanupCursor {
         };
         let credits = (metadata.len() + 1).min(budget - report.attempted);
         drop(guard);
+        drop(io);
         if let Some(resources) = resources {
             resources.delete_units(credits as u64).await;
         }
+        let _io = acquire_io().await;
         let _guard = gate.write().await;
         let metadata = match Self::metadata_only(&dir.path).await {
             Ok(Some(metadata)) => metadata,
@@ -156,18 +164,25 @@ impl CleanupCursor {
         scan_budget: usize,
         delete_budget: usize,
     ) -> CleanupReport {
-        self.run_batch_with_budget(lifecycle, scan_budget, delete_budget, None)
-            .await
+        self.run_batch_with_budget(lifecycle, scan_budget, delete_budget, None, || async {
+            None
+        })
+        .await
     }
 
-    pub async fn run_batch_with_budget(
+    pub async fn run_batch_with_budget<F>(
         &mut self,
         lifecycle: &PageLifecycle,
         scan_budget: usize,
         delete_budget: usize,
         resources: Option<&crate::background::BackgroundBudget>,
-    ) -> CleanupReport {
+        acquire_io: impl Fn() -> F + Sync,
+    ) -> CleanupReport
+    where
+        F: Future<Output = Option<tokio::sync::OwnedSemaphorePermit>> + Send,
+    {
         let mut report = CleanupReport::default();
+        let mut io = acquire_io().await;
         if self.shards.is_none() {
             self.started = Instant::now();
             self.pending = 0;
@@ -245,9 +260,11 @@ impl CleanupCursor {
                                             .is_some_and(is_owned_temp) =>
                                 {
                                     drop(exclusive);
+                                    drop(io);
                                     if let Some(resources) = resources {
                                         resources.delete().await;
                                     }
+                                    io = acquire_io().await;
                                     exclusive = gate.write().await;
                                     // Revalidate after waiting without the stripe.
                                     if let Err(error) = Self::validate_directory(&dir.path).await {
@@ -289,8 +306,16 @@ impl CleanupCursor {
                 drop(exclusive);
                 if dir.exhausted {
                     let errors = report.errors;
+                    drop(io);
                     match self
-                        .finish_directory(&dir, lifecycle, delete_budget, &mut report, resources)
+                        .finish_directory(
+                            &dir,
+                            lifecycle,
+                            delete_budget,
+                            &mut report,
+                            resources,
+                            &acquire_io,
+                        )
                         .await
                     {
                         Ok(true) => {
@@ -304,6 +329,7 @@ impl CleanupCursor {
                             self.pending += 1;
                         }
                     }
+                    io = acquire_io().await;
                 } else {
                     self.current = Some(dir);
                 }
@@ -326,7 +352,9 @@ impl CleanupCursor {
                                 shard.filter(|s| *s < crate::page_lifecycle::SHARDS)
                             {
                                 if let Some(resources) = resources {
+                                    drop(io);
                                     resources.delete().await;
+                                    io = acquire_io().await;
                                 }
                                 let gate = lifecycle.checkpoint_gate(shard);
                                 // An active writer owns its temp until publication completes.
