@@ -40,9 +40,17 @@ pub trait Machine: Send + 'static {
     fn encode(record: &Self::Record) -> io::Result<Bytes>;
     fn decode(bytes: &[u8]) -> io::Result<Self::Record>;
     fn apply(&mut self, lsn: Lsn, record: Self::Record) -> io::Result<()>;
+    /// A recovering machine may need startup queries or appends before it
+    /// can take a checkpoint. Requests remain admissible during that phase.
+    fn checkpoint_ready(&self) -> bool {
+        true
+    }
     fn snapshot(&self) -> io::Result<Self::Snapshot>;
     fn decode_snapshot(bytes: &[u8]) -> io::Result<Self::SnapshotRecord>;
     fn restore(&mut self, record: Self::SnapshotRecord) -> io::Result<()>;
+    fn finish_snapshot_restore(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -278,6 +286,7 @@ impl JournalService {
         }
         let life = lifecycle::enter(&self.streams, &path)?;
         let exit = lifecycle::Exit(life.clone());
+        let writer_life = life.clone();
         // Startup-only: persist every newly created stream ancestor before an
         // acknowledgement can depend on that path surviving a crash.
         let mut parent = path.parent();
@@ -308,9 +317,16 @@ impl JournalService {
                         #[cfg(test)]
                         let disk = disk.with_control(test_control);
                         let _ = ready.send(Ok(()));
-                        if let Err(error) =
-                            writer::run(disk, machine, receive, &poison, policy, snapshot_slots)
-                                .await
+                        if let Err(error) = writer::run(
+                            disk,
+                            machine,
+                            receive,
+                            &poison,
+                            policy,
+                            snapshot_slots,
+                            writer_life,
+                        )
+                        .await
                         {
                             poison.store(true, Ordering::Release);
                             tracing::error!(%error, "journal stream stopped; restart required");

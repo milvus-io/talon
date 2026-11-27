@@ -23,8 +23,6 @@ pub struct SmallObjectStore {
     #[cfg(test)]
     pub(super) access_pause: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     pub(super) access_dirty: Arc<super::access::DirtyQueue>,
-    pub(super) access_disk: Mutex<super::access::DiskState>,
-    pub(super) access_bytes: std::sync::atomic::AtomicU64,
     streams: RwLock<BTreeMap<usize, Stream>>,
     policy: std::sync::OnceLock<Arc<Lru>>,
     index: std::sync::OnceLock<Weak<crate::BlockIndex>>,
@@ -49,6 +47,7 @@ impl SmallObjectStore {
             root_lock,
             None,
             None,
+            false,
         )
     }
     pub(crate) fn open_with_service(
@@ -59,6 +58,7 @@ impl SmallObjectStore {
         root_lock: Option<Arc<crate::page_access_store::CacheRootLock>>,
         service: Option<&Arc<talon_journal::JournalService>>,
         maintenance: Option<Arc<crate::background::BackgroundBudget>>,
+        compact: bool,
     ) -> io::Result<Self> {
         validate_geometry(threshold, segment_size, capacity)?;
         let journal_started = Instant::now();
@@ -68,8 +68,14 @@ impl SmallObjectStore {
         };
         let journal_ms = journal_started.elapsed().as_secs_f64() * 1000.0;
         let locators_started = Instant::now();
-        let recovered =
-            Self::recover_streams(&journal, &model, threshold, segment_size, root_lock)?;
+        let recovered = Self::recover_streams(
+            &journal,
+            &model,
+            threshold,
+            segment_size,
+            root_lock,
+            compact,
+        )?;
         let locators_ms = locators_started.elapsed().as_secs_f64() * 1000.0;
         let setup_started = Instant::now();
         let mut streams = BTreeMap::new();
@@ -78,7 +84,6 @@ impl SmallObjectStore {
             streams.insert(slot, Arc::new(OnceCell::new_with(Some(Arc::new(stream)))));
         }
         let fallback = streams[&0].get().unwrap().clone();
-        let access_bytes = super::access::allocated(&root)?;
         let allocation_unit = crate::capacity::filesystem_stats(&root)
             .map_err(io::Error::other)?
             .f_frsize
@@ -92,8 +97,6 @@ impl SmallObjectStore {
             #[cfg(test)]
             access_pause: Mutex::default(),
             access_dirty: Arc::default(),
-            access_disk: Mutex::default(),
-            access_bytes: std::sync::atomic::AtomicU64::new(access_bytes),
             root,
             fallback,
             journal,
@@ -111,6 +114,7 @@ impl SmallObjectStore {
         threshold: u64,
         segment_size: u64,
         root_lock: Option<Arc<crate::page_access_store::CacheRootLock>>,
+        compact: bool,
     ) -> io::Result<BTreeMap<usize, SegmentStore>> {
         let mut recovered = BTreeMap::new();
         recovered.insert(
@@ -123,21 +127,33 @@ impl SmallObjectStore {
                 journal.clone(),
             ),
         );
-        for (&id, meta) in model
-            .segments
-            .iter()
-            .filter(|(_, meta)| meta.durable_end > 0)
         {
-            let stream = recovered.entry(meta.slot).or_insert_with(|| {
-                SegmentStore::empty(
-                    threshold,
-                    segment_size,
-                    root_lock.clone(),
-                    meta.slot,
-                    journal.clone(),
-                )
-            });
-            stream.recover(id, meta)?;
+            let started = Instant::now();
+            let mut catalog = journal.model.0.write().unwrap();
+            catalog.reserve_recovery();
+            for (&id, meta) in model
+                .segments
+                .iter()
+                .filter(|(_, meta)| meta.durable_end > 0)
+            {
+                let stream = recovered.entry(meta.slot).or_insert_with(|| {
+                    SegmentStore::empty(
+                        threshold,
+                        segment_size,
+                        root_lock.clone(),
+                        meta.slot,
+                        journal.clone(),
+                    )
+                });
+                stream.recover(id, meta, &mut catalog, compact)?;
+            }
+            catalog.activate()?;
+            tracing::info!(
+                catalog_ms = started.elapsed().as_secs_f64() * 1000.0,
+                slots = catalog.lookup.capacity(),
+                compact,
+                "small catalog activated"
+            );
         }
         for (id, allocated) in journal.finish_recovery(model)? {
             let state = recovered
@@ -451,7 +467,10 @@ impl SmallObjectStore {
     }
 
     fn metadata_allocated_bytes(&self) -> u64 {
-        self.access_bytes.load(std::sync::atomic::Ordering::Relaxed) + self.journal.allocated()
+        self.journal
+            .access_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
+            + self.journal.allocated()
     }
 
     #[cfg(test)]
@@ -821,7 +840,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compact_recovery_classifies_all_streams_in_one_lookup_pass() {
+    async fn compact_recovery_admits_all_streams_during_activation() {
         let root = tempfile::tempdir().unwrap();
         let mut fixtures = Vec::new();
         {
@@ -843,7 +862,17 @@ mod tests {
             }
             store.maintain(true).await.unwrap();
         }
-        let reopened = open(root.path());
+        let reopened = SmallObjectStore::open_with_service(
+            root.path().to_owned(),
+            128 << 10,
+            256 << 10,
+            16 << 20,
+            None,
+            None,
+            None,
+            true,
+        )
+        .unwrap();
         let index = Arc::new(crate::BlockIndex::new());
         let mut generic = Vec::new();
         reopened.restore_policy_units(&index, &mut generic, false);
@@ -851,7 +880,7 @@ mod tests {
         reopened.assert_no_resident_policy_allocations();
         {
             let catalog = reopened.journal.model.0.read().unwrap();
-            assert_eq!(catalog.compact_recovery_slots, catalog.lookup.capacity());
+            assert_eq!(catalog.compact_recovery_slots, 0);
             for slot in 0..4 {
                 let expected = fixtures
                     .iter()

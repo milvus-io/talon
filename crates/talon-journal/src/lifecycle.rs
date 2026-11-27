@@ -1,6 +1,7 @@
 //! Last-drop never joins an I/O thread on a serving reactor. Startup-only
 //! reopen waits for a retiring writer, before touching that cache's files.
 use super::*;
+use std::future::Future;
 use std::sync::Weak;
 use std::sync::{Condvar, OnceLock};
 
@@ -37,6 +38,7 @@ pub(crate) fn wait_for_retiring(root: &Path) -> io::Result<()> {
 #[derive(Default)]
 pub(crate) struct Life {
     closing: AtomicBool,
+    closing_notify: tokio::sync::Notify,
     done: Mutex<bool>,
     changed: Condvar,
 }
@@ -82,6 +84,23 @@ impl Life {
     }
     pub fn close(&self) {
         self.closing.store(true, Ordering::Release);
+        self.closing_notify.notify_waiters();
+    }
+    pub fn is_closing(&self) -> bool {
+        self.closing.load(Ordering::Acquire)
+    }
+    pub async fn closing(&self) {
+        let notified = self.closing_notify.notified();
+        if !self.is_closing() {
+            notified.await;
+        }
+    }
+    pub async fn until_close<T>(&self, work: impl Future<Output = T>) -> Option<T> {
+        tokio::select! {
+            biased;
+            () = self.closing() => None,
+            result = work => Some(result),
+        }
     }
     fn wait(&self) {
         let mut done = self.done.lock().unwrap();

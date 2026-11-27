@@ -29,6 +29,9 @@ pub(super) fn open_small_store(
         root_lock,
         service,
         maintenance,
+        // Namespace runtime installs compact policy. Standalone callers
+        // select the policy when attaching their runtime.
+        service.is_some(),
     )?)))
 }
 

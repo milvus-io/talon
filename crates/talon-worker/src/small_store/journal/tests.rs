@@ -21,7 +21,7 @@ fn snapshot_keeps_rows_when_live_deletion_compacts_and_append_moves_them() {
     model.apply(insert(10, "last")).unwrap();
     let mut snapshot = model.snapshot().unwrap();
     let mut restored = Model::default();
-    for _ in 0..3 {
+    for _ in 0..2 {
         restored
             .restore(Model::decode_snapshot(&snapshot.next().unwrap().unwrap()).unwrap())
             .unwrap();
@@ -223,22 +223,76 @@ async fn compact_journal_preserves_live_and_recovered_identity() {
 }
 
 #[test]
-fn legacy_snapshot_headers_preserve_the_original_durability_boundary() {
+fn legacy_snapshot_records_require_an_empty_cache() {
     use talon_journal::Machine;
-    for sealed in [false, true] {
-        let mut bytes = vec![4];
-        for n in [1u64, 0, 5, 64] {
-            bytes.extend_from_slice(&n.to_le_bytes());
-        }
-        bytes.push(u8::from(sealed));
-        let record = Model::decode_snapshot(&bytes).unwrap();
-        let mut model = Model {
-            next: 2,
-            ..Default::default()
+    for kind in [0, 4, 5, 8, 9] {
+        let Err(error) = Model::decode_snapshot(&[kind, 0, 0, 0, 0, 0, 0, 0, 0]) else {
+            panic!("legacy snapshot record accepted");
         };
-        model.restore(record).unwrap();
-        assert_eq!(model.segments[&1].durable_end, if sealed { 5 } else { 0 });
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
+}
+
+#[test]
+fn packed_snapshot_validates_keys_counts_and_extent_bounds() {
+    use talon_journal::Machine;
+
+    let mut model = Model::default();
+    model
+        .apply(Event::Insert {
+            slot: 0,
+            segment: 1,
+            offset: 0,
+            record: Record {
+                key: crate::small_store::key::SmallKey::new(&id("valid")),
+                len: 5,
+                checksum: None,
+            },
+        })
+        .unwrap();
+    model.apply(Event::Seal { segment: 1 }).unwrap();
+    let frames = model
+        .snapshot()
+        .unwrap()
+        .collect::<io::Result<Vec<_>>>()
+        .unwrap();
+    let restore_header = || {
+        let mut restored = Model::default();
+        for bytes in &frames[..2] {
+            restored
+                .restore(Model::decode_snapshot(bytes).unwrap())
+                .unwrap();
+        }
+        restored
+    };
+    assert_eq!(
+        restore_header()
+            .finish_snapshot_restore()
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidData
+    );
+
+    // Single trailer row with no prefix. Its key starts after the frame
+    // header and the row's offset, length, prefix index and suffix length.
+    let mut broken = frames[2].to_vec();
+    broken[28] = 0xff;
+    assert!(
+        matches!(Model::decode_snapshot(&broken), Err(error) if error.kind() == io::ErrorKind::InvalidData)
+    );
+    assert!(
+        matches!(Model::decode_snapshot(&frames[2][..frames[2].len() - 1]), Err(error) if error.kind() == io::ErrorKind::InvalidData)
+    );
+
+    let mut broken = frames[2].to_vec();
+    broken[14..18].copy_from_slice(&9u32.to_le_bytes());
+    assert_eq!(
+        restore_header()
+            .restore(Model::decode_snapshot(&broken).unwrap())
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidData
+    );
 }
 
 #[test]
@@ -515,6 +569,7 @@ async fn recovered_small_store_tail_uses_initial_snapshot_budget() {
             None,
             Some(&service),
             Some(budget),
+            true,
         )
         .unwrap(),
     );

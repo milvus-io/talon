@@ -515,6 +515,73 @@ impl Maintenance for BlockSnapshot {
         Box::pin(async {})
     }
 }
+
+#[derive(Default)]
+struct BlockSnapshotBytes(tokio::sync::Notify);
+
+impl Maintenance for BlockSnapshotBytes {
+    fn bytes(&self, _: usize) -> LocalBoxFuture<'_, ()> {
+        Box::pin(async {
+            self.0.notify_one();
+            std::future::pending().await
+        })
+    }
+    fn io(&self) -> LocalBoxFuture<'_, Box<dyn Send>> {
+        Box::pin(async { Box::new(()) as Box<dyn Send> })
+    }
+    fn delete(&self) -> LocalBoxFuture<'_, ()> {
+        Box::pin(async {})
+    }
+}
+
+#[tokio::test]
+async fn shutdown_cancels_throttled_snapshot_and_replays_both_logs() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = service(dir.path());
+    let budget = Arc::new(BlockSnapshotBytes::default());
+    let a = s
+        .open_stream_with_maintenance(
+            "a".into(),
+            State::default(),
+            StreamOptions {
+                checkpoint_bytes: 96,
+                ..Default::default()
+            },
+            Some(budget.clone()),
+        )
+        .unwrap();
+    a.append((1, 11), Ack::Durable).await.unwrap();
+    a.append((2, 22), Ack::Durable).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), budget.0.notified())
+        .await
+        .unwrap();
+    let root = dir.path().join("a");
+    assert!(root.join("snapshot.tmp").exists());
+    a.append((3, 33), Ack::Written).await.unwrap();
+    drop(a);
+    drop(s);
+    let path = dir.path().to_owned();
+    // Waiting directly observes the retiring writer before reopen can remove
+    // temporary files itself. The budget will never release its bytes.
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::task::spawn_blocking(move || JournalService::wait_for_retiring(&path)),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    assert!(!root.join("snapshot.tmp").exists());
+    assert!(!root.join("snapshot.00000000000000000002").exists());
+    assert!(root.join("journal.00000000000000000001").exists());
+    assert!(root.join("journal.00000000000000000002").exists());
+    let s = service(dir.path());
+    let a = stream(&s, "a");
+    assert_eq!(
+        a.query(|m| Ok(m.0.clone())).await.unwrap(),
+        BTreeMap::from([(1, 11), (2, 22), (3, 33)])
+    );
+}
 #[tokio::test]
 async fn queued_checkpoint_does_not_block_append_holding_snapshot_permit() {
     let dir = tempfile::tempdir().unwrap();

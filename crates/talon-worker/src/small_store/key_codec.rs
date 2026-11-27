@@ -93,6 +93,123 @@ pub(super) fn encode(id: &dyn SmallIdentity) -> Vec<u8> {
     out
 }
 
+/// Size of the WAL identity before the reversible packed encoding.
+pub(super) fn logical_len(mut input: &[u8]) -> usize {
+    let mut len = 25;
+    for _ in 0..2 {
+        loop {
+            let end = input.iter().position(|&byte| byte == 0).unwrap();
+            len += end;
+            let escaped = input[end + 1] != 0;
+            input = &input[end + 2..];
+            if !escaped {
+                break;
+            }
+            len += 1;
+        }
+    }
+    let tag = input[0];
+    let version = input.len() - 5 - if tag & 0x40 != 0 { 8 } else { 0 };
+    len + if tag & 0x20 != 0 {
+        version * 2
+    } else {
+        version
+    }
+}
+
+pub(super) fn validated<'a>(
+    mut input: &'a [u8],
+    scratch: &'a mut [Vec<u8>; 3],
+) -> std::io::Result<SmallRef<'a>> {
+    use super::format::{invalid, u32, u64, validate_key};
+
+    fn string<'a>(input: &mut &'a [u8], scratch: &'a mut Vec<u8>) -> std::io::Result<&'a str> {
+        scratch.clear();
+        loop {
+            let end = input
+                .iter()
+                .position(|&byte| byte == 0)
+                .ok_or_else(|| invalid("unterminated packed key field"))?;
+            let escaped = *input
+                .get(end + 1)
+                .ok_or_else(|| invalid("truncated packed key field"))?;
+            let value = &input[..end];
+            *input = &input[end + 2..];
+            match escaped {
+                0 if scratch.is_empty() => {
+                    return std::str::from_utf8(value).map_err(|_| invalid("packed key UTF-8"))
+                }
+                0 => {
+                    scratch.extend_from_slice(value);
+                    return std::str::from_utf8(scratch).map_err(|_| invalid("packed key UTF-8"));
+                }
+                255 => {
+                    scratch.extend_from_slice(value);
+                    scratch.push(0);
+                }
+                _ => return Err(invalid("packed key escape")),
+            }
+        }
+    }
+
+    let [bucket, path, version] = scratch;
+    let bucket = string(&mut input, bucket)?;
+    let object_path = string(&mut input, path)?;
+    let (&tag, rest) = input
+        .split_first()
+        .ok_or_else(|| invalid("packed key tag"))?;
+    input = rest;
+    let backend = Backend::from_tag(tag & 0x1f).ok_or_else(|| invalid("packed key backend"))?;
+    let block_size = u32(&mut input)?;
+    let offset = if tag & 0x40 != 0 {
+        let offset = u64(&mut input)?;
+        if offset == 0 {
+            return Err(invalid("noncanonical packed key offset"));
+        }
+        offset
+    } else {
+        0
+    };
+    let version = if tag & 0x20 != 0 {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        version.clear();
+        version.extend(
+            input
+                .iter()
+                .flat_map(|&b| [HEX[usize::from(b >> 4)], HEX[usize::from(b & 15)]]),
+        );
+        version
+    } else {
+        if input.len() % 2 == 0
+            && input
+                .iter()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+        {
+            return Err(invalid("noncanonical packed key version"));
+        }
+        input
+    };
+    let key = SmallRef {
+        kind: if tag & 0x80 != 0 {
+            UnitKind::ExactRange
+        } else {
+            UnitKind::Whole
+        },
+        block: BlockRef {
+            object: ObjectRef {
+                backend,
+                bucket,
+                object_path,
+            },
+            offset,
+            block_size,
+            version: std::str::from_utf8(version).map_err(|_| invalid("packed key UTF-8"))?,
+        },
+    };
+    validate_key(&key)?;
+    Ok(key)
+}
+
 pub(super) fn decode(mut input: &[u8]) -> SmallKey {
     let bucket = unfield(&mut input);
     let path = unfield(&mut input);
@@ -172,6 +289,8 @@ mod tests {
                         let key = SmallRef { block: key, kind };
                         let encoded = encode(&key);
                         assert_eq!(decode(&encoded).view(), key);
+                        assert_eq!(validated(&encoded, &mut Default::default()).unwrap(), key);
+                        assert_eq!(logical_len(&encoded), format::key_len(&key));
                         let mut bucket = Vec::new();
                         let mut object_path = Vec::new();
                         assert_eq!(

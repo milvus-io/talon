@@ -1,6 +1,9 @@
 //! The writer's checkpointable metadata state. Segment maps use copy-on-write
 //! so a snapshot can be encoded off the I/O thread while mutations continue.
-use super::super::{checksum_len, records::Records};
+use super::super::{
+    checksum_len, key_codec,
+    records::{key_hash, Records},
+};
 use super::*;
 use crate::small_store::key::SmallKey;
 
@@ -13,12 +16,9 @@ pub(crate) struct Record {
 }
 
 impl Record {
+    #[cfg(test)]
     pub(in crate::small_store) fn stored_len(&self) -> u64 {
         self.len + checksum_len(self.checksum)
-    }
-
-    fn metadata_bytes(&self) -> u64 {
-        format::record_metadata_bytes(&self.key) - checksum_len(self.checksum)
     }
 }
 
@@ -40,10 +40,14 @@ impl SegmentMeta {
         if self.sealed {
             self.metadata
         } else {
-            8 + self
-                .records
-                .before(self.durable_end)
-                .map(|(_, r)| r.metadata_bytes())
+            let mut scratch = Vec::new();
+            8 + (0..self.records.position(self.durable_end))
+                .filter_map(|row| self.records.metadata(row).map(|meta| (row, meta)))
+                .map(|(row, meta)| {
+                    let key = self.records.encoded_key(row, &mut scratch);
+                    format::metadata_bytes_for_key_len(key_codec::logical_len(key))
+                        - checksum_len(meta.checksum)
+                })
                 .sum::<u64>()
         }
     }
@@ -53,6 +57,15 @@ impl SegmentMeta {
 pub(crate) struct Model {
     pub segments: BTreeMap<u64, Arc<SegmentMeta>>,
     pub next: u64,
+    pub(in crate::small_store) snapshot_restore: snapshot::Restore,
+}
+
+pub(crate) struct EncodedRecord {
+    pub(super) key: Vec<u8>,
+    pub(super) len: u64,
+    pub(super) checksum: Option<u64>,
+    pub(super) hash: u32,
+    key_len: usize,
 }
 
 pub(crate) enum Event {
@@ -61,6 +74,12 @@ pub(crate) enum Event {
         segment: u64,
         offset: u64,
         record: Record,
+    },
+    ReplayInsert {
+        slot: usize,
+        segment: u64,
+        offset: u64,
+        record: EncodedRecord,
     },
     Delete {
         segment: u64,
@@ -89,6 +108,7 @@ impl Event {
     pub fn encode(&self) -> io::Result<Vec<u8>> {
         let mut b = Vec::new();
         match self {
+            Self::ReplayInsert { .. } => return Err(invalid("cannot append a decoded insert")),
             Self::SetNext { next } => {
                 b.push(5);
                 b.extend_from_slice(&next.to_le_bytes());
@@ -163,13 +183,19 @@ impl Event {
                 if len > 128 << 20 || !id.valid_extent(len) {
                     return Err(invalid("journal extent"));
                 }
-                let key = SmallKey::new(&id);
+                let record = EncodedRecord {
+                    key: key_codec::encode(&id),
+                    key_len: b.len(),
+                    hash: key_hash(&id),
+                    len,
+                    checksum,
+                };
                 b = &[];
-                Self::Insert {
+                Self::ReplayInsert {
                     slot,
                     segment,
                     offset,
-                    record: Record { key, len, checksum },
+                    record,
                 }
             }
             1 => Self::Delete {
@@ -218,38 +244,31 @@ impl Model {
                 offset,
                 record,
             } => {
-                if segment == 0 {
-                    return Err(invalid("zero segment id"));
+                use super::super::key::SmallIdentity;
+                format::validate_key(&record.key)?;
+                if !record.key.view().valid_extent(record.len) || record.len > 128 << 20 {
+                    return Err(invalid("journal extent"));
                 }
-                self.next = self.next.max(
-                    segment
-                        .checked_add(1)
-                        .ok_or_else(|| invalid("segment id overflow"))?,
-                );
-                let s = Arc::make_mut(self.segments.entry(segment).or_insert_with(|| {
-                    Arc::new(SegmentMeta {
-                        slot,
-                        bytes: 0,
-                        durable_end: 0,
-                        metadata: 8,
-                        sealed: false,
-                        records: Records::default(),
-                    })
-                }));
-                if s.slot != slot || s.sealed || offset < s.durable_end {
-                    return Err(invalid("insert into sealed/wrong stream"));
-                }
-                let stored_len = record.stored_len();
-                let end = offset
-                    .checked_add(stored_len)
-                    .ok_or_else(|| invalid("extent overflow"))?;
-                if s.records.overlaps(offset, stored_len) {
-                    return Err(invalid("overlapping journal extent"));
-                }
-                let metadata_bytes = record.metadata_bytes();
-                s.records.insert(offset, record)?;
-                s.bytes = s.bytes.max(end);
-                s.metadata += metadata_bytes;
+                self.insert(
+                    slot,
+                    segment,
+                    offset,
+                    EncodedRecord {
+                        key: key_codec::encode(&record.key),
+                        key_len: format::key_len(&record.key),
+                        hash: key_hash(&record.key),
+                        len: record.len,
+                        checksum: record.checksum,
+                    },
+                )?;
+            }
+            Event::ReplayInsert {
+                slot,
+                segment,
+                offset,
+                record,
+            } => {
+                self.insert(slot, segment, offset, record)?;
             }
             Event::Delete { segment, offset } => {
                 let s = Arc::make_mut(
@@ -263,14 +282,11 @@ impl Model {
                 s.metadata += 21;
             }
             Event::Seal { segment } => {
-                let s = Arc::make_mut(
-                    self.segments
-                        .get_mut(&segment)
-                        .ok_or_else(|| invalid("seal missing segment"))?,
-                );
-                s.durable_end = s.bytes;
-                s.sealed = true;
-                s.records.seal();
+                let s = self
+                    .segments
+                    .get_mut(&segment)
+                    .ok_or_else(|| invalid("seal missing segment"))?;
+                Self::seal(s);
             }
             Event::Flush {
                 segment,
@@ -311,19 +327,73 @@ impl Model {
                     if old == new {
                         return Err(invalid("self relocation"));
                     }
-                    let s = Arc::make_mut(
-                        self.segments
-                            .get_mut(&new)
-                            .ok_or_else(|| invalid("replacement missing segment"))?,
-                    );
-                    s.durable_end = s.bytes;
-                    s.sealed = true;
-                    s.records.seal();
+                    let s = self
+                        .segments
+                        .get_mut(&new)
+                        .ok_or_else(|| invalid("replacement missing segment"))?;
+                    Self::seal(s);
                 }
                 // Empty standby/active files have no Insert record.
                 self.segments.remove(&old);
             }
         }
+        Ok(())
+    }
+
+    fn seal(s: &mut Arc<SegmentMeta>) {
+        if !s.sealed {
+            let s = Arc::make_mut(s);
+            s.durable_end = s.bytes;
+            s.sealed = true;
+            s.records.seal();
+        }
+    }
+
+    fn insert(
+        &mut self,
+        slot: usize,
+        segment: u64,
+        offset: u64,
+        record: EncodedRecord,
+    ) -> io::Result<()> {
+        if segment == 0 {
+            return Err(invalid("zero segment id"));
+        }
+        self.next = self.next.max(
+            segment
+                .checked_add(1)
+                .ok_or_else(|| invalid("segment id overflow"))?,
+        );
+        let s = Arc::make_mut(self.segments.entry(segment).or_insert_with(|| {
+            Arc::new(SegmentMeta {
+                slot,
+                bytes: 0,
+                durable_end: 0,
+                metadata: 8,
+                sealed: false,
+                records: Records::default(),
+            })
+        }));
+        if s.slot != slot || s.sealed || offset < s.durable_end {
+            return Err(invalid("insert into sealed/wrong stream"));
+        }
+        let stored_len = record.len + checksum_len(record.checksum);
+        let end = offset
+            .checked_add(stored_len)
+            .ok_or_else(|| invalid("extent overflow"))?;
+        if s.records.overlaps(offset, stored_len) {
+            return Err(invalid("overlapping journal extent"));
+        }
+        s.records.insert_encoded(
+            offset,
+            record.len,
+            record.checksum,
+            record.hash,
+            &record.key,
+        )?;
+        s.bytes = s.bytes.max(end);
+        s.metadata +=
+            format::metadata_bytes_for_key_len(record.key_len) - checksum_len(record.checksum);
         Ok(())
     }
 }
@@ -335,62 +405,13 @@ fn take_byte(b: &mut &[u8]) -> io::Result<u8> {
     Ok(first)
 }
 
-/// Frozen segment maps keep key buffers shared while the CPU encoder walks them.
-pub(crate) struct Snapshot {
-    next: Option<u64>,
-    segments: std::collections::btree_map::IntoIter<u64, Arc<SegmentMeta>>,
-    current: Option<(u64, Arc<SegmentMeta>, usize)>,
-}
-pub(crate) enum SnapshotRecord {
-    Next(u64),
-    Segment(u64, Arc<SegmentMeta>),
-    Insert(Event),
-}
-impl Iterator for Snapshot {
-    type Item = io::Result<Bytes>;
-    fn next(&mut self) -> Option<Self::Item> {
-        if let Some(next) = self.next.take() {
-            let mut b = vec![5];
-            b.extend_from_slice(&next.to_le_bytes());
-            return Some(Ok(b.into()));
-        }
-        if let Some((id, s, after)) = &mut self.current {
-            while *after < s.records.slots() {
-                let row = *after;
-                *after += 1;
-                let Some((offset, r)) = s.records.get(row) else {
-                    continue;
-                };
-                return Some(
-                    Event::Insert {
-                        slot: s.slot,
-                        segment: *id,
-                        offset,
-                        record: r,
-                    }
-                    .encode()
-                    .map(Bytes::from),
-                );
-            }
-            self.current = None;
-        }
-        let (id, s) = self.segments.next()?;
-        let mut b = vec![8];
-        for n in [id, s.slot as u64, s.bytes, s.metadata] {
-            b.extend_from_slice(&n.to_le_bytes());
-        }
-        b.push(u8::from(s.sealed));
-        b.extend_from_slice(&s.durable_end.to_le_bytes());
-        self.current = Some((id, s, 0));
-        Some(Ok(b.into()))
-    }
-}
 impl talon_journal::Machine for Model {
     type Record = Event;
-    type SnapshotRecord = SnapshotRecord;
-    type Snapshot = Snapshot;
+    type SnapshotRecord = snapshot::SnapshotRecord;
+    type Snapshot = snapshot::Snapshot;
     fn encoded_len(event: &Event) -> io::Result<usize> {
         Ok(match event {
+            Event::ReplayInsert { .. } => return Err(invalid("cannot append a decoded insert")),
             Event::Insert { record, .. } => {
                 41 + format::key_len(&record.key) - checksum_len(record.checksum) as usize
             }
@@ -407,108 +428,18 @@ impl talon_journal::Machine for Model {
     fn apply(&mut self, _: u64, event: Event) -> io::Result<()> {
         self.apply(event)
     }
-    fn snapshot(&self) -> io::Result<Snapshot> {
-        Ok(Snapshot {
-            next: Some(self.next),
-            segments: self.segments.clone().into_iter(),
-            current: None,
-        })
+    fn snapshot(&self) -> io::Result<Self::Snapshot> {
+        Ok(snapshot::Snapshot::new(self))
     }
-    fn decode_snapshot(bytes: &[u8]) -> io::Result<SnapshotRecord> {
-        let mut b = bytes;
-        let kind = take_byte(&mut b)?;
-        match kind {
-            5 => {
-                let next = format::u64(&mut b)?;
-                if !b.is_empty() || next == 0 {
-                    return Err(invalid("snapshot allocator"));
-                }
-                Ok(SnapshotRecord::Next(next))
-            }
-            4 | 8 => {
-                let id = format::u64(&mut b)?;
-                let slot =
-                    usize::try_from(format::u64(&mut b)?).map_err(|_| invalid("slot overflow"))?;
-                let bytes = format::u64(&mut b)?;
-                let metadata = format::u64(&mut b)?;
-                let sealed = match take_byte(&mut b)? {
-                    0 => false,
-                    1 => true,
-                    _ => return Err(invalid("snapshot seal")),
-                };
-                let durable_end = if kind == 8 {
-                    format::u64(&mut b)?
-                } else if sealed {
-                    bytes
-                } else {
-                    0
-                };
-                if !b.is_empty() || durable_end > bytes || (sealed && durable_end != bytes) {
-                    return Err(invalid("invalid snapshot segment header"));
-                }
-                Ok(SnapshotRecord::Segment(
-                    id,
-                    Arc::new(SegmentMeta {
-                        slot,
-                        bytes,
-                        durable_end,
-                        metadata,
-                        sealed,
-                        records: Records::default(),
-                    }),
-                ))
-            }
-            INSERT_LEGACY | INSERT_WITH_TRAILER => {
-                Ok(SnapshotRecord::Insert(Event::decode(bytes)?))
-            }
-            _ => Err(invalid("snapshot operation")),
-        }
+    fn decode_snapshot(bytes: &[u8]) -> io::Result<Self::SnapshotRecord> {
+        snapshot::decode(bytes)
     }
-    fn restore(&mut self, record: SnapshotRecord) -> io::Result<()> {
-        match record {
-            SnapshotRecord::Next(next) => {
-                if !self.segments.is_empty() {
-                    return Err(invalid("snapshot allocator order"));
-                }
-                self.next = next;
-            }
-            SnapshotRecord::Segment(id, s) => {
-                // The snapshot encoder emits one segment at a time.
-                if let Some(mut previous) = self.segments.last_entry() {
-                    if previous.get().sealed {
-                        Arc::make_mut(previous.get_mut()).records.seal();
-                    }
-                }
-                if id == 0 || id >= self.next || self.segments.insert(id, s).is_some() {
-                    return Err(invalid("snapshot segment"));
-                }
-            }
-            SnapshotRecord::Insert(Event::Insert {
-                slot,
-                segment,
-                offset,
-                record,
-            }) => {
-                let s = Arc::make_mut(
-                    self.segments
-                        .get_mut(&segment)
-                        .ok_or_else(|| invalid("snapshot missing segment"))?,
-                );
-                let stored_len = record.stored_len();
-                let end = offset
-                    .checked_add(stored_len)
-                    .ok_or_else(|| invalid("snapshot extent overflow"))?;
-                if s.slot != slot
-                    || end > s.bytes
-                    || (offset < s.durable_end && end > s.durable_end)
-                    || s.records.overlaps(offset, stored_len)
-                {
-                    return Err(invalid("snapshot extent"));
-                }
-                s.records.insert(offset, record)?;
-            }
-            _ => return Err(invalid("snapshot insert")),
-        }
+    fn restore(&mut self, record: Self::SnapshotRecord) -> io::Result<()> {
+        snapshot::restore(self, record)
+    }
+    fn finish_snapshot_restore(&mut self) -> io::Result<()> {
+        self.snapshot_restore.finish()?;
+        self.snapshot_restore = Default::default();
         Ok(())
     }
 }

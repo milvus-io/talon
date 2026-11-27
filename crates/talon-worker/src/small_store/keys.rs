@@ -197,6 +197,68 @@ impl Keys {
         self.shrink_to_fit();
     }
 
+    pub fn append_prefix(&mut self, prefix: &[u8]) -> io::Result<u32> {
+        let id = self.prefixes.len() as u32;
+        self.prefixes
+            .push(Span::append(&mut self.prefix_bytes, prefix)?);
+        Ok(id)
+    }
+
+    pub fn append_snapshot_key(&mut self, prefix: Option<u32>, suffix: &[u8]) -> io::Result<()> {
+        let index = self.rows.len();
+        self.rows.push(Span::append(&mut self.suffixes, suffix)?);
+        let Some(id) = prefix.or_else(|| (!self.prefix_ids.is_empty()).then_some(u32::MAX)) else {
+            return Ok(());
+        };
+        if matches!(&self.prefix_ids, Indices::Narrow(_))
+            && prefix.is_some_and(|id| id >= u16::MAX as u32)
+        {
+            let Indices::Narrow(ids) = std::mem::take(&mut self.prefix_ids) else {
+                unreachable!()
+            };
+            self.prefix_ids = Indices::Wide(
+                ids.into_iter()
+                    .map(|id| {
+                        if id == u16::MAX {
+                            u32::MAX
+                        } else {
+                            u32::from(id)
+                        }
+                    })
+                    .collect(),
+            );
+        }
+        match &mut self.prefix_ids {
+            Indices::Narrow(ids) => ids.push(id as u16),
+            Indices::Wide(ids) if ids.is_empty() && id < u16::MAX as u32 => {
+                let mut ids = vec![u16::MAX; index];
+                ids.push(id as u16);
+                self.prefix_ids = Indices::Narrow(ids);
+            }
+            Indices::Wide(ids) => {
+                if ids.is_empty() {
+                    ids.resize(index, u32::MAX);
+                }
+                ids.push(id);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn freeze_appended(&mut self) {
+        let offsets = self
+            .rows
+            .iter()
+            .map(|row| row.offset)
+            .chain(std::iter::once(self.suffixes.len() as u32));
+        self.offsets = if self.suffixes.len() <= usize::from(u16::MAX) {
+            Indices::Narrow(offsets.map(|offset| offset as u16).collect())
+        } else {
+            Indices::Wide(offsets.collect())
+        };
+        self.rows = Vec::new();
+    }
+
     fn freeze(&mut self) {
         let mut offsets = Vec::with_capacity(self.rows.len() + 1);
         let mut suffixes = Vec::with_capacity(self.rows.iter().map(|r| r.len as usize).sum());

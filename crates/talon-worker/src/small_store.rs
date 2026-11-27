@@ -399,6 +399,7 @@ impl SegmentStore {
             threshold,
             segment_size,
             root_lock,
+            false,
         )?;
         if streams.len() != 1 {
             return Err(invalid("test stream has foreign slot"));
@@ -942,13 +943,18 @@ impl SegmentStore {
             }
             (old, entries, cost)
         };
+        let tracks_access = self.journal.model.0.read().unwrap().recency.is_some();
         if let Some(budget) = budget {
-            budget.bytes(cost as usize).await;
+            let access_bytes = if tracks_access && !entries.is_empty() {
+                12 * entries.len() + 24 * entries.len().div_ceil(512)
+            } else {
+                0
+            };
+            budget.bytes(cost as usize + access_bytes).await;
         }
 
         // Full access checkpoints take this gate before I/O. Preserve that
         // ordering so a snapshot and relocation cannot wait on each other.
-        let tracks_access = self.journal.model.0.read().unwrap().recency.is_some();
         let acquire_io = || async {
             let access_relocation = if tracks_access {
                 Some(self.journal.access_relocation.read().await)
@@ -1154,6 +1160,9 @@ impl SegmentStore {
             .as_ref()
             .filter(|copy| !copy.records.is_empty())
             .map(|copy| copy.id);
+        if let Some(copy) = staged.as_ref().filter(|_| replacement.is_some()) {
+            access::persist_relocation(&self.journal, old, copy).await;
+        }
         #[cfg(test)]
         tests::crash("compact_reconciled");
         self.journal
@@ -1402,7 +1411,13 @@ impl SegmentStore {
         }
     }
 
-    fn recover(&mut self, id: u64, meta: &journal::SegmentMeta) -> io::Result<()> {
+    fn recover(
+        &mut self,
+        id: u64,
+        meta: &journal::SegmentMeta,
+        catalog: &mut catalog::Catalog,
+        compact: bool,
+    ) -> io::Result<()> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -1417,29 +1432,16 @@ impl SegmentStore {
             fd: tokio::sync::Mutex::new(Weak::new()),
         });
         let allocated = metadata.blocks() * 512;
-        let mut records = 0;
-        let mut live = 0;
-        let mut live_data_bytes = 0;
-        for (offset, record) in meta.records.before(meta.durable_end) {
-            records += 1;
-            live += charge(&record.key, record.len);
-            live_data_bytes += record.stored_len();
-            self.entries.write().unwrap().restore(
-                &record.key,
-                Location {
-                    file: file.clone(),
-                    segment: id,
-                    offset,
-                    len: record.len,
-                    checksum: record.checksum,
-                    access: None,
-                },
-            )?;
-        }
+        let (live, live_data_bytes, records) =
+            catalog.restore_segment(id, meta, file.clone(), compact)?;
         let state = self.state.get_mut();
         state.allocated += allocated;
         state.live += live;
-        let recovered_metadata = meta.recovered_metadata();
+        let recovered_metadata = if meta.sealed {
+            meta.metadata
+        } else {
+            8 + live - live_data_bytes
+        };
         state.written += meta.durable_end + recovered_metadata;
         state.segments.insert(
             id,

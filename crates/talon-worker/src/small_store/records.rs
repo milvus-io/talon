@@ -79,10 +79,15 @@ impl Rows {
     }
 
     fn partition(&self, before: impl Fn(u32) -> bool) -> usize {
-        match self {
-            Self::Compact(rows) => rows.partition_point(|row| before(row.offset())),
-            Self::Wide(rows) => rows.partition_point(|row| before(row.offset)),
-        }
+        self.partition_from(0, before)
+    }
+
+    fn partition_from(&self, start: usize, before: impl Fn(u32) -> bool) -> usize {
+        start
+            + match self {
+                Self::Compact(rows) => rows[start..].partition_point(|row| before(row.offset())),
+                Self::Wide(rows) => rows[start..].partition_point(|row| before(row.offset)),
+            }
     }
 
     fn store(&mut self, index: usize, row: WideRow, replace: bool) {
@@ -207,6 +212,24 @@ impl Records {
             && &key[prefix.len()..] == suffix
     }
 
+    pub fn encoded_key<'a>(&'a self, row: usize, scratch: &'a mut Vec<u8>) -> &'a [u8] {
+        let (prefix, suffix) = self.key_parts(row);
+        if prefix.is_empty() {
+            suffix
+        } else if suffix.is_empty() {
+            prefix
+        } else {
+            scratch.clear();
+            scratch.extend_from_slice(prefix);
+            scratch.extend_from_slice(suffix);
+            scratch
+        }
+    }
+
+    pub fn key_parts(&self, row: usize) -> (&[u8], &[u8]) {
+        self.keys.get(row).expect("small-object key")
+    }
+
     pub fn get(&self, row: usize) -> Option<(u64, Record)> {
         let meta = self.metadata(row)?;
         let (prefix, suffix) = self.keys.get(row).expect("small-object key");
@@ -245,6 +268,7 @@ impl Records {
         self.iter().map(|(_, record)| record)
     }
 
+    #[cfg(test)]
     pub fn before(&self, end: u64) -> impl Iterator<Item = (u64, Record)> + '_ {
         self.iter().take_while(move |(offset, _)| *offset < end)
     }
@@ -268,18 +292,70 @@ impl Records {
             .is_some_and(|row| row.offset + row.stored_len() > end)
     }
 
+    #[cfg(test)]
     pub fn insert(&mut self, offset: u64, record: Record) -> io::Result<usize> {
         format::validate_key(&record.key)?;
-        if !record.key.view().valid_extent(record.len)
-            || offset >= 1 << 30
-            || record.len == 0
-            || record.len > 128 << 20
-            || offset + record.stored_len() > 1 << 30
+        if !record.key.view().valid_extent(record.len) {
+            return Err(format::invalid("invalid small-object record extent"));
+        }
+        self.insert_encoded(
+            offset,
+            record.len,
+            record.checksum,
+            key_hash(&record.key),
+            &key_codec::encode(&record.key),
+        )
+    }
+
+    pub fn insert_encoded(
+        &mut self,
+        offset: u64,
+        len: u64,
+        checksum: Option<u64>,
+        hash: u32,
+        key: &[u8],
+    ) -> io::Result<usize> {
+        self.insert_key(offset, len, checksum, hash, |keys, index, replace| {
+            keys.insert(index, key, replace)
+        })
+    }
+
+    pub fn append_snapshot_prefix(&mut self, prefix: &[u8]) -> io::Result<u32> {
+        self.keys.append_prefix(prefix)
+    }
+
+    pub fn append_snapshot_row(
+        &mut self,
+        record: Metadata,
+        prefix: Option<u32>,
+        suffix: &[u8],
+    ) -> io::Result<usize> {
+        self.insert_key(
+            record.offset,
+            record.len,
+            record.checksum,
+            record.hash,
+            |keys, _, _| keys.append_snapshot_key(prefix, suffix),
+        )
+    }
+
+    fn insert_key(
+        &mut self,
+        offset: u64,
+        len: u64,
+        checksum: Option<u64>,
+        hash: u32,
+        insert: impl FnOnce(&mut Keys, usize, bool) -> io::Result<()>,
+    ) -> io::Result<usize> {
+        if offset >= 1 << 30
+            || len == 0
+            || len > 128 << 20
+            || offset + len + checksum_len(checksum) > 1 << 30
         {
             return Err(format::invalid("invalid small-object record extent"));
         }
         if matches!(
-            (&self.checksums, record.checksum),
+            (&self.checksums, checksum),
             (Checksums::Trailer, Some(_)) | (Checksums::Legacy(_), None)
         ) {
             return Err(format::invalid(
@@ -288,31 +364,33 @@ impl Records {
         }
         let row = WideRow {
             offset: offset as u32,
-            len: record.len as u32,
-            hash: key_hash(&record.key),
+            len: len as u32,
+            hash,
         };
-        let key = key_codec::encode(&record.key);
-        let vacant = self.position(offset);
+        let append = self.slots() == 0 || self.offset_at(self.slots() - 1) < offset;
+        let vacant = if append {
+            self.slots()
+        } else {
+            self.position(offset)
+        };
         let replace = self
             .rows
             .get(vacant)
             .is_some_and(|row| u64::from(row.offset) == offset && row.len == 0);
-        let index = if replace {
+        let index = if append || replace {
             vacant
         } else {
             self.rows.partition(|o| u64::from(o) <= offset)
         };
-        self.keys.insert(index, &key, replace)?;
+        insert(&mut self.keys, index, replace)?;
         if matches!(self.checksums, Checksums::Unset) {
-            self.checksums = if record.checksum.is_some() {
+            self.checksums = if checksum.is_some() {
                 Checksums::Legacy(Vec::new())
             } else {
                 Checksums::Trailer
             };
         }
-        if let (Checksums::Legacy(checksums), Some(checksum)) =
-            (&mut self.checksums, record.checksum)
-        {
+        if let (Checksums::Legacy(checksums), Some(checksum)) = (&mut self.checksums, checksum) {
             if replace {
                 checksums[index] = checksum;
             } else {
@@ -358,6 +436,23 @@ impl Records {
         self.rows.partition(|o| u64::from(o) < offset)
     }
 
+    pub fn position_from(&self, start: usize, offset: u64) -> usize {
+        if self
+            .rows
+            .get(start)
+            .is_some_and(|row| u64::from(row.offset) == offset)
+        {
+            return start;
+        }
+        self.rows.partition_from(start, |o| u64::from(o) < offset)
+    }
+
+    pub fn offset_matches(&self, row: usize, offset: u64) -> bool {
+        self.rows
+            .get(row)
+            .is_some_and(|row| row.len != 0 && u64::from(row.offset) == offset)
+    }
+
     pub(super) fn offset_at(&self, row: usize) -> u64 {
         u64::from(self.rows.get(row).unwrap().offset)
     }
@@ -376,6 +471,11 @@ impl Records {
 
     pub fn seal(&mut self) {
         self.keys.seal();
+        self.shrink_to_fit();
+    }
+
+    pub fn freeze_snapshot(&mut self) {
+        self.keys.freeze_appended();
         self.shrink_to_fit();
     }
 

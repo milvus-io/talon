@@ -203,6 +203,7 @@ fn recover<M: Machine>(root: PathBuf, mut machine: M, threads: usize) -> io::Res
         }
         Err(e) => return Err(e),
     };
+    let snapshot_started = std::time::Instant::now();
     let snapshot = path(&root, true, current.snapshot);
     if std::fs::metadata(&snapshot)?.len() != current.bytes {
         return Err(invalid("snapshot length mismatch"));
@@ -218,8 +219,12 @@ fn recover<M: Machine>(root: PathBuf, mut machine: M, threads: usize) -> io::Res
     if ordinal != current.records {
         return Err(invalid("snapshot record count mismatch"));
     }
+    machine.finish_snapshot_restore()?;
+    let snapshot_ms = snapshot_started.elapsed().as_secs_f64() * 1000.0;
+    let wal_started = std::time::Instant::now();
     let mut lsn = current.lsn;
     let mut offset = 0;
+    let mut wal_bytes = 0;
     for (i, g) in current.logs.iter().enumerate() {
         offset = replay::read(
             &path(&root, false, *g),
@@ -235,7 +240,13 @@ fn recover<M: Machine>(root: PathBuf, mut machine: M, threads: usize) -> io::Res
                 Ok(())
             },
         )?;
+        wal_bytes += offset;
     }
+    tracing::info!(path = %root.display(), snapshot_ms,
+        wal_ms = wal_started.elapsed().as_secs_f64() * 1000.0,
+        snapshot_bytes = current.bytes, wal_bytes, snapshot_records = ordinal,
+        wal_records = lsn - current.lsn, recovery_threads = threads,
+        "journal replay phases");
     let last = path(&root, false, *current.logs.last().unwrap());
     let file = OpenOptions::new().write(true).open(&last)?;
     if file.metadata()?.len() != offset {
@@ -418,7 +429,8 @@ impl Disk {
         snapshot: M::Snapshot,
         policy: Option<Arc<dyn Maintenance>>,
         slots: Arc<Semaphore>,
-    ) -> LocalBoxFuture<'static, io::Result<Snapshot>> {
+        life: Arc<lifecycle::Life>,
+    ) -> LocalBoxFuture<'static, io::Result<Option<Snapshot>>> {
         let root = self.root.clone();
         let accounting = self.accounting.clone();
         #[cfg(test)]
@@ -426,17 +438,25 @@ impl Disk {
         Box::pin(async move {
             // One shared service bounds snapshot encoder threads/buffers even
             // if thousands of namespaces cross the rotation threshold together.
-            let _slot = slots.acquire_owned().await.map_err(io::Error::other)?;
+            let Some(slot) = life.until_close(slots.acquire_owned()).await else {
+                return Ok(None);
+            };
+            let slot = Arc::new(slot.map_err(io::Error::other)?);
+            let encoder_slot = slot.clone();
             // At most four chunks beyond the encoder's current frame. Blocking
             // sends happen only on the CPU encoder, never on the I/O runtime.
             let (send, mut receive) = mpsc::channel::<io::Result<Bytes>>(4);
             std::thread::Builder::new()
                 .name("journal-snapshot".into())
                 .spawn(move || {
+                    let _slot = encoder_slot;
                     let mut buffer = Vec::new();
                     let mut ordinal = 0;
                     let result = (|| {
                         for item in snapshot {
+                            if send.is_closed() {
+                                return Err(stopped());
+                            }
                             let bytes = item?;
                             ordinal += 1;
                             let encoded = frame::encode(ordinal, &bytes)?;
@@ -464,7 +484,10 @@ impl Disk {
             let temp = root.join("snapshot.tmp");
             let f = {
                 let _io = match &policy {
-                    Some(p) => Some(p.io().await),
+                    Some(p) => match life.until_close(p.io()).await {
+                        Some(permit) => Some(permit),
+                        None => return Ok(None),
+                    },
                     None => None,
                 };
                 create(&temp).await?
@@ -472,7 +495,10 @@ impl Disk {
             let mut offset = 0;
             let mut records = 0;
             let mut encoded_all = false;
-            while let Some(bytes) = receive.recv().await {
+            while let Some(chunk) = life.until_close(receive.recv()).await {
+                let Some(bytes) = chunk else {
+                    return Err(io::Error::other("snapshot encoder stopped"));
+                };
                 let bytes = bytes?;
                 if bytes.is_empty() {
                     encoded_all = true;
@@ -487,10 +513,15 @@ impl Disk {
                     records += 1;
                 }
                 if let Some(p) = &policy {
-                    p.bytes(bytes.len()).await;
+                    if life.until_close(p.bytes(bytes.len())).await.is_none() {
+                        return Ok(None);
+                    }
                 }
                 let _io = match &policy {
-                    Some(p) => Some(p.io().await),
+                    Some(p) => match life.until_close(p.io()).await {
+                        Some(permit) => Some(permit),
+                        None => return Ok(None),
+                    },
                     None => None,
                 };
                 let n = bytes.len() as u64;
@@ -499,14 +530,23 @@ impl Disk {
                 accounting.set(temp.clone(), f.metadata().await?.blocks() * 512);
             }
             if !encoded_all {
-                return Err(io::Error::other("snapshot encoder stopped"));
+                return Ok(None);
             }
             #[cfg(test)]
-            crate::tests::pause(&control.snapshot_finalize_pause).await;
+            if life
+                .until_close(crate::tests::pause(&control.snapshot_finalize_pause))
+                .await
+                .is_none()
+            {
+                return Ok(None);
+            }
             // Acquire outside the writer loop, which must keep serving callers
             // that can hold this permit. Retain it through CURRENT and cleanup.
             let io = match &policy {
-                Some(p) => Some(p.io().await),
+                Some(p) => match life.until_close(p.io()).await {
+                    Some(permit) => Some(permit),
+                    None => return Ok(None),
+                },
                 None => None,
             };
             f.sync_all().await?;
@@ -519,17 +559,39 @@ impl Disk {
             sync_dir(&root).await?;
             #[cfg(test)]
             crate::tests::crash("snapshot_file");
-            Ok(Snapshot {
+            Ok(Some(Snapshot {
                 generation,
                 lsn,
                 bytes: offset,
                 records,
                 policy,
                 _io: io,
-            })
+            }))
         })
     }
-    pub async fn publish_snapshot(&mut self, snapshot: Snapshot) -> io::Result<()> {
+    pub async fn cancel_snapshot(&mut self) -> io::Result<()> {
+        let generation = self.current.pending;
+        if generation == 0 {
+            return Ok(());
+        }
+        // Rotation already published both logs. Remove only the unreferenced
+        // snapshot after draining its writes, then clear the pending marker.
+        for file in [
+            self.root.join("snapshot.tmp"),
+            path(&self.root, true, generation),
+        ] {
+            remove(&file).await?;
+            self.accounting.remove(&file);
+        }
+        sync_dir(&self.root).await?;
+        self.current.pending = 0;
+        self.publish().await
+    }
+    pub async fn publish_snapshot(
+        &mut self,
+        snapshot: Snapshot,
+        life: &lifecycle::Life,
+    ) -> io::Result<()> {
         self.current.garbage.push((true, self.current.snapshot));
         for &g in &self.current.logs {
             if g < snapshot.generation {
@@ -547,7 +609,7 @@ impl Disk {
         crate::tests::crash("snapshot_current");
         for (s, g) in &self.current.garbage {
             if let Some(p) = &snapshot.policy {
-                p.delete().await;
+                life.until_close(p.delete()).await;
             }
             let p = path(&self.root, *s, *g);
             remove(&p).await?;

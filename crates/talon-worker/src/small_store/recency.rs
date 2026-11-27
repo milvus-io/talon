@@ -83,6 +83,10 @@ impl Recency {
         time != 0 && value.fetch_max(time.min(self.started), Relaxed) == 0
     }
 
+    pub fn value(&self, segment: u64, row: usize) -> &AtomicU64 {
+        &self.rows[&segment].times[row]
+    }
+
     fn touch(&self, segment: u64, row: usize) {
         let value = &self.rows[&segment].times[row];
         let now = access_millis();

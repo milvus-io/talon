@@ -126,27 +126,6 @@ impl Directory {
         }
         out
     }
-    pub(super) fn restore(
-        &mut self,
-        key: &dyn SmallIdentity,
-        location: Location,
-    ) -> std::io::Result<()> {
-        let mut catalog = self.catalog.0.write().unwrap();
-        if catalog.find(key, VISIBLE).is_some() {
-            return Err(super::format::invalid("duplicate recovered object"));
-        }
-        let slot = catalog
-            .at((location.segment, location.offset))
-            .expect("journaled small object");
-        let flags = catalog.lookup.flags(slot);
-        catalog.files.insert(location.segment, location.file);
-        catalog.publish_segment(location.segment);
-        catalog.lookup.set_flags(slot, flags | VISIBLE);
-        *catalog.live.entry(self.slot).or_default() += 1;
-        catalog.shared.live_count.fetch_add(1, Relaxed);
-        Ok(())
-    }
-
     pub(super) fn segment_entries(&self, segment: u64) -> Vec<(SmallKey, Location)> {
         let catalog = self.catalog.0.read().unwrap();
         let Some(meta) = catalog.segment(segment) else {

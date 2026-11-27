@@ -13,9 +13,13 @@ pub(super) fn key_len(id: &dyn SmallIdentity) -> usize {
 }
 
 pub(super) fn record_metadata_bytes(id: &dyn SmallIdentity) -> u64 {
+    metadata_bytes_for_key_len(key_len(id))
+}
+
+pub(super) fn metadata_bytes_for_key_len(len: usize) -> u64 {
     // Existing segment estimate, including the eight checksum bytes.
     // Records with a trailer account for those bytes in the data file instead.
-    37 + key_len(id) as u64
+    37 + len as u64
 }
 
 pub(super) fn validate_key(id: &dyn SmallIdentity) -> io::Result<()> {

@@ -3,7 +3,11 @@ use crate::small_store::catalog::Address;
 use std::io::{BufReader, Read};
 
 const ROWS_PER_BATCH: usize = 512;
-const BATCH_BYTES: usize = 64 << 10;
+const SNAPSHOT_MAGIC: &[u8; 8] = b"TLSA0003";
+const DELTA_MAGIC: &[u8; 8] = b"TLSL0002";
+const ENTRY_BYTES: usize = 12;
+const GROUP_HEADER_BYTES: usize = 12;
+const FRAME_HEADER_BYTES: usize = 12;
 
 impl SmallObjectStore {
     pub(crate) fn init_recency(&self) {
@@ -63,54 +67,62 @@ impl SmallObjectStore {
     }
 
     pub(super) fn restore_compact_access(&self) {
+        let started = Instant::now();
         let catalog = self.journal.model.0.read().unwrap();
         let recency = catalog.recency.as_ref().unwrap();
-        let result = (|| -> io::Result<DiskState> {
+        let result = (|| -> io::Result<(DiskState, usize)> {
             let Some(mut snapshot) = open_access(&self.root.join(FILE))? else {
-                return Ok(DiskState::default());
+                return Ok((reset_state(&self.root), 0));
             };
             let mut state = DiskState::default();
-            let mut magic = [0; 8];
-            snapshot.read_exact(&mut magic)?;
-            match &magic {
-                LEGACY => {}
-                MAGIC => {
-                    state.generation = read_generation(&mut snapshot)?;
-                    state.snapshot_bytes = snapshot.get_ref().metadata()?.len();
-                }
-                _ => return Err(invalid("small access snapshot version")),
-            }
+            state.generation = read_header(&mut snapshot, SNAPSHOT_MAGIC)?;
+            state.snapshot_bytes = snapshot.get_ref().metadata()?.len();
+
             let mut matched = 0;
             let mut repaired = false;
-            let mut apply = |key: CacheUnit, time: u64| {
-                if let Some(slot) = catalog.find(&key.view(), super::super::lookup::VISIBLE) {
-                    if let Some((recency, value)) = catalog.recency_at(slot) {
-                        matched += usize::from(recency.restore(value, time));
+            let mut apply = |id, entries: &[u8]| {
+                let Some(segment) = catalog.model.segments.get(&id) else {
+                    return;
+                };
+                let records = &segment.records;
+                let mut row = 0;
+                for (offset, time) in decode_entries(entries) {
+                    let offset = u64::from(offset);
+                    if offset >= segment.durable_end {
+                        break;
+                    }
+                    row = records.position_from(row, offset);
+                    if records.offset_matches(row, offset) {
+                        matched += usize::from(recency.restore(recency.value(id, row), time));
                         repaired |= time == 0 || time > recency.started;
+                        row += 1;
                     }
                 }
             };
             replay_access(&mut snapshot, false, &mut apply)?;
-            if &magic == MAGIC {
-                if let Some(mut log) = open_access(&self.root.join(LOG))? {
-                    log.read_exact(&mut magic)?;
-                    if &magic != LOG_MAGIC {
-                        return Err(invalid("small access log version"));
-                    }
-                    if read_generation(&mut log)? == state.generation {
-                        state.full = replay_access(&mut log, true, &mut apply)?;
+            if let Some(mut log) = open_access(&self.root.join(LOG))? {
+                if read_header(&mut log, DELTA_MAGIC)? == state.generation {
+                    if !replay_access(&mut log, true, &mut apply)? {
+                        state.full = false;
                         state.log_bytes = log.get_ref().metadata()?.len();
                     }
                 }
             }
             state.full |= repaired || matched < catalog.live.values().sum();
-            Ok(state)
+            Ok((state, matched))
         })();
         match result {
-            Ok(state) => *self.access_disk.lock().unwrap() = state,
+            Ok((state, matched)) => {
+                *self.journal.access_disk.lock().unwrap() = state;
+                tracing::info!(root = %self.root.display(), matched,
+                    access_ms = started.elapsed().as_secs_f64() * 1000.0,
+                    snapshot_bytes = state.snapshot_bytes, log_bytes = state.log_bytes,
+                    "small compact access restored");
+            }
             Err(error) => {
                 // Startup publishes no readers until the replay is complete.
                 recency.reset();
+                *self.journal.access_disk.lock().unwrap() = reset_state(&self.root);
                 tracing::warn!(%error, root = %self.root.display(), "small object access recovery failed; starting fresh idle windows");
             }
         }
@@ -120,20 +132,19 @@ impl SmallObjectStore {
         &self,
         budget: Option<&crate::background::BackgroundBudget>,
     ) -> io::Result<()> {
+        // A relocation persists destination ages in this same generation
+        // before making the replacement visible in the metadata WAL.
+        let _relocation = self.journal.access_relocation.write().await;
         let mut state = {
-            let mut disk = self.access_disk.lock().unwrap();
+            let mut disk = self.journal.access_disk.lock().unwrap();
             let state = *disk;
             // An error after sampling dirty rows requires a fresh snapshot.
             disk.full = true;
+            disk.log_bytes = 0;
             state
         };
         let full = state.full
             || state.log_bytes >= MIN_COMPACT_BYTES.max(state.snapshot_bytes.div_ceil(2));
-        let access_relocation = if full {
-            Some(self.journal.access_relocation.write().await)
-        } else {
-            None
-        };
         let mut cursor: Address = (0, 0);
         let ceiling = self
             .journal
@@ -149,10 +160,7 @@ impl SmallObjectStore {
         let mut fd = None;
         let mut offset = state.log_bytes;
         if full {
-            state.generation = state
-                .generation
-                .checked_add(1)
-                .ok_or_else(|| invalid("access generation exhausted"))?;
+            state.generation = state.generation.wrapping_add(1).max(1);
             let file = {
                 let _io = match budget {
                     Some(b) => Some(b.io().await),
@@ -160,8 +168,13 @@ impl SmallObjectStore {
                 };
                 disk_io::open(tmp.clone(), disk_io::Open::Replace).await?
             };
-            self.write_access_chunks(&file, header(MAGIC, state.generation).into(), 0, budget)
-                .await?;
+            self.write_access_chunks(
+                &file,
+                header(SNAPSHOT_MAGIC, state.generation).into(),
+                0,
+                budget,
+            )
+            .await?;
             offset = HEADER;
             fd = Some(file);
         }
@@ -174,17 +187,16 @@ impl SmallObjectStore {
             }
         }
         loop {
-            let mut bytes = Vec::new();
-            let mut result = Ok(());
+            let mut batch = AgeBatch::default();
             let done = {
                 let catalog = self.journal.model.0.read().unwrap();
                 let recency = catalog.recency.as_ref().unwrap();
                 let mut sample = |id, row| {
                     if let Some(time) = recency.sample(id, row, full) {
-                        let (_, record) = catalog.segment(id).unwrap().records.get(row).unwrap();
-                        result = encode(&mut bytes, &record.key, time);
+                        let offset = catalog.segment(id).unwrap().records.offset_at(row);
+                        batch.push(id, offset as u32, time);
                     }
-                    result.is_ok() && bytes.len() < BATCH_BYTES
+                    true
                 };
                 if full {
                     catalog.visit_recency(&mut cursor, ceiling, ROWS_PER_BATCH, |_, id, row| {
@@ -194,7 +206,7 @@ impl SmallObjectStore {
                     catalog.visit_dirty_recency(&mut cursor, ceiling, ROWS_PER_BATCH, sample)
                 }
             };
-            result?;
+            let bytes = batch.finish();
             if !bytes.is_empty() {
                 if fd.is_none() {
                     fd = Some(disk_io::open(self.root.join(LOG), disk_io::Open::Update).await?);
@@ -209,12 +221,19 @@ impl SmallObjectStore {
             }
             tokio::task::yield_now().await;
         }
-        drop(access_relocation);
         if let Some(fd) = fd {
+            if full {
+                let mut footer = Vec::new();
+                format::frame(&mut footer, &[])?;
+                let len = footer.len() as u64;
+                self.write_access_chunks(&fd, footer.into(), offset, budget)
+                    .await?;
+                offset += len;
+            }
             self.sync_access(fd, budget).await?;
             if full {
                 self.rename_access(tmp, FILE, budget).await?;
-                self.publish_access(LOG, header(LOG_MAGIC, state.generation).into(), budget)
+                self.publish_access(LOG, header(DELTA_MAGIC, state.generation).into(), budget)
                     .await?;
                 state.snapshot_bytes = offset;
                 state.log_bytes = HEADER;
@@ -225,10 +244,10 @@ impl SmallObjectStore {
             let size = tokio::task::spawn_blocking(move || allocated(&root))
                 .await
                 .map_err(io::Error::other)??;
-            self.access_bytes.store(size, Ordering::Relaxed);
+            self.journal.access_bytes.store(size, Ordering::Relaxed);
         }
         state.full = false;
-        *self.access_disk.lock().unwrap() = state;
+        *self.journal.access_disk.lock().unwrap() = state;
         Ok(())
     }
 }
@@ -241,24 +260,100 @@ fn open_access(path: &std::path::Path) -> io::Result<Option<BufReader<std::fs::F
     }
 }
 
-fn read_generation(reader: &mut impl Read) -> io::Result<u64> {
-    let mut generation = [0; 8];
-    reader.read_exact(&mut generation)?;
-    Ok(u64::from_le_bytes(generation))
+fn read_header(reader: &mut impl Read, magic: &[u8; 8]) -> io::Result<u64> {
+    let mut header = [0; HEADER as usize];
+    reader.read_exact(&mut header).map_err(|error| {
+        if error.kind() == io::ErrorKind::UnexpectedEof {
+            invalid("truncated compact access header")
+        } else {
+            error
+        }
+    })?;
+    if &header[..8] != magic {
+        return Err(invalid("unsupported compact access version"));
+    }
+    let generation = u64::from_le_bytes(header[8..].try_into().unwrap());
+    if generation == 0 {
+        return Err(invalid("invalid compact access generation"));
+    }
+    Ok(generation)
+}
+
+fn reset_state(root: &std::path::Path) -> DiskState {
+    // A new checkpoint must also supersede any compatible log left after
+    // a reset. A crash before log replacement must not resurrect its ages.
+    let generation = open_access(&root.join(LOG))
+        .ok()
+        .flatten()
+        .and_then(|mut file| read_header(&mut file, DELTA_MAGIC).ok())
+        .unwrap_or(0);
+    DiskState {
+        generation,
+        ..DiskState::default()
+    }
+}
+
+#[derive(Default)]
+struct AgeBatch {
+    bytes: Vec<u8>,
+    group: Vec<u8>,
+    segment: u64,
+}
+
+impl AgeBatch {
+    fn push(&mut self, segment: u64, offset: u32, time: u64) {
+        if self.segment != segment {
+            self.flush();
+            self.segment = segment;
+            self.group.extend_from_slice(&segment.to_le_bytes());
+            self.group.extend_from_slice(&[0; 4]);
+        }
+        self.group.extend_from_slice(&offset.to_le_bytes());
+        self.group.extend_from_slice(&time.to_le_bytes());
+    }
+
+    fn flush(&mut self) {
+        if self.group.is_empty() {
+            return;
+        }
+        let count = ((self.group.len() - GROUP_HEADER_BYTES) / ENTRY_BYTES) as u32;
+        self.group[8..12].copy_from_slice(&count.to_le_bytes());
+        format::frame(&mut self.bytes, &self.group).expect("write access frame to memory");
+        self.group.clear();
+    }
+
+    fn finish(mut self) -> Vec<u8> {
+        self.flush();
+        self.bytes
+    }
+}
+
+fn decode_entries(input: &[u8]) -> impl Iterator<Item = (u32, u64)> + '_ {
+    input.chunks_exact(ENTRY_BYTES).map(|row| {
+        (
+            u32::from_le_bytes(row[..4].try_into().unwrap()),
+            u64::from_le_bytes(row[4..].try_into().unwrap()),
+        )
+    })
 }
 
 fn replay_access(
     reader: &mut impl Read,
-    allow_partial_tail: bool,
-    mut apply: impl FnMut(CacheUnit, u64),
+    log: bool,
+    mut apply: impl FnMut(u64, &[u8]),
 ) -> io::Result<bool> {
-    let mut header = [0; 12];
+    let mut header = [0; FRAME_HEADER_BYTES];
     let mut record = Vec::new();
+    let mut previous = (0, 0);
     let read_tail = |reader: &mut dyn Read, target: &mut [u8]| -> io::Result<bool> {
         match reader.read_exact(target) {
             Ok(()) => Ok(true),
-            Err(error) if allow_partial_tail && error.kind() == io::ErrorKind::UnexpectedEof => {
-                Ok(false)
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                if log {
+                    Ok(false)
+                } else {
+                    Err(invalid("truncated compact access snapshot"))
+                }
             }
             Err(error) => Err(error),
         }
@@ -266,15 +361,31 @@ fn replay_access(
     loop {
         match reader.read_exact(&mut header[..1]) {
             Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                return if log {
+                    Ok(false)
+                } else {
+                    Err(invalid("missing compact access footer"))
+                };
+            }
             Err(error) => return Err(error),
         }
         if !read_tail(reader, &mut header[1..])? {
             return Ok(true);
         }
         let len = u32::from_le_bytes(header[..4].try_into().unwrap()) as usize;
-        if len > format::MAX_KEY + 32 {
-            return Err(invalid("small access frame length"));
+        if len == 0 && !log {
+            let expected = u64::from_le_bytes(header[4..].try_into().unwrap());
+            if expected != xxhash_rust::xxh3::xxh3_64(&[]) || reader.read(&mut [0])? != 0 {
+                return Err(invalid("invalid compact access footer"));
+            }
+            return Ok(false);
+        }
+        if !(GROUP_HEADER_BYTES + ENTRY_BYTES..=GROUP_HEADER_BYTES + ROWS_PER_BATCH * ENTRY_BYTES)
+            .contains(&len)
+            || (len - GROUP_HEADER_BYTES) % ENTRY_BYTES != 0
+        {
+            return Err(invalid("compact access frame length"));
         }
         record.resize(len, 0);
         if !read_tail(reader, &mut record)? {
@@ -282,10 +393,98 @@ fn replay_access(
         }
         let expected = u64::from_le_bytes(header[4..].try_into().unwrap());
         if xxhash_rust::xxh3::xxh3_64(&record) != expected {
-            return Err(invalid("small access frame checksum"));
+            return Err(invalid("compact access frame checksum"));
         }
         let mut body = record.as_slice();
-        let time = format::u64(&mut body)?;
-        apply(format::id(body)?, time);
+        let segment = format::u64(&mut body)?;
+        let count = format::u32(&mut body)? as usize;
+        if segment == 0 || count != body.len() / ENTRY_BYTES {
+            return Err(invalid("compact access frame count or segment"));
+        }
+        if log {
+            previous = (0, 0);
+        }
+        for (offset, time) in decode_entries(body) {
+            let address = (segment, offset);
+            if offset >= 1 << 30 || time >= 1 << 62 || address <= previous {
+                return Err(invalid("compact access row bounds or order"));
+            }
+            previous = address;
+        }
+        apply(segment, body);
     }
+}
+
+// Called with the relocation gate and the compaction I/O permit held. An
+// unpublished destination remains invisible during replay if Replace fails.
+pub(in crate::small_store) async fn persist_relocation(
+    journal: &journal::Journal,
+    old: u64,
+    copy: &StagedSegment,
+) {
+    if journal.model.0.read().unwrap().recency.is_none() {
+        return;
+    }
+    let _writer = journal.access_log_write.lock().await;
+    let mut state = *journal.access_disk.lock().unwrap();
+    if state.log_bytes < HEADER {
+        return;
+    }
+    let result = async {
+        let mut translations: Vec<_> = copy
+            .records
+            .iter()
+            .map(|(&old, record)| (old, record.new_offset))
+            .collect();
+        translations.sort_unstable();
+        let fd = disk_io::open(journal.access_log_path(), disk_io::Open::Update).await?;
+        let old_size = disk_io::allocated(fd.clone()).await?;
+        for rows in translations.chunks(ROWS_PER_BATCH) {
+            let bytes = {
+                let catalog = journal.model.0.read().unwrap();
+                let Some(recency) = &catalog.recency else {
+                    return Ok(());
+                };
+                let records = &catalog.segment(old).unwrap().records;
+                let mut batch = AgeBatch::default();
+                let mut row = 0;
+                for &(offset, new_offset) in rows {
+                    row = records.position_from(row, offset);
+                    debug_assert!(records.offset_matches(row, offset));
+                    let time = recency.time(recency.value(old, row).load(Ordering::Relaxed));
+                    batch.push(copy.id, new_offset as u32, time);
+                    row += 1;
+                }
+                batch.finish()
+            };
+            let len = bytes.len() as u64;
+            disk_io::write(fd.clone(), bytes.into(), state.log_bytes).await?;
+            state.log_bytes += len;
+        }
+        let new_size = disk_io::allocated(fd.clone()).await?;
+        disk_io::sync(fd).await?;
+        journal
+            .access_bytes
+            .fetch_add(new_size.saturating_sub(old_size), Ordering::Relaxed);
+        Ok::<_, io::Error>(())
+    }
+    .await;
+    if let Err(error) = result {
+        state.full = true;
+        state.log_bytes = 0;
+        tracing::warn!(%error, old, new = copy.id, "small access relocation could not persist ages");
+    }
+    *journal.access_disk.lock().unwrap() = state;
+}
+
+#[cfg(test)]
+pub(super) fn read_log(path: &std::path::Path) -> Vec<(u64, u32, u64)> {
+    let mut log = open_access(&path.join(LOG)).unwrap().unwrap();
+    read_header(&mut log, DELTA_MAGIC).unwrap();
+    let mut rows = Vec::new();
+    assert!(!replay_access(&mut log, true, |segment, body| {
+        rows.extend(decode_entries(body).map(|(offset, time)| (segment, offset, time)));
+    })
+    .unwrap());
+    rows
 }

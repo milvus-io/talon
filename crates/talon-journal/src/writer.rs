@@ -54,12 +54,13 @@ pub(crate) async fn run<M: Machine>(
     failed: &AtomicBool,
     policy: Arc<std::sync::RwLock<Option<Arc<dyn Maintenance>>>>,
     snapshot_slots: Arc<Semaphore>,
+    life: Arc<lifecycle::Life>,
 ) -> io::Result<()> {
     let mut write: Option<WriteBatch<M>> = None;
     let mut sync: Option<SyncBatch<M>> = None;
     let mut durable = Vec::new();
     let mut barrier: Option<Request<M>> = None;
-    let mut checkpoint: Option<LocalBoxFuture<'static, io::Result<disk::Snapshot>>> = None;
+    let mut checkpoint: Option<LocalBoxFuture<'static, io::Result<Option<disk::Snapshot>>>> = None;
     let mut checkpoint_completion: Option<watch::Sender<bool>> = None;
     let mut pending_checkpoint: Option<watch::Sender<bool>> = None;
     let mut closed = false;
@@ -67,6 +68,7 @@ pub(crate) async fn run<M: Machine>(
     let result=async {
         loop {
             if failed.load(Ordering::Acquire) {return Err(stopped());}
+            let checkpoint_ready = !life.is_closing() && machine.checkpoint_ready();
             // Coalesce callers by snapshot cut and release queue admission.
             // Appends holding maintenance permits must remain admissible while
             // a snapshot waits for those permits; no per-caller list is retained.
@@ -86,14 +88,18 @@ pub(crate) async fn run<M: Machine>(
                     disk.sync().await?;
                     let request=barrier.take().unwrap();
                     if let Command::Query(query)=request.command {query(&machine);}
-                } else if checkpoint.is_none() && (pending_checkpoint.is_some() || disk.offset>=disk.options.checkpoint_bytes) {
+                    continue;
+                } else if checkpoint_ready && checkpoint.is_none() && (pending_checkpoint.is_some() || disk.offset>=disk.options.checkpoint_bytes) {
                     let snapshot=machine.snapshot()?;
                     let generation=disk.rotate().await?;
-                    checkpoint=Some(disk.snapshot::<M>(generation,disk.lsn,snapshot,policy.read().unwrap().clone(),snapshot_slots.clone()));
+                    checkpoint=Some(disk.snapshot::<M>(generation,disk.lsn,snapshot,policy.read().unwrap().clone(),snapshot_slots.clone(),life.clone()));
                     checkpoint_completion=pending_checkpoint.take();
                 }
             }
-            if closed && write.is_none() && sync.is_none() && checkpoint.is_none() && barrier.is_none() && pending_checkpoint.is_none() {return Ok(());}
+            if closed && write.is_none() && sync.is_none() && checkpoint.is_none() && barrier.is_none() {
+                disk.sync().await?;
+                return Ok(());
+            }
             tokio::select! {
                 result=async {sync.as_mut().unwrap().await}, if sync.is_some()=>{
                     sync=None;let (requests,result)=result;result?;
@@ -106,8 +112,13 @@ pub(crate) async fn run<M: Machine>(
                     }
                 }
                 result=async {checkpoint.as_mut().unwrap().await}, if checkpoint.is_some()=>{
-                    checkpoint=None;disk.publish_snapshot(result?).await?;
-                    if let Some(completion)=checkpoint_completion.take() {completion.send_replace(true);}
+                    checkpoint=None;
+                    if let Some(snapshot)=result? {
+                        disk.publish_snapshot(snapshot, &life).await?;
+                        if let Some(completion)=checkpoint_completion.take() {completion.send_replace(true);}
+                    } else {
+                        drop(checkpoint_completion.take());
+                    }
                 }
                 result=async {write.as_mut().unwrap().await}, if write.is_some()=>{
                     write=None;
@@ -137,7 +148,7 @@ pub(crate) async fn run<M: Machine>(
                 // Do not extend the log beyond an unfinished batch. Ordering
                 // only apply/ack lets later pwrite calls leave an interior hole
                 // after process loss, which is not a recoverable torn tail.
-                request=receive.recv(), if !closed && write.is_none() && barrier.is_none() && (disk.offset<disk.options.checkpoint_bytes || checkpoint.is_some())=>{
+                request=receive.recv(), if !closed && write.is_none() && barrier.is_none() && (!checkpoint_ready || disk.offset<disk.options.checkpoint_bytes || checkpoint.is_some())=>{
                     let Some(request)=request else {closed=true;continue;};
                     if !matches!(request.command,Command::Append{..}) {barrier=Some(request);continue;}
                     let mut requests=vec![request];let mut bytes=Vec::new();let mut pending=Vec::new();
@@ -163,6 +174,7 @@ pub(crate) async fn run<M: Machine>(
     drop(checkpoint_completion);
     drop(pending_checkpoint);
     drop(durable);
+    life.close();
     // Accepted native I/O retains its buffers/descriptors and lease even after
     // another operation failed. Do not race a reopen against abandoned writes.
     if let Some(write) = write {
@@ -174,5 +186,6 @@ pub(crate) async fn run<M: Machine>(
     if let Some(checkpoint) = checkpoint {
         let _ = checkpoint.await;
     }
-    result
+    result?;
+    disk.cancel_snapshot().await
 }

@@ -1,6 +1,7 @@
 //! Advisory recency: coalesced dirty keys, a bounded delta log, and infrequent
 //! full checkpoints. Neither file establishes residency or stores payloads.
 mod compact;
+pub(super) use compact::persist_relocation;
 #[cfg(test)]
 mod tests;
 
@@ -199,7 +200,7 @@ impl SmallObjectStore {
             // A payload may have sealed after the last access flush. Its fresh
             // recovery age must be saved even if it is never read again.
             state.full |= matched < residents;
-            *self.access_disk.lock().unwrap() = state;
+            *self.journal.access_disk.lock().unwrap() = state;
             Ok(())
         })();
         if let Err(error) = result {
@@ -292,7 +293,7 @@ impl SmallObjectStore {
                 let (mut state, full, bytes) =
                     tokio::task::spawn_blocking(move || -> io::Result<_> {
                         prepare.enable_access_tracking()?;
-                        let mut state = *prepare.access_disk.lock().unwrap();
+                        let mut state = *prepare.journal.access_disk.lock().unwrap();
                         let overflow = prepare.access_dirty.overflow.swap(false, Ordering::AcqRel);
                         let pending =
                             std::mem::take(&mut *prepare.access_dirty.pending.lock().unwrap());
@@ -302,7 +303,7 @@ impl SmallObjectStore {
                                 >= MIN_COMPACT_BYTES.max(state.snapshot_bytes.div_ceil(2));
                         // Failure after consuming dirty state must retry from all live
                         // timestamps, including a partial append or ambiguous rename.
-                        prepare.access_disk.lock().unwrap().full = true;
+                        prepare.journal.access_disk.lock().unwrap().full = true;
                         let mut bytes = Vec::new();
                         if full {
                             state.generation = state
@@ -378,10 +379,10 @@ impl SmallObjectStore {
                     let size = tokio::task::spawn_blocking(move || allocated(&root))
                         .await
                         .map_err(io::Error::other)??;
-                    store.access_bytes.store(size, Ordering::Relaxed);
+                    store.journal.access_bytes.store(size, Ordering::Relaxed);
                 }
                 state.full = false;
-                *store.access_disk.lock().unwrap() = state;
+                *store.journal.access_disk.lock().unwrap() = state;
                 Ok(())
             })
             .await
