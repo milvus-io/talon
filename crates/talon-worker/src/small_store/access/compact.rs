@@ -7,17 +7,15 @@ const BATCH_BYTES: usize = 64 << 10;
 
 impl SmallObjectStore {
     pub(crate) fn init_recency(&self) {
-        let mut catalog = self.journal.model.0.write().unwrap();
-        catalog.recency = Some(crate::small_store::recency::Recency::new(&catalog.model));
+        self.journal.model.init_recency();
     }
 
     pub(crate) fn has_recency(&self) -> bool {
-        self.journal.model.0.read().unwrap().recency.is_some()
+        self.journal.model.has_recency()
     }
 
     pub(crate) fn recency_for_unlink(&self, nonblocking: bool) -> Option<bool> {
-        let catalog = crate::small_store::read_for_unlink(&self.journal.model.0, nonblocking)?;
-        Some(catalog.recency.is_some())
+        self.journal.model.recency_for_unlink(nonblocking)
     }
 
     pub(crate) fn idle_recency_candidates(
@@ -28,38 +26,9 @@ impl SmallObjectStore {
         scan: usize,
         deletes: usize,
     ) -> Vec<(CacheUnit, Arc<crate::small_store::policy::SmallAccess>)> {
-        let catalog = self.journal.model.0.read().unwrap();
-        let Some(end) = cursor.end.or_else(|| {
-            let (&id, segment) = catalog.model.segments.last_key_value()?;
-            Some((id, segment.bytes))
-        }) else {
-            return Vec::new();
-        };
-        // Freeze the active segment's extent as well as its ID. Otherwise a
-        // busy stream can keep the sweep from returning to older rows.
-        cursor.end = Some(end);
-        let mut candidates = Vec::new();
-        let done = catalog.visit_recency(&mut cursor.next, end, scan, |slot, id, row| {
-            let (recency, value) = catalog.recency_at(slot).unwrap();
-            if now.saturating_sub(recency.time(value.load(Ordering::Relaxed))) > age {
-                let records = &catalog.segment(id).unwrap().records;
-                let (offset, record) = records
-                    .metadata(row)
-                    .map(|record| (record.offset, record))
-                    .unwrap();
-                let ticket = catalog.compact_access(slot, (id, offset), record.stored_len());
-                let ticket = ticket.small().unwrap();
-                if ticket.state.lock().unwrap().pins == 0 {
-                    let (_, record) = records.get(row).unwrap();
-                    candidates.push((record.key.view().cache_unit(), ticket.clone()));
-                }
-            }
-            candidates.len() < deletes
-        });
-        if done {
-            *cursor = IdleRecencyCursor::default();
-        }
-        candidates
+        self.journal
+            .model
+            .idle_recency_candidates(cursor, now, age, scan, deletes)
     }
 
     pub(super) fn restore_compact_access(&self) {
@@ -103,7 +72,7 @@ impl SmallObjectStore {
                     }
                 }
             }
-            state.full |= repaired || matched < catalog.live.values().sum();
+            state.full |= repaired || matched < catalog.visible_count();
             Ok(state)
         })();
         match result {
@@ -129,22 +98,9 @@ impl SmallObjectStore {
         };
         let full = state.full
             || state.log_bytes >= MIN_COMPACT_BYTES.max(state.snapshot_bytes.div_ceil(2));
-        let access_relocation = if full {
-            Some(self.journal.access_relocation.write().await)
-        } else {
-            None
-        };
+        let access_relocation = self.journal.lock_access_snapshot(full).await;
         let mut cursor: Address = (0, 0);
-        let ceiling = self
-            .journal
-            .model
-            .0
-            .read()
-            .unwrap()
-            .model
-            .segments
-            .last_key_value()
-            .map_or((0, 0), |(&id, segment)| (id, segment.bytes));
+        let ceiling = self.journal.model.recency_ceiling().unwrap_or_default();
         let tmp = self.root.join("access.checkpoint.tmp");
         let mut fd = None;
         let mut offset = state.log_bytes;
@@ -176,24 +132,16 @@ impl SmallObjectStore {
         loop {
             let mut bytes = Vec::new();
             let mut result = Ok(());
-            let done = {
-                let catalog = self.journal.model.0.read().unwrap();
-                let recency = catalog.recency.as_ref().unwrap();
-                let mut sample = |id, row| {
-                    if let Some(time) = recency.sample(id, row, full) {
-                        let (_, record) = catalog.segment(id).unwrap().records.get(row).unwrap();
-                        result = encode(&mut bytes, &record.key, time);
-                    }
+            let done = self.journal.model.sample_recency(
+                &mut cursor,
+                ceiling,
+                ROWS_PER_BATCH,
+                full,
+                |key, time| {
+                    result = encode(&mut bytes, &key, time);
                     result.is_ok() && bytes.len() < BATCH_BYTES
-                };
-                if full {
-                    catalog.visit_recency(&mut cursor, ceiling, ROWS_PER_BATCH, |_, id, row| {
-                        sample(id, row)
-                    })
-                } else {
-                    catalog.visit_dirty_recency(&mut cursor, ceiling, ROWS_PER_BATCH, sample)
-                }
-            };
+                },
+            );
             result?;
             if !bytes.is_empty() {
                 if fd.is_none() {

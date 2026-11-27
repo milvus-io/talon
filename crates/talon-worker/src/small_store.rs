@@ -950,13 +950,8 @@ impl SegmentStore {
 
         // Full access checkpoints take this gate before I/O. Preserve that
         // ordering so a snapshot and relocation cannot wait on each other.
-        let tracks_access = self.journal.model.0.read().unwrap().recency.is_some();
         let acquire_io = || async {
-            let access_relocation = if tracks_access {
-                Some(self.journal.access_relocation.read().await)
-            } else {
-                None
-            };
+            let access_relocation = self.journal.lock_segment_relocation().await;
             let io = match budget {
                 Some(budget) => Some(budget.io().await),
                 None => None,

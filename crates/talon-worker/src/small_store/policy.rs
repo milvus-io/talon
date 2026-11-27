@@ -96,13 +96,8 @@ impl SmallAccess {
     pub fn snapshot(&self) -> u64 {
         let catalog = self.catalog.upgrade().expect("live small catalog");
         let mut catalog = catalog.write().unwrap();
-        let revision = catalog.next_revision();
-        self.state.lock().unwrap().revision = revision;
-        if let Some(slot) = self.slot(&catalog) {
-            let flags = catalog.lookup.flags(slot);
-            catalog.lookup.set_flags(slot, flags & !REFERENCED);
-        }
-        revision
+        let slot = self.slot(&catalog);
+        catalog.observe_policy(self, slot)
     }
 
     pub fn is_current(&self, revision: u64) -> bool {
@@ -144,6 +139,29 @@ impl Catalog {
             })
             .expect("small policy revision exhausted")
             + 1
+    }
+
+    pub(super) fn observe_policy(&mut self, ticket: &SmallAccess, slot: Option<usize>) -> u64 {
+        let revision = self.next_revision();
+        ticket.state.lock().unwrap().revision = revision;
+        if let Some(slot) = slot {
+            let flags = self.lookup.flags(slot);
+            self.lookup.set_flags(slot, flags & !REFERENCED);
+        }
+        revision
+    }
+
+    pub(super) fn stores_access(access: &AccessHandle) -> bool {
+        access.small().is_none() || access.tracks_clock()
+    }
+
+    pub(super) fn attach_access(&mut self, slot: usize, access: AccessHandle) {
+        let address = self.address(slot);
+        if let Some(policy) = self.policy.get_mut(&address) {
+            policy.access = access;
+        } else {
+            self.access.insert(address, access);
+        }
     }
 
     pub(super) fn compact_entry(&self, slot: usize) -> PolicyEntry {
@@ -194,7 +212,7 @@ impl Catalog {
         for stream in streams {
             if self.compact_streams.insert(stream) {
                 self.compact_totals.insert(stream, (0, 0));
-                if self.live.get(&stream).copied().unwrap_or(0) != 0 {
+                if self.stream_len(stream) != 0 {
                     recovered.insert(stream);
                 }
             }
@@ -233,6 +251,9 @@ impl Catalog {
         let (address, record) = self.metadata(self.lookup.handle(slot)).unwrap();
         let stream = self.segment(address.0).unwrap().slot;
         let stored_len = record.stored_len();
+        if !self.compact_streams.contains(&stream) {
+            self.enable_compact([stream]);
+        }
         let flags = self.lookup.flags(slot);
         let old = if flags & POLICY != 0 {
             self.charges.get(&address).copied().unwrap_or(stored_len)
@@ -261,7 +282,7 @@ impl Catalog {
             state.bytes = bytes;
             state.revision = revision;
         }
-        if self.recency.is_some() {
+        if self.has_recency() {
             self.touch_recency(slot);
         } else if clock {
             entry.access = entry.access.enable_clock();
@@ -270,24 +291,23 @@ impl Catalog {
         entry.access
     }
 
-    pub(super) fn compact_update<T>(
+    pub(super) fn update_ticket<T>(
         &mut self,
-        slot: usize,
+        ticket: &Arc<SmallAccess>,
+        invalidate_gc: bool,
         update: impl FnOnce(&mut PolicyState) -> T,
     ) -> T {
-        let entry = self.compact_entry(slot);
-        let ticket = entry.access.small().cloned().unwrap();
         let address = *ticket.address.lock().unwrap();
         let mut state = ticket.state.lock().unwrap();
         let pins = state.pins;
         let result = update(&mut state);
-        if state.pins > pins {
+        if invalidate_gc && state.pins > pins {
             ticket.gc_revision.store(0, Ordering::Relaxed);
         }
         if state.pins == 0 {
             self.pins.remove(&address);
         } else {
-            self.pins.insert(address, ticket.clone());
+            self.pins.insert(address, Arc::clone(ticket));
         }
         result
     }
