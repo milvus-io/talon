@@ -1,6 +1,23 @@
 //! Complete runtime overrides loaded from a local or ConfigMap-projected file.
+use crate::config::{background_io_bytes_per_sec, validate_page_tti, DurationOverflow};
+use crate::namespace_rules::{self, NamespaceRule};
 use crate::RateLimitPolicy;
 use serde::{Deserialize, Serialize};
+
+pub use crate::namespace_rules::NamespaceDynamicConfig;
+
+impl NamespaceDynamicConfig {
+    /// Check the local tuning's duration and rate limit bounds.
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(hours) = self.page_tti_hours {
+            validate_page_tti(hours).map_err(DurationOverflow::tti_error)?;
+        }
+        if let Some(limits) = self.rate_limits {
+            limits.validate().map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+}
 
 /// Only fields with live runtime consumers belong in this contract.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -11,7 +28,7 @@ pub struct WorkerDynamicConfig {
     #[serde(default)]
     pub namespaces: std::collections::BTreeMap<String, NamespaceDynamicConfig>,
     #[serde(default)]
-    pub namespace_rules: Vec<crate::namespace_rules::NamespaceRule>,
+    pub namespace_rules: Vec<NamespaceRule>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub page_tti_hours: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -31,24 +48,12 @@ pub struct WorkerDynamicConfig {
 }
 impl WorkerDynamicConfig {
     pub fn validate(&self) -> Result<(), String> {
-        crate::namespace_rules::validate(&self.namespace_rules).map_err(|e| e.to_string())?;
+        namespace_rules::validate(&self.namespace_rules).map_err(|e| e.to_string())?;
         for rule in &self.namespace_rules {
-            NamespaceDynamicConfig {
-                page_tti_hours: rule.config.page_tti_hours,
-                rate_limits: rule.config.rate_limits,
-            }
-            .validate()?;
+            rule.config.validate()?;
         }
         if let Some(hours) = self.page_tti_hours {
-            let millis = hours
-                .checked_mul(3_600_000)
-                .ok_or("TTI duration overflows")?;
-            if std::time::Instant::now()
-                .checked_add(std::time::Duration::from_millis(millis))
-                .is_none()
-            {
-                return Err("TTI duration overflows clock".into());
-            }
+            validate_page_tti(hours).map_err(DurationOverflow::tti_error)?;
         }
         if self.namespaces.len() > 4096 {
             return Err("too many namespace configurations".into());
@@ -81,7 +86,7 @@ impl WorkerDynamicConfig {
         }
         if self
             .background_io_max_mb_per_sec
-            .is_some_and(|rate| rate > u64::MAX / 1_000_000)
+            .is_some_and(|rate| background_io_bytes_per_sec(rate).is_none())
         {
             return Err("background I/O rate overflows bytes per second".into());
         }
@@ -154,29 +159,6 @@ impl WorkerDynamicConfig {
     }
 }
 
-/// A complete override for one namespace. Omitted fields inherit worker defaults.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct NamespaceDynamicConfig {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rate_limits: Option<crate::MetricLimits>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub page_tti_hours: Option<u64>,
-}
-impl NamespaceDynamicConfig {
-    pub fn validate(&self) -> Result<(), String> {
-        // Validate the same bounds as global tuning without recursively visiting namespaces.
-        let config = WorkerDynamicConfig {
-            page_tti_hours: self.page_tti_hours,
-            ..Default::default()
-        };
-        config.validate()?;
-        if let Some(limits) = &self.rate_limits {
-            limits.validate().map_err(|e| e.to_string())?;
-        }
-        Ok(())
-    }
-}
 impl WorkerDynamicConfig {
     pub fn settings_for(&self, namespace: &str) -> NamespaceDynamicConfig {
         let own = self.namespaces.get(namespace).cloned().unwrap_or_default();
@@ -185,35 +167,21 @@ impl WorkerDynamicConfig {
             page_tti_hours: own
                 .page_tti_hours
                 .or_else(|| {
-                    crate::namespace_rules::resolve(&self.namespace_rules, None, namespace)
-                        .page_tti_hours
+                    namespace_rules::resolve_field(&self.namespace_rules, namespace, |rule| {
+                        rule.page_tti_hours
+                    })
                 })
                 .or(self.page_tti_hours),
         }
     }
     pub fn effective_rate_limits(&self, startup: &RateLimitPolicy) -> RateLimitPolicy {
         let mut policy = self.rate_limits.as_ref().unwrap_or(startup).clone();
-        policy.namespace_rules = self.namespace_rules.clone();
-        if self
-            .namespace_rules
-            .iter()
-            .any(|r| r.config.rate_limits.is_some())
-            || self
-                .namespaces
-                .values()
-                .any(|config| config.rate_limits.is_some())
-        {
-            if !policy.enabled {
-                policy.default = Default::default();
-                policy.overrides.clear();
-            }
-            policy.enabled = true;
-            for (name, config) in &self.namespaces {
-                if let Some(limits) = config.rate_limits {
-                    policy.overrides.insert(name.clone(), limits);
-                }
-            }
-        }
+        policy.apply_namespace_limits(
+            &self.namespace_rules,
+            self.namespaces
+                .iter()
+                .filter_map(|(name, own)| own.rate_limits.map(|limits| (name.clone(), limits))),
+        );
         policy
     }
 }

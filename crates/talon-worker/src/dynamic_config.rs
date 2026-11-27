@@ -97,7 +97,7 @@ impl DynamicConfig {
                 for name in namespace_names {
                     let namespace = talon_core::NamespaceId::named(&name);
                     let desired_ns = desired
-                        .for_namespace(&namespace)
+                        .namespace_cache_config(&namespace)
                         .map_err(|e| e.to_string())?;
                     let limits = desired.rate_limits.limits_for(&namespace);
                     next.namespaces.insert(
@@ -144,18 +144,8 @@ impl DynamicConfig {
             } else {
                 (WorkerDynamicConfig::parse(text)?, None)
             };
-            runtime.validate_dynamic_tti(&next)?;
-            if self.status.config.as_ref() != Some(&next) {
-                let limiter = runtime.rate_limiter();
-                let policy = next.effective_rate_limits(limiter.startup_policy());
-                if self.status.config.as_ref().map_or(true, |current| {
-                    current.effective_rate_limits(limiter.startup_policy()) != policy
-                }) {
-                    limiter.update(policy).map_err(|e| e.to_string())?;
-                }
-                runtime.update_dynamic_settings(next.clone());
-                self.status.config = Some(next);
-            }
+            runtime.apply_dynamic_settings(self.status.config.as_ref(), &next)?;
+            self.status.config = Some(next);
             if let (Some(current), Some(endpoint)) = (&self.broker_endpoint, broker_update) {
                 if current.load().as_ref() != &endpoint {
                     current.store(Arc::new(endpoint));
@@ -209,6 +199,18 @@ pub async fn reload_once(
     observability.set_config_reload_status(state.status());
 }
 
+impl Worker {
+    /// Reload process tuning through the worker's shared runtime.
+    pub async fn reload_config_once(
+        &self,
+        path: &Path,
+        state: &mut DynamicConfig,
+        observability: &WorkerObservability,
+    ) {
+        reload_once(path, state, self.default_runtime(), observability).await;
+    }
+}
+
 pub fn spawn_reload(
     path: PathBuf,
     mut state: DynamicConfig,
@@ -221,7 +223,7 @@ pub fn spawn_reload(
         loop {
             tokio::select! {
                 _ = observability.shutdown().stopped() => return,
-                _ = ticker.tick() => reload_once(&path, &mut state, worker.default_runtime(), &observability).await,
+                _ = ticker.tick() => worker.reload_config_once(&path, &mut state, &observability).await,
             }
         }
     })

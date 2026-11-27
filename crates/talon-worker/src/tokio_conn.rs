@@ -396,7 +396,7 @@ async fn handle_request(
         return Ok(Some(stream));
     }
 
-    if let Err(throttled) = worker.rate_limiter().admit(worker.namespace(), req.len) {
+    if let Err(throttled) = worker.admit_read(req.len) {
         let mut err = data::encode_typed_error(
             h.request_id,
             DataErrorCode::RateLimited,
@@ -707,7 +707,7 @@ async fn handle_cached_range(
     // Meter the cache-only read too, so a resident-version read cannot escape
     // the namespace's read_iops / read_throughput limits (a plain GetCachedRange
     // without namespace metadata is charged to the default namespace).
-    if let Err(throttled) = worker.rate_limiter().admit(worker.namespace(), request.len) {
+    if let Err(throttled) = worker.admit_read(request.len) {
         let mut reply = data::encode_typed_error(
             decoded.request_id,
             DataErrorCode::RateLimited,

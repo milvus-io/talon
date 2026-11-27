@@ -1,12 +1,36 @@
 //! Ordered wildcard policies for cache namespace names.
-use crate::{Error, NamespaceCacheConfig, Result};
+use crate::{Error, MetricLimits, Result};
 use serde::{Deserialize, Serialize};
 
+/// Per-namespace cache overrides. Omitted fields inherit the worker defaults.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NamespaceCacheConfig {
+    pub l2_page_size_bytes: Option<u64>,
+    pub l1_page_size_bytes: Option<u64>,
+    pub page_tti_hours: Option<u64>,
+    pub page_access_checkpoint_interval_minutes: Option<u64>,
+    pub page_gc_interval_minutes: Option<u64>,
+    pub paged_miss_run_concurrency: Option<usize>,
+    pub rate_limits: Option<MetricLimits>,
+}
+
+/// A complete override for one namespace. Omitted fields inherit worker defaults.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NamespaceDynamicConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limits: Option<MetricLimits>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_tti_hours: Option<u64>,
+}
+
+/// An override keyed by a case-sensitive namespace wildcard.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NamespaceRule {
     pub pattern: String,
-    pub config: crate::dynamic_config::NamespaceDynamicConfig,
+    pub config: NamespaceDynamicConfig,
 }
 
 pub fn validate(rules: &[NamespaceRule]) -> Result<()> {
@@ -57,29 +81,33 @@ pub fn matches(pattern: &str, name: &str) -> bool {
     i == p.len()
 }
 
+/// Merge wildcard overrides in order, then apply fields from the exact match.
 pub fn resolve(
     rules: &[NamespaceRule],
     exact: Option<&NamespaceCacheConfig>,
     name: &str,
 ) -> NamespaceCacheConfig {
-    let mut result = NamespaceCacheConfig::default();
-    for rule in rules.iter().filter(|r| matches(&r.pattern, name)) {
-        result.page_tti_hours = rule.config.page_tti_hours.or(result.page_tti_hours);
-        result.rate_limits = rule.config.rate_limits.or(result.rate_limits);
-    }
-    if let Some(own) = exact {
-        macro_rules! merge { ($($field:ident),*) => { $(result.$field = own.$field.or(result.$field);)* }; }
-        merge!(
-            l2_page_size_bytes,
-            l1_page_size_bytes,
-            page_tti_hours,
-            page_access_checkpoint_interval_minutes,
-            page_gc_interval_minutes,
-            paged_miss_run_concurrency,
-            rate_limits
-        );
-    }
+    let mut result = exact.cloned().unwrap_or_default();
+    result.page_tti_hours = result
+        .page_tti_hours
+        .or_else(|| resolve_field(rules, name, |rule| rule.page_tti_hours));
+    result.rate_limits = result
+        .rate_limits
+        .or_else(|| resolve_field(rules, name, |rule| rule.rate_limits));
     result
+}
+
+/// Pick the last matching rule that sets the requested field.
+pub(crate) fn resolve_field<V>(
+    rules: &[NamespaceRule],
+    name: &str,
+    field: impl Fn(&NamespaceDynamicConfig) -> Option<V>,
+) -> Option<V> {
+    rules
+        .iter()
+        .rev()
+        .filter(|rule| matches(&rule.pattern, name))
+        .find_map(|rule| field(&rule.config))
 }
 
 #[cfg(test)]
@@ -141,6 +169,60 @@ rate_limits = {}
         let dynamic = crate::dynamic_config::WorkerDynamicConfig::from_config(&config);
         assert_eq!(dynamic.settings_for("prod-future").page_tti_hours, Some(12));
     }
+
+    #[test]
+    fn startup_and_reload_layer_limits_over_enabled_or_disabled_policy() {
+        for enabled in [false, true] {
+            let input = format!(
+                r#"
+[[namespace_rules]]
+pattern = "prod-*"
+config = {{ rate_limits = {{ read_iops = {{ rate = 10 }} }} }}
+[[namespace_rules]]
+pattern = "prod-us-*"
+config = {{ rate_limits = {{ read_iops = {{ rate = 20 }} }} }}
+[[namespace_rules]]
+pattern = "*"
+config = {{ page_tti_hours = 24 }}
+[rate_limits]
+enabled = {enabled}
+default = {{ read_iops = {{ rate = 30 }} }}
+overrides = {{ "prod-us-explicit" = {{ read_iops = {{ rate = 40 }} }} }}
+[namespaces.prod-us-exempt]
+rate_limits = {{}}
+"#
+            );
+            let document = crate::dynamic_config::WorkerConfigDocument::parse(&input).unwrap();
+            let startup = crate::WorkerConfig::resolve(
+                document.patch,
+                Default::default(),
+                Default::default(),
+            )
+            .unwrap()
+            .rate_limits;
+            let reload = document.tuning.effective_rate_limits(&Default::default());
+            assert_eq!(startup, reload);
+            assert_eq!(reload.namespace_rules, document.tuning.namespace_rules);
+            assert!(reload.enabled);
+            for (name, expected) in [
+                ("prod-eu", Some(10)),
+                ("prod-us-new", Some(20)),
+                ("prod-us-explicit", Some(if enabled { 40 } else { 20 })),
+                ("prod-us-exempt", None),
+                ("other", enabled.then_some(30)),
+            ] {
+                assert_eq!(
+                    reload
+                        .limits_for(&crate::NamespaceId::named(name))
+                        .read_iops
+                        .map(|limit| limit.rate),
+                    expected,
+                    "{name}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn invalid_patterns_and_limits_are_rejected() {
         for pattern in ["", "a/b", "[a-z]", "a\\b"] {

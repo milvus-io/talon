@@ -21,11 +21,14 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::namespace_rules::{self, NamespaceRule};
 use crate::status::MAX_STATUS_FIELD_BYTES;
 use crate::{
     Backend, ControlTlsConfig, ControlTlsConfigPatch, Error, ObjectNamespace,
     ObjectNamespacePolicy, RateLimitPolicy, Result,
 };
+
+pub use crate::namespace_rules::NamespaceCacheConfig;
 
 /// A configuration patch: a set of optionally-present overrides.
 ///
@@ -493,20 +496,111 @@ pub struct WorkerConfig {
     pub rate_limits: RateLimitPolicy,
     /// Optional named cache policies; unknown namespaces inherit worker defaults.
     pub namespaces: std::collections::BTreeMap<String, NamespaceCacheConfig>,
-    pub namespace_rules: Vec<crate::namespace_rules::NamespaceRule>,
+    pub namespace_rules: Vec<NamespaceRule>,
 }
 
-/// Per-namespace cache overrides. Omitted fields inherit the worker defaults.
-#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct NamespaceCacheConfig {
-    pub l2_page_size_bytes: Option<u64>,
-    pub l1_page_size_bytes: Option<u64>,
-    pub page_tti_hours: Option<u64>,
-    pub page_access_checkpoint_interval_minutes: Option<u64>,
-    pub page_gc_interval_minutes: Option<u64>,
-    pub paged_miss_run_concurrency: Option<usize>,
-    pub rate_limits: Option<crate::MetricLimits>,
+/// Effective cache settings for one namespace. Process-owned settings remain on
+/// the worker configuration.
+#[derive(Debug, Clone, Copy)]
+pub struct ResolvedNamespaceCacheConfig {
+    pub l2_page_size_bytes: u64,
+    pub l1_page_size_bytes: u64,
+    pub page_tti_hours: u64,
+    pub page_access_checkpoint_interval_minutes: u64,
+    pub page_gc_interval_minutes: u64,
+    pub paged_miss_run_concurrency: usize,
+}
+
+/// Convert the configured decimal MB/s rate, or return `None` on overflow.
+pub const fn background_io_bytes_per_sec(mb_per_sec: u64) -> Option<u64> {
+    mb_per_sec.checked_mul(1_000_000)
+}
+
+pub(crate) enum DurationOverflow {
+    Milliseconds,
+    Clock,
+}
+
+impl DurationOverflow {
+    fn config_error(self, name: &str) -> Error {
+        let unit = match self {
+            Self::Milliseconds => "milliseconds",
+            Self::Clock => "monotonic clock",
+        };
+        Error::Other(format!("{name} overflows {unit}"))
+    }
+
+    pub(crate) fn tti_error(self) -> String {
+        match self {
+            Self::Milliseconds => "TTI duration overflows",
+            Self::Clock => "TTI duration overflows clock",
+        }
+        .into()
+    }
+}
+
+fn validate_duration(
+    value: u64,
+    millis_per_unit: u64,
+) -> std::result::Result<u64, DurationOverflow> {
+    let millis = value
+        .checked_mul(millis_per_unit)
+        .ok_or(DurationOverflow::Milliseconds)?;
+    if std::time::Instant::now()
+        .checked_add(std::time::Duration::from_millis(millis))
+        .is_none()
+    {
+        return Err(DurationOverflow::Clock);
+    }
+    Ok(millis)
+}
+
+pub(crate) fn validate_page_tti(hours: u64) -> std::result::Result<u64, DurationOverflow> {
+    validate_duration(hours, 3_600_000)
+}
+
+/// The storage constraint that prevents enabling page TTI.
+#[derive(Debug, thiserror::Error)]
+pub enum TtiStorageError {
+    /// Idle eviction requires one of the storage modes that track access.
+    #[error("TTI requires paged L2 or small-object storage")]
+    UntrackedStorage,
+    /// Persist access ages at least as often as the requested TTI.
+    #[error("checkpoint interval exceeds TTI")]
+    CheckpointInterval,
+}
+
+impl TtiStorageError {
+    fn config_error(self) -> Error {
+        Error::Other(
+            match self {
+                Self::UntrackedStorage => {
+                    "page_tti_hours requires paged L2 or small-object storage"
+                }
+                Self::CheckpointInterval => {
+                    "page_access_checkpoint_interval_minutes must not exceed page_tti_hours"
+                }
+            }
+            .into(),
+        )
+    }
+}
+
+/// Check that the effective TTI is supported by the storage and checkpoint cadence.
+pub fn validate_tti_storage(
+    supports_tti: bool,
+    tti_ms: u64,
+    checkpoint_interval_ms: u64,
+) -> std::result::Result<(), TtiStorageError> {
+    if tti_ms > 0 {
+        if !supports_tti {
+            return Err(TtiStorageError::UntrackedStorage);
+        }
+        if checkpoint_interval_ms > tti_ms {
+            return Err(TtiStorageError::CheckpointInterval);
+        }
+    }
+    Ok(())
 }
 
 impl WorkerConfig {
@@ -522,12 +616,9 @@ impl WorkerConfig {
         }
     }
 
-    /// Resolve connection defaults and validate explicit origins without sharing credentials.
-    pub fn resolved_buckets(&self) -> Result<Option<Vec<BucketConfig>>> {
-        let Some(buckets) = self.buckets.as_ref().filter(|buckets| !buckets.is_empty()) else {
-            return Ok(None);
-        };
-        if self.credentials_source.is_some()
+    /// Whether any legacy top-level credential field is explicitly configured.
+    pub fn has_legacy_credentials(&self) -> bool {
+        self.credentials_source.is_some()
             || self.s3_access_key_id.is_some()
             || self.s3_secret_access_key.is_some()
             || self.s3_session_token.is_some()
@@ -537,7 +628,14 @@ impl WorkerConfig {
             || self.credential_broker_url.is_some()
             || self.credential_broker_request.is_some()
             || self.credential_broker_timeout_ms.is_some()
-        {
+    }
+
+    /// Resolve connection defaults and validate explicit origins without sharing credentials.
+    pub fn resolved_buckets(&self) -> Result<Option<Vec<BucketConfig>>> {
+        let Some(buckets) = self.buckets.as_ref().filter(|buckets| !buckets.is_empty()) else {
+            return Ok(None);
+        };
+        if self.has_legacy_credentials() {
             return Err(Error::Other(
                 "buckets cannot be combined with top-level credential fields".into(),
             ));
@@ -652,41 +750,59 @@ impl WorkerConfig {
         Ok((defaults, buckets))
     }
 
-    /// Resolve cache settings without changing process-wide resource budgets.
+    /// Return a complete, validated worker configuration for one namespace.
     pub fn for_namespace(&self, namespace: &crate::NamespaceId) -> Result<Self> {
-        namespace
-            .validate()
-            .map_err(|e| Error::Other(e.to_string()))?;
+        let cache = self.namespace_cache_config(namespace)?;
         let mut result = self.clone();
         result.namespaces.clear();
         result.namespace_rules.clear();
-        let overrides = crate::namespace_rules::resolve(
-            &self.namespace_rules,
-            self.namespaces.get(namespace.effective_name()),
-            namespace.effective_name(),
-        );
-        {
-            if let Some(value) = overrides.l2_page_size_bytes {
-                result.l2_page_size_bytes = value;
-            }
-            if let Some(value) = overrides.l1_page_size_bytes {
-                result.l1_page_size_bytes = value;
-            }
-            if let Some(value) = overrides.page_tti_hours {
-                result.page_tti_hours = value;
-            }
-            if let Some(value) = overrides.page_access_checkpoint_interval_minutes {
-                result.page_access_checkpoint_interval_minutes = value;
-            }
-            if let Some(value) = overrides.page_gc_interval_minutes {
-                result.page_gc_interval_minutes = value;
-            }
-            if let Some(value) = overrides.paged_miss_run_concurrency {
-                result.paged_miss_run_concurrency = value;
-            }
-        }
+        result.l2_page_size_bytes = cache.l2_page_size_bytes;
+        result.l1_page_size_bytes = cache.l1_page_size_bytes;
+        result.page_tti_hours = cache.page_tti_hours;
+        result.page_access_checkpoint_interval_minutes =
+            cache.page_access_checkpoint_interval_minutes;
+        result.page_gc_interval_minutes = cache.page_gc_interval_minutes;
+        result.paged_miss_run_concurrency = cache.paged_miss_run_concurrency;
         result.validate()?;
         Ok(result)
+    }
+
+    /// Project cache settings from an already validated worker configuration.
+    pub fn namespace_cache_config(
+        &self,
+        namespace: &crate::NamespaceId,
+    ) -> Result<ResolvedNamespaceCacheConfig> {
+        namespace
+            .validate()
+            .map_err(|e| Error::Other(e.to_string()))?;
+        let name = namespace.effective_name();
+        let exact = self.namespaces.get(name);
+        let tti = exact.and_then(|config| config.page_tti_hours).or_else(|| {
+            namespace_rules::resolve_field(&self.namespace_rules, name, |rule| rule.page_tti_hours)
+        });
+        Ok(self.namespace_cache(exact, tti))
+    }
+
+    fn namespace_cache(
+        &self,
+        exact: Option<&NamespaceCacheConfig>,
+        tti: Option<u64>,
+    ) -> ResolvedNamespaceCacheConfig {
+        let exact = exact.cloned().unwrap_or_default();
+        ResolvedNamespaceCacheConfig {
+            l2_page_size_bytes: exact.l2_page_size_bytes.unwrap_or(self.l2_page_size_bytes),
+            l1_page_size_bytes: exact.l1_page_size_bytes.unwrap_or(self.l1_page_size_bytes),
+            page_tti_hours: tti.unwrap_or(self.page_tti_hours),
+            page_access_checkpoint_interval_minutes: exact
+                .page_access_checkpoint_interval_minutes
+                .unwrap_or(self.page_access_checkpoint_interval_minutes),
+            page_gc_interval_minutes: exact
+                .page_gc_interval_minutes
+                .unwrap_or(self.page_gc_interval_minutes),
+            paged_miss_run_concurrency: exact
+                .paged_miss_run_concurrency
+                .unwrap_or(self.paged_miss_run_concurrency),
+        }
     }
 }
 
@@ -970,7 +1086,7 @@ pub struct WorkerConfigPatch {
     /// Optional `[rate_limits]` table: the per-namespace rate-limit policy.
     pub rate_limits: Option<RateLimitPolicy>,
     pub namespaces: Option<std::collections::BTreeMap<String, NamespaceCacheConfig>>,
-    pub namespace_rules: Option<Vec<crate::namespace_rules::NamespaceRule>>,
+    pub namespace_rules: Option<Vec<NamespaceRule>>,
 }
 
 impl Patch for WorkerConfigPatch {
@@ -2080,24 +2196,12 @@ impl WorkerConfig {
             namespaces: merged.namespaces.unwrap_or(d.namespaces),
             namespace_rules: merged.namespace_rules.unwrap_or(d.namespace_rules),
         };
-        cfg.rate_limits.namespace_rules = cfg.namespace_rules.clone();
-        if cfg.namespaces.values().any(|own| own.rate_limits.is_some())
-            || cfg
-                .namespace_rules
+        cfg.rate_limits.apply_namespace_limits(
+            &cfg.namespace_rules,
+            cfg.namespaces
                 .iter()
-                .any(|r| r.config.rate_limits.is_some())
-        {
-            if !cfg.rate_limits.enabled {
-                cfg.rate_limits.default = Default::default();
-                cfg.rate_limits.overrides.clear();
-            }
-            cfg.rate_limits.enabled = true;
-            for (name, own) in &cfg.namespaces {
-                if let Some(limits) = own.rate_limits {
-                    cfg.rate_limits.overrides.insert(name.clone(), limits);
-                }
-            }
-        }
+                .filter_map(|(name, own)| own.rate_limits.map(|limits| (name.clone(), limits))),
+        );
         cfg.validate()?;
         Ok(cfg)
     }
@@ -2127,6 +2231,10 @@ impl WorkerConfig {
         } else {
             self.resolved_buckets()?;
         }
+        self.validate_settings(None)
+    }
+
+    fn validate_settings(&self, namespace: Option<ResolvedNamespaceCacheConfig>) -> Result<()> {
         if self.credential_broker_timeout_ms == Some(0) {
             return Err(Error::Other(
                 "credential_broker_timeout_ms must be positive".into(),
@@ -2156,29 +2264,26 @@ impl WorkerConfig {
         if self.cluster_id.is_empty() {
             return Err(Error::Other("cluster_id must not be empty".into()));
         }
-        crate::namespace_rules::validate(&self.namespace_rules)?;
-        for rule in &self.namespace_rules {
-            if let Some(limits) = rule.config.rate_limits {
-                limits
-                    .validate()
-                    .map_err(|e| Error::Other(format!("invalid namespace rule limits: {e}")))?;
+        let cache = match namespace {
+            Some(cache) => cache,
+            None => {
+                namespace_rules::validate(&self.namespace_rules)?;
+                for rule in &self.namespace_rules {
+                    if let Some(limits) = rule.config.rate_limits {
+                        limits.validate().map_err(|e| {
+                            Error::Other(format!("invalid namespace rule limits: {e}"))
+                        })?;
+                    }
+                    let cache = self.namespace_cache(None, rule.config.page_tti_hours);
+                    self.validate_settings(Some(cache))?;
+                }
+                for name in self.namespaces.keys() {
+                    let cache = self.namespace_cache_config(&crate::NamespaceId::named(name))?;
+                    self.validate_settings(Some(cache))?;
+                }
+                self.namespace_cache(None, None)
             }
-            let mut probe = self.clone();
-            probe.namespace_rules.clear();
-            probe.namespaces.clear();
-            probe.namespaces.insert(
-                "rule-validation".into(),
-                NamespaceCacheConfig {
-                    page_tti_hours: rule.config.page_tti_hours,
-                    rate_limits: rule.config.rate_limits,
-                    ..Default::default()
-                },
-            );
-            probe.for_namespace(&crate::NamespaceId::named("rule-validation"))?;
-        }
-        for name in self.namespaces.keys() {
-            self.for_namespace(&crate::NamespaceId::named(name))?;
-        }
+        };
         self.rate_limits
             .validate()
             .map_err(|e| Error::Other(format!("invalid [rate_limits]: {e}")))?;
@@ -2270,11 +2375,7 @@ impl WorkerConfig {
                 return Err(Error::Other(format!("invalid {name}")));
             }
         }
-        if self
-            .background_io_max_mb_per_sec
-            .checked_mul(1_000_000)
-            .is_none()
-        {
+        if background_io_bytes_per_sec(self.background_io_max_mb_per_sec).is_none() {
             return Err(Error::Other(
                 "background_io_max_mb_per_sec overflows bytes/s".into(),
             ));
@@ -2287,61 +2388,41 @@ impl WorkerConfig {
             ));
         }
         // Validate unit conversion before runtime code converts these values to milliseconds.
-        for (name, value, millis_per_unit, allow_zero) in [
-            ("page_tti_hours", self.page_tti_hours, 3_600_000, true),
+        let tti_ms = validate_page_tti(cache.page_tti_hours)
+            .map_err(|e| e.config_error("page_tti_hours"))?;
+        for (name, value, millis_per_unit) in [
             (
                 "page_access_checkpoint_interval_minutes",
-                self.page_access_checkpoint_interval_minutes,
+                cache.page_access_checkpoint_interval_minutes,
                 60_000,
-                false,
             ),
             (
                 "page_gc_interval_minutes",
-                self.page_gc_interval_minutes,
+                cache.page_gc_interval_minutes,
                 60_000,
-                false,
             ),
             (
                 "file_cleanup_interval_hours",
                 self.file_cleanup_interval_hours,
                 3_600_000,
-                false,
             ),
             (
                 "async_eviction_check_interval_minutes",
                 self.async_eviction_check_interval_minutes,
                 60_000,
-                false,
             ),
         ] {
-            if !allow_zero && value == 0 {
+            if value == 0 {
                 return Err(Error::Other(format!("{name} must be > 0")));
             }
-            let millis = value
-                .checked_mul(millis_per_unit)
-                .ok_or_else(|| Error::Other(format!("{name} overflows milliseconds")))?;
-            if std::time::Instant::now()
-                .checked_add(std::time::Duration::from_millis(millis))
-                .is_none()
-            {
-                return Err(Error::Other(format!("{name} overflows monotonic clock")));
-            }
+            validate_duration(value, millis_per_unit).map_err(|e| e.config_error(name))?;
         }
-        if self.page_tti_hours > 0
-            && self.l2_page_size_bytes == 0
-            && self.small_object_threshold_bytes == 0
-        {
-            return Err(Error::Other(
-                "page_tti_hours requires paged L2 or small-object storage".into(),
-            ));
-        }
-        if self.page_tti_hours > 0
-            && self.page_access_checkpoint_interval_minutes > self.page_tti_hours * 60
-        {
-            return Err(Error::Other(
-                "page_access_checkpoint_interval_minutes must not exceed page_tti_hours".into(),
-            ));
-        }
+        validate_tti_storage(
+            cache.l2_page_size_bytes > 0 || self.small_object_threshold_bytes > 0,
+            tti_ms,
+            cache.page_access_checkpoint_interval_minutes * 60_000,
+        )
+        .map_err(TtiStorageError::config_error)?;
         if self.page_gc_scan_batch_size == 0 {
             return Err(Error::Other("page_gc_scan_batch_size must be > 0".into()));
         }
@@ -2356,10 +2437,10 @@ impl WorkerConfig {
         if self.page_gc_io_concurrency == 0 {
             return Err(Error::Other("page_gc_io_concurrency must be > 0".into()));
         }
-        let minimum_load = if self.l2_page_size_bytes == 0 {
+        let minimum_load = if cache.l2_page_size_bytes == 0 {
             u64::from(self.block_size)
         } else {
-            self.l2_page_size_bytes
+            cache.l2_page_size_bytes
         };
         let minimum_load = minimum_load.max(
             self.small_object_threshold_bytes
@@ -2373,7 +2454,7 @@ impl WorkerConfig {
                 "load_inflight_bytes must fit one L2 page (paged) or block (whole) and not exceed semaphore capacity".into(),
             ));
         }
-        if self.paged_miss_run_concurrency == 0 {
+        if cache.paged_miss_run_concurrency == 0 {
             return Err(Error::Other(
                 "paged_miss_run_concurrency must be > 0".into(),
             ));
@@ -2397,51 +2478,51 @@ impl WorkerConfig {
             )));
         }
         if self.l1_capacity_bytes > 0 {
-            if self.l1_page_size_bytes == 0 {
+            if cache.l1_page_size_bytes == 0 {
                 return Err(Error::Other(
                     "l1_page_size_bytes must be > 0 when L1 is enabled".into(),
                 ));
             }
-            if self.l1_page_size_bytes > self.l1_capacity_bytes {
+            if cache.l1_page_size_bytes > self.l1_capacity_bytes {
                 return Err(Error::Other(format!(
                     "l1_page_size_bytes ({}) must be <= l1_capacity_bytes ({})",
-                    self.l1_page_size_bytes, self.l1_capacity_bytes
+                    cache.l1_page_size_bytes, self.l1_capacity_bytes
                 )));
             }
-            if self.l1_page_size_bytes > self.block_size as u64 {
+            if cache.l1_page_size_bytes > self.block_size as u64 {
                 return Err(Error::Other(format!(
                     "l1_page_size_bytes ({}) must be <= block_size ({})",
-                    self.l1_page_size_bytes, self.block_size
+                    cache.l1_page_size_bytes, self.block_size
                 )));
             }
-            if u64::from(self.block_size) % self.l1_page_size_bytes != 0 {
+            if u64::from(self.block_size) % cache.l1_page_size_bytes != 0 {
                 return Err(Error::Other(format!(
                     "block_size ({}) must be divisible by l1_page_size_bytes ({})",
-                    self.block_size, self.l1_page_size_bytes
+                    self.block_size, cache.l1_page_size_bytes
                 )));
             }
         }
-        if self.l2_page_size_bytes > 0 {
-            if self.l2_page_size_bytes > self.block_size as u64 {
+        if cache.l2_page_size_bytes > 0 {
+            if cache.l2_page_size_bytes > self.block_size as u64 {
                 return Err(Error::Other(format!(
                     "l2_page_size_bytes ({}) must be <= block_size ({})",
-                    self.l2_page_size_bytes, self.block_size
+                    cache.l2_page_size_bytes, self.block_size
                 )));
             }
-            if u64::from(self.block_size) % self.l2_page_size_bytes != 0 {
+            if u64::from(self.block_size) % cache.l2_page_size_bytes != 0 {
                 return Err(Error::Other(format!(
                     "block_size ({}) must be divisible by l2_page_size_bytes ({})",
-                    self.block_size, self.l2_page_size_bytes
+                    self.block_size, cache.l2_page_size_bytes
                 )));
             }
             // L1 sits above L2 and is filled one L2 page at a time. Differing
             // page sizes would make an L1 admission span several L2 pages, so a
             // single-page L2 hit could never fill an L1 entry.
-            if self.l1_capacity_bytes > 0 && self.l1_page_size_bytes != self.l2_page_size_bytes {
+            if self.l1_capacity_bytes > 0 && cache.l1_page_size_bytes != cache.l2_page_size_bytes {
                 return Err(Error::Other(format!(
                     "l1_page_size_bytes ({}) must equal l2_page_size_bytes ({}) when both \
                      tiers are enabled",
-                    self.l1_page_size_bytes, self.l2_page_size_bytes
+                    cache.l1_page_size_bytes, cache.l2_page_size_bytes
                 )));
             }
         }
@@ -4701,8 +4782,7 @@ mod namespace_tests {
 
     #[test]
     fn namespace_overrides_inherit_and_validate_complete_geometry() {
-        let cfg = WorkerConfig::default();
-        let mut cfg = cfg;
+        let mut cfg = WorkerConfig::default();
         let patch = WorkerConfigPatch::from_toml(
             r#"
 [namespaces.acme]
@@ -4719,21 +4799,19 @@ page_tti_hours = 4
         let acme = cfg
             .for_namespace(&crate::NamespaceId::named("acme"))
             .unwrap();
-        assert_eq!(acme.block_size, cfg.block_size);
         assert_eq!(acme.l2_page_size_bytes, 1048576);
         assert_eq!(acme.page_tti_hours, 2);
-        assert_eq!(acme.capacity_bytes, cfg.capacity_bytes);
         assert_eq!(
             cfg.for_namespace(&crate::NamespaceId::Unattributed)
                 .unwrap()
-                .block_size,
-            cfg.block_size
+                .l2_page_size_bytes,
+            2097152
         );
         assert_eq!(
             cfg.for_namespace(&crate::NamespaceId::named("unknown"))
                 .unwrap()
-                .block_size,
-            cfg.block_size
+                .l2_page_size_bytes,
+            cfg.l2_page_size_bytes
         );
         cfg.namespaces.get_mut("acme").unwrap().l2_page_size_bytes = Some(3);
         assert!(cfg.validate().is_err());
@@ -4741,5 +4819,22 @@ page_tti_hours = 4
         cfg.namespaces
             .insert("../escape".into(), NamespaceCacheConfig::default());
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn background_io_rate_uses_the_same_bounds_at_startup_and_reload() {
+        let maximum = u64::MAX / 1_000_000;
+        for (rate, accepted) in [(0, true), (maximum, true), (maximum + 1, false)] {
+            let startup = WorkerConfig {
+                background_io_max_mb_per_sec: rate,
+                ..Default::default()
+            };
+            let reload = crate::dynamic_config::WorkerDynamicConfig {
+                background_io_max_mb_per_sec: Some(rate),
+                ..Default::default()
+            };
+            assert_eq!(startup.validate().is_ok(), accepted);
+            assert_eq!(reload.validate().is_ok(), accepted);
+        }
     }
 }

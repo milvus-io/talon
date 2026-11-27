@@ -124,7 +124,7 @@ impl NamespaceRateLimiter {
         let rule_overflow = policy
             .namespace_rules
             .iter()
-            .filter_map(|r| r.config.rate_limits)
+            .filter_map(|rule| rule.config.rate_limits)
             .filter(|limits| !limits.is_empty())
             .map(|limits| {
                 (

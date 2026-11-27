@@ -854,16 +854,7 @@ async fn run_worker(
     // separate from origin-transfer retries and their shorter deadlines.
     // Discovery and refresh run on Tokio, outside the native origin ring.
     let exchange_http: Arc<dyn talon_backend::HttpClient> = Arc::new(ReqwestClient::new());
-    let explicitly_configured = cfg.credentials_source.is_some()
-        || cfg.s3_access_key_id.is_some()
-        || cfg.s3_secret_access_key.is_some()
-        || cfg.s3_session_token.is_some()
-        || cfg.gcs_access_key_id.is_some()
-        || cfg.gcs_secret_access_key.is_some()
-        || cfg.azure_shared_key.is_some()
-        || cfg.credential_broker_url.is_some()
-        || cfg.credential_broker_request.is_some()
-        || cfg.credential_broker_timeout_ms.is_some()
+    let explicitly_configured = cfg.has_legacy_credentials()
         || azure_sas_from_env().is_some()
         || gcs_bearer_from_env().is_some();
 
@@ -940,13 +931,9 @@ async fn run_worker(
     observability.set_config_reload_status(state.status());
     let config_reload = if let Some(path) = std::env::var_os("TALON_WORKER_CONFIG") {
         let path = PathBuf::from(path);
-        talon_worker::dynamic_config::reload_once(
-            &path,
-            &mut state,
-            worker.default_runtime(),
-            &observability,
-        )
-        .await;
+        worker
+            .reload_config_once(&path, &mut state, &observability)
+            .await;
         Some(talon_worker::dynamic_config::spawn_reload(
             path,
             state,
@@ -1013,7 +1000,7 @@ async fn run_worker(
         cfg.ownership_gc_enabled.then(|| worker.clone()),
     );
 
-    let background = talon_worker::runtime::WorkerBackground::start(worker.clone(), &cfg);
+    let background = worker.start_background(&cfg);
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let data = serve_data_plane(cfg.clone(), worker, observability.clone(), stop.clone());
     tokio::pin!(data);

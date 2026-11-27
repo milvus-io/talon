@@ -57,36 +57,31 @@ pub(super) struct NamespaceRuntimes {
 }
 
 impl NamespaceRuntimes {
-    pub(super) fn namespace_config(&self, namespace: &NamespaceId) -> Result<WorkerConfig, String> {
-        self.config
-            .for_namespace(namespace)
-            .map_err(|error| error.to_string())
-    }
     pub(super) fn validate_settings(
         &self,
         config: &talon_core::dynamic_config::WorkerDynamicConfig,
     ) -> Result<(), String> {
-        let validate = |static_config: &WorkerConfig, hours: u64| {
-            if hours > 0 {
-                if static_config.l2_page_size_bytes == 0
-                    && static_config.small_object_threshold_bytes == 0
-                {
-                    return Err("TTI requires paged L2 or small-object storage".to_string());
-                }
-                if static_config.page_access_checkpoint_interval_minutes * 60_000
-                    > hours * 3_600_000
-                {
-                    return Err("checkpoint interval exceeds TTI".to_string());
-                }
-            }
-            Ok(())
+        let validate = |page_bytes: u64, checkpoint_minutes: u64, hours: u64| {
+            talon_core::config::validate_tti_storage(
+                page_bytes > 0 || self.config.small_object_threshold_bytes > 0,
+                hours * 3_600_000,
+                checkpoint_minutes * 60_000,
+            )
+            .map_err(|error| error.to_string())
+        };
+        let validate_default = |hours| {
+            validate(
+                self.config.l2_page_size_bytes,
+                self.config.page_access_checkpoint_interval_minutes,
+                hours,
+            )
         };
         if let Some(hours) = config.page_tti_hours {
-            validate(&self.config, hours)?;
+            validate_default(hours)?;
         }
         for rule in &config.namespace_rules {
             if let Some(hours) = rule.config.page_tti_hours {
-                validate(&self.config, hours)?;
+                validate_default(hours)?;
             }
         }
         let mut known = std::collections::BTreeSet::new();
@@ -104,9 +99,13 @@ impl NamespaceRuntimes {
             if let Some(hours) = config.settings_for(name).page_tti_hours {
                 let static_config = self
                     .config
-                    .for_namespace(&NamespaceId::named(name))
+                    .namespace_cache_config(&NamespaceId::named(name))
                     .map_err(|e| e.to_string())?;
-                validate(&static_config, hours)?;
+                validate(
+                    static_config.l2_page_size_bytes,
+                    static_config.page_access_checkpoint_interval_minutes,
+                    hours,
+                )?;
             }
         }
         Ok(())
@@ -125,7 +124,8 @@ impl NamespaceRuntimes {
         scope: Option<talon_core::backend::AccessScope>,
         backend: Option<Arc<dyn BackendStore>>,
     ) -> anyhow::Result<WorkerRuntime> {
-        let config = self.config.for_namespace(namespace)?;
+        let config = &self.config;
+        let cache = config.namespace_cache_config(namespace)?;
         let namespace_root = self.journal_service.root().join(namespace.effective_name());
         checked_dir(&namespace_root)?;
         let root = match &scope {
@@ -140,7 +140,7 @@ impl NamespaceRuntimes {
         // Persist geometry independently for each namespace. A changed page size
         // must never reinterpret existing page indices on restart.
         let identity_path = root.join("cache_geometry.json");
-        let geometry = (config.block_size, config.l2_page_size_bytes);
+        let geometry = (config.block_size, cache.l2_page_size_bytes);
         match std::fs::read(&identity_path) {
             Ok(bytes) => {
                 let stored = serde_json::from_slice::<(u32, u64)>(&bytes).map_err(|error| {
@@ -187,21 +187,21 @@ impl NamespaceRuntimes {
         let store =
             WholeBlockStore::open_with_catalog(&root, self.whole_fds.clone(), catalog.clone())?;
         let store = store.with_uring(self.uring)?;
-        let paged = if config.l2_page_size_bytes > 0 {
+        let paged = if cache.l2_page_size_bytes > 0 {
             let path = catalog.store_path(&root.join("paged"))?;
-            let registered = catalog.registered(&path, config.l2_page_size_bytes as u32)?;
+            let registered = catalog.registered(&path, cache.l2_page_size_bytes as u32)?;
             if !registered {
                 anyhow::ensure!(
                     !root.join("paged").try_exists()?,
                     incompatible("paged cache has no journal; use a new empty cache directory (legacy migration is not supported)")
                 );
-                catalog.register(&path, config.l2_page_size_bytes as u32)?;
+                catalog.register(&path, cache.l2_page_size_bytes as u32)?;
             }
             checked_dir(&root.join("paged"))?;
             Some(
                 PagedBlockStore::open_with_fd_cache(
                     root.join("paged"),
-                    config.l2_page_size_bytes as u32,
+                    cache.l2_page_size_bytes as u32,
                     self.page_fds.clone(),
                 )?
                 .with_catalog(catalog.clone(), path)
@@ -212,7 +212,7 @@ impl NamespaceRuntimes {
             None
         };
         let recovery_started = Instant::now();
-        let index = Arc::new(catalog.index(config.l2_page_size_bytes as u32));
+        let index = Arc::new(catalog.index(cache.l2_page_size_bytes as u32));
         tracing::info!(root = %root.display(), blocks = index.len(),
             elapsed_ms = recovery_started.elapsed().as_millis() as u64,
             "cache index restored");
@@ -227,20 +227,19 @@ impl NamespaceRuntimes {
             config.block_size,
             config.capacity_bytes,
             config.l1_capacity_bytes,
-            config.l1_page_size_bytes,
+            cache.l1_page_size_bytes,
             self.metrics.clone(),
             true,
             true,
         )
         .with_backend_kind(config.resolved_backend()?)
-        .with_rate_limiter(self.limiter.clone())
-        .with_paged_miss_run_concurrency(config.paged_miss_run_concurrency);
+        .with_read_admission(namespace.normalized(), self.limiter.clone())
+        .with_paged_miss_run_concurrency(cache.paged_miss_run_concurrency);
         if config.ownership_gc_enabled {
             if let Some(small) = &worker.small {
                 small.init_ownership();
             }
         }
-        worker.namespace = namespace.normalized();
         worker.dynamic_settings = self.dynamic_settings.clone();
         worker.page_mutations = Arc::new(Mutations::new(self.uring));
         worker.background_heads = self.background_heads.clone();
@@ -253,11 +252,16 @@ impl NamespaceRuntimes {
         );
         worker.l1 = Arc::new(MemoryStore::with_shared_budget(
             config.l1_capacity_bytes,
-            config.l1_page_size_bytes,
+            cache.l1_page_size_bytes,
             self.l1_budget.clone(),
         ));
         let page_gc_started = Instant::now();
-        let mut gc = PageGcConfig::from(&config);
+        let mut gc = PageGcConfig {
+            tti_ms: cache.page_tti_hours * 3_600_000,
+            checkpoint_interval_ms: cache.page_access_checkpoint_interval_minutes * 60_000,
+            interval_ms: cache.page_gc_interval_minutes * 60_000,
+            ..PageGcConfig::from(config)
+        };
         gc.scan_batch_size = gc.scan_batch_size.min(config.background_scan_batch_size);
         gc.delete_batch_size = gc
             .delete_batch_size
@@ -389,7 +393,7 @@ impl WorkerRuntime {
 
 /// Process-wide namespace routing and cache runtime ownership.
 pub struct Worker {
-    default_runtime: Arc<WorkerRuntime>,
+    pub(super) default_runtime: Arc<WorkerRuntime>,
     registry: Option<Arc<NamespaceRuntimes>>,
 }
 
@@ -402,6 +406,7 @@ impl Worker {
         })
     }
 
+    /// Access the default cache runtime for local tools and diagnostics.
     pub fn default_runtime(&self) -> &Arc<WorkerRuntime> {
         &self.default_runtime
     }
@@ -435,11 +440,14 @@ impl Worker {
         namespace: &talon_core::NamespaceId,
         config: Option<&talon_core::dynamic_config::WorkerDynamicConfig>,
     ) -> Result<talon_core::dynamic_config::NamespaceDynamicConfig, String> {
-        let startup = self
+        let startup = &self
             .registry
             .as_ref()
             .ok_or("namespace registry unavailable")?
-            .namespace_config(namespace)?;
+            .config;
+        let cache = startup
+            .namespace_cache_config(namespace)
+            .map_err(|e| e.to_string())?;
         let tuning = config
             .map(|config| config.settings_for(namespace.effective_name()))
             .unwrap_or_default();
@@ -453,7 +461,7 @@ impl Worker {
             } else {
                 Default::default()
             }),
-            page_tti_hours: Some(tuning.page_tti_hours.unwrap_or(startup.page_tti_hours)),
+            page_tti_hours: Some(tuning.page_tti_hours.unwrap_or(cache.page_tti_hours)),
         })
     }
 
@@ -1461,7 +1469,7 @@ azure_account = "brokeraccount"
         };
         let file = projected.join("worker.toml");
         let mut dynamic = DynamicConfig::default();
-        reload_once(&file, &mut dynamic, &root, &status).await;
+        root.reload_config_once(&file, &mut dynamic, &status).await;
         let first_hash = status.config_reload_status().applied_hash.unwrap();
         assert_eq!(a.current_tti_ms(), 3_600_000);
         assert_eq!(a.current_paged_miss_run_concurrency(), 2);
@@ -1603,14 +1611,8 @@ config = { page_tti_hours = 1, rate_limits = { read_iops = { rate = 1 } } }
         let root = open(dir.path(), &cfg, Arc::default());
         let a = root.for_namespace(&NamespaceId::named("a")).await.unwrap();
         let b = root.for_namespace(&NamespaceId::named("b")).await.unwrap();
-        assert!(root
-            .rate_limiter()
-            .admit(&NamespaceId::named("b"), 1)
-            .is_ok());
-        assert!(root
-            .rate_limiter()
-            .admit(&NamespaceId::named("b"), 1)
-            .is_err());
+        assert!(b.admit_read(1).is_ok());
+        assert!(b.admit_read(1).is_err());
         let mut dynamic = crate::dynamic_config::DynamicConfig::default();
         let text = r#"paged_miss_run_concurrency = 2
 background_scan_batch_size = 7
@@ -1631,23 +1633,12 @@ page_tti_hours = 2
         assert_eq!(b.current_paged_miss_run_concurrency(), 2);
         assert_eq!(b.maintenance_batch_limits(), (7, 3));
         assert!(
-            root.rate_limiter()
-                .admit(&NamespaceId::named("b"), 1)
-                .is_err(),
+            b.admit_read(1).is_err(),
             "updating a must preserve b's consumed credits"
         );
-        assert!(root
-            .rate_limiter()
-            .admit(&NamespaceId::named("a"), 1)
-            .is_ok());
-        assert!(root
-            .rate_limiter()
-            .admit(&NamespaceId::named("a"), 1)
-            .is_ok());
-        assert!(root
-            .rate_limiter()
-            .admit(&NamespaceId::named("a"), 1)
-            .is_err());
+        assert!(a.admit_read(1).is_ok());
+        assert!(a.admit_read(1).is_ok());
+        assert!(a.admit_read(1).is_err());
         let late = root
             .for_namespace(&NamespaceId::named("late"))
             .await

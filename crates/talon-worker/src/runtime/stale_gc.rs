@@ -263,12 +263,7 @@ impl StaleGc {
             self.missing.pop_front();
             return;
         }
-        if let Some(budget) = &worker.background_budget {
-            *paid += budget.delete_slice(candidate.units() - *paid).await;
-        } else {
-            *paid = candidate.units();
-        }
-        if *paid == candidate.units() {
+        if worker.pay_gc_delete(candidate.units(), paid).await {
             let (candidate, _) = self.missing.pop_front().unwrap();
             match candidate {
                 Candidate::Block(candidate) => worker.unlink_stale_block_prepaid(candidate).await,
