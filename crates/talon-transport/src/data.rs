@@ -700,11 +700,22 @@ mod tests {
 
     #[test]
     fn request_round_trips() {
-        let buf = encode_request(11, &req()).unwrap();
-        let (header, back) = decode_request(&buf).unwrap();
-        assert_eq!(header.msg_type, MsgType::GetRange);
-        assert_eq!(header.request_id, 11);
-        assert_eq!(back, req());
+        for (backend, tag) in [
+            (Backend::S3, 0u32),
+            (Backend::Gcs, 1),
+            (Backend::Azure, 2),
+            (Backend::Ali, 3),
+            (Backend::Tc, 4),
+        ] {
+            let mut request = req();
+            request.object.backend = backend;
+            let buf = encode_request(11, &request).unwrap();
+            assert_eq!(bincode::serialize(&backend).unwrap(), tag.to_le_bytes());
+            let (header, back) = decode_request(&buf).unwrap();
+            assert_eq!(header.msg_type, MsgType::GetRange);
+            assert_eq!(header.request_id, 11);
+            assert_eq!(back, request);
+        }
     }
 
     #[test]

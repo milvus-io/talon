@@ -1,22 +1,23 @@
 //! Reclaim cold local cache entries only after an authoritative backend NotFound.
 use super::WorkerRuntime;
-use crate::eviction::access_millis;
+use crate::eviction::{access_millis, StaleBlockCandidate};
 use futures::StreamExt;
 use std::{
     collections::{HashMap, VecDeque},
     sync::Arc,
     time::Duration,
 };
-use talon_core::{Error, ObjectId, WorkerConfig};
+use talon_core::backend::BackgroundRoute;
+use talon_core::{BackendStore, Error, ObjectId, WorkerConfig};
 
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 const MAX_HEADS: usize = 32;
 
 pub(super) struct StaleGc {
     cursor: (u64, u64),
-    pending: VecDeque<crate::eviction::StaleBlockCandidate>,
+    pending: VecDeque<StaleBlockCandidate>,
     round_now: Option<u64>,
-    missing: VecDeque<(crate::eviction::StaleBlockCandidate, u64)>,
+    missing: VecDeque<(StaleBlockCandidate, u64)>,
     heads: Arc<crate::background::Rate>,
     concurrency: usize,
     head_batch: usize,
@@ -58,8 +59,7 @@ impl StaleGc {
     }
 
     pub(super) async fn run_slice(&mut self, worker: &WorkerRuntime) -> Option<Duration> {
-        // Recovery has no Broker configuration. Only a request may bind the
-        // backend; local maintenance remains active while origin GC waits.
+        // A recovered credential scope waits for a foreground request to bind it.
         if !worker.backend.get()?.ready_for_background() {
             return None;
         }
@@ -140,7 +140,8 @@ impl StaleGc {
             self.cursor = cursor;
             self.pending = candidates.into();
         }
-        let mut groups: HashMap<ObjectId, Vec<crate::eviction::StaleBlockCandidate>> =
+        let mut routes = HashMap::new();
+        let mut groups: HashMap<ObjectId, (Arc<dyn BackendStore>, Vec<StaleBlockCandidate>)> =
             HashMap::new();
         while let Some(candidate) = self.pending.front() {
             if !groups.contains_key(&candidate.block.object) && groups.len() == self.head_batch {
@@ -152,20 +153,35 @@ impl StaleGc {
                     .lru
                     .stale_check_due(&candidate.block.object, now, DAY_MS)
             {
-                groups
-                    .entry(candidate.block.object.clone())
-                    .or_default()
-                    .push(candidate);
+                let object = &candidate.block.object;
+                // Decide once per bucket for this batch before queuing HEADs.
+                let store = routes
+                    .entry((object.backend, object.bucket.clone()))
+                    .or_insert_with(|| {
+                        match backend.background_route(object.backend, &object.bucket) {
+                            BackgroundRoute::Current => Some(backend.clone()),
+                            BackgroundRoute::Bound(store) => Some(store),
+                            BackgroundRoute::Skip => None,
+                        }
+                    });
+                if let Some(store) = store {
+                    groups
+                        .entry(object.clone())
+                        .or_insert_with(|| (store.clone(), Vec::new()))
+                        .1
+                        .push(candidate);
+                }
             }
         }
         let heads = &self.heads;
-        let work =
-            futures::stream::iter(groups.into_iter().map(|(object, candidates)| async move {
+        let mut work = Vec::with_capacity(groups.len());
+        for (object, (store, candidates)) in groups {
+            work.push(async move {
                 // Origin QPS is independent of local disk pacing and scan slicing.
                 heads.charge(1).await;
                 let missing = match tokio::time::timeout(
                     Duration::from_secs(5),
-                    worker.background_head(&object),
+                    worker.background_head(store, &object),
                 )
                 .await
                 {
@@ -185,8 +201,9 @@ impl StaleGc {
                 } else {
                     Vec::new()
                 }
-            }));
-        let mut work = work.buffer_unordered(self.concurrency);
+            });
+        }
+        let mut work = futures::stream::iter(work).buffer_unordered(self.concurrency);
         while let Some(candidates) = work.next().await {
             self.missing
                 .extend(candidates.into_iter().map(|candidate| (candidate, 0)));
@@ -212,11 +229,25 @@ mod tests {
         calls: AtomicUsize,
         mode: AtomicUsize, // 0 missing, 1 exists, 2 forbidden, 3 timeout
         hold: AtomicBool,
+        unavailable: AtomicBool,
+        unavailable_bucket: Option<&'static str>,
         entered: tokio::sync::Notify,
         release: tokio::sync::Notify,
     }
     #[async_trait::async_trait]
     impl BackendStore for Origin {
+        fn ready_for_background(&self) -> bool {
+            !self.unavailable.load(Ordering::Relaxed)
+        }
+
+        fn background_route(&self, _: Backend, bucket: &str) -> BackgroundRoute {
+            if self.ready_for_background() && self.unavailable_bucket != Some(bucket) {
+                BackgroundRoute::Current
+            } else {
+                BackgroundRoute::Skip
+            }
+        }
+
         async fn fetch_range(&self, _: &ObjectId, _: u64, _: u64) -> talon_core::Result<Bytes> {
             panic!("GC must not fetch data")
         }
@@ -525,6 +556,35 @@ mod tests {
             }
             assert_eq!(r.logical_resident_bytes(), 0);
         }
+    }
+
+    #[tokio::test]
+    async fn stale_gc_skips_scopes_without_a_binding() {
+        let root = tempfile::tempdir().unwrap();
+        let origin = Arc::new(Origin {
+            unavailable: AtomicBool::new(true),
+            unavailable_bucket: Some("cold"),
+            ..Default::default()
+        });
+        let worker = runtime(root.path(), false, origin.clone());
+        let warm = block(0);
+        fill(&worker, &warm, false).await;
+        for key in ["first", "second"] {
+            let mut cold = block(0);
+            cold.object = ObjectId::new(Backend::S3, "cold", key);
+            fill(&worker, &cold, false).await;
+        }
+        let mut gc = StaleGc::default();
+        assert!(gc.run_slice(&worker).await.is_none());
+        assert!(gc.round_now.is_none());
+        assert_eq!(origin.calls.load(Ordering::Relaxed), 0);
+        assert_eq!(worker.logical_resident_bytes(), 96);
+
+        origin.unavailable.store(false, Ordering::Relaxed);
+        gc.run_round_at(&worker, cold_now()).await;
+        assert_eq!(origin.calls.load(Ordering::Relaxed), 1);
+        assert!(worker.index.get(&warm).is_none());
+        assert_eq!(worker.logical_resident_bytes(), 64);
     }
 
     #[tokio::test]

@@ -46,6 +46,18 @@ public final class ConformanceTest {
         Map<String, byte[]> byName = parseVectors(Files.readString(vectors));
         System.out.println("loaded " + byName.size() + " vectors from " + vectors);
 
+        check("OSS and COS object IDs use the Rust backend tags", () -> {
+            ObjectId ali = ObjectId.parse("ali://bucket/object");
+            assertEquals("ali://bucket/object", ali.toString(), "OSS URI");
+            assertEquals(3, Messages.backendTag(ali.backend()), "OSS tag");
+            assertEquals(ali.backend(), Messages.backendFrom(3), "decoded OSS backend");
+
+            ObjectId tc = ObjectId.parse("tc://bucket/object");
+            assertEquals("tc://bucket/object", tc.toString(), "COS URI");
+            assertEquals(4, Messages.backendTag(tc.backend()), "COS tag");
+            assertEquals(tc.backend(), Messages.backendFrom(4), "decoded COS backend");
+        });
+
         check("persistent discovery matches Rust", () -> {
             Messages.Discovery view = Messages.readDiscovery(body(byName.get("control.membership_instances")).body);
             assertEquals(7L, view.topology(), "topology");

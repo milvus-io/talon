@@ -240,9 +240,16 @@ spec:
 EOF
   kubectl -n "$NAMESPACE" rollout status deployment/minio --timeout=180s
   kubectl -n "$NAMESPACE" wait --for=condition=Ready pod/minio-client --timeout=180s
-  kubectl -n "$NAMESPACE" exec minio-client -- \
-    mc alias set local http://minio:9000 "$MINIO_ACCESS_KEY" "$MINIO_SECRET_KEY"
-  kubectl -n "$NAMESPACE" exec minio-client -- mc mb --ignore-existing "local/$BUCKET"
+  # Service routing can lag behind pod readiness.
+  for _ in $(seq 1 30); do
+    if kubectl -n "$NAMESPACE" exec minio-client -- \
+      mc alias set local http://minio:9000 "$MINIO_ACCESS_KEY" "$MINIO_SECRET_KEY"; then
+      kubectl -n "$NAMESPACE" exec minio-client -- mc mb --ignore-existing "local/$BUCKET"
+      return
+    fi
+    sleep 1
+  done
+  fail "MinIO Service did not become reachable from minio-client"
 }
 
 deploy_talon() {

@@ -37,13 +37,7 @@ pub(super) fn encode_key(out: &mut Vec<u8>, id: &dyn SmallIdentity) -> io::Resul
     } else {
         0
     };
-    out.push(
-        tag | match id.object.backend {
-            Backend::S3 => 0,
-            Backend::Gcs => 1,
-            Backend::Azure => 2,
-        },
-    );
+    out.push(tag | id.object.backend as u8);
     out.extend_from_slice(&id.offset.to_le_bytes());
     out.extend_from_slice(&id.block_size.to_le_bytes());
     for s in [id.object.bucket, id.object.object_path, id.version] {
@@ -64,12 +58,8 @@ pub(super) fn view(mut bytes: &[u8]) -> io::Result<SmallRef<'_>> {
     let mut backend = [0];
     bytes.read_exact(&mut backend)?;
     let exact = backend[0] & 0x80 != 0;
-    let backend = match backend[0] & 0x7f {
-        0 => Backend::S3,
-        1 => Backend::Gcs,
-        2 => Backend::Azure,
-        _ => return Err(invalid("small object backend")),
-    };
+    let backend =
+        Backend::from_tag(backend[0] & 0x7f).ok_or_else(|| invalid("small object backend"))?;
     let offset = u64(&mut bytes)?;
     let size = u32(&mut bytes)?;
     let mut string = || -> io::Result<&str> {

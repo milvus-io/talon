@@ -6,7 +6,7 @@
 
 use sha2::{Digest, Sha256};
 
-use crate::{Backend, BlockId, NodeId, NodeInfo, NodeRole};
+use crate::{BlockId, NodeId, NodeInfo, NodeRole};
 
 const BLOCK_DOMAIN: &[u8] = b"talon-cache-maglev-block-v1\0";
 const WORKER_DOMAIN: &[u8] = b"talon-cache-maglev-worker-v1\0";
@@ -18,7 +18,7 @@ const EMPTY_SLOT: u32 = u32::MAX;
 fn cache_block_hash(block: &BlockId) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash.update(BLOCK_DOMAIN);
-    hash.update([backend_tag(block.object.backend)]);
+    hash.update([block.object.backend as u8]);
     hash_field(&mut hash, block.object.bucket.as_bytes());
     hash_field(&mut hash, block.object.object_path.as_bytes());
     hash.update(block.offset.to_le_bytes());
@@ -203,18 +203,10 @@ fn hash_field(hash: &mut Sha256, value: &[u8]) {
     hash.update(value);
 }
 
-fn backend_tag(backend: Backend) -> u8 {
-    match backend {
-        Backend::S3 => 0,
-        Backend::Gcs => 1,
-        Backend::Azure => 2,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ObjectId, Version};
+    use crate::{Backend, ObjectId, Version};
 
     fn block() -> BlockId {
         BlockId::new(

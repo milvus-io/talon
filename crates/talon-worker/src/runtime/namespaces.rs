@@ -244,7 +244,7 @@ impl NamespaceRuntimes {
             config.stale_gc_enabled,
             true,
         )
-        .with_backend_kind(config.backend.as_deref().unwrap_or("azure").parse()?)
+        .with_backend_kind(config.resolved_backend()?)
         .with_rate_limiter(self.limiter.clone())
         .with_paged_miss_run_concurrency(config.paged_miss_run_concurrency);
         worker.namespace = namespace.normalized();
@@ -662,7 +662,16 @@ impl WorkerRuntime {
             code: DataErrorCode::InvalidRequest,
             message: error.to_string(),
         })?;
-        if let Some(broker) = broker {
+        let registry = broker.as_ref().and_then(|_| self.registry());
+        // The startup URL only determines whether a default route exists.
+        // The resolver reads the active URL when binding credentials.
+        let worker_url = registry
+            .as_ref()
+            .and_then(|registry| registry.config.credential_endpoint.as_ref())
+            .map(|endpoint| endpoint.expose().as_str());
+        if let Some(broker) =
+            broker.filter(|broker| broker.config().url_with_default(worker_url).is_some())
+        {
             let (backend, bucket, objects) =
                 request_target(header, payload).map_err(|error| DataPlaneError {
                     code: DataErrorCode::InvalidRequest,
@@ -670,8 +679,7 @@ impl WorkerRuntime {
                 })?;
             let result = async {
                 self.ensure_configured_backend(backend)?;
-                let registry = self
-                    .registry()
+                let registry = registry
                     .ok_or_else(|| anyhow::anyhow!("runtime has no credential scope registry"))?;
                 let resolved = registry
                     .backend
@@ -1131,6 +1139,10 @@ mod tests {
             r#""listen" = "127.0.0.1:9001"
 "paged_miss_run_concurrency" = 2
 "namespaces" = { "a" = { "page_tti_hours" = 1 } }
+[broker]
+broker_endpoint = "https://broker.example/exchange?token=private-marker"
+timeout_ms = 17
+azure_account = "brokeraccount"
 "#,
             &root
         ));
@@ -1140,8 +1152,17 @@ mod tests {
         assert!(status.restart_required);
         assert_eq!(
             status.pending_restart_fields,
-            vec!["advertise_addr", "listen"]
+            vec![
+                "advertise_addr",
+                "broker",
+                "credential_broker_timeout_ms",
+                "credential_endpoint",
+                "listen"
+            ]
         );
+        assert!(!serde_json::to_string(&status)
+            .unwrap()
+            .contains("private-marker"));
         assert_eq!(
             status.effective_config.as_ref().unwrap()["listen"],
             startup.listen
@@ -1172,6 +1193,56 @@ mod tests {
         assert!(!state.status().restart_required);
         assert!(state.status().applied_hash.is_some());
         assert_eq!(a.current_tti_ms(), startup.page_tti_hours * 3_600_000);
+    }
+
+    #[tokio::test]
+    async fn unified_config_reloads_an_existing_broker_endpoint() {
+        use crate::dynamic_config::DynamicConfig;
+
+        let old = "[broker]\nbroker_endpoint = 'https://broker-a.example/exchange'";
+        let new =
+            "[broker]\nbroker_endpoint = 'https://broker-b.example/exchange?token=private-marker'";
+        let startup = talon_core::WorkerConfig::resolve(
+            talon_core::WorkerConfigPatch::from_toml(old).unwrap(),
+            Default::default(),
+            Default::default(),
+        )
+        .unwrap();
+        let endpoint = Arc::new(arc_swap::ArcSwap::from_pointee(
+            startup.credential_endpoint.clone().unwrap(),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let root = open(dir.path(), &config(), Arc::default());
+        let mut state = DynamicConfig::new(startup, Default::default(), Default::default())
+            .with_broker_endpoint(Some(endpoint.clone()));
+        assert!(state.apply_runtime(old, &root));
+        assert!(state.apply_runtime(new, &root));
+        let active = endpoint.load_full();
+        assert_eq!(
+            active.expose(),
+            "https://broker-b.example/exchange?token=private-marker"
+        );
+        assert!(!state.status().restart_required);
+        assert!(state.status().applied_hash.is_some());
+        assert!(!serde_json::to_string(&state.status())
+            .unwrap()
+            .contains("private-marker"));
+
+        assert!(!state.apply_runtime("[broker]\nbroker_endpoint = 'ftp://broker.example/'", &root));
+        assert_eq!(endpoint.load().expose(), active.expose());
+        assert!(state.apply_runtime("", &root));
+        assert_eq!(
+            state.status().pending_restart_fields,
+            ["credential_endpoint"]
+        );
+        assert_eq!(endpoint.load().expose(), active.expose());
+
+        assert!(state.apply_runtime(old, &root));
+        assert_eq!(
+            endpoint.load().expose(),
+            "https://broker-a.example/exchange"
+        );
+        assert!(!state.status().restart_required);
     }
 
     #[tokio::test]

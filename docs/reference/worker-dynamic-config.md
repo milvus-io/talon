@@ -65,6 +65,12 @@ are required; restoring a previous file is a valid rollback.
 | `background_io_max_mb_per_sec`, `background_delete_max_per_sec` | Worker-wide background pacing; zero removes the rate limit |
 | `async_eviction_high_watermark`, `async_eviction_low_watermark` | Paired thresholds with `0 < low < high <= 1` |
 | `rate_limits` | Namespace `read_iops`/`read_throughput`; `{}` means unlimited, omitted inherits |
+| `broker.broker_endpoint` | Replace an already configured default Broker URL |
+
+Use this setting to switch between Broker endpoints serving the same identity,
+permissions, and storage origins. New routes use the updated URL. Routes already
+prepared use their original URL. Adding or removing the default Broker requires
+a Worker restart.
 
 Only `page_tti_hours` and `rate_limits` may be hot-updated per namespace.
 Namespace entries reject storage geometry and checkpoint/GC interval overrides;

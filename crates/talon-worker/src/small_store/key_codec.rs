@@ -40,12 +40,7 @@ pub(super) fn encode(id: &dyn SmallIdentity) -> Vec<u8> {
         && version
             .iter()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b));
-    let backend = match id.object.backend {
-        Backend::S3 => 0,
-        Backend::Gcs => 1,
-        Backend::Azure => 2,
-    };
-    let tag = backend
+    let tag = id.object.backend as u8
         | if id.kind == UnitKind::ExactRange {
             0x80
         } else {
@@ -78,12 +73,7 @@ pub(super) fn decode(mut input: &[u8]) -> SmallKey {
     } else {
         UnitKind::Whole
     };
-    let backend = match tag & 0x1f {
-        0 => Backend::S3,
-        1 => Backend::Gcs,
-        2 => Backend::Azure,
-        _ => unreachable!("encoded small-object backend"),
-    };
+    let backend = Backend::from_tag(tag & 0x1f).expect("encoded small-object backend");
     let block_size = u32::from_le_bytes(input[1..5].try_into().unwrap());
     input = &input[5..];
     let offset = if tag & 0x40 != 0 {
@@ -121,10 +111,17 @@ pub(super) fn decode(mut input: &[u8]) -> SmallKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::small_store::format;
 
     #[test]
     fn round_trip_preserves_every_identity_field() {
-        for backend in [Backend::S3, Backend::Gcs, Backend::Azure] {
+        for backend in [
+            Backend::S3,
+            Backend::Gcs,
+            Backend::Azure,
+            Backend::Ali,
+            Backend::Tc,
+        ] {
             for path in [
                 "",
                 "a\0b",
@@ -145,6 +142,8 @@ mod tests {
                     for kind in [UnitKind::Whole, UnitKind::ExactRange] {
                         let key = SmallRef { block: key, kind };
                         assert_eq!(decode(&encode(&key)).view(), key);
+                        let persisted = format::key(&key).unwrap();
+                        assert_eq!(format::view(&persisted).unwrap(), key);
                     }
                 }
             }
