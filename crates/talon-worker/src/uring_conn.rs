@@ -47,14 +47,14 @@ use talon_transport::DataErrorCode;
 
 use crate::data_error::encode_runtime_error;
 use crate::observability::WorkerObservability;
-use crate::runtime::{ServeOutcome, WorkerRuntime};
+use crate::runtime::{ServeOutcome, Worker, WorkerRuntime};
 use monoio::io::splice::splice_file_to_pipe;
 use monoio::net::unix::{new_pipe, Pipe};
 
 /// Serve one accepted data-plane connection until EOF or a fatal error.
 pub async fn handle_conn(
     mut stream: TcpStream,
-    worker: Arc<WorkerRuntime>,
+    worker: Arc<Worker>,
     observability: Arc<WorkerObservability>,
 ) -> anyhow::Result<()> {
     let stopped = observability.shutdown().stopped();
@@ -124,7 +124,7 @@ async fn handle_request(
     mut stream: TcpStream,
     header: &FrameHeader,
     payload: &[u8],
-    worker: &Arc<WorkerRuntime>,
+    worker: &Worker,
     observability: &Arc<WorkerObservability>,
     request_started: Instant,
     reader: &mut BufferedFrameReader,
@@ -1163,13 +1163,13 @@ async fn handle_delete(
 /// owns only protocol state.
 #[derive(Clone)]
 pub struct RingConnHandler {
-    worker: Arc<WorkerRuntime>,
+    worker: Arc<Worker>,
     observability: Arc<WorkerObservability>,
 }
 
 impl RingConnHandler {
     /// Build a protocol handler for an already-admitted connection.
-    pub fn new(worker: Arc<WorkerRuntime>, observability: Arc<WorkerObservability>) -> Self {
+    pub fn new(worker: Arc<Worker>, observability: Arc<WorkerObservability>) -> Self {
         Self {
             worker,
             observability,
@@ -1179,11 +1179,11 @@ impl RingConnHandler {
 
 impl crate::uring_serve::RingHandler for RingConnHandler {
     fn begin_shutdown(&self) {
-        self.worker.stop_background_heads();
+        self.worker.default_runtime().stop_background_heads();
         self.observability.begin_shutdown();
     }
     fn listening(&self) {
-        self.worker.start_background_heads();
+        self.worker.default_runtime().start_background_heads();
         self.observability.readiness().set_store_ready(true);
     }
 
@@ -1321,6 +1321,15 @@ mod tests {
         backend: Arc<dyn BackendStore>,
         block_size: u32,
     ) -> (Arc<WorkerRuntime>, Arc<WorkerObservability>) {
+        build_runtime(root, backend, block_size, None)
+    }
+
+    fn build_runtime(
+        root: &std::path::Path,
+        backend: Arc<dyn BackendStore>,
+        block_size: u32,
+        paged: Option<crate::PagedBlockStore>,
+    ) -> (Arc<WorkerRuntime>, Arc<WorkerObservability>) {
         let index = Arc::new(BlockIndex::new());
         let inflight = Arc::new(InFlightLoads::new());
         let node = NodeInfo {
@@ -1342,12 +1351,15 @@ mod tests {
         obs.readiness().set_backend_ready(true);
         obs.readiness().set_store_ready(true);
         obs.readiness().set_control_registered(true);
-        let worker = Arc::new(WorkerRuntime::new(
+        let worker = Arc::new(WorkerRuntime::new_with_l1(
             WholeBlockStore::open(root).unwrap(),
+            paged,
             index,
             inflight,
             backend,
             block_size,
+            0,
+            0,
             0,
             obs.metrics().clone(),
         ));
@@ -1735,7 +1747,7 @@ mod tests {
             let addr = l.local_addr().unwrap();
             monoio::spawn(async move {
                 let (s, _) = l.accept().await.unwrap();
-                let _ = handle_conn(s, worker, obs).await;
+                let _ = handle_conn(s, Worker::standalone(worker), obs).await;
             });
 
             let obj = ObjectId::new(talon_core::Backend::Azure, "c", "obj");
@@ -1784,7 +1796,9 @@ mod tests {
             let addr = listener.local_addr().unwrap();
             monoio::spawn(async move {
                 let (stream, _) = listener.accept().await.unwrap();
-                handle_conn(stream, worker, obs).await.unwrap();
+                handle_conn(stream, Worker::standalone(worker), obs)
+                    .await
+                    .unwrap();
             });
             let req = RangeRequest {
                 object: ObjectId::new(talon_core::Backend::Azure, "c", "v2"),
@@ -1855,7 +1869,9 @@ mod tests {
             let addr = listener.local_addr().unwrap();
             monoio::spawn(async move {
                 let (socket, _) = listener.accept().await.unwrap();
-                handle_conn(socket, worker, obs).await.unwrap();
+                handle_conn(socket, Worker::standalone(worker), obs)
+                    .await
+                    .unwrap();
             });
             let mut socket = TcpStream::connect(addr).await.unwrap();
             for namespace in [false, true] {
@@ -1900,15 +1916,12 @@ mod tests {
         block_size: u32,
         page_size: u32,
     ) -> (Arc<WorkerRuntime>, Arc<WorkerObservability>) {
-        let (worker, obs) = build(&root.join("whole"), backend, block_size);
-        let worker = Arc::new(
-            Arc::try_unwrap(worker)
-                .unwrap_or_else(|_| panic!("sole owner"))
-                .with_paged_store(
-                    crate::PagedBlockStore::open(root.join("paged"), page_size).unwrap(),
-                ),
-        );
-        (worker, obs)
+        build_runtime(
+            &root.join("whole"),
+            backend,
+            block_size,
+            Some(crate::PagedBlockStore::open(root.join("paged"), page_size).unwrap()),
+        )
     }
 
     /// The cross-page guarantee, end to end over a real socket: a miss (byte
@@ -1938,7 +1951,7 @@ mod tests {
             let addr = l.local_addr().unwrap();
             monoio::spawn(async move {
                 let (s, _) = l.accept().await.unwrap();
-                let _ = handle_conn(s, worker, obs).await;
+                let _ = handle_conn(s, Worker::standalone(worker), obs).await;
             });
 
             let obj = ObjectId::new(talon_core::Backend::Azure, "c", "obj");
@@ -1984,7 +1997,7 @@ mod tests {
             let address = listener.local_addr().unwrap();
             monoio::spawn(async move {
                 let (stream, _) = listener.accept().await.unwrap();
-                let _ = handle_conn(stream, worker, obs).await;
+                let _ = handle_conn(stream, Worker::standalone(worker), obs).await;
             });
             let object = ObjectId::new(talon_core::Backend::Azure, "c", "admitted");
             let request = CachedBlockPutRequest {
@@ -2027,7 +2040,7 @@ mod tests {
             let addr = l.local_addr().unwrap();
             monoio::spawn(async move {
                 let (s, _) = l.accept().await.unwrap();
-                let _ = handle_conn(s, worker, obs).await;
+                let _ = handle_conn(s, Worker::standalone(worker), obs).await;
             });
 
             let obj = ObjectId::new(talon_core::Backend::Azure, "c", "big");
@@ -2062,7 +2075,7 @@ mod tests {
             let addr = l.local_addr().unwrap();
             monoio::spawn(async move {
                 let (s, _) = l.accept().await.unwrap();
-                let _ = handle_conn(s, worker, obs).await;
+                let _ = handle_conn(s, Worker::standalone(worker), obs).await;
             });
 
             let mut c = TcpStream::connect(addr).await.unwrap();
@@ -2104,7 +2117,7 @@ mod tests {
             let addr = l.local_addr().unwrap();
             monoio::spawn(async move {
                 let (s, _) = l.accept().await.unwrap();
-                let _ = handle_conn(s, worker, obs).await;
+                let _ = handle_conn(s, Worker::standalone(worker), obs).await;
             });
 
             let obj = ObjectId::new(talon_core::Backend::Azure, "c", "written");
@@ -2157,7 +2170,7 @@ mod tests {
             let addr = l.local_addr().unwrap();
             monoio::spawn(async move {
                 let (s, _) = l.accept().await.unwrap();
-                let _ = handle_conn(s, worker, obs).await;
+                let _ = handle_conn(s, Worker::standalone(worker), obs).await;
             });
 
             let obj = ObjectId::new(talon_core::Backend::Azure, "c", "doomed");
@@ -2207,7 +2220,7 @@ mod tests {
             let addr = l.local_addr().unwrap();
             monoio::spawn(async move {
                 let (s, _) = l.accept().await.unwrap();
-                let _ = handle_conn(s, worker, obs).await;
+                let _ = handle_conn(s, Worker::standalone(worker), obs).await;
             });
 
             let obj = ObjectId::new(talon_core::Backend::Azure, "c", "obj");
@@ -2235,7 +2248,7 @@ mod tests {
             let addr = l.local_addr().unwrap();
             let served = monoio::spawn(async move {
                 let (s, _) = l.accept().await.unwrap();
-                handle_conn(s, worker, obs).await
+                handle_conn(s, Worker::standalone(worker), obs).await
             });
             let c = TcpStream::connect(addr).await.unwrap();
             drop(c);
@@ -2266,7 +2279,7 @@ mod tests {
         drop(probe);
 
         let admission = crate::ConnectionAdmission::new(8, obs.metrics().clone());
-        let handler = RingConnHandler::new(worker, obs);
+        let handler = RingConnHandler::new(Worker::standalone(worker), obs);
         let handle = tokio_rt.handle().clone();
         let serve_addr = addr.clone();
         std::thread::spawn(move || {

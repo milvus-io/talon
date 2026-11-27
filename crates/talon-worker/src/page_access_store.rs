@@ -76,7 +76,7 @@ impl PageAccessStore {
         Ok(bytes.len())
     }
     pub(crate) fn encode(
-        id: &BlockId,
+        id: &impl serde::Serialize,
         page_size: u32,
         snapshot: &AccessSnapshot,
     ) -> anyhow::Result<Vec<u8>> {

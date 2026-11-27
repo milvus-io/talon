@@ -1,5 +1,5 @@
 //! ConfigMap-projected file loading, validation, and last-good runtime state.
-use crate::{WorkerObservability, WorkerRuntime};
+use crate::{Worker, WorkerObservability, WorkerRuntime};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
@@ -212,7 +212,7 @@ pub async fn reload_once(
 pub fn spawn_reload(
     path: PathBuf,
     mut state: DynamicConfig,
-    runtime: Arc<WorkerRuntime>,
+    worker: Arc<Worker>,
     observability: Arc<WorkerObservability>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -221,7 +221,7 @@ pub fn spawn_reload(
         loop {
             tokio::select! {
                 _ = observability.shutdown().stopped() => return,
-                _ = ticker.tick() => reload_once(&path, &mut state, &runtime, &observability).await,
+                _ = ticker.tick() => reload_once(&path, &mut state, worker.default_runtime(), &observability).await,
             }
         }
     })

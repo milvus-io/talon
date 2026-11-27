@@ -80,37 +80,54 @@ impl PartialEq for dyn BlockIdentity + '_ {
 }
 impl Eq for dyn BlockIdentity + '_ {}
 
-struct Packed {
-    text: Box<str>,
-    bucket_end: usize,
-    path_end: usize,
-    offset: u64,
-    block_size: u32,
-    backend: Backend,
+// The Arc owns both the header and the original UTF-8 bytes. The private
+// header uses ASCII varints so all three fields can be borrowed as str slices.
+const WIDE_BLOCK_SIZE: u8 = 32;
+
+fn append_number(text: &mut String, mut value: u64) {
+    while value >= 64 {
+        text.push(char::from((value as u8 & 63) | 64));
+        value >>= 6;
+    }
+    text.push(char::from(value as u8));
+}
+
+fn read_number(bytes: &mut &[u8]) -> u64 {
+    let mut value = 0;
+    for shift in (0..64).step_by(6) {
+        let (byte, rest) = bytes.split_first().expect("packed block key header");
+        *bytes = rest;
+        value |= u64::from(byte & 63) << shift;
+        if byte & 64 == 0 {
+            return value;
+        }
+    }
+    unreachable!("number exceeds block key header")
 }
 
 #[derive(Clone)]
-pub(crate) struct BlockKey(Arc<Packed>);
+pub(crate) struct BlockKey(Arc<str>);
 
 impl BlockKey {
     pub fn new(id: &dyn BlockIdentity) -> Self {
         let id = id.view();
         let mut text = String::with_capacity(
-            id.object.bucket.len() + id.object.object_path.len() + id.version.len(),
+            16 + id.object.bucket.len() + id.object.object_path.len() + id.version.len(),
         );
+        text.push(char::from(id.object.backend as u8));
+        if id.block_size.is_power_of_two() {
+            text.push(char::from(id.block_size.trailing_zeros() as u8));
+        } else {
+            text.push(char::from(WIDE_BLOCK_SIZE));
+            append_number(&mut text, u64::from(id.block_size));
+        }
+        append_number(&mut text, id.offset);
+        append_number(&mut text, id.object.bucket.len() as u64);
+        append_number(&mut text, id.object.object_path.len() as u64);
         text.push_str(id.object.bucket);
-        let bucket_end = text.len();
         text.push_str(id.object.object_path);
-        let path_end = text.len();
         text.push_str(id.version);
-        Self(Arc::new(Packed {
-            text: text.into_boxed_str(),
-            bucket_end,
-            path_end,
-            offset: id.offset,
-            block_size: id.block_size,
-            backend: id.object.backend,
-        }))
+        Self(Arc::from(text))
     }
 
     pub fn materialize(&self) -> BlockId {
@@ -131,15 +148,29 @@ impl BlockKey {
 
 impl BlockIdentity for BlockKey {
     fn view(&self) -> BlockRef<'_> {
+        let bytes = self.0.as_bytes();
+        let backend = Backend::from_tag(bytes[0]).expect("packed block key backend");
+        let mut fields = &bytes[2..];
+        let block_size = if bytes[1] == WIDE_BLOCK_SIZE {
+            read_number(&mut fields) as u32
+        } else {
+            1 << bytes[1]
+        };
+        let offset = read_number(&mut fields);
+        let bucket_len = read_number(&mut fields) as usize;
+        let path_len = read_number(&mut fields) as usize;
+        let text = &self.0[bytes.len() - fields.len()..];
+        let (bucket, rest) = text.split_at(bucket_len);
+        let (object_path, version) = rest.split_at(path_len);
         BlockRef {
             object: ObjectRef {
-                backend: self.0.backend,
-                bucket: &self.0.text[..self.0.bucket_end],
-                object_path: &self.0.text[self.0.bucket_end..self.0.path_end],
+                backend,
+                bucket,
+                object_path,
             },
-            offset: self.0.offset,
-            block_size: self.0.block_size,
-            version: &self.0.text[self.0.path_end..],
+            offset,
+            block_size,
+            version,
         }
     }
 }
@@ -182,19 +213,29 @@ mod tests {
 
     #[test]
     fn packed_keys_preserve_exact_identity_and_json() {
-        let key = |bucket, path, version| {
+        let key = |backend, bucket, path, version| {
             BlockId::new(
-                ObjectId::new(Backend::Azure, bucket, path),
+                ObjectId::new(backend, bucket, path),
                 17,
                 123,
                 Version::new(version),
             )
         };
         let ids = [
-            key("a", "bc", "d"),
-            key("ab", "c", "d"),
-            key("a", "b", "cd"),
-            key("桶", "路径/é", "版本"),
+            key(Backend::Azure, "a", "bc", "d"),
+            key(Backend::S3, "a", "bc", "d"),
+            key(Backend::Gcs, "a", "bc", "d"),
+            key(Backend::Ali, "a", "bc", "d"),
+            key(Backend::Tc, "a", "bc", "d"),
+            key(Backend::Azure, "ab", "c", "d"),
+            key(Backend::Azure, "a", "b", "cd"),
+            key(Backend::Azure, "桶", "路径/é", "版本"),
+            BlockId::new(
+                ObjectId::new(Backend::Gcs, "桶".repeat(2048), "路径/é".repeat(1024)),
+                u64::MAX,
+                u32::MAX,
+                Version::new("version"),
+            ),
         ];
         let mut map = HashMap::new();
         for (i, id) in ids.iter().enumerate() {

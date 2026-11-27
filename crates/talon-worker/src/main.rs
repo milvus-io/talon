@@ -50,7 +50,7 @@ use talon_worker::uring_conn;
 #[cfg(test)]
 use talon_worker::WholeBlockStore;
 use talon_worker::{
-    serve_admin, BlockIndex, ConnectionAdmission, InFlightLoads, WorkerObservability, WorkerRuntime,
+    serve_admin, BlockIndex, ConnectionAdmission, InFlightLoads, Worker, WorkerObservability,
 };
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -924,7 +924,7 @@ async fn run_worker(
     tracing::info!(backend = backend_kind, "object-store backend ready");
 
     let recovery_started = Instant::now();
-    let runtime = WorkerRuntime::open_namespaces_with_uring(
+    let runtime = Worker::open_namespaces_with_uring(
         &cfg,
         cache_root_lock,
         backend,
@@ -940,7 +940,13 @@ async fn run_worker(
     observability.set_config_reload_status(state.status());
     let config_reload = if let Some(path) = std::env::var_os("TALON_WORKER_CONFIG") {
         let path = PathBuf::from(path);
-        talon_worker::dynamic_config::reload_once(&path, &mut state, &worker, &observability).await;
+        talon_worker::dynamic_config::reload_once(
+            &path,
+            &mut state,
+            worker.default_runtime(),
+            &observability,
+        )
+        .await;
         Some(talon_worker::dynamic_config::spawn_reload(
             path,
             state,
@@ -1088,7 +1094,7 @@ fn validate_origin_runtime(force_tokio: bool, uring_available: bool) -> anyhow::
 
 async fn serve_data_plane(
     cfg: WorkerConfig,
-    worker: Arc<WorkerRuntime>,
+    worker: Arc<Worker>,
     observability: Arc<WorkerObservability>,
     stop: Arc<std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<()> {
@@ -1166,7 +1172,7 @@ async fn serve_data_plane(
 
 async fn serve_tokio_data_plane(
     listener: TcpListener,
-    worker: Arc<WorkerRuntime>,
+    worker: Arc<Worker>,
     observability: Arc<WorkerObservability>,
     connection_admission: ConnectionAdmission,
 ) -> anyhow::Result<()> {
@@ -1243,7 +1249,7 @@ fn spawn_control_plane(
     channel: Option<ControlTlsChannel>,
     observability: Arc<WorkerObservability>,
     heartbeat_interval: Duration,
-    membership: Option<Arc<WorkerRuntime>>,
+    membership: Option<Arc<Worker>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let heartbeat = async {
@@ -1558,6 +1564,7 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::*;
+    use talon_worker::WorkerRuntime;
 
     #[tokio::test]
     async fn pod_iam_s3_compatible_legacy_origin_requires_endpoint_before_exchange() {
@@ -1863,7 +1870,7 @@ mod tests {
             None,
             observability.clone(),
             Duration::from_millis(20),
-            Some(worker),
+            Some(Worker::standalone(worker)),
         );
         tokio::time::timeout(Duration::from_secs(1), async {
             while heartbeats.load(Ordering::Relaxed) < 4 || queries.load(Ordering::Relaxed) == 0 {
@@ -1977,12 +1984,13 @@ mod tests {
                 }
             }
         });
+        let process = Worker::standalone(worker.clone());
         let control = spawn_control_plane(
             coordinator,
             None,
             observability.clone(),
             Duration::from_millis(10),
-            Some(worker.clone()),
+            Some(process.clone()),
         );
         tokio::time::timeout(Duration::from_secs(2), async {
             while queries.load(Ordering::Relaxed) < 2 {
@@ -1997,7 +2005,7 @@ mod tests {
             "refresh runs without GC"
         );
         let background = talon_worker::runtime::WorkerBackground::start(
-            worker.clone(),
+            process,
             &WorkerConfig {
                 node_id: Some(node.id.0),
                 ownership_gc_enabled: true,
@@ -2354,7 +2362,7 @@ mod tests {
         let serving = obs.clone();
         let admission = ConnectionAdmission::new(2, obs.metrics().clone());
         let mut task = tokio::spawn(async move {
-            serve_tokio_data_plane(listener, worker, serving, admission).await
+            serve_tokio_data_plane(listener, Worker::standalone(worker), serving, admission).await
         });
         let request = talon_transport::encode_request(
             1,
@@ -2452,7 +2460,7 @@ mod tests {
         let srv_obs = Arc::clone(&observability);
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let _ = handle_conn(stream, srv_worker, srv_obs).await;
+            let _ = handle_conn(stream, Worker::standalone(srv_worker), srv_obs).await;
         });
 
         // A client that issues two identical range requests on one connection:
@@ -2540,16 +2548,18 @@ mod tests {
         // 16-byte pages in a 64-byte block: a 40-byte read from offset 5 spans
         // three pages, partial at both ends.
         let worker = Arc::new(
-            WorkerRuntime::new(
+            WorkerRuntime::new_with_l1(
                 WholeBlockStore::open(root.join("whole")).unwrap(),
+                Some(talon_worker::PagedBlockStore::open(root.join("paged"), 16).unwrap()),
                 index,
                 inflight,
                 backend,
                 64,
                 0,
+                0,
+                0,
                 observability.metrics().clone(),
             )
-            .with_paged_store(talon_worker::PagedBlockStore::open(root.join("paged"), 16).unwrap())
             .with_page_gc(talon_worker::page_gc::PageGcConfig {
                 tti_ms: 1,
                 checkpoint_interval_ms: 1,
@@ -2564,7 +2574,7 @@ mod tests {
         let srv_obs = Arc::clone(&observability);
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let _ = handle_conn(stream, srv_worker, srv_obs).await;
+            let _ = handle_conn(stream, Worker::standalone(srv_worker), srv_obs).await;
         });
 
         let obj = ObjectId::new(talon_core::Backend::Azure, "c", "obj");
@@ -2706,7 +2716,7 @@ mod tests {
         let srv_obs = Arc::clone(&observability);
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let _ = handle_conn(stream, srv_worker, srv_obs).await;
+            let _ = handle_conn(stream, Worker::standalone(srv_worker), srv_obs).await;
         });
 
         let obj = ObjectId::new(talon_core::Backend::Azure, "c", "written.bin");
@@ -2786,9 +2796,13 @@ mod tests {
         let server_observability = Arc::clone(&observability);
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            handle_conn(stream, server_worker, server_observability)
-                .await
-                .unwrap();
+            handle_conn(
+                stream,
+                Worker::standalone(server_worker),
+                server_observability,
+            )
+            .await
+            .unwrap();
         });
 
         let mut client = TcpStream::connect(address).await.unwrap();
@@ -2828,9 +2842,13 @@ mod tests {
         let server_observability = Arc::clone(&observability);
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            handle_conn(stream, server_worker, server_observability)
-                .await
-                .is_err()
+            handle_conn(
+                stream,
+                Worker::standalone(server_worker),
+                server_observability,
+            )
+            .await
+            .is_err()
         });
         let mut client = TcpStream::connect(address).await.unwrap();
         client
@@ -2860,7 +2878,8 @@ mod tests {
             .await
             .unwrap();
         let (stream, _) = listener.accept().await.unwrap();
-        let task = tokio::spawn(async move { handle_conn(stream, worker, obs).await });
+        let task =
+            tokio::spawn(async move { handle_conn(stream, Worker::standalone(worker), obs).await });
         let request = ControlMessage::StatObject {
             object: ObjectId::new(talon_core::Backend::Azure, "c", "o"),
         };

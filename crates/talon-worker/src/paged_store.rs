@@ -133,6 +133,12 @@ impl PagedBlockStore {
         self.catalog.is_some()
     }
 
+    pub(crate) fn publishes_to(&self, index: &crate::BlockIndex) -> bool {
+        self.catalog
+            .as_ref()
+            .is_some_and(|(catalog, _)| catalog.publishes_to(index))
+    }
+
     async fn commit_catalog_page(
         self: &Arc<Self>,
         id: &BlockId,
@@ -367,7 +373,10 @@ impl PagedBlockStore {
         .await
     }
     /// Retain the root lease through detached blocking disk mutations.
-    pub fn with_root_lock(mut self, lock: Arc<crate::page_access_store::CacheRootLock>) -> Self {
+    pub(crate) fn with_root_lock(
+        mut self,
+        lock: Arc<crate::page_access_store::CacheRootLock>,
+    ) -> Self {
         self.root_lock = Some(lock);
         self
     }
@@ -534,25 +543,6 @@ impl PagedBlockStore {
         // Metadata reads wait on disk even with only two CPUs. Bound I/O
         // concurrency independently of CPU count, shared across all shards.
         self.restore_index_with_workers(index, 16)
-    }
-
-    /// Startup has exclusive ownership of the index, including whole entries
-    /// recovered earlier. Build page tables on CPU workers before merging them.
-    pub(crate) fn restore_index_exclusive(&self, index: &mut crate::BlockIndex) -> Result<()> {
-        if self.catalog.is_none() {
-            return self.restore_index(index);
-        }
-        let entries = self.scan_allocated()?;
-        for entry in &entries {
-            if !matches!(entry.meta.form, BlockForm::Paged { page_size, .. } if page_size == self.page_size)
-            {
-                return Err(
-                    crate::cache_reset::incompatible("catalog page geometry mismatch").into(),
-                );
-            }
-        }
-        index.restore_allocated(entries, crate::recovery::workers());
-        Ok(())
     }
 
     pub(crate) fn restore_index_with_workers(

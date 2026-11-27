@@ -196,6 +196,7 @@ impl Journal {
             "small journal recovery reconciled");
         Ok(allocations)
     }
+    #[cfg(test)]
     pub fn set_budget(&self, budget: Arc<crate::background::BackgroundBudget>) {
         self.handle.set_maintenance(budget);
     }

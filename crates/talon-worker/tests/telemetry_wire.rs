@@ -94,9 +94,13 @@ async fn v2_stat_cold_hit_cache_only_and_v1_on_same_connection() {
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
-        talon_worker::tokio_conn::handle_conn(stream, worker, obs)
-            .await
-            .unwrap();
+        talon_worker::tokio_conn::handle_conn(
+            stream,
+            talon_worker::Worker::standalone(worker),
+            obs,
+        )
+        .await
+        .unwrap();
     });
     let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
     let parent = talon_telemetry::TraceContext::from_w3c(

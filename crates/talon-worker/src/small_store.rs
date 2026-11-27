@@ -6,7 +6,7 @@
 mod access;
 mod catalog;
 pub(crate) mod key;
-mod lookup;
+pub(crate) mod lookup;
 pub(crate) mod policy;
 mod recency;
 pub(crate) use access::DirtyAccess;

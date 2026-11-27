@@ -28,6 +28,11 @@ pub enum Ack {
 }
 
 pub trait Machine: Send + 'static {
+    /// Apply live records in LSN order after the covering sync. This lets
+    /// machines expose their state directly to readers. All appends to such
+    /// machines receive durable acknowledgements.
+    const APPLY_AFTER_SYNC: bool = false;
+
     type Record: Send + 'static;
     type SnapshotRecord: Send + 'static;
     type Snapshot: Iterator<Item = io::Result<Bytes>> + Send + 'static;

@@ -56,6 +56,16 @@ fn request(offset: u64, len: u64) -> RangeRequest {
     }
 }
 fn runtime(root: &Path, l1: bool, capacity: u64, tti: u64) -> WorkerRuntime {
+    runtime_with_paged_store(root, l1, capacity)
+        .with_page_gc(PageGcConfig {
+            tti_ms: tti,
+            checkpoint_interval_ms: 10,
+            ..Default::default()
+        })
+        .unwrap()
+}
+
+fn runtime_with_paged_store(root: &Path, l1: bool, capacity: u64) -> WorkerRuntime {
     let capacity = capacity.div_ceil(16) * disk_unit();
     let paged = PagedBlockStore::open(root.join("paged"), 16).unwrap();
     let index = Arc::new(BlockIndex::new());
@@ -64,6 +74,7 @@ fn runtime(root: &Path, l1: bool, capacity: u64, tti: u64) -> WorkerRuntime {
     }
     WorkerRuntime::new_with_l1(
         WholeBlockStore::open(root.join("whole")).unwrap(),
+        Some(paged),
         index,
         Arc::new(InFlightLoads::new()),
         Arc::new(Origin::default()),
@@ -73,13 +84,6 @@ fn runtime(root: &Path, l1: bool, capacity: u64, tti: u64) -> WorkerRuntime {
         16,
         WorkerMetrics::new(capacity),
     )
-    .with_paged_store(paged)
-    .with_page_gc(PageGcConfig {
-        tti_ms: tti,
-        checkpoint_interval_ms: 10,
-        ..Default::default()
-    })
-    .unwrap()
 }
 async fn collect_all(r: &WorkerRuntime) -> u64 {
     let report = r.gc_once().await;
@@ -95,10 +99,12 @@ async fn gc_scans_all_pages_despite_batch_limits_and_restarts_from_the_beginning
     r.page_gc_config.delete_batch_size = 1;
     r.page_clock.set(10000);
     // No data files are needed for a pass that only checks unexpired metadata.
-    let state = r.page_lifecycle.block(&id());
     let count = 65_537;
+    let mut wide = id();
+    wide.block_size = count;
+    let state = r.page_lifecycle.block(&wide);
     for page in 0..count {
-        state.register(PageIndex(page), Some(10000), 10000, false);
+        state.register_fixture(PageIndex(page), Some(10000), 10000, false);
     }
     for _ in 0..2 {
         let report = r.gc_once().await;
@@ -113,9 +119,11 @@ async fn scheduled_page_scan_keeps_a_cursor_and_bounded_candidates() {
     let root = tempfile::tempdir().unwrap();
     let r = runtime(root.path(), false, 0, 100);
     r.page_clock.set(10000);
-    let state = r.page_lifecycle.block(&id());
-    for page in 0..10000 {
-        state.register(PageIndex(page), Some(10000), 10000, false);
+    let mut wide = id();
+    wide.block_size = 10_000;
+    let state = r.page_lifecycle.block(&wide);
+    for page in 0..10_000 {
+        state.register_fixture(PageIndex(page), Some(10000), 10000, false);
     }
     let first = r.gc_next_batch().await;
     assert!(!first.completed_scan);
@@ -147,7 +155,6 @@ async fn disabled_tti_still_records_access_and_checkpoints() {
         r.page_clock.set(10000);
         r.serve_range(&request(0, 32)).await.unwrap();
         let block = r.page_lifecycle.get(&id()).unwrap();
-        let before = block.inner.lock().unwrap().revision;
         assert_eq!(r.checkpoint_access_times().await.blocks, 1);
         r.page_clock.set(20000);
         assert_eq!(r.page_access_time(), Some(20000));
@@ -159,14 +166,7 @@ async fn disabled_tti_still_records_access_and_checkpoints() {
             r.serve(&request(0, 32)).await.unwrap(),
             ServeOutcome::SendfileMany(_)
         ));
-        {
-            let state = block.inner.lock().unwrap();
-            assert_eq!(state.revision, before);
-            assert_eq!(
-                state.pages.read().unwrap()[&0].handle.last_access(),
-                Some(20000)
-            );
-        }
+        assert_eq!(block.last_access(0), Some(20000));
         assert_eq!(r.checkpoint_access_times().await.blocks, 1);
         assert_eq!(r.gc_once().await.reclaimed, 0);
     }
@@ -180,13 +180,263 @@ async fn clean_checkpoint_does_not_traverse_page_states() {
     r.serve_range(&request(0, 16)).await.unwrap();
     assert_eq!(r.checkpoint_access_times().await.blocks, 1);
     let block = r.page_lifecycle.block(&id());
-    let held = block.inner.lock().unwrap();
+    let rows = block.hold_rows();
+    let held = rows.write().unwrap();
     let result =
         tokio::time::timeout(Duration::from_millis(500), r.checkpoint_access_times()).await;
     drop(held);
     let report = result.expect("a clean checkpoint must not lock resident page states");
     assert_eq!(report.blocks, 0);
     assert_eq!(report.bytes, 0);
+}
+
+fn checkpoint_block(shard: usize) -> BlockId {
+    (0..)
+        .map(|offset| BlockId {
+            offset: offset * 4096,
+            block_size: 4096,
+            ..id()
+        })
+        .find(|block| crate::page_lifecycle::disk_shard(block) == shard)
+        .unwrap()
+}
+
+#[tokio::test]
+async fn checkpoint_membership_scheduled_full_ticks_share_sparse_inventory() {
+    use crate::catalog::{Operation, StoreKind};
+
+    const HISTORICAL_SLOTS: u64 = 8192;
+    let root = tempfile::tempdir().unwrap();
+    let directory = Arc::new(std::sync::RwLock::new(crate::index::Directory::default()));
+    directory.write().unwrap().attach(16);
+    let r = WorkerRuntime::new_with_l1(
+        WholeBlockStore::open(root.path().join("whole")).unwrap(),
+        Some(PagedBlockStore::open(root.path().join("paged"), 16).unwrap()),
+        Arc::new(BlockIndex::from_catalog(directory.clone())),
+        Arc::new(InFlightLoads::new()),
+        Arc::new(Origin::default()),
+        4096,
+        0,
+        0,
+        16,
+        WorkerMetrics::new(0),
+    )
+    .with_page_gc(PageGcConfig::default())
+    .unwrap();
+    r.page_clock.set(20_000);
+    let early = checkpoint_block(0);
+    let later = checkpoint_block(1);
+    let admit = |block, now| {
+        directory.write().unwrap().apply(
+            block,
+            StoreKind::Paged,
+            &Operation::Put { page: 0, len: 4096 },
+            None,
+            Some(512),
+        );
+        r.page_lifecycle
+            .block(block)
+            .register(PageIndex(0), Some(now), now, true);
+        std::fs::create_dir_all(r.paged.as_ref().unwrap().dir_for(block).parent().unwrap())
+            .unwrap();
+    };
+    admit(&early, 10_000);
+    let filler = |offset| BlockId { offset, ..id() };
+    {
+        let mut rows = directory.write().unwrap();
+        for offset in 0..HISTORICAL_SLOTS {
+            rows.apply(
+                &filler(offset),
+                StoreKind::Whole,
+                &Operation::PutWhole { len: 1 },
+                None,
+                Some(512),
+            );
+        }
+        for offset in 0..HISTORICAL_SLOTS - 64 {
+            rows.apply(
+                &filler(offset),
+                StoreKind::Whole,
+                &Operation::DeleteBlock,
+                None,
+                None,
+            );
+        }
+    }
+    let ceiling = r.index.policy_scan_ceiling();
+    assert_eq!(ceiling, HISTORICAL_SLOTS as usize + 1);
+    let first = r.checkpoint_next_shard().await;
+    let first_work = r.page_lifecycle.checkpoint_inventory_work();
+
+    // The preceding tick could not inventory this new paged member in a
+    // reused hole. Its first full scheduled checkpoint must still include it.
+    admit(&later, 20_000);
+    assert_eq!(r.index.policy_scan_ceiling(), ceiling);
+    let second = r.checkpoint_next_shard().await;
+    let second_work = r.page_lifecycle.checkpoint_inventory_work();
+    eprintln!("scheduled directory visits/locks first={first_work:?} cumulative={second_work:?}");
+    for report in [first, second] {
+        assert_eq!(report.failures, 0);
+        assert_eq!(report.blocks, 1);
+        assert!(report.bytes > 0);
+    }
+    assert_eq!(first_work, (65, 2));
+    assert_eq!(second_work, first_work);
+    let dir = r.paged.as_ref().unwrap().dir_for(&later);
+    let shard = crate::page_access_shard::load(dir.parent().unwrap(), 1, 16, 20_000).unwrap();
+    assert_eq!(shard.records[&later].records, [(0, 20_000)].into());
+}
+
+#[tokio::test]
+async fn scheduled_checkpoint_keeps_inventory_across_shard_failures() {
+    use crate::page_access_store::CacheRootLock;
+    use talon_core::WorkerConfig;
+
+    let root = tempfile::tempdir().unwrap();
+    let config = WorkerConfig {
+        small_object_threshold_bytes: 0,
+        block_size: 4096,
+        l2_page_size_bytes: 4096,
+        backend: Some("s3".into()),
+        page_tti_hours: 0,
+        ..Default::default()
+    };
+    let open = || {
+        Worker::open_namespaces(
+            &config,
+            Arc::new(CacheRootLock::acquire(root.path()).unwrap()),
+            Arc::new(Origin::default()),
+            WorkerMetrics::new(config.capacity_bytes),
+        )
+        .unwrap()
+    };
+    let worker = open();
+    let paged = worker.paged.as_ref().unwrap();
+    let blocks = [
+        checkpoint_block(0),
+        checkpoint_block(1),
+        checkpoint_block(2),
+    ];
+    let ages = [10_000, 20_000, 30_000];
+    let payload = Bytes::from(vec![0x5a; 4096]);
+    for (block, age) in blocks.iter().zip(ages) {
+        worker.page_clock.set(age);
+        worker
+            .commit_fetched_page(block, PageIndex(0), 4096, payload.clone())
+            .await
+            .unwrap();
+    }
+    let blocked_paths = [&blocks[0], &blocks[1]].map(|block| {
+        let dir = paged.dir_for(block);
+        let path = dir
+            .parent()
+            .unwrap()
+            .join(crate::page_access_shard::FILE_NAME);
+        std::fs::create_dir(&path).unwrap();
+        path
+    });
+    for block in &blocks[..2] {
+        let failed = worker.checkpoint_next_shard().await;
+        assert_eq!((failed.blocks, failed.failures), (0, 1));
+        assert!(worker.page_lifecycle.get(block).unwrap().dirty().is_some());
+    }
+    let success = worker.checkpoint_next_shard().await;
+    assert_eq!((success.blocks, success.failures), (1, 0));
+    assert_eq!(worker.page_lifecycle.checkpoint_inventory_work(), (3, 1));
+
+    for path in blocked_paths {
+        std::fs::remove_dir(path).unwrap();
+    }
+    let retry = worker.checkpoint_access_times().await;
+    assert_eq!((retry.blocks, retry.failures), (2, 0));
+    worker.drain_page_mutations().await;
+    drop(worker);
+
+    let reopened = open();
+    for (block, age) in blocks.iter().zip(ages) {
+        assert_eq!(
+            reopened.page_lifecycle.get(block).unwrap().last_access(0),
+            Some(age)
+        );
+        assert_eq!(
+            reopened
+                .cached_page(block, PageIndex(0), 4096)
+                .await
+                .unwrap(),
+            Some(payload.clone()),
+        );
+    }
+}
+
+#[tokio::test]
+async fn checkpoint_membership_explicit_flush_includes_admission_before_later_gate() {
+    use crate::page_access_store::CacheRootLock;
+    use talon_core::WorkerConfig;
+
+    let root = tempfile::tempdir().unwrap();
+    let config = WorkerConfig {
+        small_object_threshold_bytes: 0,
+        block_size: 4096,
+        l2_page_size_bytes: 4096,
+        backend: Some("s3".into()),
+        page_tti_hours: 0,
+        ..Default::default()
+    };
+    let open = || {
+        Worker::open_namespaces(
+            &config,
+            Arc::new(CacheRootLock::acquire(root.path()).unwrap()),
+            Arc::new(Origin::default()),
+            WorkerMetrics::new(config.capacity_bytes),
+        )
+        .unwrap()
+    };
+    let r = open();
+    assert!(r.index.uses_catalog());
+    let early = checkpoint_block(0);
+    let later = checkpoint_block(1);
+    let body = Bytes::from(vec![0x5a; 4096]);
+    r.page_clock.set(10_000);
+    r.commit_fetched_page(&early, PageIndex(0), 4096, body.clone())
+        .await
+        .unwrap();
+    let ceiling = r.index.policy_scan_ceiling();
+    let gate = r.page_lifecycle.checkpoint_gate(1);
+    let held = gate.lock().await;
+    let worker = r.clone();
+    let flush = tokio::spawn(async move { worker.checkpoint_access_times().await });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while r.page_lifecycle.checkpoint_start(0).2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    r.page_clock.set(20_000);
+    r.commit_fetched_page(&later, PageIndex(0), 4096, body.clone())
+        .await
+        .unwrap();
+    assert_eq!(r.index.policy_scan_ceiling(), ceiling + 1);
+    drop(held);
+    let report = flush.await.unwrap();
+    assert_eq!(report.failures, 0);
+    r.drain_page_mutations().await;
+    drop(r);
+
+    // Reopen without another flush. The later page's exact age must come
+    // from this flush, and the catalog must still locate its payload.
+    let restarted = open();
+    let block = restarted.page_lifecycle.get(&later).unwrap();
+    assert_eq!(block.last_access(0), Some(20_000));
+    assert_eq!(report.blocks, 2);
+    assert_eq!(
+        restarted
+            .cached_page(&later, PageIndex(0), 4096)
+            .await
+            .unwrap(),
+        Some(body),
+    );
 }
 
 #[tokio::test]
@@ -197,14 +447,9 @@ async fn access_only_checkpoint_failure_retries_without_structural_changes() {
     r.serve_range(&request(0, 16)).await.unwrap();
     assert_eq!(r.checkpoint_access_times().await.blocks, 1);
     let block = r.page_lifecycle.get(&id()).unwrap();
-    let revision = block.inner.lock().unwrap().revision;
     r.page_clock.set(10100);
     r.serve_range(&request(0, 1)).await.unwrap();
-    {
-        let state = block.inner.lock().unwrap();
-        assert_eq!(state.revision, revision);
-        assert_eq!(state.dirty_since(), Some(10100));
-    }
+    assert_eq!(block.dirty(), Some((10100, false)));
     let dir = r.paged.as_ref().unwrap().dir_for(&id());
     let path = dir
         .parent()
@@ -213,10 +458,10 @@ async fn access_only_checkpoint_failure_retries_without_structural_changes() {
     std::fs::remove_file(&path).unwrap();
     std::fs::create_dir(&path).unwrap();
     assert_eq!(r.checkpoint_access_times().await.failures, 1);
-    assert_eq!(block.inner.lock().unwrap().dirty_since(), Some(10100));
+    assert_eq!(block.dirty().map(|(since, _)| since), Some(10100));
     std::fs::remove_dir(&path).unwrap();
     assert_eq!(r.checkpoint_access_times().await.blocks, 1);
-    assert_eq!(block.inner.lock().unwrap().dirty_since(), None);
+    assert_eq!(block.dirty().map(|(since, _)| since), None);
     let recovered = crate::page_access_shard::load(
         dir.parent().unwrap(),
         crate::page_lifecycle::disk_shard(&id()),
@@ -291,12 +536,7 @@ async fn restart_and_failback_never_renew_missing_or_old_access() {
     for _ in 0..3 {
         let r = runtime(root.path(), false, 0, 100);
         let state = r.page_lifecycle.get(&id()).unwrap();
-        assert_eq!(
-            state.inner.lock().unwrap().pages.read().unwrap()[&0]
-                .handle
-                .last_access(),
-            Some(10000)
-        );
+        assert_eq!(state.last_access(0), Some(10000));
     }
     let r = runtime(root.path(), false, 0, 100);
     assert_eq!(collect_all(&r).await, 32);
@@ -386,15 +626,7 @@ async fn checkpoint_failure_retries_and_does_not_recreate_empty_directory() {
     let dir = r.paged.as_ref().unwrap().dir_for(&id());
     std::fs::create_dir(dir.parent().unwrap().join("access.shard")).unwrap();
     assert_eq!(r.checkpoint_access_times().await.failures, 1);
-    assert!(r
-        .page_lifecycle
-        .get(&id())
-        .unwrap()
-        .inner
-        .lock()
-        .unwrap()
-        .dirty_since()
-        .is_some());
+    assert!(r.page_lifecycle.get(&id()).unwrap().dirty().is_some());
     std::fs::remove_dir(dir.parent().unwrap().join("access.shard")).unwrap();
     assert_eq!(r.checkpoint_access_times().await.blocks, 1);
     r.page_clock.set(10101);
@@ -446,7 +678,7 @@ async fn cancelling_request_cannot_split_commit_transaction() {
     let root = tempfile::tempdir().unwrap();
     let r = runtime(root.path(), false, 0, 100);
     let state = r.page_lifecycle.block(&id());
-    let gate = state.gate.lock().await;
+    let gate = state.lock().await;
     let task = {
         let r = r.clone();
         tokio::spawn(async move {
@@ -498,7 +730,7 @@ async fn background_service_collects_without_requests_and_shutdown_checkpoints()
     let r = Arc::new(r);
     r.page_clock.set(10101);
     let service = crate::runtime::WorkerBackground::start(
-        r.clone(),
+        Worker::standalone(r.clone()),
         &talon_core::WorkerConfig {
             ownership_gc_enabled: false,
             ..Default::default()
@@ -558,7 +790,7 @@ fn page_tti_metadata_scale() {
             let id = BlockId::new(object(), b as u64 * 16384, 16384, Version::new("v1"));
             let state = life.block(&id);
             for p in 0..1024.min(count - b * 1024) {
-                state.register(PageIndex(p as u32), Some(1000), 1000, true);
+                state.register_fixture(PageIndex(p as u32), Some(1000), 1000, true);
             }
             blocks.push(state);
         }
@@ -574,16 +806,7 @@ fn page_tti_metadata_scale() {
             ("expired", usize::MAX),
         ] {
             for block in &blocks {
-                let pages: Vec<_> = block
-                    .inner
-                    .lock()
-                    .unwrap()
-                    .pages
-                    .read()
-                    .unwrap()
-                    .keys()
-                    .copied()
-                    .collect();
+                let pages = block.page_keys();
                 for p in pages {
                     let age = if hot_modulus != usize::MAX && p as usize % hot_modulus == 0 {
                         1999
@@ -628,20 +851,17 @@ fn page_tti_metadata_scale() {
         for (i, block) in blocks.iter().enumerate() {
             let dir = root.path().join(i.to_string());
             std::fs::create_dir(&dir).unwrap();
-            let state = block.inner.lock().unwrap();
             let snapshot = AccessSnapshot {
-                revision: state.revision,
+                revision: 0,
                 sampled_at: 2000,
-                records: state
-                    .pages
-                    .read()
-                    .unwrap()
-                    .iter()
-                    .map(|(&p, e)| (p, e.handle.last_access().unwrap()))
+                records: block
+                    .page_keys()
+                    .into_iter()
+                    .map(|p| (p, block.last_access(p).unwrap()))
                     .collect(),
             };
-            drop(state);
-            bytes += PageAccessStore::checkpoint(&dir, &block.id, 16, &snapshot).unwrap();
+            bytes +=
+                PageAccessStore::checkpoint(&dir, &block.id.materialize(), 16, &snapshot).unwrap();
         }
         println!(
             "{{\"pages\":{count},\"checkpoint_bytes\":{bytes},\"checkpoint_ms\":{:.3}}}",
@@ -715,7 +935,7 @@ async fn cancelled_admission_must_finish_capacity_enforcement() {
     let r = runtime(root.path(), false, 16, 0);
     r.serve_range(&request(0, 16)).await.unwrap();
     let state = r.page_lifecycle.block(&id());
-    let gate = state.gate.lock().await;
+    let gate = state.lock().await;
     let task = {
         let r = r.clone();
         tokio::spawn(async move {
@@ -813,7 +1033,7 @@ async fn cancelled_whole_admission_finishes_capacity_and_paged_fallback() {
             body = Bytes::from_static(&[2; 16]);
         }
         let state = r.page_lifecycle.block(&target);
-        let gate = state.gate.lock().await;
+        let gate = state.lock().await;
         let task = {
             let r = r.clone();
             let target = target.clone();
@@ -876,7 +1096,7 @@ async fn file_cleanup_runs_independently_of_gc_interval() {
         background_delete_max_per_sec: 0,
         ..Default::default()
     };
-    let service = crate::runtime::WorkerBackground::start(r.clone(), &config);
+    let service = crate::runtime::WorkerBackground::start(Worker::standalone(r.clone()), &config);
     // Wait for both startup passes, so removing a newly created orphan requires
     // a later cleanup invocation while GC is still waiting for its next interval.
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -959,7 +1179,7 @@ async fn orphan_cleanup_retries_with_tti_disabled_and_preserves_live_snapshots()
     r.page_gc_config.interval_ms = 1;
     let r = Arc::new(r);
     let service = crate::runtime::WorkerBackground::start(
-        r.clone(),
+        Worker::standalone(r.clone()),
         &talon_core::WorkerConfig {
             ownership_gc_enabled: false,
             ..Default::default()
@@ -1010,7 +1230,7 @@ async fn orphan_cleanup_covers_unindexed_directories_with_paged_reads_disabled()
     r.page_gc_config.interval_ms = 1;
     let r = Arc::new(r);
     let service = crate::runtime::WorkerBackground::start(
-        r.clone(),
+        Worker::standalone(r.clone()),
         &talon_core::WorkerConfig {
             ownership_gc_enabled: false,
             ..Default::default()
@@ -1039,7 +1259,7 @@ async fn background_cleanup_discovers_startup_residue_without_a_foreground_pass(
     std::fs::write(&temporary, b"partial").unwrap();
     let r = Arc::new(r);
     let service = crate::runtime::WorkerBackground::start(
-        r.clone(),
+        Worker::standalone(r.clone()),
         &talon_core::WorkerConfig {
             ownership_gc_enabled: false,
             stale_gc_enabled: false,
@@ -1067,7 +1287,7 @@ async fn orphan_cleanup_waits_for_active_checkpoint_and_commit_gate() {
     r.serve_range(&request(0, 16)).await.unwrap();
     let dir = r.paged.as_ref().unwrap().dir_for(&id());
     let state = r.page_lifecycle.block(&id());
-    let gate = state.gate.lock().await;
+    let gate = state.lock().await;
     let tmp = dir.join("access.meta.tmp.inflight");
     std::fs::write(&tmp, b"new checkpoint").unwrap();
     let cleanup = {
@@ -1230,17 +1450,7 @@ async fn shard_checkpoint_preserves_clean_blocks_migrates_legacy_and_drops_delet
     let r = runtime(root.path(), false, 0, 1000);
     r.page_clock.set(10010);
     assert_eq!(
-        r.page_lifecycle
-            .get(&b)
-            .unwrap()
-            .inner
-            .lock()
-            .unwrap()
-            .pages
-            .read()
-            .unwrap()[&0]
-            .handle
-            .last_access(),
+        r.page_lifecycle.get(&b).unwrap().last_access(0),
         Some(10000)
     );
     assert_eq!(r.checkpoint_access_times().await.blocks, 2);
@@ -1251,7 +1461,8 @@ async fn shard_checkpoint_preserves_clean_blocks_migrates_legacy_and_drops_delet
         .unwrap()
         .record_access(10010);
     let cold = r.page_lifecycle.get(&b).unwrap();
-    let held = cold.inner.lock().unwrap();
+    let rows = cold.hold_rows();
+    let held = rows.write().unwrap();
     let report = tokio::time::timeout(Duration::from_secs(1), r.checkpoint_access_times()).await;
     drop(held);
     assert_eq!(report.expect("dirty flush must skip cold blocks").blocks, 1);
@@ -1283,20 +1494,7 @@ async fn shard_checkpoint_preserves_clean_blocks_migrates_legacy_and_drops_delet
     std::fs::write(dir.parent().unwrap().join("access.shard"), b"corrupt").unwrap();
     drop(r);
     let r = runtime(root.path(), false, 0, 1000);
-    assert_eq!(
-        r.page_lifecycle
-            .get(&b)
-            .unwrap()
-            .inner
-            .lock()
-            .unwrap()
-            .pages
-            .read()
-            .unwrap()[&0]
-            .handle
-            .last_access(),
-        None
-    );
+    assert_eq!(r.page_lifecycle.get(&b).unwrap().last_access(0), None);
 }
 
 #[tokio::test]
@@ -1305,9 +1503,6 @@ async fn index_lifecycle_handle_survives_read_delete_recreate_races() {
     let r = runtime(root.path(), true, 0, 100);
     r.serve_range(&request(0, 16)).await.unwrap();
     let state = r.page_lifecycle.get(&id()).unwrap();
-    let old = state.inner.lock().unwrap().pages.read().unwrap()[&0]
-        .handle
-        .clone();
     let candidate = state.candidate(PageIndex(0)).unwrap();
     let read = r
         .index
@@ -1315,34 +1510,24 @@ async fn index_lifecycle_handle_survives_read_delete_recreate_races() {
         .unwrap();
     assert!(r.evict_page_candidate(candidate.clone(), 2).await.is_none());
     drop(read);
-    assert!(r.evict_page_candidate(candidate, 2).await.is_some());
+    assert!(r.evict_page_candidate(candidate.clone(), 2).await.is_some());
     assert!(r
         .index
         .page_reads_and_touch(&id(), PageIndex(0), PageIndex(1))
         .is_none());
-    assert!(old.acquire().is_none());
+
     r.serve_range(&request(0, 16)).await.unwrap();
-    let fresh = state.inner.lock().unwrap().pages.read().unwrap()[&0]
-        .handle
-        .clone();
-    assert!(!Arc::ptr_eq(&old, &fresh));
-    assert!(
-        old.acquire().is_none(),
-        "retired handle must remain closed after recreation"
-    );
-    assert!(fresh.acquire().is_some());
+    assert!(r.evict_page_candidate(candidate, 2).await.is_none());
+    assert!(state.acquire(PageIndex(0)).is_some());
     let newer = state.candidate(PageIndex(0)).unwrap();
-    r.evict_page_candidate(newer, 2).await.unwrap();
-    drop(state);
-    r.page_lifecycle.retire_empty(&id());
+    r.evict_page_candidate(newer.clone(), 2).await.unwrap();
     assert!(r.page_lifecycle.get(&id()).is_none());
     r.serve_range(&request(0, 16)).await.unwrap();
     assert!(r
         .index
         .page_reads_and_touch(&id(), PageIndex(0), PageIndex(1))
         .is_some());
-    assert!(old.acquire().is_none());
-    assert!(fresh.acquire().is_none());
+    assert!(r.evict_page_candidate(newer, 2).await.is_none());
 }
 
 #[tokio::test]
@@ -1385,15 +1570,7 @@ async fn cancelled_shard_checkpoint_keeps_publication_owned_and_serialized() {
     )
     .unwrap();
     assert_eq!(recovered.records[&id()].records.len(), 1);
-    assert!(r
-        .page_lifecycle
-        .get(&id())
-        .unwrap()
-        .inner
-        .lock()
-        .unwrap()
-        .dirty_since()
-        .is_none());
+    assert!(r.page_lifecycle.get(&id()).unwrap().dirty().is_none());
 }
 
 #[tokio::test]
@@ -1570,7 +1747,7 @@ async fn page_access_journal_scale() {
         std::fs::create_dir_all(r.paged.as_ref().unwrap().dir_for(&id).parent().unwrap()).unwrap();
         let block = r.page_lifecycle.block(&id);
         for page in 0..1000 {
-            block.register(PageIndex(page), Some(10000), 10000, true);
+            block.register_fixture(PageIndex(page), Some(10000), 10000, true);
         }
         blocks.push(block);
     }
@@ -1659,11 +1836,39 @@ async fn disabled_tti_restores_checkpointed_access_after_restart() {
     drop(r);
     let r = runtime(root.path(), false, 0, 0);
     let state = r.page_lifecycle.get(&id()).unwrap();
-    assert_eq!(
-        state.inner.lock().unwrap().pages.read().unwrap()[&0]
-            .handle
-            .last_access(),
-        Some(10_000)
-    );
+    assert_eq!(state.last_access(0), Some(10_000));
     assert_eq!(r.gc_once().await.reclaimed, 0);
+}
+
+#[tokio::test]
+async fn paged_constructor_checkpoints_and_restores_access() {
+    let root = tempfile::tempdir().unwrap();
+    let open = || {
+        runtime_with_paged_store(root.path(), false, 0)
+            .with_page_gc(PageGcConfig {
+                tti_ms: 0,
+                checkpoint_interval_ms: 10,
+                ..Default::default()
+            })
+            .unwrap()
+    };
+    let worker = open();
+    worker.page_clock.set(10_000);
+    worker.serve_range(&request(0, 16)).await.unwrap();
+    let checkpoint = worker.checkpoint_access_times().await;
+    assert_eq!(checkpoint.failures, 0);
+    assert_eq!(checkpoint.blocks, 1);
+    drop(worker);
+
+    let worker = open();
+    let page = worker.page_lifecycle.get(&id()).unwrap();
+    assert_eq!(page.last_access(0), Some(10_000));
+    worker.page_clock.set(10_001);
+    let mut dynamic = crate::dynamic_config::DynamicConfig::default();
+    assert!(dynamic.apply_runtime(
+        "page_tti_hours = 1\nrate_limits = { enabled = false }\n",
+        &worker,
+    ));
+    assert_eq!(worker.current_tti_ms(), 3_600_000);
+    assert_eq!(worker.gc_once().await.reclaimed, 0);
 }

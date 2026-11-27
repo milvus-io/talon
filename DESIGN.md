@@ -405,16 +405,18 @@ dedup (a correctness requirement — per-shard dedup would refetch the same
   cache residency. Disabling L1 retains the whole-block `sendfile` path. No
   `mmap` as the default abstraction.
 - **Eviction:** byte-accounted **approximate LRU (second chance)**. Resident
-  index entries hold stable access tokens; a read marks an atomic reference bit
-  during its existing index lookup, without cloning the block identity or taking
-  the policy mutex. Strict tail order is intentionally relaxed; pins, version
-  identity and byte accounting remain exact. Capacity reclamation walks a live
-  ordered queue in batches of 64 candidates, giving referenced units a second
-  chance. A bounded second pass guarantees progress under continuous reads.
-  Explicit and superseded-version deletion remove queue nodes immediately;
-  there is no full-cache minimum search for each victim or stale-node backlog.
-  Capacity is per-worker, with support for multiple cache dirs each with its own
-  cap.
+  Whole and Paged units hold reference bits that reads mark during index lookup.
+  Capacity reclamation uses a CLOCK hand over occupied directory slots and their
+  resident units, with a second pass to select units that received a second
+  chance. Pins, version identity and byte accounting remain exact. Capacity is
+  per-worker, with support for multiple cache dirs each with its own cap.
+- **Whole and Paged residency journal:** the runtime index attaches to the
+  recovered directory shared with the journal writer. Checkpoint freeze takes
+  a reference per slab and collects Whole overlaps, store descriptors and
+  pending intents. A subsequent update copies the touched shared slab and
+  any affected page metadata. For a chunked page map this copies the shared
+  chunk tree and the touched shared chunk. See the
+  [paged catalog recovery and checkpoint design](docs/explanation/paged-catalog.md#recovery-and-checkpointing).
 - **Packed-object idle metadata:** TTI reads coalesce dirty resident keys in
   memory. Periodic flushes append full-key access deltas; a size-triggered base
   snapshot bounds replay, with a full-checkpoint fallback on queue overflow or

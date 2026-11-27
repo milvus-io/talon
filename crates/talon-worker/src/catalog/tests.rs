@@ -1,5 +1,5 @@
 use super::*;
-use crate::block_key::{BlockIdentity, BlockKey};
+use crate::block_key::BlockKey;
 use crate::PagedBlockStore;
 use bytes::Bytes;
 use talon_core::{Backend, ObjectId, PageIndex, Version};
@@ -42,14 +42,297 @@ fn repeated_whole_put_preserves_canonical_identity() {
                 },
             )
             .unwrap();
-        let (key, value) = state.stores["whole"].blocks.iter().next().unwrap();
-        assert!(key.ptr_eq(&value.id));
-        assert_eq!(value.disk_id, DiskId::new(2, 0).ok());
+        let directory = state.live.directory.read().unwrap();
+        let handle = directory.rows.handle(&block(0)).unwrap();
+        let row = directory.rows.at(handle as usize - 1).unwrap();
+        assert_eq!(row.geometry.disk_id, DiskId::new(2, 0).ok());
         if let Some(old) = previous {
-            assert!(BlockKey::ptr_eq(&old, key));
+            assert!(BlockKey::ptr_eq(&old, &row.id));
         }
-        previous = Some(key.clone());
+        previous = Some(row.id.clone());
     }
+}
+
+#[test]
+fn descending_large_page_map_roundtrips_a_frozen_snapshot() {
+    const PAGE: u32 = 4096;
+    const BLOCK: u32 = 256 << 20;
+    const COUNT: u32 = BLOCK / PAGE;
+    let mut state = State::default();
+    state
+        .apply(
+            1,
+            Record::PagedStore {
+                path: "paged".into(),
+                page_size: PAGE,
+            },
+        )
+        .unwrap();
+    let mut id = block(0);
+    id.block_size = BLOCK + 2 * PAGE;
+    let disk_id = Some(DiskId::new(2, 0).unwrap());
+    let put = |directory: &mut crate::index::Directory, page, bytes| {
+        directory.apply(
+            &id,
+            StoreKind::Paged,
+            &Operation::Put {
+                page,
+                len: u64::from(BLOCK),
+            },
+            disk_id,
+            Some(bytes),
+        );
+    };
+    {
+        let mut directory = state.live.directory.write().unwrap();
+        for page in (0..COUNT).rev() {
+            put(&mut directory, page, u64::from(PAGE));
+        }
+        put(&mut directory, COUNT + 1, u64::MAX);
+    }
+    let frozen = state.snapshot().unwrap();
+    {
+        let mut directory = state.live.directory.write().unwrap();
+        directory.apply(
+            &id,
+            StoreKind::Paged,
+            &Operation::DeletePage { page: 255 },
+            disk_id,
+            Some(0),
+        );
+        put(&mut directory, 256, 2 * u64::from(PAGE));
+        let live = directory.store_geometry(StoreKind::Paged, &id).unwrap();
+        assert_eq!(live.allocation(255), None);
+        assert_eq!(live.allocation(256), Some(8192));
+    }
+    let mut restored = State::default();
+    for bytes in frozen {
+        restored
+            .restore(State::decode_snapshot(&bytes.unwrap()).unwrap())
+            .unwrap();
+    }
+    let directory = restored.live.directory.read().unwrap();
+    let row = directory.store_geometry(StoreKind::Paged, &id).unwrap();
+    assert_eq!(row.page_count(), COUNT as usize + 1);
+    assert_eq!(row.last_page(), COUNT + 1);
+    assert_eq!(row.disk_id, disk_id);
+    assert!(row.pages_after(None).eq((0..COUNT)
+        .map(|page| (page, 4096))
+        .chain([(COUNT + 1, u64::MAX)])));
+    assert!(row
+        .pages_after(Some(COUNT - 2))
+        .eq([(COUNT - 1, 4096), (COUNT + 1, u64::MAX)]));
+}
+
+#[test]
+fn range_pins_survive_chunk_promotion_and_exclude_page_deletion() {
+    let mut id = block(0);
+    id.block_size = 4096 * 512;
+    let directory = Arc::new(std::sync::RwLock::new(crate::index::Directory::default()));
+    directory.write().unwrap().attach(4096);
+    let index = Arc::new(crate::BlockIndex::from_catalog(directory.clone()));
+    let lifecycle = crate::page_lifecycle::PageLifecycle::with_index(index.clone(), true);
+    let put = |page| {
+        directory.write().unwrap().apply(
+            &id,
+            StoreKind::Paged,
+            &Operation::Put {
+                page,
+                len: u64::from(id.block_size),
+            },
+            None,
+            Some(4096),
+        );
+    };
+    for page in 2..258 {
+        put(page);
+    }
+    let block = lifecycle.block(&id);
+    let old = index
+        .page_reads_and_touch(&id, PageIndex(254), PageIndex(258))
+        .unwrap();
+    put(0); // Moves held rows from the flat arrays into chunks.
+    for page in 254..258 {
+        assert!(block.candidate(PageIndex(page)).is_none());
+    }
+    let overlap = index
+        .page_reads_and_touch(&id, PageIndex(255), PageIndex(257))
+        .unwrap();
+    old.record_access_and_release(Some(10));
+    assert_eq!(block.last_access(254), Some(10));
+    assert_eq!(block.last_access(255), Some(10));
+    assert_eq!(block.last_access(256), Some(10));
+    assert_eq!(block.last_access(257), Some(10));
+    assert!(block.candidate(PageIndex(254)).is_some());
+    assert!(block.candidate(PageIndex(255)).is_none());
+    assert!(block.candidate(PageIndex(256)).is_none());
+    assert!(block.candidate(PageIndex(257)).is_some());
+    overlap.record_access_and_release(Some(20));
+    assert_eq!(block.last_access(255), Some(20));
+    assert_eq!(block.last_access(256), Some(20));
+    let delete = block.candidate(PageIndex(255)).unwrap();
+    assert!(block.claim(&delete, 30, None));
+    assert!(index
+        .page_reads_and_touch(&id, PageIndex(254), PageIndex(257))
+        .is_none());
+    assert!(block.candidate(PageIndex(254)).is_some());
+    directory.write().unwrap().apply(
+        &id,
+        StoreKind::Paged,
+        &Operation::DeletePage { page: 255 },
+        None,
+        Some(0),
+    );
+    put(255);
+    assert_eq!(block.last_access(255), None);
+    assert_eq!(block.last_access(256), Some(20));
+    assert!(block.candidate(PageIndex(256)).is_some());
+}
+
+#[tokio::test]
+async fn wide_catalog_block_claim_allows_unrelated_reads_and_durable_publication() {
+    use crate::page_lifecycle::PageLifecycle;
+    use futures::FutureExt;
+    use std::time::Duration;
+
+    const PAGES: u32 = 65_536;
+    let root = tempfile::tempdir().unwrap();
+    let catalog = open(root.path());
+    let paged = store(&catalog);
+    let index = Arc::new(catalog.index(4));
+    let life = PageLifecycle::with_index(index.clone(), false);
+    let mut wide = block(0);
+    wide.block_size = PAGES * 4;
+    let slot = {
+        let mut directory = catalog.live.directory.write().unwrap();
+        // Seed wide geometry directly so the fixture requires only two durable writes.
+        for page in 0..PAGES {
+            directory.apply(
+                &wide,
+                StoreKind::Paged,
+                &Operation::Put {
+                    page,
+                    len: u64::from(wide.block_size),
+                },
+                None,
+                Some(4),
+            );
+        }
+        directory.slot(&wide).unwrap()
+    };
+    let other = block(1);
+    let body = Bytes::from_static(b"data");
+    paged
+        .commit_page(&other, PageIndex(0), 8, body.clone())
+        .await
+        .unwrap();
+
+    let state = life.block(&wide);
+    let reader = index
+        .page_reads_and_touch(&wide, PageIndex(PAGES - 2), PageIndex(PAGES))
+        .unwrap();
+    let gate = state.lock().await;
+    assert!(state.claim_all_pages().is_none());
+    drop(reader);
+
+    let claim = state.claim_all_pages().unwrap();
+    assert_eq!(claim.len(), PAGES as usize);
+    assert_eq!(index.page_work.operation_counts(slot), (1, 0));
+    assert!(state.acquire(PageIndex(0)).is_none());
+    assert!(index
+        .page_reads_and_touch(&wide, PageIndex(0), PageIndex(PAGES))
+        .is_none());
+    assert!(state.candidate(PageIndex(PAGES - 1)).is_none());
+    assert!(
+        state.lock().now_or_never().is_none(),
+        "single-page eviction uses this same exclusive gate"
+    );
+    assert!(state.lock_page_fill().now_or_never().is_none());
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let read = index
+            .page_reads_and_touch(&other, PageIndex(0), PageIndex(1))
+            .unwrap();
+        paged
+            .commit_page(&other, PageIndex(1), 8, body.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            paged.get_page_bytes(&other, PageIndex(1), 4).await.unwrap(),
+            body
+        );
+        drop(read);
+    })
+    .await
+    .unwrap();
+
+    // Abort touches only its operation stripe, even while directory access is blocked.
+    let directory = catalog.live.directory.write().unwrap();
+    std::thread::scope(|scope| {
+        let (sent, received) = std::sync::mpsc::channel();
+        scope.spawn(move || {
+            drop(claim);
+            sent.send(()).unwrap();
+        });
+        let aborted = received.recv_timeout(Duration::from_secs(5));
+        drop(directory);
+        aborted.unwrap();
+    });
+    assert_eq!(index.page_work.operation_counts(slot), (0, 0));
+    assert!(state.acquire(PageIndex(PAGES - 1)).is_some());
+    drop(gate);
+    println!(
+        "wide_pages={PAGES} active_block_claims=1 active_page_claims=0 unrelated_durable_puts=1"
+    );
+}
+
+#[tokio::test]
+async fn catalog_block_claim_abort_preserves_pending_page_operations_and_reuse() {
+    use crate::page_lifecycle::PageLifecycle;
+
+    let root = tempfile::tempdir().unwrap();
+    let catalog = open(root.path());
+    let paged = store(&catalog);
+    let index = Arc::new(catalog.index(4));
+    let life = PageLifecycle::with_index(index.clone(), false);
+    let id = block(0);
+    let page = PageIndex(0);
+    let body = Bytes::from_static(b"data");
+    paged.commit_page(&id, page, 4, body.clone()).await.unwrap();
+    let state = life.block(&id);
+    let slot = catalog.live.directory.read().unwrap().slot(&id).unwrap();
+    let _gate = state.lock().await;
+
+    let selected = state.candidate(page).unwrap();
+    assert!(state.claim(&selected, 0, None));
+    assert!(state.claim_all_pages().is_none());
+    state.abort(&selected, 1);
+    let old = state.claim_all_pages().unwrap();
+    assert!(!state.claim(&selected, 0, None));
+
+    // Retire and refill while obsolete handles survive, as a forced replacement.
+    paged.delete_block_async(&id).await.unwrap();
+    paged.commit_page(&id, page, 4, body).await.unwrap();
+    assert_eq!(catalog.live.directory.read().unwrap().slot(&id), Some(slot));
+    let pending = state.candidate(page).unwrap();
+    let new = state.claim_all_pages().unwrap();
+    drop(old);
+    assert!(!state.claim(&selected, 0, None));
+    assert!(!state.claim(&pending, 0, None));
+    assert!(state.acquire(page).is_none());
+
+    // The first unlink fails before removing any resident file.
+    let path = paged.catalog_dir_for(&id).unwrap().join("0.page");
+    std::fs::rename(&path, path.with_extension("saved")).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    assert!(paged.delete_block_async(&id).await.is_err());
+    assert!(state.acquire(page).is_none());
+    drop(new);
+    assert_eq!(index.page_work.operation_counts(slot), (0, 1));
+    drop(state.acquire(page).unwrap());
+    assert!(state.claim(&pending, 0, None));
+    state.abort(&pending, 1);
+    assert!(state.acquire(page).is_some());
 }
 
 #[test]
@@ -105,11 +388,14 @@ fn frozen_snapshot_preserves_pages_and_pending_transaction_ids() {
     let entries = restored.entries("paged").unwrap().unwrap();
     assert_eq!(entries[0].allocated, vec![(Some(PageIndex(0)), 4096)]);
     assert_eq!(entries[0].meta.disk_id, DiskId::new(2, 0).ok());
-    assert_eq!(restored.pending[&4].disk_id, DiskId::new(2, 0).ok());
+    assert_eq!(
+        restored.live.pending.read().unwrap()[&4].disk_id,
+        DiskId::new(2, 0).ok()
+    );
     restored
         .apply(6, Record::Resolve { transaction: 4 })
         .unwrap();
-    assert!(restored.pending.is_empty());
+    assert!(restored.live.pending.read().unwrap().is_empty());
     assert!(restored.entries("paged").unwrap().unwrap().is_empty());
     assert_eq!(
         state.entries("paged").unwrap().unwrap()[0].allocated,
@@ -189,13 +475,19 @@ async fn large_block_checkpoint_reopens_without_an_oversized_frame() {
     assert!(serde_json::to_vec(&block).unwrap().len() > 16 << 20);
     let path = "paged";
     let mut state = State::default();
-    state.stores.insert(
-        path.into(),
-        model::Store {
+    state
+        .restore(model::SnapshotRecord::PagedStore {
+            path: path.into(),
             page_size: 1024,
-            blocks: [(BlockKey::new(&id), Arc::new(block))].into(),
-        },
-    );
+        })
+        .unwrap();
+    state
+        .restore(model::SnapshotRecord::Block {
+            store: path.into(),
+            block,
+            continuation: false,
+        })
+        .unwrap();
     let root = tempfile::tempdir().unwrap();
     let service = service(Arc::new(CacheRootLock::acquire(root.path()).unwrap())).unwrap();
     let handle = service
@@ -234,14 +526,12 @@ async fn large_block_checkpoint_reopens_without_an_oversized_frame() {
     catalog
         .journal
         .query(move |state| {
-            let restored = &state.stores[path].blocks[&id as &dyn BlockIdentity];
-            assert_eq!(restored.pages.len(), count as usize - 1);
-            assert_eq!(restored.len, u64::from(id.block_size));
-            assert!(!restored.pages.contains_key(&0));
+            let directory = state.live.directory.read().unwrap();
+            let restored = directory.store_geometry(StoreKind::Paged, &id).unwrap();
+            assert_eq!(restored.page_count(), count as usize - 1);
+            assert_eq!(restored.len(), u64::from(id.block_size));
             assert!(restored
-                .pages
-                .iter()
-                .map(|(&page, &bytes)| (page, bytes))
+                .pages_after(None)
                 .eq((1..count).map(|page| (page, 4096))));
             Ok(())
         })
@@ -287,8 +577,16 @@ fn snapshot_page_chunks_validate_identity_order_and_legacy_records() {
     state.restore(chunk(2, 16, true)).unwrap();
     assert!(state.restore(chunk(1, 16, true)).is_err());
     assert_eq!(
-        state.stores[path].blocks[&block(0) as &dyn BlockIdentity].pages,
-        [(0, 4096), (2, 4096)].into()
+        state
+            .live
+            .directory
+            .read()
+            .unwrap()
+            .store_geometry(StoreKind::Paged, &block(0))
+            .unwrap()
+            .pages_after(None)
+            .collect::<Vec<_>>(),
+        [(0, 4096), (2, 4096)]
     );
 }
 
@@ -371,7 +669,7 @@ fn many_pending_intents_reconcile_inside_tokio_startup() {
                 let catalog = open(root.path());
                 assert!(catalog
                     .journal
-                    .query_blocking(|state| Ok(state.pending.is_empty()))
+                    .query_blocking(|state| Ok(state.live.pending.read().unwrap().is_empty()))
                     .unwrap());
                 assert!(catalog.recover(path).unwrap().unwrap().is_empty());
             });
@@ -451,23 +749,50 @@ async fn replay_restores_exact_residency_and_allocation_without_listing_data() {
     let root = tempfile::tempdir().unwrap();
     let catalog = open(root.path());
     let paged = store(&catalog);
-    paged
-        .commit_page(&block(0), PageIndex(0), 16, Bytes::from_static(b"aaaa"))
-        .await
-        .unwrap();
-    paged
-        .commit_page(&block(0), PageIndex(2), 16, Bytes::from_static(b"bbbb"))
-        .await
-        .unwrap();
-    paged
-        .commit_page(&block(1), PageIndex(1), 12, Bytes::from_static(b"cccc"))
+    let index = Arc::new(catalog.index(4));
+    let policy = index.restore_lru();
+    let id = block(0);
+    let (first, sibling) = tokio::join!(
+        paged.commit_page_payload(&id, PageIndex(0), 16, Bytes::from_static(b"aaaa").into()),
+        paged.commit_page_payload(&id, PageIndex(2), 16, Bytes::from_static(b"bbbb").into()),
+    );
+    let (first, _) = first.unwrap();
+    let (sibling, _) = sibling.unwrap();
+    assert_eq!(index.len(), 1);
+    assert_eq!(index.page_count(), 2);
+    assert_eq!(index.resident_bytes(), first + sibling);
+    assert_eq!((policy.total_bytes(), policy.len()), (first + sibling, 2));
+    assert_eq!(
+        index.presence(&id, PageIndex(0), PageIndex(1)),
+        crate::Presence::PageHit
+    );
+    assert_eq!(
+        index.presence(&id, PageIndex(0), PageIndex(3)),
+        crate::Presence::PageMiss
+    );
+    let (other, _) = paged
+        .commit_page_payload(
+            &block(1),
+            PageIndex(1),
+            12,
+            Bytes::from_static(b"cccc").into(),
+        )
         .await
         .unwrap();
     paged
         .evict_page_async(&block(0), PageIndex(0))
         .await
         .unwrap();
-    paged.delete_block_async(&block(1)).await.unwrap();
+    assert_eq!(index.len(), 2);
+    assert_eq!(index.page_count(), 2);
+    assert_eq!(index.resident_bytes(), sibling + other);
+    assert_eq!((policy.total_bytes(), policy.len()), (sibling + other, 2));
+    paged
+        .evict_page_async(&block(1), PageIndex(1))
+        .await
+        .unwrap();
+    assert_eq!(index.len(), 1);
+    assert_eq!((policy.total_bytes(), policy.len()), (sibling, 1));
     let dir = paged.catalog_dir_for(&block(0)).unwrap();
     assert!(dir.join("2.page").exists());
     assert!(!dir.join("block.meta").exists());
@@ -475,6 +800,15 @@ async fn replay_restores_exact_residency_and_allocation_without_listing_data() {
     assert_eq!(before.len(), 1);
     assert_eq!(before[0].allocated.len(), 1);
     let expected = before[0].allocated.clone();
+    assert_eq!(expected[0].1, sibling);
+    assert_eq!(index.resident_bytes(), expected[0].1);
+    assert_eq!(
+        index.snapshot_units(),
+        [(id.clone(), expected[0].0, expected[0].1)]
+    );
+    assert_eq!(index.page_count(), 1);
+    drop(policy);
+    drop(index);
     drop(paged);
     drop(catalog);
     // If recovery enumerates or stats data, this replacement makes it fail.
@@ -482,11 +816,133 @@ async fn replay_restores_exact_residency_and_allocation_without_listing_data() {
     std::fs::rename(&data, root.path().join("hidden-data")).unwrap();
     std::fs::write(&data, b"not a directory").unwrap();
     let catalog = open(root.path());
+    let index = catalog.index(4);
+    assert_eq!(index.snapshot_units(), [(id, expected[0].0, expected[0].1)]);
     let recovered = catalog.recover("paged").unwrap().unwrap();
     assert_eq!(recovered.len(), 1);
     assert_eq!(recovered[0].allocated, expected);
     assert_eq!(recovered[0].meta.id.materialize(), block(0));
     assert_eq!(recovered[0].meta.len, 16);
+}
+
+#[tokio::test]
+async fn shared_slots_keep_store_addresses_and_reused_generations_distinct() {
+    use crate::WholeBlockStore;
+    use talon_core::ObjectStore;
+
+    let root = tempfile::tempdir().unwrap();
+    let catalog = open(root.path());
+    let whole = WholeBlockStore::open_with_catalog(
+        root.path(),
+        Arc::new(crate::fd_cache::FdCache::new(8)),
+        catalog.clone(),
+    )
+    .unwrap();
+    let paged = store(&catalog);
+    let index = Arc::new(catalog.index(4));
+    let policy = index.restore_lru();
+    let mut id = block(0);
+    id.block_size = 16 << 10;
+    let whole_data = Bytes::from(vec![b'a'; 8192]);
+    whole.put(&id, whole_data.clone()).await.unwrap();
+    let whole_bytes = catalog.recover("whole").unwrap().unwrap()[0].allocated[0].1;
+    assert_eq!(
+        (index.len(), index.page_count(), index.resident_bytes()),
+        (1, 0, whole_bytes)
+    );
+    assert_eq!((policy.total_bytes(), policy.len()), (whole_bytes, 1));
+    let whole_disk = catalog.disk_id("whole", &id).unwrap().unwrap();
+    let key = index.shared_identity(&id).unwrap();
+    assert_eq!(index.whole_and_touch(&id), Some(Some(whole_disk)));
+
+    let (page_bytes, _) = paged
+        .commit_page_payload(
+            &id,
+            PageIndex(1),
+            whole_data.len() as u64,
+            Bytes::from_static(b"efgh").into(),
+        )
+        .await
+        .unwrap();
+    let page_disk = catalog.disk_id("paged", &id).unwrap().unwrap();
+    assert_ne!(whole_disk, page_disk);
+    assert!(key.ptr_eq(&index.shared_identity(&id).unwrap()));
+    assert_eq!(index.len(), 1);
+    assert_eq!(index.page_count(), 1);
+    assert_eq!(index.resident_bytes(), page_bytes);
+    assert_eq!((policy.total_bytes(), policy.len()), (page_bytes, 1));
+    assert_eq!(whole.get_bytes(&id).await.unwrap(), whole_data);
+    assert_eq!(
+        paged.get_page_bytes(&id, PageIndex(1), 4).await.unwrap(),
+        Bytes::from_static(b"efgh")
+    );
+
+    catalog.checkpoint().await.unwrap();
+    drop((paged, whole, index, catalog, policy));
+
+    let catalog = open(root.path());
+    let index = Arc::new(catalog.index(4));
+    let policy = index.restore_lru();
+    assert_eq!(catalog.disk_id("whole", &id).unwrap(), Some(whole_disk));
+    assert_eq!(catalog.disk_id("paged", &id).unwrap(), Some(page_disk));
+    assert_eq!(index.page_count(), 1);
+    let paged = store(&catalog);
+    paged.delete_block_async(&id).await.unwrap();
+    assert!(index.is_empty());
+    assert_eq!(index.resident_bytes(), 0);
+    assert_eq!(index.page_count(), 0);
+    assert_eq!((policy.total_bytes(), policy.len()), (0, 0));
+    drop((paged, index, catalog, policy));
+
+    // The delete is in the tail log, so attachment must expose the Whole
+    // shadow from the checkpoint and charge it once.
+    let catalog = open(root.path());
+    let index = Arc::new(catalog.index(4));
+    let policy = index.restore_lru();
+    assert_eq!(index.whole_and_touch(&id), Some(Some(whole_disk)));
+    assert_eq!(
+        (index.len(), index.page_count(), index.resident_bytes()),
+        (1, 0, whole_bytes)
+    );
+    assert_eq!((policy.total_bytes(), policy.len()), (whole_bytes, 1));
+    let recovered_handle = catalog
+        .live
+        .directory
+        .read()
+        .unwrap()
+        .rows
+        .handle(&id)
+        .unwrap();
+    let whole = WholeBlockStore::open_with_catalog(
+        root.path(),
+        Arc::new(crate::fd_cache::FdCache::new(8)),
+        catalog.clone(),
+    )
+    .unwrap();
+    assert_eq!(whole.get_bytes(&id).await.unwrap(), whole_data);
+    whole.delete(&id).await.unwrap();
+    assert!(index.shared_identity(&id).is_none());
+    whole.put(&id, Bytes::from_static(b"ijkl")).await.unwrap();
+    assert_eq!(
+        catalog.live.directory.read().unwrap().rows.handle(&id),
+        Some(recovered_handle)
+    );
+    let replacement = index.whole_and_touch(&id).flatten().unwrap();
+    assert_ne!(replacement, whole_disk);
+    assert_eq!(
+        whole.get_bytes(&id).await.unwrap(),
+        Bytes::from_static(b"ijkl")
+    );
+
+    let mut other_version = id.clone();
+    other_version.version = Version::new("v2");
+    whole
+        .put(&other_version, Bytes::from_static(b"mnop"))
+        .await
+        .unwrap();
+    assert_eq!(policy.len(), 2);
+    assert_eq!(index.policy_version_blocks(&id).len(), 2);
+    assert_eq!(index.get(&other_version).unwrap().id, other_version);
 }
 
 #[tokio::test]
@@ -529,6 +985,78 @@ async fn pending_put_is_cleaned_by_exact_path_including_replaced_page() {
         assert_eq!(catalog.recover("paged").unwrap().unwrap().len(), 1);
         assert_eq!(std::fs::read(refill.join("0.page")).unwrap(), b"new!");
     }
+}
+
+#[tokio::test]
+async fn catalog_page_pins_survive_row_moves_and_ignore_reused_slots() {
+    use crate::page_lifecycle::{disk_shard, PageLifecycle};
+
+    let root = tempfile::tempdir().unwrap();
+    let catalog = open(root.path());
+    let paged = store(&catalog);
+    let index = Arc::new(catalog.index(4));
+    let lifecycle = PageLifecycle::with_index(index.clone(), true);
+    let id = block(0);
+    let body = Bytes::from_static(b"data");
+    paged
+        .commit_page(&id, PageIndex(2), 16, body.clone())
+        .await
+        .unwrap();
+    let state = lifecycle.block(&id);
+    let shard = disk_shard(&id);
+    // An existing access base requires a delta tombstone.
+    lifecycle.set_checkpoint_journal(
+        shard,
+        crate::page_access_shard::JournalState {
+            generation: 1,
+            ..Default::default()
+        },
+    );
+    let [slot]: [usize; 1] = lifecycle.recovery_slots()[shard]
+        .as_slice()
+        .try_into()
+        .unwrap();
+    let (_, old) = index
+        .page_reads_and_touch_at(&id, PageIndex(2), PageIndex(3))
+        .unwrap();
+
+    paged
+        .commit_page(&id, PageIndex(0), 16, body.clone())
+        .await
+        .unwrap();
+    assert!(state.candidate(PageIndex(2)).is_none());
+    assert!(index
+        .page_reads_and_touch_at(&id, PageIndex(0), PageIndex(3))
+        .is_none());
+    assert!(
+        state.candidate(PageIndex(0)).is_some(),
+        "partial-range read leaked a pin"
+    );
+    paged.evict_page_async(&id, PageIndex(0)).await.unwrap();
+    assert!(state.candidate(PageIndex(2)).is_none());
+
+    // Simulate retirement outside normal GC while an old guard still exists.
+    paged.delete_block_async(&id).await.unwrap();
+    assert_eq!(lifecycle.dirty_summary(), (0, None));
+    let (_, membership, changed) = lifecycle.checkpoint_start(shard);
+    assert!(changed);
+    assert_eq!(
+        lifecycle.checkpoint_journal(shard, membership).1,
+        vec![id.clone()]
+    );
+    paged
+        .commit_page(&id, PageIndex(2), 16, body)
+        .await
+        .unwrap();
+    assert_eq!(lifecycle.recovery_slots()[shard], vec![slot]);
+
+    let new = state.acquire(PageIndex(2)).unwrap();
+    old.record_access_and_release(Some(100));
+    assert_eq!(state.last_access(2), None);
+    assert!(state.candidate(PageIndex(2)).is_none());
+    new.record_access_and_release(Some(200));
+    assert_eq!(state.last_access(2), Some(200));
+    assert!(state.candidate(PageIndex(2)).is_some());
 }
 
 #[tokio::test]

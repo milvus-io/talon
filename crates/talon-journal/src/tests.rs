@@ -34,8 +34,12 @@ pub(crate) fn crash(stage: &str) {
     }
 }
 #[derive(Clone, Default)]
-struct State(BTreeMap<u64, u64>);
-impl Machine for State {
+struct TestState<const AFTER_SYNC: bool>(BTreeMap<u64, u64>, Option<Arc<AtomicUsize>>);
+type State = TestState<false>;
+
+impl<const AFTER_SYNC: bool> Machine for TestState<AFTER_SYNC> {
+    const APPLY_AFTER_SYNC: bool = AFTER_SYNC;
+
     type Record = (u64, u64);
     type SnapshotRecord = (u64, u64);
     type Snapshot = std::vec::IntoIter<io::Result<Bytes>>;
@@ -55,6 +59,9 @@ impl Machine for State {
         ))
     }
     fn apply(&mut self, _: Lsn, r: Self::Record) -> io::Result<()> {
+        if let Some(applied) = &self.1 {
+            applied.fetch_add(1, Ordering::Relaxed);
+        }
         if r.1 == 0 {
             self.0.remove(&r.0);
         } else {
@@ -301,6 +308,43 @@ async fn append_projection_uses_the_append_sync() {
         assert_eq!(handle.inner.control.syncs.load(Ordering::Relaxed), 1);
     }
 }
+#[tokio::test]
+async fn shared_machine_applies_only_after_successful_sync() {
+    let dir = tempfile::tempdir().unwrap();
+    let service =
+        JournalService::open(dir.path().to_owned(), Arc::new(()), Options::default()).unwrap();
+    for (name, fail) in [("after-sync", false), ("sync-failure", true)] {
+        let applied = Arc::new(AtomicUsize::new(0));
+        let handle = service
+            .open_stream(
+                name.into(),
+                TestState::<true>(BTreeMap::new(), Some(applied.clone())),
+                StreamOptions::default(),
+            )
+            .unwrap();
+        let pause = Arc::new(Pause::default());
+        *handle.inner.control.sync_pause.lock().unwrap() = Some(pause.clone());
+        let append = {
+            let handle = handle.clone();
+            // Even a Written request is durable for an externally visible model.
+            tokio::spawn(async move { handle.append((7, 11), Ack::Written).await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), pause.entered.notified())
+            .await
+            .unwrap();
+        assert_eq!(applied.load(Ordering::Relaxed), 0);
+        handle
+            .inner
+            .control
+            .fail_sync
+            .store(fail, Ordering::Relaxed);
+        pause.resume.notify_one();
+        let reply = append.await.unwrap();
+        assert_eq!(reply.is_ok(), !fail);
+        assert_eq!(applied.load(Ordering::Relaxed), usize::from(!fail));
+    }
+}
+
 #[test]
 fn frames_reject_corrupt_headers_and_order_parallel_decode() {
     let bytes = frame::encode(1, &State::encode(&(1, 2)).unwrap()).unwrap();

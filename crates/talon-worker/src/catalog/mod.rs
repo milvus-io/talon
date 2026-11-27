@@ -5,29 +5,26 @@
 mod benchmark;
 mod model;
 mod reconcile;
+mod rows;
 #[cfg(test)]
 mod tests;
 
-use crate::{
-    block_key::{BlockIdentity, BlockKey},
-    index::StoredBlock,
-    page_access_store::CacheRootLock,
-};
+use crate::{index::StoredBlock, page_access_store::CacheRootLock};
 pub(crate) use model::Operation;
-use model::{valid_store, Record, State};
+use model::{valid_store, LiveModel, Record, State};
+#[cfg(test)]
+pub(crate) use rows::take_page_rows_visited;
+pub(crate) use rows::{BlockRow, BlockRows, Geometry, StoreKind};
 use std::{
-    collections::HashMap,
     num::NonZeroU64,
     path::{Path, PathBuf},
-    sync::{Arc, RwLock},
+    sync::Arc,
 };
 use talon_core::BlockId;
 use talon_journal::{Ack, Handle, JournalService, Options, StreamOptions};
 
 pub(crate) const DIRECTORY: &str = ".paged-catalog";
 const TRANSACTIONS: usize = 1024;
-
-pub(crate) type WholeLocations = Arc<RwLock<HashMap<BlockKey, DiskId>>>;
 
 /// A block's shard and first durable Begin sequence, local to one catalog.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -74,6 +71,7 @@ pub(crate) struct Transaction {
 pub(crate) struct Catalog {
     root: PathBuf,
     journal: Handle<State>,
+    live: LiveModel,
     admission: Arc<tokio::sync::Semaphore>,
 }
 
@@ -102,15 +100,18 @@ impl Catalog {
     ) -> anyhow::Result<Arc<Self>> {
         let root = root.canonicalize()?;
         let relative = root.strip_prefix(service.root())?.join(DIRECTORY);
+        let state = State::default();
+        let live = state.live.clone();
         let journal = service.open_stream_with_maintenance(
             relative,
-            State::default(),
+            state,
             StreamOptions::default(),
             maintenance,
         )?;
         let catalog = Arc::new(Self {
             root,
             journal,
+            live,
             admission,
         });
         catalog.reconcile()?;
@@ -189,7 +190,7 @@ impl Catalog {
                     },
                 },
                 |state, id| {
-                    let disk_id = state.pending[&id]
+                    let disk_id = state.live.pending.read().unwrap()[&id]
                         .disk_id
                         .expect("applied Begin has a disk ID");
                     move || (id, disk_id)
@@ -203,23 +204,29 @@ impl Catalog {
         })
     }
 
-    pub(crate) fn disk_id(&self, store: &str, block: &BlockId) -> std::io::Result<Option<DiskId>> {
-        let store = store.to_owned();
-        let block = block.clone();
-        self.journal
-            .query_blocking(move |state| Ok(state.disk_id(&store, &block)))
+    pub(crate) fn index(&self, page_size: u32) -> crate::BlockIndex {
+        self.live.index(page_size)
     }
 
-    pub(crate) async fn lookup_disk_id(
-        &self,
-        store: &str,
-        block: &BlockId,
-    ) -> std::io::Result<Option<DiskId>> {
-        let store = store.to_owned();
-        let block = block.clone();
-        self.journal
-            .query(move |state| Ok(state.disk_id(&store, &block)))
-            .await
+    pub(crate) fn publishes_to(&self, index: &crate::BlockIndex) -> bool {
+        index.shares_directory(&self.live.directory)
+    }
+
+    pub(crate) fn disk_id(&self, store: &str, block: &BlockId) -> std::io::Result<Option<DiskId>> {
+        Ok(StoreKind::from_path(store).and_then(|kind| self.live.disk_id(kind, block)))
+    }
+
+    // The standalone store holds its file gate across this lookup. A failed
+    // durable intent keeps its old address hidden until startup reconciliation.
+    pub(crate) fn standalone_whole_disk_id(&self, block: &BlockId) -> Option<DiskId> {
+        let pending = self.live.pending.read().unwrap();
+        if pending
+            .values()
+            .any(|intent| intent.store == "whole" && intent.block == *block)
+        {
+            return None;
+        }
+        self.live.disk_id(StoreKind::Whole, block)
     }
 
     pub(crate) async fn complete(
@@ -239,76 +246,18 @@ impl Catalog {
         Ok(())
     }
 
-    pub(crate) fn recover_whole_locations(&self) -> std::io::Result<WholeLocations> {
-        let locations = self.journal.query_blocking(|state| {
-            Ok(state.stores["whole"]
-                .blocks
-                .values()
-                .map(|block| {
-                    (
-                        block.id.clone(),
-                        block.disk_id.expect("whole block has a disk ID"),
-                    )
-                })
-                .collect())
-        })?;
-        Ok(Arc::new(RwLock::new(locations)))
-    }
-
-    pub(crate) async fn complete_whole(
-        &self,
-        transaction: Transaction,
-        allocated: u64,
-        id: BlockId,
-        locations: WholeLocations,
-    ) -> anyhow::Result<()> {
-        self.journal
-            .append_with(
-                Record::Complete {
-                    transaction: transaction.id,
-                    allocated,
-                },
-                move |state, _| {
-                    let key = state.stores["whole"]
-                        .blocks
-                        .get(&id as &dyn BlockIdentity)
-                        .map(|block| block.id.clone());
-                    let disk_id = transaction.disk_id;
-                    move || {
-                        let mut locations = locations.write().unwrap();
-                        if let Some(key) = key {
-                            locations.insert(key, disk_id);
-                        } else {
-                            locations.remove(&id as &dyn BlockIdentity);
-                        }
-                    }
-                },
-            )
-            .await?;
-        Ok(())
-    }
-
     pub(crate) async fn checkpoint(&self) -> anyhow::Result<()> {
         Ok(self.journal.checkpoint().await?)
     }
 
     pub(crate) async fn pages(&self, store: &str, block: &BlockId) -> anyhow::Result<Vec<u32>> {
-        let store = store.to_owned();
-        let block = block.clone();
-        Ok(self
-            .journal
-            .query(move |state| {
-                Ok(state
-                    .stores
-                    .get(&store)
-                    .and_then(|store| {
-                        store
-                            .blocks
-                            .get(&block as &dyn crate::block_key::BlockIdentity)
-                    })
-                    .map(|block| block.pages.keys().copied().collect())
-                    .unwrap_or_default())
-            })
-            .await?)
+        let Some(kind) = StoreKind::from_path(store) else {
+            return Ok(Vec::new());
+        };
+        let directory = self.live.directory.read().unwrap();
+        Ok(directory
+            .store_geometry(kind, block)
+            .map(|geometry| geometry.pages_after(None).map(|(page, _)| page).collect())
+            .unwrap_or_default())
     }
 }

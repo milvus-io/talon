@@ -8,7 +8,7 @@ pub(super) const POLICY: u8 = 64;
 pub(super) const REFERENCED: u8 = 128;
 
 #[derive(Default)]
-pub(super) struct Lookup {
+pub(crate) struct Lookup {
     handles: Vec<u32>,
     control: Vec<AtomicU8>,
     len: usize,
@@ -69,6 +69,12 @@ impl Lookup {
     }
 
     pub fn find(&self, hash: u32, mut equal: impl FnMut(u32, u8) -> bool) -> Option<usize> {
+        self.find_all(hash, |slot, handle| equal(handle, self.flags(slot)))
+    }
+
+    /// The visitor may collect every match by returning false. All entries
+    /// sharing a hash are reachable before the first empty slot.
+    pub fn find_all(&self, hash: u32, mut visit: impl FnMut(usize, u32) -> bool) -> Option<usize> {
         if self.capacity() == 0 {
             return None;
         }
@@ -81,7 +87,7 @@ impl Lookup {
             }
             if handle != DELETED
                 && self.control[slot].load(Ordering::Relaxed) & FINGERPRINT == fingerprint
-                && equal(handle, self.flags(slot))
+                && visit(slot, handle)
             {
                 return Some(slot);
             }
@@ -118,7 +124,7 @@ impl Lookup {
                 slot = 0;
             }
         }
-        panic!("small-object lookup reservation exhausted")
+        panic!("lookup reservation exhausted")
     }
 
     pub fn remove(&mut self, slot: usize) -> u8 {

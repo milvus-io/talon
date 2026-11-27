@@ -177,7 +177,6 @@ impl Catalog {
             state: Mutex::new(PolicyState {
                 independent: true,
                 bytes,
-                position: 0,
                 revision: self.next_revision(),
                 pins: 0,
             }),

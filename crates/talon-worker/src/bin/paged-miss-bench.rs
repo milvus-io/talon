@@ -81,17 +81,17 @@ fn tmp_root(limit: usize) -> PathBuf {
 
 async fn sample(limit: usize) -> Duration {
     let root = tmp_root(limit);
-    let runtime = WorkerRuntime::new(
+    let runtime = WorkerRuntime::new_with_l1(
         WholeBlockStore::open(root.join("whole")).expect("open whole store"),
+        Some(PagedBlockStore::open(root.join("paged"), PAGE_SIZE).expect("open paged store")),
         Arc::new(BlockIndex::new()),
         Arc::new(InFlightLoads::new()),
         Arc::new(LatencyBackend),
         4 * PAGE_SIZE,
         0,
+        0,
+        0,
         WorkerMetrics::new(1 << 30),
-    )
-    .with_paged_store(
-        PagedBlockStore::open(root.join("paged"), PAGE_SIZE).expect("open paged store"),
     )
     .with_paged_miss_run_concurrency(limit);
 

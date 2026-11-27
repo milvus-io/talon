@@ -204,6 +204,7 @@ impl WorkerRuntime {
 mod tests {
     use super::*;
     use crate::runtime::disk_unit;
+    use crate::Worker;
     use crate::{
         BlockIndex, CacheUnit, InFlightLoads, PagedBlockStore, WholeBlockStore, WorkerMetrics,
     };
@@ -229,20 +230,18 @@ mod tests {
         for entry in store.scan_allocated().unwrap() {
             index.commit_stored(entry);
         }
-        let r = WorkerRuntime::new(
+        WorkerRuntime::new_with_l1(
             store,
+            paged.then(|| PagedBlockStore::open(root.join("paged"), 16).unwrap()),
             index,
             Arc::new(InFlightLoads::new()),
             Arc::new(UnusedOrigin),
             16,
             capacity,
+            0,
+            0,
             WorkerMetrics::new(capacity),
-        );
-        if paged {
-            r.with_paged_store(PagedBlockStore::open(root.join("paged"), 16).unwrap())
-        } else {
-            r
-        }
+        )
     }
 
     fn block(n: u64) -> BlockId {
@@ -278,7 +277,7 @@ mod tests {
         root: &Path,
         paged: bool,
         low_watermark: f64,
-    ) -> (Arc<WorkerRuntime>, WorkerConfig, Vec<Arc<WorkerRuntime>>) {
+    ) -> (Arc<Worker>, WorkerConfig, Vec<Arc<WorkerRuntime>>) {
         let config = WorkerConfig {
             small_object_threshold_bytes: 0,
             block_size: 16,
@@ -291,7 +290,7 @@ mod tests {
         };
         let lock = Arc::new(crate::page_access_store::CacheRootLock::acquire(root).unwrap());
         let worker = Arc::new(
-            WorkerRuntime::open_namespaces(
+            Worker::open_namespaces(
                 &config,
                 lock,
                 Arc::new(UnusedOrigin),
@@ -496,7 +495,7 @@ mod tests {
             fill(&r, 0, paged).await;
             fill(&r, 1, paged).await;
             let state = r.page_lifecycle.block(&block(0));
-            let gate = state.gate.lock().await;
+            let gate = state.lock().await;
             let r = Arc::new(r);
             let worker = r.clone();
             let task = tokio::spawn(async move {
@@ -623,7 +622,9 @@ mod tests {
     #[tokio::test]
     async fn backlog_continues_without_waiting_for_idle_interval() {
         let root = tempfile::tempdir().unwrap();
-        let r = Arc::new(runtime(root.path(), false, 160));
+        let mut r = runtime(root.path(), false, 160);
+        r.page_gc_config.delete_batch_size = 1;
+        let r = Arc::new(r);
         for n in 0..9 {
             fill(&r, n, false).await;
         }
@@ -636,7 +637,8 @@ mod tests {
             stale_gc_enabled: false,
             ..Default::default()
         };
-        let service = crate::runtime::WorkerBackground::start(r.clone(), &config);
+        let service =
+            crate::runtime::WorkerBackground::start(Worker::standalone(r.clone()), &config);
         tokio::time::timeout(Duration::from_secs(3), async {
             while r.resident_bytes() > 2 * disk_unit() {
                 tokio::task::yield_now().await;
@@ -660,7 +662,8 @@ mod tests {
             ownership_gc_enabled: false,
             ..Default::default()
         };
-        let service = crate::runtime::WorkerBackground::start(r.clone(), &config);
+        let service =
+            crate::runtime::WorkerBackground::start(Worker::standalone(r.clone()), &config);
         tokio::time::timeout(Duration::from_secs(2), async {
             while r.resident_bytes() > 8 * disk_unit() {
                 tokio::task::yield_now().await;
@@ -699,7 +702,7 @@ mod tests {
         tokio::task::yield_now().await;
         assert_eq!(r.resident_bytes(), 9 * disk_unit());
         let disabled = crate::runtime::WorkerBackground::start(
-            r.clone(),
+            Worker::standalone(r.clone()),
             &WorkerConfig {
                 async_eviction_enabled: false,
                 ownership_gc_enabled: false,
@@ -723,14 +726,15 @@ mod tests {
             fill(&r, 0, paged).await;
             fill(&r, 1, paged).await;
             let state = r.page_lifecycle.block(&block(0));
-            let gate = state.gate.lock().await;
+            let gate = state.lock().await;
             let config = WorkerConfig {
                 async_eviction_enabled: true,
                 background_task_concurrency: 4,
                 ownership_gc_enabled: false,
                 ..Default::default()
             };
-            let service = crate::runtime::WorkerBackground::start(r.clone(), &config);
+            let service =
+                crate::runtime::WorkerBackground::start(Worker::standalone(r.clone()), &config);
             tokio::time::timeout(Duration::from_secs(2), async {
                 while r.page_mutations.active_count() == 0 {
                     tokio::task::yield_now().await;

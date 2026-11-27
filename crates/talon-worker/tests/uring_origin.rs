@@ -33,7 +33,7 @@ use talon_backend::{
 };
 use talon_core::{Backend, BlockId, NamespaceId, ObjectId, Version, WorkerConfig};
 use talon_transport::data::CachedRangeRequest;
-use talon_worker::{page_access_store::CacheRootLock, WorkerMetrics, WorkerRuntime};
+use talon_worker::{page_access_store::CacheRootLock, Worker, WorkerMetrics};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 // Tokio drives the fixture server, DNS and legacy cache maintenance only.
@@ -836,7 +836,7 @@ fn uring_https_load_whole_paged_namespace_and_recovery() {
             };
             let open = || {
                 Arc::new(
-                    WorkerRuntime::open_namespaces_with_uring(
+                    Worker::open_namespaces_with_uring(
                         &config,
                         Arc::new(CacheRootLock::acquire(root.path()).unwrap()),
                         backend.clone(),
@@ -1013,7 +1013,7 @@ fn wire_load_and_read_run_without_tokio_scheduler_or_blocking_pool() {
             ..Default::default()
         };
         let worker = Arc::new(
-            WorkerRuntime::open_namespaces_with_uring(
+            Worker::open_namespaces_with_uring(
                 &config,
                 Arc::new(CacheRootLock::acquire(root.path()).unwrap()),
                 backend,
@@ -1117,7 +1117,10 @@ fn wire_load_and_read_run_without_tokio_scheduler_or_blocking_pool() {
                 other => panic!("unexpected LOAD result: {other:?}"),
             }
         }
-        assert_eq!(worker.resident_bytes(), allocated_data_bytes(root.path()));
+        assert_eq!(
+            worker.default_runtime().resident_bytes(),
+            allocated_data_bytes(root.path())
+        );
         assert_eq!(
             origin.requests.load(Ordering::SeqCst),
             3,
@@ -1233,7 +1236,7 @@ fn aligned_http_bodies_and_paged_commits_preserve_payload() {
                     };
                     let backend = origin.backend(tls);
                     let open = || {
-                        WorkerRuntime::open_namespaces_with_uring(
+                        Worker::open_namespaces_with_uring(
                             &config,
                             Arc::new(CacheRootLock::acquire(root.path()).unwrap()),
                             backend.clone(),
@@ -1242,7 +1245,8 @@ fn aligned_http_bodies_and_paged_commits_preserve_payload() {
                         )
                         .unwrap()
                     };
-                    let runtime = open();
+                    let worker = open();
+                    let runtime = worker.default_runtime();
                     let alignment = talon_uring::DirectIoAlignment::probe(root.path()).unwrap();
                     for len in [8192, 12289] {
                         let block = BlockId::new(
@@ -1287,8 +1291,9 @@ fn aligned_http_bodies_and_paged_commits_preserve_payload() {
                         check_files(root.path(), alignment.offset()),
                         if page_size == 0 { 2 } else { 6 }
                     );
-                    drop(runtime);
-                    let recovered = open();
+                    drop(worker);
+                    let recovered_worker = open();
+                    let recovered = recovered_worker.default_runtime();
                     assert_eq!(
                         recovered.resident_bytes(),
                         allocated_data_bytes(root.path())

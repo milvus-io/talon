@@ -1,5 +1,4 @@
-//! Startup-only construction. Build independent policy indexes without taking
-//! the live policy mutex for each unit; sorted queues are collected in bulk.
+//! Startup-only construction before publishing the policy.
 use super::*;
 
 pub(crate) struct RecoveredUnit {
@@ -10,170 +9,68 @@ pub(crate) struct RecoveredUnit {
 }
 
 impl Lru {
-    /// The input contains each resident unit exactly once. Sibling pages must
-    /// share their idle clock, just as they do after ordinary admission.
+    pub(crate) fn from_runtime(
+        index: Arc<crate::BlockIndex>,
+        units: Vec<RecoveredUnit>,
+        blocks: usize,
+        track_blocks: bool,
+    ) -> Self {
+        index.enable_compact_policy(track_blocks);
+        Self::from_recovered(index, units, blocks, track_blocks)
+    }
+
+    /// Restore explicit tokens for Small Store's legacy policy. Standalone
+    /// policy tests also exercise Whole and Page units through this path.
     pub(crate) fn from_recovered(
         index: Arc<crate::BlockIndex>,
         units: Vec<RecoveredUnit>,
         blocks: usize,
         track_blocks: bool,
     ) -> Self {
-        let workers = if units.len() < 4096 {
-            1
-        } else {
-            std::thread::available_parallelism()
-                .map_or(1, usize::from)
-                .min(2)
-        };
-        Self::recover(index, units, blocks, workers, track_blocks)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn assert_empty_ordinary_policy(&self) {
-        let inner = self.inner.lock().unwrap();
-        assert!(inner.queue.is_empty());
-        assert!(inner.block_queue.is_empty());
-        assert!(inner.ownership_queue.is_empty());
-        assert_eq!(inner.versions.capacity(), 0);
-    }
-
-    #[cfg(test)]
-    fn recover_with_workers(units: Vec<RecoveredUnit>, blocks: usize, workers: usize) -> Self {
-        Self::recover(
-            Arc::new(crate::BlockIndex::new()),
-            units,
-            blocks,
-            workers,
-            true,
-        )
-    }
-
-    fn recover(
-        index: Arc<crate::BlockIndex>,
-        units: Vec<RecoveredUnit>,
-        blocks: usize,
-        workers: usize,
-        track_blocks: bool,
-    ) -> Self {
         let started = std::time::Instant::now();
-        let unit_index = || {
-            let started = std::time::Instant::now();
-            for (position, u) in units.iter().enumerate() {
-                index.policy_insert(
-                    &u.unit,
-                    PolicyEntry {
-                        state: PolicyState {
-                            independent: u.independent,
-                            bytes: u.bytes,
-                            position: position as u64,
-                            revision: position as u64,
-                            pins: 0,
-                        },
-                        access: u.access.clone(),
+        let mut total_bytes = 0u64;
+        for unit in &units {
+            total_bytes = total_bytes.saturating_add(unit.bytes);
+            let revision = index.compact.next_revision();
+            index.compact.admitted_at(revision);
+            index.policy_insert(
+                &unit.unit,
+                PolicyEntry {
+                    state: PolicyState {
+                        independent: unit.independent,
+                        bytes: unit.bytes,
+                        revision,
+                        pins: 0,
+                    },
+                    access: unit.access.clone(),
+                },
+            );
+            if track_blocks
+                && index
+                    .policy_block_update(unit.unit.block(), |activity| {
+                        activity.revision = revision;
+                    })
+                    .is_none()
+            {
+                index.policy_block_insert(
+                    unit.unit.block.clone(),
+                    LegacyBlockActivity {
+                        pins: 0,
+                        revision,
+                        access: Some(unit.access.clock().clone()),
                     },
                 );
             }
-            let queue = units
-                .iter()
-                .enumerate()
-                .map(|(position, u)| (position as u64, u.unit.clone()))
-                .collect();
-            tracing::info!(
-                units = units.len(),
-                workers,
-                phase = "membership",
-                elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
-                "cache policy index restored"
-            );
-            queue
-        };
-        let version_index = || {
-            let started = std::time::Instant::now();
-            let mut versions = VersionIndex::with_capacity(
-                units.iter().filter(|u| !u.independent).count().min(blocks),
-            );
-            for u in &units {
-                if !u.independent {
-                    versions.insert(u.unit.block.clone());
-                }
-            }
-            tracing::info!(
-                units = units.len(),
-                workers,
-                phase = "versions",
-                version_blocks = versions.len(),
-                elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
-                "cache policy index restored"
-            );
-            versions
-        };
-        let block_index = || {
-            if !track_blocks {
-                return (BTreeMap::new(), BTreeMap::new());
-            }
-            let started = std::time::Instant::now();
-            let mut queue = Vec::with_capacity(units.len().min(blocks));
-            for (position, u) in units.iter().enumerate() {
-                let position = position as u64;
-                if index
-                    .policy_block_update(u.unit.block(), |activity| {
-                        activity.revision = position;
-                    })
-                    .is_none()
-                {
-                    let key = index.policy_block_insert(
-                        u.unit.block.clone(),
-                        BlockPolicy {
-                            pins: 0,
-                            position,
-                            revision: position,
-                            ownership_position: AtomicU64::new(position),
-                            ownership_pending: AtomicBool::new(true),
-                            access: u.access.clock().clone(),
-                        },
-                    );
-                    queue.push((position, key));
-                }
-            }
-            let ownership = queue.iter().cloned().collect();
-            let queue = queue.into_iter().collect();
-            tracing::info!(
-                units = units.len(),
-                workers,
-                phase = "blocks",
-                elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
-                "cache policy index restored"
-            );
-            (queue, ownership)
-        };
-        // Version construction runs beside membership recovery. Both unit and
-        // block state now share the directory, so update them on this thread.
-        let (queue, versions, (block_queue, ownership_queue)) = std::thread::scope(|scope| {
-            let version_task = (workers > 1).then(|| scope.spawn(version_index));
-            let units = unit_index();
-            let blocks = block_index();
-            let versions = match version_task {
-                Some(task) => task.join().expect("version recovery panicked"),
-                None => version_index(),
-            };
-            (units, versions, blocks)
-        });
-        let total_bytes = units
-            .iter()
-            .fold(0u64, |total, u| total.saturating_add(u.bytes));
-        let clock = units.len() as u64;
+        }
+        let legacy_units = units.len();
         let lru = Self {
             inner: Mutex::new(Inner {
                 index,
-                queue,
-                versions,
-                block_queue,
-                ownership_queue,
+                legacy_units,
+                capacity_hand: (0, 0),
                 track_blocks,
                 track_small_clock: track_blocks,
-                total_bytes,
-                clock,
-                admission_ceiling: clock,
+                legacy_bytes: total_bytes,
                 small_cursor: 0,
                 small_first: false,
             }),
@@ -185,13 +82,21 @@ impl Lru {
         drop(units);
         tracing::info!(
             blocks,
-            units = clock,
-            workers,
-            temporary_drop_ms = drop_started.elapsed().as_secs_f64() * 1000.0,
+            legacy_units,
+            resident_units = lru.inner.lock().unwrap().index.compact.totals().1,
             elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            temporary_drop_ms = drop_started.elapsed().as_secs_f64() * 1000.0,
             "cache policy indexes completed"
         );
         lru
+    }
+
+    #[cfg(test)]
+    pub(crate) fn assert_empty_ordinary_policy(&self) {
+        let inner = self.inner.lock().unwrap();
+        assert_eq!(inner.legacy_units, 0);
+        assert_eq!(inner.index.compact.totals().1, 0);
+        assert_eq!(inner.index.policy_scan_ceiling(), 0);
     }
 }
 
@@ -228,46 +133,42 @@ mod tests {
         let access = lru.insert(unit.clone(), 8192);
         assert!(!access.tracks_clock());
         assert_eq!(lru.evict_to_fit(0), [unit]);
-        let g = lru.inner.lock().unwrap();
-        assert!(g.block_queue.is_empty());
-        assert!(g.ownership_queue.is_empty());
+        assert!(lru.is_empty());
     }
 
     #[test]
     fn bulk_independent_keys_match_admission() {
-        for workers in 1..=3 {
-            let first = block(10);
-            let mut second = first.clone();
-            second.version = Version::new("v2");
-            let ordinary = Lru::new();
-            let units = [&first, &second]
-                .into_iter()
-                .map(|id| {
-                    let unit = CacheUnit::Whole(id.clone());
-                    let access = ordinary.insert_with_policy(unit.clone(), 100, true);
-                    RecoveredUnit {
-                        independent: true,
-                        unit: unit.into(),
-                        bytes: 100,
-                        access,
-                    }
-                })
-                .collect();
-            let recovered = Lru::recover_with_workers(units, 2, workers);
-            {
-                let a = ordinary.inner.lock().unwrap();
-                let b = recovered.inner.lock().unwrap();
-                assert!(b.versions.is_empty());
-                assert_eq!(b.versions.capacity(), 0);
-                assert_eq!(a.total_bytes, b.total_bytes);
-            }
-            assert!(recovered.superseded_candidates(&second).is_empty());
-            assert_eq!(recovered.block_candidates(&first).len(), 1);
-            recovered.remove_block(&first);
-            assert_eq!(recovered.block_candidates(&second).len(), 1);
-            recovered.remove_block(&second);
-            assert!(recovered.is_empty());
+        let first = block(10);
+        let mut second = first.clone();
+        second.version = Version::new("v2");
+        let ordinary = Lru::new();
+        let units = [&first, &second]
+            .into_iter()
+            .map(|id| {
+                let unit = CacheUnit::Whole(id.clone());
+                let access = ordinary.insert_with_policy(unit.clone(), 100, true);
+                RecoveredUnit {
+                    independent: true,
+                    unit: unit.into(),
+                    bytes: 100,
+                    access,
+                }
+            })
+            .collect();
+        let recovered = Lru::from_recovered(Arc::new(crate::BlockIndex::new()), units, 2, true);
+        {
+            let a = ordinary.inner.lock().unwrap();
+            let b = recovered.inner.lock().unwrap();
+            assert_eq!(b.index.policy_versioned_count(&first), 0);
+            assert_eq!(b.index.policy_versioned_count(&second), 0);
+            assert_eq!(a.legacy_bytes, b.legacy_bytes);
         }
+        assert!(recovered.superseded_candidates(&second).is_empty());
+        assert_eq!(recovered.block_candidates(&first).len(), 1);
+        recovered.remove_block(&first);
+        assert_eq!(recovered.block_candidates(&second).len(), 1);
+        recovered.remove_block(&second);
+        assert!(recovered.is_empty());
     }
 
     #[test]
@@ -281,95 +182,58 @@ mod tests {
             (CacheUnit::Page(old.clone(), PageIndex(255)), 4096),
             (CacheUnit::Whole(new.clone()), 31),
         ];
-        for workers in 1..=3 {
-            let ordinary = Lru::new();
-            let mut shared = HashMap::new();
-            let units = input
-                .iter()
-                .map(|(unit, bytes)| {
-                    ordinary.insert(unit.clone(), *bytes);
-                    let access = shared
-                        .entry(unit.block().clone())
-                        .or_insert_with(AccessHandle::default);
-                    RecoveredUnit {
-                        independent: false,
-                        unit: unit.clone().into(),
-                        bytes: *bytes,
-                        access: access.sibling(),
-                    }
-                })
-                .collect();
-            let recovered = Lru::recover_with_workers(units, 3, workers);
-            {
-                let a = ordinary.inner.lock().unwrap();
-                let b = recovered.inner.lock().unwrap();
-                assert_eq!(a.queue, b.queue);
-                assert_eq!(a.block_queue, b.block_queue);
-                assert_eq!(a.ownership_queue, b.ownership_queue);
-                assert_eq!(a.clock, b.clock);
-                assert_eq!(a.admission_ceiling, b.admission_ceiling);
-                assert_eq!(a.total_bytes, b.total_bytes);
-                assert!(a.versions == b.versions);
-                for id in a.block_queue.values() {
-                    let activity = a.index.policy_block_get(id).unwrap();
-                    let restored = b.index.policy_block_get(id).unwrap();
-                    assert_eq!(
-                        (
-                            activity.units,
-                            activity.pins,
-                            activity.position,
-                            activity.revision,
-                            activity.ownership_position,
-                            activity.ownership_pending
-                        ),
-                        (
-                            restored.units,
-                            restored.pins,
-                            restored.position,
-                            restored.revision,
-                            restored.ownership_position,
-                            restored.ownership_pending
-                        )
-                    );
+        let ordinary = Lru::new();
+        let mut shared = HashMap::new();
+        let units = input
+            .iter()
+            .map(|(unit, bytes)| {
+                ordinary.insert(unit.clone(), *bytes);
+                let access = shared
+                    .entry(unit.block().clone())
+                    .or_insert_with(AccessHandle::default);
+                RecoveredUnit {
+                    independent: false,
+                    unit: unit.clone().into(),
+                    bytes: *bytes,
+                    access: access.sibling(),
                 }
-                for unit in a.queue.values() {
-                    let entry = a.index.policy_get(unit).unwrap();
-                    let restored = b.index.policy_get(unit).unwrap();
-                    assert_eq!(
-                        (entry.bytes, entry.position, entry.revision, entry.pins),
-                        (
-                            restored.bytes,
-                            restored.position,
-                            restored.revision,
-                            restored.pins
-                        )
-                    );
-                    assert!(Arc::ptr_eq(
-                        restored.access.clock(),
-                        &b.index.policy_block_get(unit.block()).unwrap().access
-                    ));
-                }
-            }
-            for lru in [&ordinary, &recovered] {
-                assert!(lru.pin(&input[0].0));
-                assert_eq!(lru.evict_superseded(&new), vec![input[2].0.clone()]);
-                lru.unpin(&input[0].0);
-                let candidate = lru.block_candidates(&old).pop().unwrap();
-                lru.touch(&input[0].0);
-                assert!(!lru.candidate_is_current(&candidate));
-                lru.remove_block(&old);
-                lru.insert(input[0].0.clone(), 7);
-                assert_eq!(lru.total_bytes(), 57);
-                assert_eq!(lru.len(), 3);
-                assert_eq!(lru.evict_to_fit(0).len(), 3);
-                assert_eq!(lru.total_bytes(), 0);
-                let g = lru.inner.lock().unwrap();
-                assert!(
-                    g.versions.is_empty()
-                        && g.block_queue.is_empty()
-                        && g.ownership_queue.is_empty()
+            })
+            .collect();
+        let recovered = Lru::from_recovered(Arc::new(crate::BlockIndex::new()), units, 3, true);
+        {
+            let a = ordinary.inner.lock().unwrap();
+            let b = recovered.inner.lock().unwrap();
+            assert_eq!(a.legacy_units, b.legacy_units);
+            assert_eq!(
+                a.index.compact.admission_ceiling(),
+                b.index.compact.admission_ceiling()
+            );
+            assert_eq!(a.legacy_bytes, b.legacy_bytes);
+            for (unit, _) in &input {
+                let entry = a.index.policy_get(unit).unwrap();
+                let restored = b.index.policy_get(unit).unwrap();
+                assert_eq!(
+                    (entry.bytes, entry.revision, entry.pins),
+                    (restored.bytes, restored.revision, restored.pins)
                 );
+                let activity = b.index.policy_block_get(unit.block()).unwrap();
+                assert_eq!(restored.access.last_access(), activity.last_access);
             }
+        }
+        for lru in [&ordinary, &recovered] {
+            assert!(lru.pin(&input[0].0));
+            assert_eq!(lru.evict_superseded(&new), vec![input[2].0.clone()]);
+            lru.unpin(&input[0].0);
+            let candidate = lru.block_candidates(&old).pop().unwrap();
+            lru.touch(&input[0].0);
+            assert!(!lru.candidate_is_current(&candidate));
+            lru.remove_block(&old);
+            lru.insert(input[0].0.clone(), 7);
+            assert_eq!(lru.total_bytes(), 57);
+            assert_eq!(lru.len(), 3);
+            assert_eq!(lru.evict_to_fit(0).len(), 3);
+            assert_eq!(lru.total_bytes(), 0);
+            assert!(lru.is_empty());
         }
     }
 
@@ -389,7 +253,8 @@ mod tests {
             let second = CacheUnit::Page(id.clone(), PageIndex(19));
             let lru = if recover {
                 let shared = AccessHandle::default();
-                Lru::recover_with_workers(
+                Lru::from_recovered(
+                    Arc::new(crate::BlockIndex::new()),
                     vec![
                         RecoveredUnit {
                             independent: false,
@@ -405,7 +270,7 @@ mod tests {
                         },
                     ],
                     1,
-                    2,
+                    true,
                 )
             } else {
                 let lru = Lru::new();
@@ -413,18 +278,9 @@ mod tests {
                 lru.insert(second.clone(), 8192);
                 lru
             };
-            let identity = {
-                let inner = lru.inner.lock().unwrap();
-                let activity = inner.index.policy_block_get(&id).unwrap();
-                let key = &inner.block_queue[&activity.position];
-                assert!(BlockKey::ptr_eq(
-                    key,
-                    &inner.ownership_queue[&activity.ownership_position]
-                ));
-                key.downgrade()
-            };
+            let identity = lru.index().shared_identity(&id).unwrap().downgrade();
             let limit = lru.ownership_admission_ceiling();
-            let candidate = lru.next_ownership_block(&mut (0, limit), limit).unwrap().1;
+            let candidate = lru.first_ownership_candidate(0..limit).unwrap();
             assert_eq!(candidate.units, 2);
             assert_eq!(lru.remove(&first), Some(4096));
             assert_eq!(

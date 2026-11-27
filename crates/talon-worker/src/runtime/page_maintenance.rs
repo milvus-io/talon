@@ -1,8 +1,25 @@
 //! Page mutations are owned worker tasks: cancellation never splits disk and index updates.
 use super::*;
+use crate::block_key::{BlockIdentity, BlockKey};
 use crate::page_access_store::{AccessSnapshot, PageAccessStore};
 use crate::page_gc::{CheckpointReport, GcReport};
-use crate::page_lifecycle::{GcCandidate, PageCheckpoint};
+use crate::page_lifecycle::{
+    CheckpointInventory, GcCandidate, PageSnapshot, PagedMutation, SHARDS,
+};
+
+#[derive(Default)]
+pub(super) struct CheckpointCursor {
+    shard: usize,
+    inventory: Option<CheckpointInventory>,
+}
+
+struct PreparedCheckpoint {
+    membership: u64,
+    snapshots: Vec<PageSnapshot>,
+    journal: crate::page_access_shard::JournalState,
+    full: bool,
+    bytes: Vec<u8>,
+}
 
 impl WorkerRuntime {
     pub(super) fn background_io_slots(&self) -> &Arc<tokio::sync::Semaphore> {
@@ -72,72 +89,11 @@ impl WorkerRuntime {
                 "checkpoint interval exceeds TTI"
             );
         }
-        self.page_lifecycle.enable_access_tracking();
         if let Some(small) = self.small.as_ref() {
             small.enable_access_tracking()?;
         }
         if let Some(paged) = self.paged.as_ref() {
-            self.index.restore_page_states(&self.page_lifecycle);
-            let now = self.page_clock.now();
-            // Load each shard once; keep only one shard's recovered metadata in memory.
-            for shard in 0..crate::page_lifecycle::SHARDS {
-                let dir = paged.root().join(format!("{shard:02x}"));
-                let mut recovered_shard =
-                    crate::page_access_shard::load(&dir, shard, paged.page_size(), now);
-                if let Some(recovered) = &recovered_shard {
-                    self.page_lifecycle
-                        .set_checkpoint_journal(shard, recovered.journal);
-                    self.page_lifecycle.checkpoint_recovered(shard);
-                }
-                let (ceiling, _, _) = self.page_lifecycle.checkpoint_start(shard);
-                let mut slot = 0;
-                loop {
-                    let blocks = self
-                        .page_lifecycle
-                        .checkpoint_batch(shard, &mut slot, ceiling);
-                    if blocks.is_empty() {
-                        break;
-                    }
-                    for state in blocks {
-                        let recovered = match &mut recovered_shard {
-                            Some(shard) => shard.records.remove(&state.id).unwrap_or_else(|| {
-                                crate::page_access_store::AccessRecovery {
-                                    corrupt: shard.corrupt,
-                                    ..Default::default()
-                                }
-                            }),
-                            None if paged.journaled() => Default::default(),
-                            None => PageAccessStore::load(
-                                &paged.dir_for(&state.id),
-                                &state.id,
-                                paged.page_size(),
-                                now,
-                            ),
-                        };
-                        let pages: Vec<_> = state
-                            .inner
-                            .lock()
-                            .unwrap()
-                            .pages
-                            .read()
-                            .unwrap()
-                            .keys()
-                            .copied()
-                            .collect();
-                        if recovered.corrupt {
-                            self.page_gc_metrics.corrupt.add(pages.len() as u64);
-                        }
-                        self.page_gc_metrics.future.add(recovered.future as u64);
-                        for page in pages {
-                            let access = recovered.records.get(&page).copied();
-                            if access.is_none() {
-                                self.page_gc_metrics.missing.inc();
-                            }
-                            state.register(PageIndex(page), access, now, false);
-                        }
-                    }
-                }
-            }
+            self.restore_paged_access(paged);
         }
         self.page_gc_metrics
             .tti_seconds
@@ -148,6 +104,47 @@ impl WorkerRuntime {
         self.fallback_background_io = Arc::new(tokio::sync::Semaphore::new(config.io_concurrency));
         self.page_gc_config = config;
         Ok(self)
+    }
+
+    pub(super) fn restore_paged_access(&self, paged: &PagedBlockStore) {
+        // Checkpoints also provide ages for enabling TTI through live settings.
+        self.page_lifecycle.enable_access_tracking();
+        let now = self.page_clock.now();
+        let slots = self.page_lifecycle.recovery_slots();
+        for (shard, slots) in slots.into_iter().enumerate() {
+            let dir = paged.root().join(format!("{shard:02x}"));
+            let mut recovered_shard =
+                crate::page_access_shard::load(&dir, shard, paged.page_size(), now);
+            if let Some(recovered) = &recovered_shard {
+                self.page_lifecycle
+                    .set_checkpoint_journal(shard, recovered.journal);
+            }
+            if recovered_shard.is_some() || !slots.is_empty() {
+                self.page_lifecycle.checkpoint_recovered(shard);
+            }
+            for slot in slots {
+                let Some(state) = self.page_lifecycle.recovery_block(slot) else {
+                    continue;
+                };
+                let id = state.id.materialize();
+                let recovered = match &mut recovered_shard {
+                    Some(shard) => shard.records.remove(&id).unwrap_or_else(|| {
+                        crate::page_access_store::AccessRecovery {
+                            corrupt: shard.corrupt,
+                            ..Default::default()
+                        }
+                    }),
+                    None if paged.journaled() => Default::default(),
+                    None => PageAccessStore::load(&paged.dir_for(&id), &id, paged.page_size(), now),
+                };
+                let (resident, missing) = state.restore_ages(&recovered.records);
+                if recovered.corrupt {
+                    self.page_gc_metrics.corrupt.add(resident);
+                }
+                self.page_gc_metrics.future.add(recovered.future as u64);
+                self.page_gc_metrics.missing.add(missing);
+            }
+        }
     }
 
     pub(crate) async fn drain_page_mutations(&self) {
@@ -295,13 +292,14 @@ impl WorkerRuntime {
         candidate: GcCandidate,
         reason: usize,
     ) -> Option<u64> {
-        self.evict_page_candidate_to_target(candidate, reason, self.capacity_bytes)
+        self.evict_page_candidate_to_target(candidate, None, reason, self.capacity_bytes)
             .await
     }
 
     async fn evict_page_candidate_to_target(
         &self,
         candidate: GcCandidate,
+        capacity: Option<crate::eviction::EvictionCandidate>,
         reason: usize,
         target: u64,
     ) -> Option<u64> {
@@ -310,7 +308,10 @@ impl WorkerRuntime {
             runtime.background_delete().await;
             let _io = runtime.acquire_background_io(None).await?;
             let block = &candidate.block;
-            let _gate = block.gate.lock().await;
+            let _gate = block.lock().await;
+            if capacity.as_ref().is_some_and(|ticket| !runtime.lru.candidate_is_current(ticket)) {
+                return None;
+            }
             if reason == 1 && (runtime.capacity_bytes == 0 || runtime.resident_bytes() <= target) { return None; }
             let age = runtime.current_tti_ms();
             if reason == 0 && age == 0 { return None; }
@@ -318,9 +319,20 @@ impl WorkerRuntime {
             if !block.claim(&candidate, runtime.page_clock.now(), tti) {return None;}
             let paged = runtime.paged.as_ref()?;
             let page = candidate.page;
-            let id = block.id.as_ref();
-            let bytes = runtime.index.get(id).map(|m| talon_core::page_len(m.len, paged.page_size(), page)).unwrap_or(0);
-            if let Err(error) = paged.evict_page_async(id, page).await {
+            let id = &block.id.materialize();
+            let (bytes, last_sidecar_page) = runtime.index.get(id).map_or((0, false), |meta| {
+                let last = !paged.journaled() && runtime.index.uses_catalog()
+                    && matches!(meta.form, BlockForm::Paged { ref present, .. } if present.count() == 1);
+                (talon_core::page_len(meta.len, paged.page_size(), page), last)
+            });
+            let removed = if last_sidecar_page {
+                // The compact row retires with its final page. Retry a failed
+                // directory unlink before removing that page from accounting.
+                paged.delete_block_async(id).await
+            } else {
+                paged.evict_page_async(id, page).await
+            };
+            if let Err(error) = removed {
                 block.abort(&candidate, reason); runtime.page_gc_metrics.delete_errors.inc();
                 tracing::warn!(block = %id, page = page.0, %error, "page unlink failed; retaining accounting for retry");
                 return None;
@@ -328,14 +340,21 @@ impl WorkerRuntime {
             runtime.l1.remove_page(id, page);
             #[cfg(test)]
             crate::page_access_store::crash_barrier("last_page_unlink").unwrap();
-            runtime.index.clear_page(id, page);
-            runtime.lru.remove(&CacheUnit::Page(id.clone(), page));
-            block.finish(&candidate, runtime.page_clock.now());
+            if !paged.journaled() {
+                runtime.index.clear_page(id, page);
+            }
             runtime.metrics.record_eviction(); runtime.refresh_l1_metrics();
             runtime.page_gc_metrics.deleted[reason].inc(); runtime.page_gc_metrics.bytes[reason].add(bytes);
-            if block.inner.lock().unwrap().pages.read().unwrap().is_empty() {
+            // A durable catalog completion already retires the page and
+            // removes the block row when its last page is gone.
+            if !paged.journaled() && !last_sidecar_page && !block.has_pages() {
                 match paged.delete_block_async(id).await {
-                    Ok(()) => { block.inner.lock().unwrap().cleanup_pending = false; if runtime.index.get(id).is_some_and(|m| matches!(m.form, BlockForm::Paged {..})) {runtime.index.remove(id);} }
+                    Ok(()) => {
+                        block.cleanup_finished();
+                        if runtime.index.summary(id).is_some_and(|m| matches!(m.shape, BlockShape::Paged { .. })) {
+                            runtime.index.remove(id);
+                        }
+                    }
                     Err(error) => {runtime.page_gc_metrics.delete_errors.inc(); tracing::warn!(block = %id, %error, "empty page directory cleanup failed");}
                 }
             }
@@ -343,28 +362,29 @@ impl WorkerRuntime {
         }).await
     }
 
-    async fn cleanup_empty_block(&self, block: Arc<crate::page_lifecycle::BlockState>) {
+    async fn cleanup_empty_block(&self, block: PagedMutation) {
         let runtime = self.clone();
         self.page_mutations
             .run(async move {
                 runtime.background_delete().await;
                 let _io = runtime.acquire_background_io(None).await;
-                let _gate = block.gate.lock().await;
-                if !block.inner.lock().unwrap().pages.read().unwrap().is_empty() {
+                let _gate = block.lock().await;
+                if block.has_pages() {
                     return;
                 }
                 let Some(paged) = &runtime.paged else {
                     return;
                 };
-                match paged.delete_block_async(&block.id).await {
+                let id = block.id.materialize();
+                match paged.delete_block_async(&id).await {
                     Ok(()) => {
-                        block.inner.lock().unwrap().cleanup_pending = false;
+                        block.cleanup_finished();
                         if runtime
                             .index
-                            .get(&block.id)
-                            .is_some_and(|m| matches!(m.form, BlockForm::Paged { .. }))
+                            .summary(&id)
+                            .is_some_and(|m| matches!(m.shape, BlockShape::Paged { .. }))
                         {
-                            runtime.index.remove(&block.id);
+                            runtime.index.remove(&id);
                         }
                     }
                     Err(error) => {
@@ -388,9 +408,9 @@ impl WorkerRuntime {
         &self,
         candidate: crate::eviction::StaleBlockCandidate,
         membership: Option<Arc<super::MembershipSnapshot>>,
-    ) {
+    ) -> bool {
         self.unlink_stale_block_inner(candidate, membership, false, None)
-            .await;
+            .await
     }
 
     pub(super) async fn unlink_stale_block_prepaid(
@@ -426,7 +446,7 @@ impl WorkerRuntime {
                 let whole = matches!(&unit, CacheUnit::Whole(_));
                 let state = runtime.page_lifecycle.block(&block);
                 {
-                    let _gate = state.gate.lock().await;
+                    let _gate = state.lock().await;
                     let settings = runtime.clone();
                     match small
                         .delete_idle(unit, ticket, move || {
@@ -449,7 +469,6 @@ impl WorkerRuntime {
                         }
                     }
                 }
-                runtime.page_lifecycle.retire_empty(&block);
             })
             .await;
     }
@@ -469,21 +488,19 @@ impl WorkerRuntime {
                 };
                 let block = candidate.unit.block().clone();
                 let whole = matches!(candidate.unit, CacheUnit::Whole(_));
-                let state = runtime.page_lifecycle.block(&block);
-                if let Some(_gate) = before_deadline(deadline, state.gate.lock()).await {
+                let state = if deadline.is_some() {
+                    runtime.page_lifecycle.mutation(BlockKey::new(&block))
+                } else {
+                    runtime.page_lifecycle.block(&block)
+                };
+                if let Some(_gate) = before_deadline(deadline, state.lock()).await {
                     let validator = runtime.clone();
                     let small = runtime.small.as_ref().unwrap();
                     match small
                         .delete_gc(candidate, revision, deadline, move || {
                             membership.as_ref().map_or(true, |view| {
-                                uncontended(validator.membership.try_lock()).is_some_and(|held| {
-                                    let now = Instant::now();
-                                    now < view.valid_until
-                                        && held.as_ref().is_some_and(|current| {
-                                            current.generation == view.generation
-                                                && now < current.valid_until
-                                        })
-                                })
+                                uncontended(validator.membership.try_lock())
+                                    .is_some_and(|held| ownership_authorized(held.as_deref(), view))
                             })
                         })
                         .await
@@ -502,7 +519,6 @@ impl WorkerRuntime {
                     }
                 }
                 drop(state);
-                runtime.page_lifecycle.retire_empty(&block);
             })
             .await;
     }
@@ -513,7 +529,7 @@ impl WorkerRuntime {
         membership: Option<Arc<super::MembershipSnapshot>>,
         prepaid: bool,
         idle_at: Option<u64>,
-    ) {
+    ) -> bool {
         let runtime = self.clone();
         self.page_mutations.run(async move {
             let ownership_deadline = membership.as_ref().map(|view| view.valid_until);
@@ -523,21 +539,43 @@ impl WorkerRuntime {
                     budget.delete_units(candidate.units as u64).await;
                 }
             }
-            let Some(_io) = runtime.acquire_background_io(ownership_deadline).await else { return; };
-            let state = runtime.page_lifecycle.block(&candidate.block);
+            let Some(io) = runtime.acquire_background_io(ownership_deadline).await else { return false; };
+            let state = if ownership_deadline.is_some() {
+                runtime.page_lifecycle.mutation(BlockKey::new(&candidate.block))
+            } else {
+                runtime.page_lifecycle.block(&candidate.block)
+            };
             {
-                let Some(_gate) = before_deadline(ownership_deadline, state.gate.lock()).await else { return; };
-                if idle_at.is_some_and(|now| !candidate.is_idle(now.max(crate::eviction::access_millis()), runtime.current_tti_ms())) { return; }
-                if !runtime.lru.stale_candidate_is_current(&candidate) { return; }
-                let Some(claim) = state.claim_all_pages() else { return; };
-                // A reader may have completed while the pages were being closed.
-                if !runtime.lru.stale_candidate_is_current(&candidate) { return; }
-                if membership.as_ref().is_some_and(|view|
-                    Instant::now() >= view.valid_until || !runtime.membership_is_current(view)) { return; }
+                let Some(_gate) = before_deadline(ownership_deadline, state.lock()).await else { return false; };
+                if idle_at.is_some_and(|now| !candidate.is_idle(now.max(crate::eviction::access_millis()), runtime.current_tti_ms())) { return false; }
                 let id = &candidate.block;
-                let bytes = runtime.index.get(id).map_or(0, |meta| meta.resident_bytes());
+                let claim;
+                // Claim cleanup can wait for the operation stripe. Return the
+                // shared I/O permit first, with the block gate still held.
+                let io_permit = io;
+                let bytes = if ownership_deadline.is_some() && runtime.index.uses_catalog() {
+                    let Some(observed) = state.try_claim_catalog_ownership(&candidate) else { return false; };
+                    let (acquired, bytes) = observed;
+                    claim = acquired;
+                    bytes
+                } else {
+                    if !runtime.lru.stale_candidate_is_current(&candidate) { return false; }
+                    let Some(acquired) = state.claim_all_pages() else { return false; };
+                    claim = acquired;
+                    // A reader may have completed before the block claim.
+                    if !runtime.lru.stale_candidate_is_current(&candidate) { return false; }
+                    runtime.index.get(id).map_or(0, |meta| meta.resident_bytes())
+                };
                 let pages = claim.len();
-                let compact = runtime.small.as_ref().is_some_and(|small| small.has_recency());
+                let compact = if let Some(small) = &runtime.small {
+                    let Some(compact) = small.recency_for_unlink(ownership_deadline.is_some()) else { return false; };
+                    compact
+                } else {
+                    false
+                };
+                if membership.as_ref().is_some_and(|view|
+                    !uncontended(runtime.membership.try_lock())
+                        .is_some_and(|held| ownership_authorized(held.as_deref(), view))) { return false; }
                 let whole = if compact {
                     runtime.store.delete(id).await
                 } else {
@@ -546,33 +584,34 @@ impl WorkerRuntime {
                 if let Err(error) = whole {
                     runtime.page_gc_metrics.delete_errors.inc();
                     tracing::warn!(block = %id, %error, "stale block unlink failed; retaining accounting");
-                    return;
+                    return false;
                 }
                 if let Some(small) = runtime.small.as_ref().filter(|_| !compact) {
                     if let Err(error) = small.delete(&CacheUnit::ExactRange(id.clone())).await {
                         tracing::warn!(block = %id, %error, "exact range unlink failed");
-                        return;
+                        return false;
                     }
                 }
                 if let Some(paged) = runtime.paged.as_ref().filter(|_| pages > 0) {
                     if let Err(error) = paged.delete_block_async(id).await {
                         runtime.page_gc_metrics.delete_errors.inc();
                         tracing::warn!(block = %id, %error, "stale paged block unlink failed; retaining accounting");
-                        return;
+                        return false;
                     }
                 }
                 runtime.invalidate_l1(id);
                 runtime.index.remove(id);
                 runtime.lru.remove_tracked_block(id);
-                claim.finish(runtime.page_clock.now());
+                drop(io_permit);
+                drop(claim);
                 runtime.metrics.record_eviction();
                 if pages > 0 {
                     runtime.page_gc_metrics.deleted[reason].add(pages as u64);
                     runtime.page_gc_metrics.bytes[reason].add(bytes);
                 }
+                true
             }
-            runtime.page_lifecycle.retire_empty(&candidate.block);
-        }).await;
+        }).await
     }
 
     /// Capacity and superseded page eviction share the same commit protocol as TTI.
@@ -607,15 +646,10 @@ impl WorkerRuntime {
             .collect();
         let work =
             futures::stream::iter(candidates.into_iter().map(|(unit, candidate)| async move {
-                let retired = match &unit.unit {
-                    CacheUnit::Page(id, _) | CacheUnit::Whole(id) | CacheUnit::ExactRange(id) => id.clone(),
-                };
                 match unit.unit.clone() {
                     CacheUnit::Page(_, _) => {
-                        if self.lru.candidate_is_current(&unit) {
-                            if let Some(c) = candidate {
-                                self.evict_page_candidate_to_target(c, reason, target).await;
-                            }
+                        if let Some(c) = candidate {
+                            self.evict_page_candidate_to_target(c, Some(unit), reason, target).await;
                         }
                     }
                     CacheUnit::ExactRange(id) => {
@@ -624,7 +658,7 @@ impl WorkerRuntime {
                         self.page_mutations.run(async move {
                             runtime.background_delete().await;
                             let _io = runtime.acquire_background_io(None).await;
-                            let _gate = state.gate.lock().await;
+                            let _gate = state.lock().await;
                             if reason == 1 && (runtime.capacity_bytes == 0 || runtime.resident_bytes() <= target) {
                                 return;
                             }
@@ -646,7 +680,7 @@ impl WorkerRuntime {
                         .run(async move {
                             runtime.background_delete().await;
                             let _io = runtime.acquire_background_io(None).await;
-                            let _gate = state.gate.lock().await;
+                            let _gate = state.lock().await;
                             if reason == 1
                                 && (runtime.capacity_bytes == 0
                                     || runtime.resident_bytes() <= target)
@@ -658,7 +692,7 @@ impl WorkerRuntime {
                             }
                             // A stale whole candidate must never delete newly
                             // materialized pages through a directory fallback.
-                            if !state.inner.lock().unwrap().pages.read().unwrap().is_empty() {
+                            if state.has_pages() {
                                 return;
                             }
                             if let Err(error) = runtime.delete_whole(&id).await {
@@ -673,7 +707,6 @@ impl WorkerRuntime {
                         .await;
                     }
                 }
-                self.page_lifecycle.retire_empty(&retired);
             }));
         let concurrency = if reason == 1 {
             self.page_gc_config.io_concurrency
@@ -695,7 +728,7 @@ impl WorkerRuntime {
     }
 
     async fn checkpoint_shards(&self, all: bool) -> CheckpointReport {
-        if self.paged.is_none() {
+        if self.paged.is_none() || !self.page_lifecycle.tracks_access() {
             return CheckpointReport::default();
         }
         let Ok(mut cursor) = self.page_checkpoint.clone().try_lock_owned() else {
@@ -705,11 +738,15 @@ impl WorkerRuntime {
         // Retain serialization and dirty-state ownership even if the caller is cancelled.
         self.page_mutations.run(async move {
             let mut report = CheckpointReport::default();
-            for _ in 0..if all { crate::page_lifecycle::SHARDS } else { 1 } {
-                let shard = *cursor;
-                *cursor = (shard + 1) % crate::page_lifecycle::SHARDS;
+            if all {
+                cursor.inventory = None;
+            }
+            for step in 0..if all { SHARDS } else { 1 } {
+                let shard = cursor.shard;
+                cursor.shard = (shard + 1) % SHARDS;
+                let remaining = if all { SHARDS - step } else { SHARDS - shard };
                 let _io = runtime.acquire_background_io(None).await;
-                let result = runtime.checkpoint_shard(shard).await;
+                let result = runtime.checkpoint_shard(shard, remaining, &mut cursor.inventory).await;
                 match result {
                     Ok((blocks, bytes)) => {
                         report.blocks += blocks;
@@ -726,122 +763,42 @@ impl WorkerRuntime {
                     }
                 }
             }
-            if all || *cursor == 0 { runtime.refresh_checkpoint_metrics().await; }
+            if all || cursor.shard == 0 {
+                cursor.inventory = None;
+                runtime.refresh_checkpoint_metrics().await;
+            }
             report
         }).await
     }
 
-    async fn checkpoint_shard(&self, shard: usize) -> anyhow::Result<(usize, usize)> {
+    async fn checkpoint_shard(
+        &self,
+        shard: usize,
+        remaining: usize,
+        inventory: &mut Option<CheckpointInventory>,
+    ) -> anyhow::Result<(usize, usize)> {
         let paged = self.paged.as_ref().expect("paged TTI");
         let gate = self.page_lifecycle.checkpoint_gate(shard);
         let _guard = gate.lock().await;
         let worker = self.clone();
-        let prepared = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            let (ceiling, membership, dirty) = worker.page_lifecycle.checkpoint_start(shard);
-            let (journal, removed) = worker.page_lifecycle.checkpoint_journal(shard, membership);
-            if !dirty {
-                return Ok(None);
-            }
-            let full = journal.compact();
-            let mut retry = journal;
-            retry.full = true;
-            worker.page_lifecycle.set_checkpoint_journal(shard, retry);
-            let mut slot = 0;
-            let mut snapshots = Vec::new();
-            let mut size = 24;
-            loop {
-                let blocks = if full {
-                    worker
-                        .page_lifecycle
-                        .checkpoint_batch(shard, &mut slot, ceiling)
-                } else {
-                    worker
-                        .page_lifecycle
-                        .checkpoint_dirty_batch(shard, &mut slot, ceiling)
-                };
-                if blocks.is_empty() {
-                    break;
-                }
-                for block in blocks {
-                    let state = block.inner.lock().unwrap();
-                    let summary = state.work.checkpoint();
-                    let replace = full || state.revision != state.checkpointed_revision;
-                    // Bound construction before retaining page guards or encoding.
-                    let records = state.pages.read().unwrap().len();
-                    size += serde_json::to_vec(block.id.as_ref())?.len() + records * 12 + 52;
-                    anyhow::ensure!(
-                        size <= crate::page_access_shard::MAX_BYTES,
-                        "access shard exceeds 64 MiB limit"
-                    );
-                    // Consume markers before sampling timestamps. Concurrent reads
-                    // remain dirty for the next checkpoint; failure restores markers.
-                    let pages: Vec<_> = state
-                        .pages
-                        .read()
-                        .unwrap()
-                        .iter()
-                        .map(|(&page, entry)| PageCheckpoint::new(page, &entry.handle))
-                        .collect();
-                    // Structural changes replace this block's map (including
-                    // removals). Access-only deltas carry just touched pages.
-                    let snapshot = AccessSnapshot {
-                        revision: state.revision,
-                        sampled_at: worker.page_clock.now(),
-                        records: pages
-                            .iter()
-                            .filter(|page| replace || page.dirty())
-                            .filter_map(|page| page.access.map(|age| (page.page, age)))
-                            .collect(),
-                    };
-                    let resident = !state.pages.read().unwrap().is_empty();
-                    drop(state);
-                    snapshots.push((block, snapshot, resident, pages, summary, replace));
-                }
-            }
-            let paged = worker.paged.as_ref().expect("paged TTI");
-            let dir = paged.root().join(format!("{shard:02x}"));
-            // Whole-block-only registry entries have no paged directory to persist.
-            if !dir.exists() && snapshots.iter().all(|(_, _, resident, _, _, _)| !resident) {
-                for (_, _, _, pages, summary, _) in snapshots {
-                    for page in pages {
-                        page.commit();
-                    }
-                    summary.commit();
-                }
-                worker.page_lifecycle.checkpoint_finished(shard, membership);
-                return Ok(None);
-            }
-            let bytes = if full {
-                crate::page_access_shard::encode(
-                    paged.page_size(),
-                    snapshots
-                        .iter()
-                        .filter(|(_, _, resident, _, _, _)| *resident)
-                        .map(|(block, snapshot, _, _, _, _)| (block.id.as_ref(), snapshot)),
-                )?
-            } else {
-                let empty = AccessSnapshot {
-                    revision: 0,
-                    sampled_at: worker.page_clock.now(),
-                    records: Vec::new(),
-                };
-                // Tombstones precede live replacements, so delete/recreate in
-                // the same flush keeps the new block's ages.
-                crate::page_access_shard::encode_delta(
-                    paged.page_size(),
-                    removed
-                        .iter()
-                        .map(|id| (id, &empty, true))
-                        .chain(snapshots.iter().map(|(block, snapshot, _, _, _, replace)| {
-                            (block.id.as_ref(), snapshot, *replace)
-                        })),
-                )?
-            };
-            Ok(Some((membership, snapshots, journal, full, bytes)))
+        let mut round_inventory = inventory.take();
+        let (round_inventory, prepared) = tokio::task::spawn_blocking(move || {
+            let prepared = worker.prepare_checkpoint(shard, remaining, &mut round_inventory);
+            (round_inventory, prepared)
         })
         .await
-        .expect("access checkpoint preparation panicked")?;
-        let Some((membership, snapshots, journal, full, bytes)) = prepared else {
+        .expect("access checkpoint preparation panicked");
+        // The remaining shards belong to the round, regardless of whether
+        // this shard can prepare or publish its checkpoint.
+        *inventory = round_inventory;
+        let Some(PreparedCheckpoint {
+            membership,
+            snapshots,
+            journal,
+            full,
+            bytes,
+        }) = prepared?
+        else {
             return Ok((0, 0));
         };
         let dir = paged.root().join(format!("{shard:02x}"));
@@ -854,26 +811,125 @@ impl WorkerRuntime {
         )
         .await?;
         let worker = self.clone();
-        tokio::task::spawn_blocking(move || {
-            let count = snapshots
-                .iter()
-                .filter(|(_, _, resident, _, _, _)| *resident)
-                .count();
-            // Enable deletion journaling before releasing the sampled block Arcs:
-            // retire_empty may run as soon as their final outside reference drops.
+        let count = tokio::task::spawn_blocking(move || {
+            let count = snapshots.iter().filter(|sample| sample.resident).count();
             worker.page_lifecycle.set_checkpoint_journal(shard, journal);
-            for (block, snapshot, _, pages, summary, _) in snapshots {
-                block.inner.lock().unwrap().checkpointed_revision = snapshot.revision;
-                for page in pages {
-                    page.commit();
-                }
-                summary.commit();
+            for sample in snapshots {
+                sample.commit();
             }
             worker.page_lifecycle.checkpoint_finished(shard, membership);
-            Ok((count, bytes))
+            count
         })
         .await
-        .expect("access checkpoint completion panicked")
+        .expect("access checkpoint completion panicked");
+        Ok((count, bytes))
+    }
+
+    fn prepare_checkpoint(
+        &self,
+        shard: usize,
+        remaining: usize,
+        inventory: &mut Option<CheckpointInventory>,
+    ) -> anyhow::Result<Option<PreparedCheckpoint>> {
+        let life = &self.page_lifecycle;
+        let (mut ceiling, mut membership, dirty) = life.checkpoint_start(shard);
+        let (journal, removed) = life.checkpoint_journal(shard, membership);
+        let full = dirty && journal.compact();
+        if full && inventory.is_none() {
+            *inventory = Some(CheckpointInventory::gather(life, shard, remaining));
+        }
+        // Retire this shard's slots on its turn, including clean and delta ticks.
+        let slots = inventory
+            .as_mut()
+            .map(|inventory| inventory.take_shard(shard));
+        if !dirty {
+            return Ok(None);
+        }
+        let slots = if full {
+            slots.unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if full {
+            // The inventory can predate this gate by many ticks. Capture
+            // the shard cut after gathering it, under directory -> shard order.
+            (ceiling, membership, _) = life.checkpoint_start(shard);
+        }
+        let mut retry = journal;
+        retry.full = true;
+        life.set_checkpoint_journal(shard, retry);
+        let mut snapshots = Vec::new();
+        let mut size = 24;
+        let mut sample_slot = |slot| -> anyhow::Result<()> {
+            if let Some(snapshot) = life.checkpoint_snapshot(
+                shard,
+                slot,
+                full,
+                membership,
+                &self.page_clock,
+                &mut size,
+            )? {
+                snapshots.push(snapshot);
+            }
+            Ok(())
+        };
+        for &slot in &slots {
+            sample_slot(slot as usize)?;
+        }
+        // New paged members publish existing dirty bits. A bit persists until
+        // a sample consumes it or removal records a tombstone. Any pre-cut
+        // member the inventory missed is therefore found by this same walk
+        // used for deltas. Inventory slots have already had their sample.
+        let mut cursor = 0;
+        while cursor < ceiling {
+            for slot in life.checkpoint_dirty_slots(shard, &mut cursor, ceiling) {
+                if slots.binary_search(&(slot as u32)).is_err() {
+                    sample_slot(slot)?;
+                }
+            }
+        }
+        if full {
+            PageSnapshot::keep_latest(&mut snapshots);
+        }
+        let paged = self.paged.as_ref().expect("paged TTI");
+        let dir = paged.root().join(format!("{shard:02x}"));
+        if !dir.exists() && snapshots.iter().all(|sample| !sample.resident) {
+            for sample in snapshots {
+                sample.commit();
+            }
+            life.checkpoint_finished(shard, membership);
+            return Ok(None);
+        }
+        let bytes = if full {
+            crate::page_access_shard::encode(
+                paged.page_size(),
+                snapshots
+                    .iter()
+                    .filter(|sample| sample.resident)
+                    .map(|sample| (sample.block.view(), &sample.snapshot)),
+            )?
+        } else {
+            let empty = AccessSnapshot {
+                revision: 0,
+                sampled_at: self.page_clock.now(),
+                records: Vec::new(),
+            };
+            crate::page_access_shard::encode_delta(
+                paged.page_size(),
+                removed.iter().map(|id| (id.view(), &empty, true)).chain(
+                    snapshots
+                        .iter()
+                        .map(|sample| (sample.block.view(), &sample.snapshot, sample.replace)),
+                ),
+            )?
+        };
+        Ok(Some(PreparedCheckpoint {
+            membership,
+            snapshots,
+            journal,
+            full,
+            bytes,
+        }))
     }
 
     async fn refresh_checkpoint_metrics(&self) {
@@ -882,6 +938,16 @@ impl WorkerRuntime {
         self.page_gc_metrics.dirty_blocks.set(remaining as f64);
         self.page_gc_metrics.dirty_age.set(oldest as f64 / 1000.0);
     }
+}
+
+fn ownership_authorized(
+    current: Option<&super::MembershipSnapshot>,
+    expected: &super::MembershipSnapshot,
+) -> bool {
+    let now = Instant::now();
+    now < expected.valid_until
+        && current
+            .is_some_and(|view| view.generation == expected.generation && now < view.valid_until)
 }
 
 pub(crate) async fn before_deadline<F: std::future::Future>(
@@ -949,7 +1015,7 @@ mod tests {
             .unwrap()
             .with_catalog(catalog.clone(), path.into())
             .with_root_lock(lock.clone());
-        let worker = WorkerRuntime::new(
+        let worker = WorkerRuntime::new_with_l1(
             WholeBlockStore::open_with_catalog(
                 &scope,
                 Arc::new(crate::fd_cache::FdCache::new(
@@ -958,14 +1024,16 @@ mod tests {
                 catalog.clone(),
             )
             .unwrap(),
-            Arc::new(BlockIndex::new()),
+            Some(paged),
+            Arc::new(catalog.index(config.l2_page_size_bytes as u32)),
             Arc::new(InFlightLoads::new()),
             Arc::new(UnusedOrigin),
             config.block_size,
             config.capacity_bytes,
+            0,
+            0,
             WorkerMetrics::new(config.capacity_bytes),
         )
-        .with_paged_store(paged)
         .with_page_gc(PageGcConfig::from(&config))
         .unwrap();
         (worker, catalog, config)
@@ -1071,7 +1139,10 @@ mod tests {
             worker.store.get_range_bytes_at(&id, Some(old), 0, 16).await,
             Err(talon_core::Error::NotFound(_))
         ));
-        worker.forget_missing_l2_parent(&id, Some(old)).await;
+        worker
+            .forget_missing_l2_parent(&id, Some(old))
+            .await
+            .unwrap();
         assert_eq!(
             worker
                 .cached_block_range(&id, 0, 16)
@@ -1081,6 +1152,198 @@ mod tests {
             Bytes::from_static(&[2; 16])
         );
         assert_eq!(worker.lru.block_candidates(&id).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn delayed_whole_miss_keeps_same_address_repair_after_reopen() {
+        let root = tempfile::tempdir().unwrap();
+        let id = block();
+        let repaired = Bytes::from_static(&[2; 16]);
+        let (worker, catalog, _) = runtime(root.path());
+        let request = CachedBlockPutRequest {
+            block: id.clone(),
+            object_len: 16,
+            body_len: 16,
+        };
+        worker
+            .admit_cached_block(&request, Bytes::from_static(&[1; 16]))
+            .await
+            .unwrap();
+        let address = catalog.disk_id("whole", &id).unwrap().unwrap();
+        std::fs::remove_file(address.path(&worker.store.root().join("whole"), "blk")).unwrap();
+        assert!(matches!(
+            worker
+                .store
+                .get_range_bytes_at(&id, Some(address), 0, 16)
+                .await,
+            Err(talon_core::Error::NotFound(_))
+        ));
+
+        // Run the repair between the observed miss and its delayed cleanup.
+        worker
+            .admit_cached_block(&request, repaired.clone())
+            .await
+            .unwrap();
+        assert_eq!(catalog.disk_id("whole", &id).unwrap(), Some(address));
+        worker
+            .forget_missing_l2_parent(&id, Some(address))
+            .await
+            .unwrap();
+        assert_eq!(catalog.disk_id("whole", &id).unwrap(), Some(address));
+        assert_eq!(
+            worker.cached_block_range(&id, 0, 16).await.unwrap(),
+            Some(repaired.clone())
+        );
+        drop(worker);
+        drop(catalog);
+
+        let (worker, catalog, _) = runtime(root.path());
+        assert_eq!(catalog.disk_id("whole", &id).unwrap(), Some(address));
+        assert_eq!(
+            worker.cached_block_range(&id, 0, 16).await.unwrap(),
+            Some(repaired)
+        );
+    }
+
+    #[tokio::test]
+    async fn whole_miss_recheck_propagates_lookup_error() {
+        let root = tempfile::tempdir().unwrap();
+        let (worker, catalog, _) = runtime(root.path());
+        let id = block();
+        worker
+            .commit_cached_block(&id, Bytes::from_static(&[1; 16]))
+            .await
+            .unwrap();
+        let address = catalog.disk_id("whole", &id).unwrap().unwrap();
+        let path = address.path(&worker.store.root().join("whole"), "blk");
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&path, &path).unwrap();
+
+        let error = worker
+            .forget_missing_l2_parent(&id, Some(address))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, talon_core::Error::Io(e) if e.raw_os_error() == Some(libc::ELOOP)));
+        assert_eq!(catalog.disk_id("whole", &id).unwrap(), Some(address));
+        assert_eq!(worker.lru.block_candidates(&id).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn missing_whole_file_retires_shared_catalog_and_policy() {
+        let root = tempfile::tempdir().unwrap();
+        let (worker, catalog, _) = runtime(root.path());
+        let id = block();
+        worker
+            .commit_cached_block(&id, Bytes::from_static(&[1; 16]))
+            .await
+            .unwrap();
+
+        let disk_id = catalog.disk_id("whole", &id).unwrap().unwrap();
+        std::fs::remove_file(disk_id.path(&worker.store.root().join("whole"), "blk")).unwrap();
+
+        assert!(worker
+            .cached_block_range(&id, 0, 16)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(catalog.recover("whole").unwrap().unwrap().is_empty());
+        assert!(worker.index.is_empty());
+        assert_eq!(worker.lru.total_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn journaled_pages_checkpoint_and_restore_with_tti_disabled() {
+        let root = tempfile::tempdir().unwrap();
+        let id = block();
+        let data = Bytes::from_static(b"data");
+        let (worker, catalog, _) = runtime(root.path());
+        assert_eq!(worker.current_tti_ms(), 0);
+        let now = worker.page_clock.now() - 2;
+        worker.page_clock.set(now);
+        worker
+            .commit_fetched_page(&id, PageIndex(0), 16, data.clone())
+            .await
+            .unwrap();
+        worker
+            .commit_fetched_page(&id, PageIndex(2), 16, data.clone())
+            .await
+            .unwrap();
+        worker.page_clock.set(now + 1);
+        assert_eq!(
+            worker.cached_page(&id, PageIndex(2), 16).await.unwrap(),
+            Some(data)
+        );
+        let state = worker.page_lifecycle.block(&id);
+        assert_eq!(state.last_access(0), Some(now));
+        assert_eq!(state.last_access(2), Some(now + 1));
+        assert_eq!(worker.checkpoint_access_times().await.blocks, 1);
+        worker.drain_page_mutations().await;
+        drop(state);
+        drop(worker);
+        drop(catalog);
+
+        let (worker, _, _) = runtime(root.path());
+        let state = worker.page_lifecycle.block(&id);
+        assert_eq!(state.last_access(0), Some(now));
+        assert_eq!(state.last_access(2), Some(now + 1));
+        let candidate = state.candidate(PageIndex(0)).unwrap();
+        assert!(worker.evict_page_candidate(candidate, 2).await.is_some());
+        assert_eq!(worker.checkpoint_access_times().await.blocks, 1);
+        assert_eq!(state.page_keys(), vec![2]);
+        let candidate = state.candidate(PageIndex(2)).unwrap();
+        assert!(worker.evict_page_candidate(candidate, 2).await.is_some());
+        worker.checkpoint_access_times().await;
+        let paged = worker.paged.as_ref().unwrap();
+        let shard = crate::page_lifecycle::disk_shard(&id);
+        let dir = paged.root().join(format!("{shard:02x}"));
+        let snapshot =
+            crate::page_access_shard::load(&dir, shard, paged.page_size(), now + 1).unwrap();
+        assert!(!snapshot.records.contains_key(&id));
+        assert_eq!(worker.page_lifecycle.dirty_summary(), (0, None));
+    }
+
+    #[tokio::test]
+    async fn page_capacity_rechecks_ticket_after_waiting_for_mutation_gate() {
+        use futures::FutureExt;
+        let root = tempfile::tempdir().unwrap();
+        let (worker, _, _) = runtime(root.path());
+        let id = block();
+        let page = PageIndex(0);
+        worker
+            .commit_fetched_page(&id, page, 16, Bytes::from_static(b"data"))
+            .await
+            .unwrap();
+        let bytes = worker.lru.total_bytes();
+        assert!(bytes > 0);
+        let state = worker.page_lifecycle.block(&id);
+        let guard = state.lock_page_fill().await;
+        let tickets = worker.lru.block_candidates(&id);
+        assert_eq!(tickets.len(), 1);
+        let unlink = tokio::spawn({
+            let worker = worker.clone();
+            async move { worker.unlink_units_to_target(tickets, 1, 0).await }
+        });
+
+        // Tokio queues later readers behind a pending writer. Once a shared
+        // acquisition stalls, the unlink has selected the page and reached its gate.
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while state.lock_page_fill().now_or_never().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("capacity unlink did not queue at the page gate");
+        let replacement = worker.lru.block_candidates(&id);
+        assert_eq!(replacement.len(), 1);
+        drop(guard);
+        unlink.await.unwrap();
+
+        assert_eq!(worker.lru.total_bytes(), bytes);
+        assert_eq!(worker.resident_bytes(), bytes);
+        assert_eq!(
+            worker.cached_page(&id, page, 16).await.unwrap(),
+            Some(Bytes::from_static(b"data"))
+        );
     }
 
     #[tokio::test]

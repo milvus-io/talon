@@ -15,6 +15,11 @@ impl SmallObjectStore {
         self.journal.model.0.read().unwrap().recency.is_some()
     }
 
+    pub(crate) fn recency_for_unlink(&self, nonblocking: bool) -> Option<bool> {
+        let catalog = crate::small_store::read_for_unlink(&self.journal.model.0, nonblocking)?;
+        Some(catalog.recency.is_some())
+    }
+
     pub(crate) fn idle_recency_candidates(
         &self,
         cursor: &mut IdleRecencyCursor,

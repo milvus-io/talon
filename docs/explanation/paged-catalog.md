@@ -151,33 +151,30 @@ the same-key gates. Transaction IDs are never reused after a checkpoint.
 The shared engine checkpoints after its configured log-byte threshold and at
 orderly Worker background shutdown. Before acknowledging writes into a new log,
 it publishes a recovery set containing the old snapshot, old log and new log.
-The adapter freezes block references and pending intents at that boundary;
-subsequent block mutations use copy-on-write. A CPU thread incrementally encodes
+At that boundary the adapter copies the store descriptors and pending intents,
+takes a reference to each 256-slot slab, and eagerly collects the Whole overlap
+table into a separate snapshot slab. Subsequent writes copy a shared slab when
+they change one of its rows. Page updates copy a shared flat array on mutation.
+For a chunked row they copy the shared chunk tree and the touched shared chunk,
+retaining references to untouched chunks. A CPU thread incrementally encodes
 snapshot records through a bounded channel while the ring continues other work.
-Freezing still builds an O(live blocks + pending intents) reference vector on the
-shared I/O thread. This avoids a deep metadata copy but can briefly pause other
-streams; it is not a claim of complete CPU isolation during checkpoint setup.
 The engine publishes the new snapshot and tail set only after synchronization,
 then deletes the exact obsolete paths recorded for cleanup. No business adapter
 implements a second checkpoint protocol.
 
-Recovery overlaps buffered frame reads with parallel checksum and payload decode,
-while applying decoded records in file order. Independent page bitmaps and index
-entries are built in parallel before the new index is published to readers.
-Startup holds exclusive index ownership, avoiding per-entry directory-lock
-contention. The index stage uses the shared journal default CPU budget. It
-respects available parallelism and defaults to at most 4 CPUs (including the
-replay caller); explicit journal options can override the default. Small inputs
-remain serial. Encoded replay bytes and pending batches
-are bounded. State application, final index membership insertion, namespace
-initialization and access-time restoration still have ordered work, so this is
-not a claim that every startup stage saturates all CPUs.
+Recovery overlaps buffered frame reads with parallel checksum and payload
+decoding while applying decoded records in file order. The journal recovery
+budget defaults to available parallelism capped at four and can be overridden
+in journal options. Encoded replay bytes and pending batches are bounded.
 
-The writer retains catalog metadata alongside the runtime index. Startup still
-discovers namespaces/scopes and restores access-time shards. Thus the guarantee
-concerns whole-block and paged block/page enumeration, not zero
-filesystem operations or zero startup work. Access timestamps remain sampled
-in `access.shard`; ordinary read hits do not write residency log records.
+After replay and intent reconciliation, the runtime index attaches to the same
+directory used by the writer. Attachment restores Whole shadows whose Paged
+rows were deleted and initializes visible residency totals. The runtime
+initializes capacity policy state on the recovered rows before serving traffic.
+For ordinary residency, CLOCK walks occupied directory slots and examines the
+resident units in each slot. Namespace and scope discovery and access-time shard
+restoration still run at startup. Access timestamps remain sampled in
+`access.shard`. Ordinary read hits do not write residency log records.
 
 Catalog deletion and recovery clean up the `disk-*.pages` directories.
 Background file cleanup still handles legacy empty directories and old temporary

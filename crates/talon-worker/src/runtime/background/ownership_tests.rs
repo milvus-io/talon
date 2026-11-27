@@ -34,9 +34,9 @@ fn fixture_config() -> WorkerConfig {
     }
 }
 
-fn open_worker(root: &std::path::Path, config: &WorkerConfig) -> Arc<WorkerRuntime> {
+fn open_worker(root: &std::path::Path, config: &WorkerConfig) -> Arc<Worker> {
     let lock = Arc::new(crate::page_access_store::CacheRootLock::acquire(root).unwrap());
-    let worker = WorkerRuntime::open_namespaces(
+    let worker = Worker::open_namespaces(
         config,
         lock,
         Arc::new(UnusedOrigin),
@@ -46,7 +46,7 @@ fn open_worker(root: &std::path::Path, config: &WorkerConfig) -> Arc<WorkerRunti
     Arc::new(worker)
 }
 
-fn publish(worker: &WorkerRuntime, b_zone: Option<&str>) {
+fn publish(worker: &Worker, b_zone: Option<&str>) {
     let discovery = WorkerDiscovery::retained(
         &MemberRegistry {
             members: vec![
@@ -122,13 +122,13 @@ async fn two_protected_namespaces_respect_retry_deadlines() {
     let mut foreign = packed_blocks("b");
     let misplaced = foreign.next().unwrap();
     let blocker = foreign.next().unwrap();
-    for namespace in [&worker, &other] {
+    for namespace in [worker.default_runtime(), &other] {
         fill(namespace, &misplaced).await;
     }
     // Delay completion of the second scan to stagger the two retry deadlines.
     fill(&other, &blocker).await;
     let state = other.page_lifecycle.block(&blocker);
-    let gate = state.gate.lock().await;
+    let gate = state.lock().await;
     let first_pin = worker
         .lru
         .pin_guard(crate::CacheUnit::Whole(misplaced.clone()))

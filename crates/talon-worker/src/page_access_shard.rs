@@ -119,14 +119,14 @@ pub(crate) async fn checkpoint<'a>(
 
 pub(crate) fn encode<'a>(
     page_size: u32,
-    records: impl Iterator<Item = (&'a BlockId, &'a AccessSnapshot)>,
+    records: impl Iterator<Item = (impl serde::Serialize, &'a AccessSnapshot)>,
 ) -> anyhow::Result<Vec<u8>> {
     let mut bytes = Vec::from(*MAGIC);
     bytes.extend_from_slice(&page_size.to_le_bytes());
     bytes.extend_from_slice(&0_u32.to_le_bytes());
     let mut count = 0_u32;
     for (id, snapshot) in records {
-        let record = PageAccessStore::encode(id, page_size, snapshot)?;
+        let record = PageAccessStore::encode(&id, page_size, snapshot)?;
         anyhow::ensure!(
             bytes.len() + record.len() + 12 <= MAX_BYTES,
             "access shard exceeds 64 MiB limit"

@@ -4,10 +4,32 @@ struct Pending<M: Machine> {
     request: Request<M>,
     lsn: u64,
 }
-struct Durable {
-    reply: AppliedReply,
+struct Durable<M: Machine> {
+    reply: DurableReply<M>,
     _permits: Permits,
 }
+enum DurableReply<M: Machine> {
+    Applied(AppliedReply),
+    Unapplied {
+        record: M::Record,
+        lsn: Lsn,
+        reply: AppendReply<M>,
+    },
+}
+
+fn apply<M: Machine>(
+    machine: &mut M,
+    lsn: Lsn,
+    record: M::Record,
+    reply: AppendReply<M>,
+) -> io::Result<AppliedReply> {
+    machine.apply(lsn, record)?;
+    Ok(match reply {
+        AppendReply::Sequence(done) => AppliedReply::Sequence(done, lsn),
+        AppendReply::Project(prepare) => AppliedReply::Project(prepare(machine, lsn)),
+    })
+}
+
 enum AppliedReply {
     Sequence(oneshot::Sender<Lsn>, Lsn),
     Project(Publish),
@@ -22,7 +44,7 @@ impl AppliedReply {
         }
     }
 }
-type SyncBatch = LocalBoxFuture<'static, (Vec<Durable>, io::Result<()>)>;
+type SyncBatch<M> = LocalBoxFuture<'static, (Vec<Durable<M>>, io::Result<()>)>;
 type WriteBatch<M> = LocalBoxFuture<'static, (Vec<Pending<M>>, io::Result<()>)>;
 
 pub(crate) async fn run<M: Machine>(
@@ -34,7 +56,7 @@ pub(crate) async fn run<M: Machine>(
     snapshot_slots: Arc<Semaphore>,
 ) -> io::Result<()> {
     let mut write: Option<WriteBatch<M>> = None;
-    let mut sync: Option<SyncBatch> = None;
+    let mut sync: Option<SyncBatch<M>> = None;
     let mut durable = Vec::new();
     let mut barrier: Option<Request<M>> = None;
     let mut checkpoint: Option<LocalBoxFuture<'static, io::Result<disk::Snapshot>>> = None;
@@ -75,7 +97,13 @@ pub(crate) async fn run<M: Machine>(
             tokio::select! {
                 result=async {sync.as_mut().unwrap().await}, if sync.is_some()=>{
                     sync=None;let (requests,result)=result;result?;
-                    for pending in requests {pending.reply.send();}
+                    for pending in requests {
+                        let reply = match pending.reply {
+                            DurableReply::Applied(reply) => reply,
+                            DurableReply::Unapplied { record, lsn, reply } => apply(&mut machine, lsn, record, reply)?,
+                        };
+                        reply.send();
+                    }
                 }
                 result=async {checkpoint.as_mut().unwrap().await}, if checkpoint.is_some()=>{
                     checkpoint=None;disk.publish_snapshot(result?).await?;
@@ -87,16 +115,21 @@ pub(crate) async fn run<M: Machine>(
                     for pending in requests {
                         let Request{command,_permits}=pending.request;
                         if let Command::Append{record,bytes,ack,reply}=command {
-                            machine.apply(pending.lsn,record)?;disk.lsn=pending.lsn;
-                            let reply = match reply {
-                                AppendReply::Sequence(done) => AppliedReply::Sequence(done, pending.lsn),
-                                AppendReply::Project(prepare) => AppliedReply::Project(prepare(&machine, pending.lsn)),
-                            };
-                            if ack==Ack::Durable {
-                                // The applied record is no longer needed. Keep its
-                                // admission and acknowledgement until the covering sync.
-                                durable.push(Durable{reply,_permits});
-                            } else {reply.send();}
+                            let lsn = pending.lsn;
+                            if M::APPLY_AFTER_SYNC {
+                                durable.push(Durable {
+                                    reply: DurableReply::Unapplied { record, lsn, reply },
+                                    _permits,
+                                });
+                            } else {
+                                let reply = apply(&mut machine, lsn, record, reply)?;
+                                if ack == Ack::Durable {
+                                    durable.push(Durable { reply: DurableReply::Applied(reply), _permits });
+                                } else {
+                                    reply.send();
+                                }
+                            }
+                            disk.lsn = lsn;
                             drop(bytes);
                         }
                     }
