@@ -191,6 +191,10 @@ pub(super) async fn sync(fd: Arc<OwnedFd>) -> io::Result<()> {
     blocking(move || std::fs::File::from(fd.try_clone()?).sync_all()).await
 }
 
+pub(super) async fn truncate(fd: Arc<OwnedFd>, len: u64) -> io::Result<()> {
+    blocking(move || std::fs::File::from(fd.try_clone()?).set_len(len)).await
+}
+
 pub(super) async fn allocated(fd: Arc<OwnedFd>) -> io::Result<u64> {
     use std::os::unix::fs::MetadataExt;
     if talon_uring::on_ring() {

@@ -652,6 +652,35 @@ impl SmallObjectStore {
         self.maintain_with_budget(checkpoint, None).await
     }
 
+    pub(crate) fn stop_checkpoints(&self) {
+        self.journal.stop_checkpoints();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_journal_maintenance(&self, budget: Arc<dyn talon_journal::Maintenance>) {
+        self.journal.set_budget(budget);
+    }
+
+    pub(crate) async fn seal_for_shutdown(
+        self: &Arc<Self>,
+        budget: Option<Arc<crate::background::BackgroundBudget>>,
+    ) -> io::Result<()> {
+        self.stop_checkpoints();
+        let store = self.clone();
+        self.tasks
+            .run(async move {
+                for stream in store.streams() {
+                    let _io = match &budget {
+                        Some(budget) => Some(budget.io().await),
+                        None => None,
+                    };
+                    stream.checkpoint().await?;
+                }
+                Ok(())
+            })
+            .await
+    }
+
     pub(crate) async fn maintain_with_budget(
         self: &Arc<Self>,
         checkpoint: bool,

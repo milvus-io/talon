@@ -142,6 +142,140 @@ fn set_compact_age(store: &SmallObjectStore, key: &BlockId, age: u64) {
 }
 
 #[tokio::test]
+async fn compact_access_does_not_persist_ages_for_unacknowledged_addresses() {
+    let dir = tempfile::tempdir().unwrap();
+    let wal = dir.path().join("metadata/journal.00000000000000000001");
+    let key = id(1);
+    let cold = access_millis() - 30_000;
+    let (lost_address, durable_wal_len) = {
+        let (store, _) = open_compact(dir.path());
+        let durable_wal_len = std::fs::metadata(&wal).unwrap().len();
+        store.put(&key, Bytes::from_static(b"old")).await.unwrap();
+        let loc = store.lookup_entry(&key).unwrap().unwrap();
+        set_compact_age(&store, &key, cold);
+        // Model application precedes the durable ack. Simulate that window.
+        store
+            .journal
+            .append(
+                journal::Event::Flush {
+                    segment: loc.segment,
+                    durable_end: loc.offset + loc.stored_len(),
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        flush(&store).await;
+        assert_eq!(
+            std::fs::metadata(dir.path().join(FILE)).unwrap().len(),
+            HEADER + 12
+        );
+        store.track_access(&key).unwrap();
+        flush(&store).await;
+        assert!(compact::read_log(dir.path()).is_empty());
+        ((loc.segment, loc.offset), durable_wal_len)
+    };
+
+    talon_journal::JournalService::wait_for_retiring(dir.path()).unwrap();
+    // Model power loss of both the WAL tail and the new payload directory
+    // entries, while the independently synced access files survive.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&wal)
+        .unwrap()
+        .set_len(durable_wal_len)
+        .unwrap();
+    for shard in std::fs::read_dir(dir.path().join("data")).unwrap() {
+        std::fs::remove_dir_all(shard.unwrap().path()).unwrap();
+    }
+    let replacement = id(2);
+    {
+        let (store, _) = open_compact(dir.path());
+        assert!(!store.contains(&key));
+        store
+            .put(&replacement, Bytes::from_static(b"new"))
+            .await
+            .unwrap();
+        let loc = store.lookup_entry(&replacement).unwrap().unwrap();
+        assert_eq!((loc.segment, loc.offset), lost_address);
+        store.maintain(true).await.unwrap();
+    }
+    let (store, _) = open_compact(dir.path());
+    assert!(compact_age(&store, &replacement) > cold);
+}
+
+#[tokio::test]
+async fn compact_access_relocation_keeps_durable_ages_through_log_repair_or_failure() {
+    use std::io::Write;
+
+    for scenario in ["torn", "missing", "stale", "open-failure", "sync-failure"] {
+        let dir = tempfile::tempdir().unwrap();
+        let key = id(3);
+        let cold = access_millis() - 30_000;
+        let log = dir.path().join(LOG);
+        let source;
+        {
+            let (store, policy) = open_compact(dir.path());
+            for n in 0..6 {
+                store
+                    .put(&id(n), Bytes::from(vec![n as u8; 48 << 10]))
+                    .await
+                    .unwrap();
+            }
+            store.maintain(true).await.unwrap();
+            source = store.lookup_entry(&key).unwrap().unwrap().segment;
+            set_compact_age(&store, &key, cold);
+            flush(&store).await;
+            for n in 0..3 {
+                store.delete(&id(n)).await.unwrap();
+                policy.remove(&CacheUnit::Whole(id(n)));
+            }
+        }
+        match scenario {
+            "torn" => std::fs::OpenOptions::new()
+                .append(true)
+                .open(&log)
+                .unwrap()
+                .write_all(&[1, 2])
+                .unwrap(),
+            "missing" => std::fs::remove_file(&log).unwrap(),
+            "stale" => {
+                let mut bytes = std::fs::read(&log).unwrap();
+                bytes[8..16].copy_from_slice(&99u64.to_le_bytes());
+                std::fs::write(&log, bytes).unwrap();
+            }
+            _ => {}
+        }
+        let (store, _) = open_compact(dir.path());
+        assert_eq!(compact_age(&store, &key), cold, "{scenario}");
+        if scenario == "open-failure" || scenario == "sync-failure" {
+            let saved = log.with_extension("saved");
+            if scenario == "open-failure" {
+                std::fs::rename(&log, &saved).unwrap();
+            } else {
+                store
+                    .journal
+                    .control
+                    .fail_access_sync
+                    .store(true, Ordering::Relaxed);
+            }
+            assert!(!store.maintain(false).await.unwrap(), "{scenario}");
+            assert_eq!(store.lookup_entry(&key).unwrap().unwrap().segment, source);
+            if scenario == "open-failure" {
+                std::fs::rename(saved, &log).unwrap();
+            }
+        }
+        assert!(store.maintain(false).await.unwrap(), "{scenario}");
+        assert_ne!(store.lookup_entry(&key).unwrap().unwrap().segment, source);
+        drop(store);
+
+        // No access checkpoint between durable Replace and reopen.
+        let (reopened, _) = open_compact(dir.path());
+        assert_eq!(compact_age(&reopened, &key), cold, "{scenario}");
+    }
+}
+
+#[tokio::test]
 async fn compact_access_ignores_removed_addresses_and_merges_valid_log_prefix() {
     use std::io::Write;
 
@@ -554,6 +688,7 @@ async fn compact_delta_visits_only_dirty_rows_after_row_compaction() {
             .await
             .unwrap();
     }
+    store.streams()[0].flush().await.unwrap();
     flush(&store).await;
 
     let pending = || {

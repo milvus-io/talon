@@ -919,6 +919,70 @@ async fn small_tti_hit_is_checkpointed_and_bad_snapshot_does_not_drop_data() {
 }
 
 #[tokio::test]
+async fn worker_shutdown_cancels_small_journal_snapshot_before_sealing_tail() {
+    #[derive(Default)]
+    struct ThrottledSnapshot(tokio::sync::Notify);
+
+    impl talon_journal::Maintenance for ThrottledSnapshot {
+        fn bytes(&self, _: usize) -> futures::future::LocalBoxFuture<'_, ()> {
+            Box::pin(async {
+                self.0.notify_one();
+                std::future::pending().await
+            })
+        }
+        fn io(&self) -> futures::future::LocalBoxFuture<'_, Box<dyn Send>> {
+            Box::pin(async { Box::new(()) as Box<dyn Send> })
+        }
+        fn delete(&self) -> futures::future::LocalBoxFuture<'_, ()> {
+            Box::pin(async {})
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let (_, w) = runtime(dir.path(), false, false);
+    let w = Arc::new(w);
+    w.write_object(&object(), data()).await.unwrap();
+    let small = w.small.as_ref().unwrap().clone();
+    let throttle = Arc::new(ThrottledSnapshot::default());
+    small.set_journal_maintenance(throttle.clone());
+    let checkpoint = tokio::spawn({
+        let small = small.clone();
+        async move { small.maintain(true).await }
+    });
+    tokio::time::timeout(Duration::from_secs(3), throttle.0.notified())
+        .await
+        .unwrap();
+    let mut tail = id(&w);
+    tail.object.object_path = "tail".into();
+    small.put(&tail, data()).await.unwrap();
+    let service = WorkerBackground::start(
+        Worker::standalone(w.clone()),
+        &WorkerConfig {
+            stale_gc_enabled: false,
+            ownership_gc_enabled: false,
+            async_eviction_enabled: false,
+            background_io_max_mb_per_sec: 0,
+            ..Default::default()
+        },
+    );
+    tokio::time::timeout(Duration::from_secs(3), service.shutdown())
+        .await
+        .unwrap();
+    assert_eq!(
+        checkpoint.await.unwrap().unwrap_err().kind(),
+        std::io::ErrorKind::Interrupted
+    );
+    assert!(small.contains(&tail));
+    drop(small);
+    drop(w);
+    let (_, reopened) = runtime(dir.path(), false, false);
+    assert_eq!(
+        reopened.small.as_ref().unwrap().read(&tail).await.unwrap(),
+        Some(data())
+    );
+}
+
+#[tokio::test]
 async fn small_tti_background_and_shutdown_checkpoint_without_paged_cache() {
     for tti_ms in [0, 3_600_000] {
         let dir = tempfile::tempdir().unwrap();

@@ -77,6 +77,7 @@ pub(super) struct DiskState {
     generation: u64,
     snapshot_bytes: u64,
     log_bytes: u64,
+    log_truncate: bool,
     full: bool,
 }
 impl Default for DiskState {
@@ -85,6 +86,7 @@ impl Default for DiskState {
             generation: 0,
             snapshot_bytes: 0,
             log_bytes: 0,
+            log_truncate: false,
             full: true,
         }
     }

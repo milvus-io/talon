@@ -439,6 +439,32 @@ async fn crash_child() {
         crash(&stage);
         unreachable!();
     }
+    if stage == "reused_snapshot_current" {
+        let budget = Arc::new(BlockSnapshotBytes::default());
+        a.set_maintenance(budget.clone());
+        let checkpoint = tokio::spawn({
+            let a = a.clone();
+            async move { a.checkpoint().await }
+        });
+        budget.0.notified().await;
+        a.append((2, 2), Ack::Durable).await.unwrap();
+        a.stop_checkpoints();
+        checkpoint.await.unwrap().unwrap_err();
+        drop(a);
+        let a = stream(&s, "a");
+        let pause = Arc::new(Pause::default());
+        *a.inner.control.snapshot_finalize_pause.lock().unwrap() = Some(pause.clone());
+        let checkpoint = tokio::spawn({
+            let a = a.clone();
+            async move { a.checkpoint().await }
+        });
+        pause.entered.notified().await;
+        a.append((1, 0), Ack::Durable).await.unwrap();
+        std::env::set_var("TALON_JOURNAL_CRASH_STAGE", "snapshot_current");
+        pause.resume.notify_one();
+        checkpoint.await.unwrap().unwrap();
+        unreachable!();
+    }
     a.checkpoint().await.unwrap();
     a.append((2, 2), Ack::Durable).await.unwrap();
     a.append((1, 0), Ack::Durable).await.unwrap();
@@ -452,6 +478,7 @@ fn process_loss_at_write_and_checkpoint_boundaries() {
         "rotate",
         "snapshot_file",
         "snapshot_current",
+        "reused_snapshot_current",
         "cleanup",
     ] {
         let dir = tempfile::tempdir().unwrap();
@@ -581,6 +608,152 @@ async fn shutdown_cancels_throttled_snapshot_and_replays_both_logs() {
         a.query(|m| Ok(m.0.clone())).await.unwrap(),
         BTreeMap::from([(1, 11), (2, 22), (3, 33)])
     );
+}
+
+#[tokio::test]
+async fn repeated_cancel_and_reopen_reuse_the_rotation_and_publish_the_next_cut() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("a");
+    for n in 1..=70 {
+        let s = service(dir.path());
+        let budget = Arc::new(BlockSnapshotBytes::default());
+        let a = s
+            .open_stream_with_maintenance(
+                "a".into(),
+                State::default(),
+                StreamOptions::default(),
+                Some(budget.clone()),
+            )
+            .unwrap();
+        assert_eq!(
+            a.append((2 * n - 1, n), Ack::Durable).await.unwrap(),
+            2 * n - 1
+        );
+        let checkpoint = tokio::spawn({
+            let a = a.clone();
+            async move { a.checkpoint().await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), budget.0.notified())
+            .await
+            .unwrap();
+        assert_eq!(a.append((2 * n, n), Ack::Written).await.unwrap(), 2 * n);
+        a.stop_checkpoints();
+        assert_eq!(
+            checkpoint.await.unwrap().unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        drop(a);
+        drop(s);
+        JournalService::wait_for_retiring(dir.path()).unwrap();
+        assert!(!root.join("journal.00000000000000000003").exists());
+    }
+    let s = service(dir.path());
+    let a = stream(&s, "a");
+    let pause = Arc::new(Pause::default());
+    *a.inner.control.snapshot_finalize_pause.lock().unwrap() = Some(pause.clone());
+    let checkpoint = tokio::spawn({
+        let a = a.clone();
+        async move { a.checkpoint().await }
+    });
+    tokio::time::timeout(Duration::from_secs(2), pause.entered.notified())
+        .await
+        .unwrap();
+    assert_eq!(a.append((141, 141), Ack::Written).await.unwrap(), 141);
+    pause.resume.notify_one();
+    checkpoint.await.unwrap().unwrap();
+    assert!(!root.join("journal.00000000000000000001").exists());
+    drop(a);
+    drop(s);
+    JournalService::wait_for_retiring(dir.path()).unwrap();
+    let s = service(dir.path());
+    let applied = Arc::new(AtomicUsize::new(0));
+    let a = s
+        .open_stream(
+            "a".into(),
+            TestState::<false>(BTreeMap::new(), Some(applied.clone())),
+            StreamOptions::default(),
+        )
+        .unwrap();
+    assert_eq!(applied.load(Ordering::Relaxed), 141);
+    assert_eq!(
+        a.query(|m| Ok(m.0.clone())).await.unwrap(),
+        (1u64..=140)
+            .map(|n| (n, n.div_ceil(2)))
+            .chain([(141, 141)])
+            .collect()
+    );
+}
+
+#[derive(Default)]
+struct BlockSnapshotDelete(tokio::sync::Notify);
+
+impl Maintenance for BlockSnapshotDelete {
+    fn bytes(&self, _: usize) -> LocalBoxFuture<'_, ()> {
+        Box::pin(async {})
+    }
+    fn io(&self) -> LocalBoxFuture<'_, Box<dyn Send>> {
+        Box::pin(async { Box::new(()) as Box<dyn Send> })
+    }
+    fn delete(&self) -> LocalBoxFuture<'_, ()> {
+        Box::pin(async {
+            self.0.notify_one();
+            std::future::pending().await
+        })
+    }
+}
+
+#[tokio::test]
+async fn shutdown_leaves_published_garbage_when_delete_is_throttled() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = service(dir.path());
+    let budget = Arc::new(BlockSnapshotDelete::default());
+    let a = s
+        .open_stream_with_maintenance(
+            "a".into(),
+            State::default(),
+            StreamOptions::default(),
+            Some(budget.clone()),
+        )
+        .unwrap();
+    a.append((1, 11), Ack::Durable).await.unwrap();
+    let checkpoint = tokio::spawn({
+        let a = a.clone();
+        async move { a.checkpoint().await }
+    });
+    tokio::time::timeout(Duration::from_secs(2), budget.0.notified())
+        .await
+        .unwrap();
+    a.stop_checkpoints();
+    checkpoint.await.unwrap().unwrap_err();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), a.append((2, 22), Ack::Durable))
+            .await
+            .unwrap()
+            .unwrap(),
+        2
+    );
+    drop(a);
+    drop(s);
+    JournalService::wait_for_retiring(dir.path()).unwrap();
+    let root = dir.path().join("a");
+    for old in [
+        "journal.00000000000000000001",
+        "snapshot.00000000000000000001",
+    ] {
+        assert!(root.join(old).exists());
+    }
+    let s = service(dir.path());
+    let a = stream(&s, "a");
+    assert_eq!(
+        a.query(|m| Ok(m.0.clone())).await.unwrap(),
+        BTreeMap::from([(1, 11), (2, 22)])
+    );
+    for old in [
+        "journal.00000000000000000001",
+        "snapshot.00000000000000000001",
+    ] {
+        assert!(!root.join(old).exists());
+    }
 }
 #[tokio::test]
 async fn queued_checkpoint_does_not_block_append_holding_snapshot_permit() {

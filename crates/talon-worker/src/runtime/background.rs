@@ -243,6 +243,11 @@ impl WorkerBackground {
     pub fn begin_shutdown(&self) {
         self.scheduler.begin_shutdown();
         self.worker.default_runtime().stop_background_heads();
+        for namespace in self.worker.namespace_runtimes() {
+            if let Some(small) = &namespace.small {
+                small.stop_checkpoints();
+            }
+        }
     }
 
     /// Stop admission, finish active maintenance and owned mutations, then flush access metadata
@@ -253,11 +258,15 @@ impl WorkerBackground {
         self.worker.drain_namespace_initializers().await;
         for namespace in self.worker.namespace_runtimes() {
             namespace.drain_page_mutations().await;
-            if let Err(error) = namespace
-                .maintain_small_budget(true, namespace.background_budget.clone())
-                .await
-            {
-                tracing::warn!(%error, "small object shutdown checkpoint failed");
+            if let Some(small) = &namespace.small {
+                // Seals make payloads replayable. WAL rotation and compaction
+                // can wait until the next run without losing those writes.
+                if let Err(error) = small
+                    .seal_for_shutdown(namespace.background_budget.clone())
+                    .await
+                {
+                    tracing::warn!(%error, "small object shutdown seal failed");
+                }
             }
             namespace.checkpoint_small_access().await;
             namespace.checkpoint_access_times().await;

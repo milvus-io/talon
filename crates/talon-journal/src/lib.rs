@@ -501,7 +501,18 @@ impl<M: Machine> Handle<M> {
         // The independent journal thread still enforces admission and ordering.
         futures::executor::block_on(tokio::task::unconstrained(self.query(query)))
     }
+    /// Cancel snapshot maintenance while permitting the final metadata appends.
+    pub fn stop_checkpoints(&self) {
+        self.inner.life.stop_checkpoints();
+    }
     pub async fn checkpoint(&self) -> io::Result<()> {
+        self.inner
+            .life
+            .until_checkpoint_stop(self.request_checkpoint())
+            .await
+            .unwrap_or_else(|| Err(io::ErrorKind::Interrupted.into()))
+    }
+    async fn request_checkpoint(&self) -> io::Result<()> {
         let permits = self.inner.service.admission.acquire(1).await?;
         let (done, wait) = oneshot::channel();
         self.send(Command::Checkpoint(done), permits).await?;

@@ -23,6 +23,7 @@ use talon_journal::{Ack, Handle, JournalService, Options, StreamOptions};
 #[derive(Default)]
 pub(super) struct TestControl {
     pub fail: std::sync::atomic::AtomicBool,
+    pub fail_access_sync: std::sync::atomic::AtomicBool,
 }
 pub(super) struct Journal {
     root: PathBuf,
@@ -201,7 +202,7 @@ impl Journal {
         Ok(allocations)
     }
     #[cfg(test)]
-    pub fn set_budget(&self, budget: Arc<crate::background::BackgroundBudget>) {
+    pub fn set_budget(&self, budget: Arc<dyn talon_journal::Maintenance>) {
         self.handle.set_maintenance(budget);
     }
     pub fn allocate(&self) -> io::Result<u64> {
@@ -239,6 +240,16 @@ impl Journal {
             )
             .await?;
         self.handle.checkpoint().await
+    }
+
+    pub(super) fn stop_checkpoints(&self) {
+        self.handle.stop_checkpoints();
+    }
+
+    pub(super) fn mark_access_durable(&self, segment: u64, end: u64) {
+        if let Some(recency) = &mut self.model.0.write().unwrap().recency {
+            recency.mark_durable(segment, end);
+        }
     }
 }
 fn data_path(root: &Path, id: u64) -> PathBuf {

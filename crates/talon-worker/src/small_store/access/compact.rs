@@ -101,11 +101,17 @@ impl SmallObjectStore {
             };
             replay_access(&mut snapshot, false, &mut apply)?;
             if let Some(mut log) = open_access(&self.root.join(LOG))? {
-                if read_header(&mut log, DELTA_MAGIC)? == state.generation {
-                    if !replay_access(&mut log, true, &mut apply)? {
-                        state.full = false;
-                        state.log_bytes = log.get_ref().metadata()?.len();
-                    }
+                if read_header(&mut log, DELTA_MAGIC).ok() == Some(state.generation) {
+                    state.log_bytes = HEADER;
+                    let result = replay_access(&mut log, true, |id, body| {
+                        apply(id, body);
+                        state.log_bytes +=
+                            (FRAME_HEADER_BYTES + GROUP_HEADER_BYTES + body.len()) as u64;
+                    });
+                    // Only complete, validated frames belong to this log. Keep
+                    // their ages even if the following frame is damaged.
+                    state.log_truncate = !matches!(result, Ok(false));
+                    state.full = state.log_truncate;
                 }
             }
             state.full |= repaired || matched < catalog.live.values().sum();
@@ -139,8 +145,8 @@ impl SmallObjectStore {
             let mut disk = self.journal.access_disk.lock().unwrap();
             let state = *disk;
             // An error after sampling dirty rows requires a fresh snapshot.
+            // Keep the previous durable log end for any intervening move.
             disk.full = true;
-            disk.log_bytes = 0;
             state
         };
         let full = state.full
@@ -160,7 +166,10 @@ impl SmallObjectStore {
         let mut fd = None;
         let mut offset = state.log_bytes;
         if full {
-            state.generation = state.generation.wrapping_add(1).max(1);
+            state.generation = state
+                .generation
+                .checked_add(1)
+                .ok_or_else(|| invalid("access generation exhausted"))?;
             let file = {
                 let _io = match budget {
                     Some(b) => Some(b.io().await),
@@ -192,9 +201,14 @@ impl SmallObjectStore {
                 let catalog = self.journal.model.0.read().unwrap();
                 let recency = catalog.recency.as_ref().unwrap();
                 let mut sample = |id, row| {
-                    if let Some(time) = recency.sample(id, row, full) {
-                        let offset = catalog.segment(id).unwrap().records.offset_at(row);
-                        batch.push(id, offset as u32, time);
+                    let segment = catalog.segment(id).unwrap();
+                    let offset = segment.records.offset_at(row);
+                    // The journal model applies events before acknowledging
+                    // fsync. Sample only the extent confirmed by that ack.
+                    if offset < recency.durable_end(id) {
+                        if let Some(time) = recency.sample(id, row, full) {
+                            batch.push(id, offset as u32, time);
+                        }
                     }
                     true
                 };
@@ -209,7 +223,13 @@ impl SmallObjectStore {
             let bytes = batch.finish();
             if !bytes.is_empty() {
                 if fd.is_none() {
-                    fd = Some(disk_io::open(self.root.join(LOG), disk_io::Open::Update).await?);
+                    self.journal.access_disk.lock().unwrap().log_truncate = true;
+                    let _io = match budget {
+                        Some(b) => Some(b.io().await),
+                        None => None,
+                    };
+                    fd = Some(open_log_for_append(&self.root, &mut state).await?);
+                    offset = state.log_bytes;
                 }
                 let len = bytes.len() as u64;
                 self.write_access_chunks(fd.as_ref().unwrap(), bytes.into(), offset, budget)
@@ -232,11 +252,25 @@ impl SmallObjectStore {
             }
             self.sync_access(fd, budget).await?;
             if full {
-                self.rename_access(tmp, FILE, budget).await?;
-                self.publish_access(LOG, header(DELTA_MAGIC, state.generation).into(), budget)
-                    .await?;
+                if let Some(b) = budget {
+                    b.bytes(HEADER as usize).await;
+                }
+                let _io = match budget {
+                    Some(b) => Some(b.io().await),
+                    None => None,
+                };
+                disk_io::rename(tmp, self.root.join(FILE)).await?;
                 state.snapshot_bytes = offset;
-                state.log_bytes = HEADER;
+                state.log_bytes = 0;
+                state.log_truncate = false;
+                // After rename a failure must leave the new generation in
+                // memory. The log opener syncs the rename before replacing
+                // the old log, so either snapshot remains crash-recoverable.
+                *self.journal.access_disk.lock().unwrap() = DiskState {
+                    full: true,
+                    ..state
+                };
+                open_log_for_append(&self.root, &mut state).await?;
             } else {
                 state.log_bytes = offset;
             }
@@ -258,6 +292,32 @@ fn open_access(path: &std::path::Path) -> io::Result<Option<BufReader<std::fs::F
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
+}
+
+async fn open_log_for_append(
+    root: &std::path::Path,
+    state: &mut DiskState,
+) -> io::Result<Arc<OwnedFd>> {
+    let path = root.join(LOG);
+    if state.log_bytes == 0 {
+        // A previous checkpoint may have stopped after renaming its snapshot.
+        // Commit the directory entry before overwriting a superseded log.
+        disk_io::sync_dir(root.to_owned()).await?;
+        let temp = root.join("access.log.tmp");
+        let fd = disk_io::open(temp.clone(), disk_io::Open::Replace).await?;
+        disk_io::write(fd.clone(), header(DELTA_MAGIC, state.generation).into(), 0).await?;
+        disk_io::sync(fd.clone()).await?;
+        disk_io::rename(temp, path).await?;
+        disk_io::sync_dir(root.to_owned()).await?;
+        state.log_bytes = HEADER;
+        return Ok(fd);
+    }
+    let fd = disk_io::open(path, disk_io::Open::Update).await?;
+    if state.log_truncate {
+        disk_io::truncate(fd.clone(), state.log_bytes).await?;
+        state.log_truncate = false;
+    }
+    Ok(fd)
 }
 
 fn read_header(reader: &mut impl Read, magic: &[u8; 8]) -> io::Result<u64> {
@@ -415,66 +475,79 @@ fn replay_access(
     }
 }
 
-// Called with the relocation gate and the compaction I/O permit held. An
-// unpublished destination remains invisible during replay if Replace fails.
+// Called after syncing the destination data and directory, with the relocation
+// gate and I/O permit held but outside the foreground publication locks. A
+// failed Replace leaves the source visible. The destination stays invisible
+// and its durable file or WAL record prevents allocator reuse after a crash.
 pub(in crate::small_store) async fn persist_relocation(
     journal: &journal::Journal,
     old: u64,
     copy: &StagedSegment,
-) {
-    if journal.model.0.read().unwrap().recency.is_none() {
-        return;
-    }
+) -> io::Result<()> {
     let _writer = journal.access_log_write.lock().await;
-    let mut state = *journal.access_disk.lock().unwrap();
-    if state.log_bytes < HEADER {
-        return;
-    }
-    let result = async {
+    let mut state = {
+        let mut disk = journal.access_disk.lock().unwrap();
+        if disk.snapshot_bytes == 0 {
+            return Ok(());
+        }
+        let state = *disk;
+        // On error a retry must discard only the attempted append.
+        disk.log_truncate = true;
+        state
+    };
+    let path = journal.access_log_path();
+    let root = path.parent().unwrap();
+    let fd = open_log_for_append(root, &mut state).await?;
+    {
         let mut translations: Vec<_> = copy
             .records
             .iter()
             .map(|(&old, record)| (old, record.new_offset))
             .collect();
         translations.sort_unstable();
-        let fd = disk_io::open(journal.access_log_path(), disk_io::Open::Update).await?;
-        let old_size = disk_io::allocated(fd.clone()).await?;
         for rows in translations.chunks(ROWS_PER_BATCH) {
             let bytes = {
                 let catalog = journal.model.0.read().unwrap();
-                let Some(recency) = &catalog.recency else {
-                    return Ok(());
-                };
+                let recency = catalog.recency.as_ref().unwrap();
                 let records = &catalog.segment(old).unwrap().records;
                 let mut batch = AgeBatch::default();
                 let mut row = 0;
                 for &(offset, new_offset) in rows {
                     row = records.position_from(row, offset);
-                    debug_assert!(records.offset_matches(row, offset));
-                    let time = recency.time(recency.value(old, row).load(Ordering::Relaxed));
-                    batch.push(copy.id, new_offset as u32, time);
-                    row += 1;
+                    // Concurrent deletes are replayed to the staged copy
+                    // before Replace, so their destination ages are irrelevant.
+                    if records.offset_matches(row, offset) {
+                        let time = recency.time(recency.value(old, row).load(Ordering::Relaxed));
+                        batch.push(copy.id, new_offset as u32, time);
+                        row += 1;
+                    }
                 }
                 batch.finish()
             };
             let len = bytes.len() as u64;
+            if len == 0 {
+                continue;
+            }
             disk_io::write(fd.clone(), bytes.into(), state.log_bytes).await?;
             state.log_bytes += len;
         }
-        let new_size = disk_io::allocated(fd.clone()).await?;
-        disk_io::sync(fd).await?;
-        journal
-            .access_bytes
-            .fetch_add(new_size.saturating_sub(old_size), Ordering::Relaxed);
-        Ok::<_, io::Error>(())
     }
-    .await;
-    if let Err(error) = result {
-        state.full = true;
-        state.log_bytes = 0;
-        tracing::warn!(%error, old, new = copy.id, "small access relocation could not persist ages");
+    #[cfg(test)]
+    if journal
+        .control
+        .fail_access_sync
+        .swap(false, Ordering::Relaxed)
+    {
+        return Err(io::Error::other("injected access relocation sync failure"));
     }
+    disk_io::sync(fd).await?;
+    let root = root.to_owned();
+    let size = tokio::task::spawn_blocking(move || allocated(&root))
+        .await
+        .map_err(io::Error::other)??;
+    journal.access_bytes.store(size, Ordering::Relaxed);
     *journal.access_disk.lock().unwrap() = state;
+    Ok(())
 }
 
 #[cfg(test)]

@@ -90,11 +90,19 @@ impl Keys {
             }
         };
         let suffix = span.get(&self.suffixes);
-        let prefix = self
-            .prefix_ids
-            .get(row)
-            .and_then(|id| self.prefixes.get(id as usize));
+        let prefix = self.prefix_id(row).map(|id| self.prefixes[id]);
         Some((prefix.map_or(&[], |p| p.get(&self.prefix_bytes)), suffix))
+    }
+
+    fn prefix_id(&self, row: usize) -> Option<usize> {
+        let sentinel = match &self.prefix_ids {
+            Indices::Narrow(_) => u32::from(u16::MAX),
+            Indices::Wide(_) => u32::MAX,
+        };
+        self.prefix_ids
+            .get(row)
+            .filter(|&id| id != sentinel)
+            .map(|id| id as usize)
     }
 
     pub fn insert(&mut self, row: usize, key: &[u8], replace: bool) -> io::Result<()> {
@@ -166,8 +174,8 @@ impl Keys {
                 next.rows
                     .push(Span::append(&mut next.suffixes, suffix).unwrap());
                 if compressed {
-                    let old = self.prefix_ids.get(row).unwrap() as usize;
-                    let id = if let Some(id) = prefix_ids.get_mut(old) {
+                    let id = if let Some(old) = self.prefix_id(row) {
+                        let id = &mut prefix_ids[old];
                         if *id == u32::MAX {
                             *id = next.prefixes.len() as u32;
                             next.prefixes
@@ -447,6 +455,36 @@ mod tests {
             assert_eq!([prefix, suffix].concat(), *key);
         }
         assert!(keys.get(expected.len()).is_none());
+    }
+
+    #[test]
+    fn narrow_snapshot_no_prefix_survives_unused_dictionary_entries_and_repacking() {
+        let mut keys = Keys::default();
+        let first = keys.append_prefix(b"used-").unwrap();
+        keys.append_snapshot_key(Some(first), b"one").unwrap();
+        for _ in 1..u16::MAX {
+            keys.append_prefix(b"unused-").unwrap();
+        }
+        let sentinel = keys.append_prefix(b"wide-").unwrap();
+        assert_eq!(sentinel, u32::from(u16::MAX));
+        keys.append_snapshot_key(None, b"two").unwrap();
+        assert!(matches!(keys.prefix_ids, Indices::Narrow(_)));
+        let expected = [b"used-one".to_vec(), b"two".to_vec()];
+        check(&keys, &expected);
+        let mut repacked = keys.clone();
+        repacked.freeze();
+        repacked.retain(|_| true);
+        check(&repacked, &expected);
+        keys.append_snapshot_key(Some(sentinel), b"three").unwrap();
+        assert!(matches!(keys.prefix_ids, Indices::Wide(_)));
+        check(
+            &keys,
+            &[
+                expected[0].clone(),
+                expected[1].clone(),
+                b"wide-three".to_vec(),
+            ],
+        );
     }
 
     #[test]

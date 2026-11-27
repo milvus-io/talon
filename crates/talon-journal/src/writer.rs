@@ -68,7 +68,7 @@ pub(crate) async fn run<M: Machine>(
     let result=async {
         loop {
             if failed.load(Ordering::Acquire) {return Err(stopped());}
-            let checkpoint_ready = !life.is_closing() && machine.checkpoint_ready();
+            let checkpoint_ready = !life.checkpoints_stopped() && machine.checkpoint_ready();
             // Coalesce callers by snapshot cut and release queue admission.
             // Appends holding maintenance permits must remain admissible while
             // a snapshot waits for those permits; no per-caller list is retained.
@@ -91,7 +91,7 @@ pub(crate) async fn run<M: Machine>(
                     continue;
                 } else if checkpoint_ready && checkpoint.is_none() && (pending_checkpoint.is_some() || disk.offset>=disk.options.checkpoint_bytes) {
                     let snapshot=machine.snapshot()?;
-                    let generation=disk.rotate().await?;
+                    let generation=disk.snapshot_generation().await?;
                     checkpoint=Some(disk.snapshot::<M>(generation,disk.lsn,snapshot,policy.read().unwrap().clone(),snapshot_slots.clone(),life.clone()));
                     checkpoint_completion=pending_checkpoint.take();
                 }
@@ -118,6 +118,7 @@ pub(crate) async fn run<M: Machine>(
                         if let Some(completion)=checkpoint_completion.take() {completion.send_replace(true);}
                     } else {
                         drop(checkpoint_completion.take());
+                        disk.discard_snapshot().await?;
                     }
                 }
                 result=async {write.as_mut().unwrap().await}, if write.is_some()=>{
@@ -187,5 +188,5 @@ pub(crate) async fn run<M: Machine>(
         let _ = checkpoint.await;
     }
     result?;
-    disk.cancel_snapshot().await
+    Ok(())
 }

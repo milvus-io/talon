@@ -946,26 +946,26 @@ impl SegmentStore {
         let tracks_access = self.journal.model.0.read().unwrap().recency.is_some();
         if let Some(budget) = budget {
             let access_bytes = if tracks_access && !entries.is_empty() {
-                12 * entries.len() + 24 * entries.len().div_ceil(512)
+                12 * entries.len() + 24 * entries.len().div_ceil(512) + 16
             } else {
                 0
             };
             budget.bytes(cost as usize + access_bytes).await;
         }
 
-        // Full access checkpoints take this gate before I/O. Preserve that
-        // ordering so a snapshot and relocation cannot wait on each other.
+        // Keep the access generation stable from translation through Replace,
+        // including while releasing the I/O permit to reconcile tombstones.
+        // Checkpoints also acquire this gate before taking their I/O permit.
+        let access_relocation = if tracks_access {
+            Some(self.journal.access_relocation.read().await)
+        } else {
+            None
+        };
         let acquire_io = || async {
-            let access_relocation = if tracks_access {
-                Some(self.journal.access_relocation.read().await)
-            } else {
-                None
-            };
-            let io = match budget {
+            match budget {
                 Some(budget) => Some(budget.io().await),
                 None => None,
-            };
-            (access_relocation, io)
+            }
         };
         let mut io = acquire_io().await;
         let mut staged = if entries.is_empty() {
@@ -975,6 +975,29 @@ impl SegmentStore {
         };
         #[cfg(test)]
         tests::crash("compact_copy");
+
+        if let Some(copy) = staged.as_ref().filter(|_| tracks_access) {
+            if let Err(error) = access::persist_relocation(&self.journal, old, copy).await {
+                // If access persistence fails, retire just the staged copy.
+                // The live source and its previously durable ages stay put.
+                tracing::warn!(%error, old, new = copy.id, "small access relocation deferred");
+                self.state.lock().await.compaction_deletes = None;
+                self.journal
+                    .append(
+                        journal::Event::Replace {
+                            old: copy.id,
+                            new: None,
+                        },
+                        true,
+                    )
+                    .await?;
+                drop(io);
+                drop(access_relocation);
+                self.unlink_compacted_segment(copy.id, budget).await?;
+                self.cached_stats.lock().unwrap().staging_allocated = 0;
+                return Ok(false);
+            }
+        }
 
         let mut source = loop {
             #[cfg(test)]
@@ -1014,6 +1037,7 @@ impl SegmentStore {
             self.reconcile_copy(copy, deleted).await?;
         };
         drop(io);
+        drop(access_relocation);
 
         // A reader which resolved the old address must retain its fd before
         // the path goes away. Readers starting after this barrier see new locators.
@@ -1160,9 +1184,6 @@ impl SegmentStore {
             .as_ref()
             .filter(|copy| !copy.records.is_empty())
             .map(|copy| copy.id);
-        if let Some(copy) = staged.as_ref().filter(|_| replacement.is_some()) {
-            access::persist_relocation(&self.journal, old, copy).await;
-        }
         #[cfg(test)]
         tests::crash("compact_reconciled");
         self.journal
@@ -1363,6 +1384,9 @@ impl SegmentStore {
                 // Publication lock excludes delete/GC until the seal record is durable.
                 s.sealed = true;
                 s.durable_end = s.bytes;
+                if !empty {
+                    self.journal.mark_access_durable(id, s.bytes);
+                }
                 s.close_writers();
                 state.allocated = state
                     .allocated

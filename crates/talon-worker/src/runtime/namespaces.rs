@@ -3386,9 +3386,8 @@ page_tti_hours = 2
             .put(&block(16), Bytes::from_static(b"x"))
             .await
             .unwrap();
-        let background = super::super::background::WorkerBackground::start(root.clone(), &config);
-        background.begin_shutdown();
         let permit = namespace.background_budget.as_ref().unwrap().io().await;
+        let background = super::super::background::WorkerBackground::start(root.clone(), &config);
         let worker = root.clone();
         let mut checkpoint = tokio::spawn(async move { worker.checkpoint_catalog().await });
         let mut small_checkpoint = tokio::spawn(async move { small.maintain(true).await });

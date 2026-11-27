@@ -38,7 +38,8 @@ pub(crate) fn wait_for_retiring(root: &Path) -> io::Result<()> {
 #[derive(Default)]
 pub(crate) struct Life {
     closing: AtomicBool,
-    closing_notify: tokio::sync::Notify,
+    checkpoints_stopped: AtomicBool,
+    checkpoint_stop: tokio::sync::Notify,
     done: Mutex<bool>,
     changed: Condvar,
 }
@@ -84,21 +85,25 @@ impl Life {
     }
     pub fn close(&self) {
         self.closing.store(true, Ordering::Release);
-        self.closing_notify.notify_waiters();
+        self.stop_checkpoints();
     }
-    pub fn is_closing(&self) -> bool {
-        self.closing.load(Ordering::Acquire)
+    pub fn stop_checkpoints(&self) {
+        self.checkpoints_stopped.store(true, Ordering::Release);
+        self.checkpoint_stop.notify_waiters();
     }
-    pub async fn closing(&self) {
-        let notified = self.closing_notify.notified();
-        if !self.is_closing() {
+    pub fn checkpoints_stopped(&self) -> bool {
+        self.checkpoints_stopped.load(Ordering::Acquire)
+    }
+    async fn checkpoint_stop(&self) {
+        let notified = self.checkpoint_stop.notified();
+        if !self.checkpoints_stopped() {
             notified.await;
         }
     }
-    pub async fn until_close<T>(&self, work: impl Future<Output = T>) -> Option<T> {
+    pub async fn until_checkpoint_stop<T>(&self, work: impl Future<Output = T>) -> Option<T> {
         tokio::select! {
             biased;
-            () = self.closing() => None,
+            () = self.checkpoint_stop() => None,
             result = work => Some(result),
         }
     }

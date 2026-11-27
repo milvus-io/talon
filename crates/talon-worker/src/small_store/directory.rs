@@ -273,6 +273,9 @@ impl Directory {
                 }
             }
             catalog.replace_published_segment(old, new.id);
+            if let Some(recency) = &mut catalog.recency {
+                recency.mark_durable(new.id, new.segment.durable_end);
+            }
         }
         catalog.retire_segment(old);
     }
