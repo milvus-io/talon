@@ -326,6 +326,24 @@ impl Directory {
         let mut catalog = model.0.write().unwrap();
         self.stage_in(&mut catalog, key, location, false)
     }
+
+    pub(crate) fn publish_compact(&mut self, location: &Location) -> bool {
+        let mut catalog = self.catalog.0.write().unwrap();
+        if catalog.recency.is_none() {
+            return false;
+        }
+        let address = (location.segment, location.offset);
+        let slot = catalog.at(address).expect("journaled small object");
+        catalog
+            .files
+            .entry(location.segment)
+            .or_insert_with(|| location.file.clone());
+        let stored_len = location.stored_len();
+        catalog.admit_new_compact(slot, self.slot, stored_len);
+        Self::publish_slot(&mut catalog, self.slot, slot, address, stored_len, true);
+        true
+    }
+
     fn stage_in(
         &mut self,
         catalog: &mut Catalog,
@@ -377,23 +395,39 @@ impl Directory {
         }
         old
     }
-    pub fn publish(&mut self, id: &dyn SmallIdentity) {
+    pub(crate) fn finish_publish(&mut self, id: &dyn SmallIdentity, access: AccessHandle) {
         let model = self.catalog.clone();
         let mut catalog = model.0.write().unwrap();
+        if access.small().is_none() || access.tracks_clock() {
+            let (address, _) = self.staged.expect("staged small object");
+            Self::attach_access_at(&mut catalog, address, access);
+        }
         self.publish_in(&mut catalog, id, true);
     }
+
     fn publish_in(&mut self, catalog: &mut Catalog, id: &dyn SmallIdentity, admit: bool) {
         let slot = self.pending(catalog, id).expect("staged small object");
+        let (address, stored_len) = self.staged.take().expect("staged small address");
+        Self::publish_slot(catalog, self.slot, slot, address, stored_len, admit);
+    }
+
+    fn publish_slot(
+        catalog: &mut Catalog,
+        stream: usize,
+        slot: usize,
+        address: Address,
+        stored_len: u64,
+        admit: bool,
+    ) {
         let flags = catalog.lookup.flags(slot);
         if flags & VISIBLE == 0 {
-            *catalog.live.entry(self.slot).or_default() += 1;
+            *catalog.live.entry(stream).or_default() += 1;
             if admit {
                 catalog.shared.live_count.fetch_add(1, Relaxed);
             }
         }
         catalog.lookup.set_flags(slot, flags | VISIBLE);
         if admit {
-            let (address, stored_len) = self.staged.expect("published small address");
             catalog.publish_segment(address.0);
             if let Some(ownership) = &mut catalog.ownership {
                 // A tail append can bound this pass without tracking holes or
@@ -403,8 +437,8 @@ impl Directory {
                 ownership.admit(address, catalog.shared.ownership.admit(), cutoff);
             }
         }
-        self.staged = None;
     }
+
     pub fn attach_access(&mut self, id: &dyn SmallIdentity, access: AccessHandle) {
         if access.small().is_some() && !access.tracks_clock() {
             return;
@@ -415,6 +449,10 @@ impl Directory {
             .or_else(|| self.find(&catalog, id, VISIBLE))
             .expect("staged small object");
         let address = catalog.metadata(catalog.lookup.handle(slot)).unwrap().0;
+        Self::attach_access_at(&mut catalog, address, access);
+    }
+
+    fn attach_access_at(catalog: &mut Catalog, address: Address, access: AccessHandle) {
         if let Some(policy) = catalog.policy.get_mut(&address) {
             policy.access = access;
         } else {

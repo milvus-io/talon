@@ -229,6 +229,21 @@ impl Catalog {
         }
     }
 
+    /// A new journaled row is private until publication. Compact recency is
+    /// sufficient until someone actually borrows an access ticket.
+    pub(super) fn admit_new_compact(&mut self, slot: usize, stream: usize, stored_len: u64) {
+        if !self.compact_streams.contains(&stream) {
+            self.enable_compact([stream]);
+        }
+        let flags = self.lookup.flags(slot);
+        debug_assert_eq!(flags & (POLICY | VISIBLE), 0);
+        let total = self.compact_totals.get_mut(&stream).unwrap();
+        total.0 += stored_len;
+        total.1 += 1;
+        self.lookup.set_flags(slot, flags | POLICY);
+        self.touch_recency(slot);
+    }
+
     pub(super) fn compact_admit(&mut self, slot: usize, bytes: u64, clock: bool) -> AccessHandle {
         let (address, record) = self.metadata(self.lookup.handle(slot)).unwrap();
         let stream = self.segment(address.0).unwrap().slot;

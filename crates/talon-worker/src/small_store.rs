@@ -232,7 +232,7 @@ impl Location {
 }
 
 struct Segment {
-    data: Option<Arc<OwnedFd>>,
+    writer: Option<Arc<disk_io::SegmentWriter>>,
     file: Arc<SegmentFile>,
     // Reservation ends, including writes whose completions are still pending.
     bytes: u64,
@@ -247,8 +247,8 @@ struct Segment {
 }
 impl Segment {
     async fn data(&self) -> io::Result<Arc<OwnedFd>> {
-        match &self.data {
-            Some(fd) => Ok(fd.clone()),
+        match &self.writer {
+            Some(writer) => Ok(writer.fd.clone()),
             None => self.file.open().await,
         }
     }
@@ -258,7 +258,72 @@ impl Segment {
     }
 
     fn close_writers(&mut self) {
-        self.data = None;
+        self.writer = None;
+    }
+}
+
+struct AppendRecord {
+    key: SmallKey,
+    value: Bytes,
+    checksum: u64,
+    charge: u64,
+}
+
+impl AppendRecord {
+    fn new(
+        id: &(impl SmallStoreKey + ?Sized),
+        value: Bytes,
+        segment_size: u64,
+        index: Option<&crate::BlockIndex>,
+    ) -> io::Result<Self> {
+        let len = value.len() as u64;
+        if !accepts_object(u64::MAX, id, len) || len > 128 << 20 {
+            return Err(invalid("invalid small object extent"));
+        }
+        let view = id.view();
+        format::validate_key(&view)?;
+        let charge = charge(&view, len);
+        if charge > segment_size {
+            return Err(invalid("small object record exceeds segment"));
+        }
+        let block = index
+            .and_then(|index| index.indexed_identity(&view.block))
+            .unwrap_or_else(|| crate::block_key::BlockKey::new(&view.block));
+        Ok(Self {
+            key: SmallKey(SharedUnit {
+                block,
+                kind: view.kind,
+            }),
+            checksum: xxhash_rust::xxh3::xxh3_64(&value),
+            value,
+            charge,
+        })
+    }
+
+    async fn validate_existing(
+        &self,
+        old: Location,
+        state: tokio::sync::MutexGuard<'_, State>,
+    ) -> io::Result<u64> {
+        let conflict = || invalid("different bytes for immutable small object identity");
+        if old.len != self.value.len() as u64 {
+            return Err(conflict());
+        }
+        let weight = old.stored_len();
+        let previous = match old.checksum {
+            Some(checksum) => checksum,
+            None => {
+                // The stream lock excludes relocation until the descriptor
+                // is retained. The trailer read can then proceed independently.
+                let read = old.retain().await?;
+                drop(state);
+                read.read_checksum_trailer().await?
+            }
+        };
+        if previous != self.checksum {
+            return Err(conflict());
+        }
+        Ok(weight)
     }
 }
 struct State {
@@ -527,35 +592,44 @@ impl SegmentStore {
             .await
     }
 
-    /// The public store holds the identity mutation guard through completion.
-    /// Different identities reserve briefly, then submit independent I/O.
+    #[cfg(test)]
     async fn put_inner(
         self: &Arc<Self>,
         id: &(impl SmallStoreKey + ?Sized),
         value: Bytes,
         policy: Option<Arc<Lru>>,
     ) -> io::Result<u64> {
-        if !accepts_object(u64::MAX, id, value.len() as u64) || value.len() > 128 << 20 {
-            return Err(invalid("invalid small object extent"));
+        let index = policy.as_ref().map(|policy| policy.index());
+        let record = AppendRecord::new(id, value, self.segment_size, index.as_deref())?;
+        let state = self.state.lock().await;
+        self.healthy(&state)?;
+        let existing = self.entries.read().unwrap().get(&record.key);
+        if let Some(old) = existing {
+            let weight = record.validate_existing(old, state).await?;
+            if let Some(policy) = policy {
+                policy.refresh_small(record.key.0, weight, &self.entries);
+            }
+            return Ok(record.charge);
         }
-        format::validate_key(&id.view())?;
-        let view = id.view();
-        let block = policy.as_ref().map_or_else(
-            || crate::block_key::BlockKey::new(&view.block),
-            |p| p.shared_identity(&view.block),
-        );
-        let unit = SharedUnit {
-            block,
-            kind: view.kind,
-        };
-        let key = SmallKey(unit.clone());
+        drop(state);
+        self.append_new(record, policy).await
+    }
+
+    /// The public store holds the identity mutation guard through completion.
+    /// Different identities reserve briefly, then submit independent I/O.
+    async fn append_new(
+        self: &Arc<Self>,
+        record: AppendRecord,
+        policy: Option<Arc<Lru>>,
+    ) -> io::Result<u64> {
+        let AppendRecord {
+            key,
+            value,
+            checksum,
+            charge,
+        } = record;
         let len = value.len() as u64;
         let stored_len = len + CHECKSUM_BYTES;
-        let charge = charge(&key, len);
-        if charge > self.segment_size {
-            return Err(invalid("small object record exceeds segment"));
-        }
-        let checksum = xxhash_rust::xxh3::xxh3_64(&value);
         // Bound active submissions, not just queued segment bytes. Reservations
         // also cannot exceed one active plus one sealing segment per stream.
         let _slot = self
@@ -563,34 +637,12 @@ impl SegmentStore {
             .acquire()
             .await
             .expect("append slots stay open");
-        let (loc, data) = loop {
+        let (loc, writer) = loop {
             let changed = self.pipeline_changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
             let mut state = self.state.lock().await;
             self.healthy(&state)?;
-            let existing = self.entries.read().unwrap().get(&key);
-            if let Some(old) = existing {
-                let conflict = || invalid("different bytes for immutable small object identity");
-                if old.len != len {
-                    return Err(conflict());
-                }
-                let weight = old.stored_len();
-                let previous = if let Some(previous) = old.checksum {
-                    previous
-                } else {
-                    let read = old.retain().await?;
-                    drop(state);
-                    read.read_checksum_trailer().await?
-                };
-                if previous != checksum {
-                    return Err(conflict());
-                }
-                if let Some(policy) = &policy {
-                    policy.insert_with_policy(unit.clone(), weight, true);
-                }
-                return Ok(charge);
-            }
             let full = state.active.is_some_and(|id| {
                 let s = &state.segments[&id];
                 s.bytes + s.metadata + charge > self.segment_size
@@ -635,52 +687,45 @@ impl SegmentStore {
                 checksum: None,
                 access: None,
             };
-            let data = s.data().await?;
+            let writer = s.writer.as_ref().expect("active segment writer").clone();
             s.bytes += stored_len;
             s.metadata += charge - stored_len;
             s.in_flight.insert(loc.offset);
             state.written += charge;
-            break (loc, data);
+            break (loc, writer);
         };
         // No append state lock is held while any of these operations is in
         // flight. Both writes are submitted; always await both, even on error,
         // so descriptors/buffers and the cache-root lease outlive kernel I/O.
-        let result = async {
+        #[cfg(test)]
+        self.pause_append().await;
+        let (payload, record) = tokio::join!(writer.append(value, checksum, loc.offset), async {
+            self.journal
+                .append(
+                    journal::Event::Insert {
+                        slot: self.slot,
+                        segment: loc.segment,
+                        offset: loc.offset,
+                        record: journal::Record {
+                            key: key.clone(),
+                            len,
+                            checksum: None,
+                        },
+                    },
+                    false,
+                )
+                .await?;
             #[cfg(test)]
-            self.pause_append().await;
-            let (payload, record) = tokio::join!(
-                async {
-                    disk_io::write_record(data.clone(), value, checksum, loc.offset).await?;
-                    #[cfg(test)]
-                    tests::crash("append_payload");
-                    Ok::<_, io::Error>(())
-                },
-                async {
-                    self.journal
-                        .append(
-                            journal::Event::Insert {
-                                slot: self.slot,
-                                segment: loc.segment,
-                                offset: loc.offset,
-                                record: journal::Record {
-                                    key: key.clone(),
-                                    len,
-                                    checksum: None,
-                                },
-                            },
-                            false,
-                        )
-                        .await?;
-                    #[cfg(test)]
-                    tests::crash("append_index");
-                    Ok::<_, io::Error>(())
-                }
-            );
-            payload?;
-            record?;
-            disk_io::allocated(data).await
-        }
-        .await;
+            tests::crash("append_index");
+            Ok::<_, io::Error>(())
+        });
+        let (allocated, result) = match payload {
+            Ok((payload, allocation)) => (
+                allocation.as_ref().ok().copied(),
+                payload.and(record).and(allocation),
+            ),
+            Err(error) => (None, Err(error)),
+        };
         let mut state = self.state.lock().await;
         let segment = state
             .segments
@@ -688,32 +733,34 @@ impl SegmentStore {
             .expect("in-flight segment is retained");
         segment.in_flight.remove(&loc.offset);
         self.appends_drained.notify_waiters();
-        let allocated = match result {
-            Ok(allocated) => allocated,
-            Err(error) => {
-                // A reserved extent/frame may be missing or torn. Do not publish
-                // this segment or accept subsequent writes after the gap.
-                state.poisoned = true;
-                self.pipeline_changed.notify_waiters();
-                self.appends_drained.notify_waiters();
-                return Err(error);
-            }
-        };
-        self.healthy(&state)?;
+        // Account for completed I/O even when a payload was partial, the
+        // journal failed, or another append has already poisoned the stream.
+        if let Some(bytes) = allocated {
+            let added = bytes.saturating_sub(segment.allocated);
+            segment.allocated += added;
+            state.allocated += added;
+        }
+        if let Err(error) = result {
+            // A reserved extent/frame may be missing or torn. Do not publish
+            // this segment or accept subsequent writes after the gap.
+            state.poisoned = true;
+            self.pipeline_changed.notify_waiters();
+            self.refresh_stats(&state);
+            return Err(error);
+        }
+        if let Err(error) = self.healthy(&state) {
+            self.refresh_stats(&state);
+            return Err(error);
+        }
         let segment = state.segments.get_mut(&loc.segment).unwrap();
-        // Completion order need not match reservation order. Allocation can
-        // grow while another append's stat is in flight; never regress it.
-        let added = allocated.saturating_sub(segment.allocated);
-        segment.allocated = segment.allocated.max(allocated);
         segment.live += charge;
         segment.live_data_bytes += stored_len;
         segment.records += 1;
-        state.allocated += added;
         state.live += charge;
         // Publish policy and locator together. The runtime's block gate keeps
         // eviction from retiring this admission before its mutation completes.
         if let Some(policy) = policy {
-            policy.publish_small(unit, stored_len, &self.entries, loc);
+            policy.publish_small(key.0, stored_len, &self.entries, loc);
         } else {
             self.entries.write().unwrap().insert(key, loc);
         }
@@ -1282,7 +1329,7 @@ impl SegmentStore {
                 path: self.path(id, "data"),
                 fd: tokio::sync::Mutex::new(Arc::downgrade(&data)),
             }),
-            data: Some(data),
+            writer: Some(Arc::new(disk_io::SegmentWriter::new(data))),
             bytes: 0,
             durable_end: 0,
             metadata: 8,
@@ -1470,7 +1517,7 @@ impl SegmentStore {
         state.segments.insert(
             id,
             Segment {
-                data: None,
+                writer: None,
                 file,
                 bytes: meta.durable_end,
                 durable_end: meta.durable_end,

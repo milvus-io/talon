@@ -157,7 +157,8 @@ pub(crate) async fn run<M: Machine>(
                         let request=requests.pop().unwrap();
                         let Command::Append{bytes:body,..}=&request.command else {unreachable!()};
                         next_lsn=next_lsn.checked_add(1).ok_or_else(||invalid("journal LSN overflow"))?;
-                        bytes.extend_from_slice(&frame::encode(next_lsn,body)?);pending.push(Pending{request,lsn:next_lsn});
+                        frame::encode_into(&mut bytes,next_lsn,body)?;
+                        pending.push(Pending{request,lsn:next_lsn});
                         if pending.len()>=256 || bytes.len()>=256<<10 {break;}
                         match receive.try_recv() {Ok(r) if matches!(r.command,Command::Append{..})=>requests.push(r),Ok(r)=>{barrier=Some(r);break;},Err(_)=>break}
                     }

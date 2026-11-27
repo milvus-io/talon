@@ -673,6 +673,7 @@ impl Lru {
         self.insert_with_policy(unit, bytes, false)
     }
 
+    #[cfg(test)]
     pub(crate) fn shared_identity(&self, id: &dyn BlockIdentity) -> BlockKey {
         self.inner
             .lock()
@@ -713,6 +714,9 @@ impl Lru {
         location: crate::small_store::Location,
     ) {
         let mut g = self.inner.lock().unwrap();
+        if directory.write().unwrap().publish_compact(&location) {
+            return;
+        }
         let key = crate::small_store::key::SmallKey(unit.clone());
         directory.write().unwrap().stage(key.clone(), location);
         let access = Self::insert_locked(&mut g, unit.clone(), bytes, true);
@@ -721,8 +725,27 @@ impl Lru {
             pause();
         }
         let mut directory = directory.write().unwrap();
-        directory.attach_access(&key, access);
-        directory.publish(&key);
+        directory.finish_publish(&key, access);
+    }
+
+    pub(crate) fn refresh_small(
+        &self,
+        unit: SharedUnit,
+        bytes: u64,
+        directory: &RwLock<crate::small_store::directory::Directory>,
+    ) {
+        let mut g = self.inner.lock().unwrap();
+        let key = crate::small_store::key::SmallRef::from_unit(&unit);
+        let mut directory = directory.write().unwrap();
+        if (!g.track_blocks || directory.has_recency())
+            && directory
+                .compact_admit(&key, bytes, g.track_small_clock)
+                .is_some()
+        {
+            return;
+        }
+        drop(directory);
+        Self::insert_locked(&mut g, unit, bytes, true);
     }
 
     fn insert_locked(
