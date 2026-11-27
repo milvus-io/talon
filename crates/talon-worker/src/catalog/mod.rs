@@ -4,6 +4,7 @@
 #[cfg(test)]
 mod benchmark;
 mod model;
+pub(crate) mod paged_paths;
 mod reconcile;
 mod rows;
 #[cfg(test)]

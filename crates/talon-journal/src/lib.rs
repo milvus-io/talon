@@ -304,13 +304,20 @@ impl JournalService {
             Box::pin(async move {
                 let _exit = exit;
                 match disk::Disk::open(path, machine, options, recovery_threads, accounting).await {
-                    Ok((disk, machine)) => {
+                    Ok((disk, machine, recovered_lsn)) => {
                         #[cfg(test)]
                         let disk = disk.with_control(test_control);
                         let _ = ready.send(Ok(()));
-                        if let Err(error) =
-                            writer::run(disk, machine, receive, &poison, policy, snapshot_slots)
-                                .await
+                        if let Err(error) = writer::run(
+                            disk,
+                            machine,
+                            recovered_lsn,
+                            receive,
+                            &poison,
+                            policy,
+                            snapshot_slots,
+                        )
+                        .await
                         {
                             poison.store(true, Ordering::Release);
                             tracing::error!(%error, "journal stream stopped; restart required");

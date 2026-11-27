@@ -24,16 +24,31 @@ pub(crate) struct OwnershipLimit {
 }
 
 #[derive(Clone, Copy, Default)]
-pub(crate) struct OwnershipCursor {
+pub(crate) struct PublishedCursor {
     segment: u64,
     physical: u64,
     offset: u64,
 }
 
+impl PublishedCursor {
+    fn enter_segment(&mut self, segment: u64, physical: u64) -> bool {
+        if self.segment == segment && self.physical == physical {
+            return false;
+        }
+        // Compaction keeps the logical position but replaces the row offsets.
+        *self = Self {
+            segment,
+            physical,
+            offset: 0,
+        };
+        true
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 pub(crate) struct SmallStaleCursor {
-    next: OwnershipCursor,
-    end: Option<OwnershipCursor>,
+    next: PublishedCursor,
+    end: Option<PublishedCursor>,
 }
 
 const DIRTY: u64 = 1 << 63;
@@ -98,6 +113,41 @@ impl OwnershipRetries {
             id
         })
     }
+
+    fn remove(&mut self, address: Address) {
+        if let Some(id) = self.ids.remove(&address) {
+            self.addresses.remove(&id);
+            if self.ids.capacity() > 64 && self.ids.len() < self.ids.capacity() / 4 {
+                self.ids.shrink_to_fit();
+            }
+        }
+    }
+
+    fn relocate(&mut self, old: Address, new: Address) {
+        if let Some(id) = self.ids.remove(&old) {
+            self.ids.insert(new, id);
+            self.addresses.insert(id, new);
+        }
+    }
+
+    fn contains(&self, id: u64, address: Address) -> bool {
+        self.addresses.get(&id) == Some(&address)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.addresses.is_empty()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.addresses.len()
+    }
+
+    fn iter_from(&self, id: u64) -> impl Iterator<Item = (u64, Address)> + '_ {
+        self.addresses
+            .range(id..)
+            .map(|(&id, &address)| (id, address))
+    }
 }
 
 impl Ownership {
@@ -110,20 +160,11 @@ impl Ownership {
     }
 
     pub fn remove(&mut self, address: Address) {
-        if let Some(id) = self.retries.ids.remove(&address) {
-            self.retries.addresses.remove(&id);
-            let ids = &mut self.retries.ids;
-            if ids.capacity() > 64 && ids.len() < ids.capacity() / 4 {
-                ids.shrink_to_fit();
-            }
-        }
+        self.retries.remove(address);
     }
 
     pub fn relocate_retry(&mut self, old: Address, new: Address) {
-        if let Some(id) = self.retries.ids.remove(&old) {
-            self.retries.ids.insert(new, id);
-            self.retries.addresses.insert(id, new);
-        }
+        self.retries.relocate(old, new);
     }
 
     pub fn relocate_segment(&mut self, old: u64, new: u64) {
@@ -157,7 +198,7 @@ impl SmallGcCandidate {
         let address = *ticket.address.lock().unwrap();
         let slot = ticket.visible_gc_slot(&catalog);
         if let Some(id) = self.retry_id {
-            if retries.addresses.get(&id) != Some(&address) {
+            if !retries.contains(id, address) {
                 return None;
             }
         } else {
@@ -319,7 +360,7 @@ impl SmallObjectStore {
     #[cfg(test)]
     pub(crate) fn ownership_retry_count(&self) -> usize {
         let catalog = self.journal.model.0.read().unwrap();
-        catalog.ownership.as_ref().unwrap().retries.addresses.len()
+        catalog.ownership.as_ref().unwrap().retries.len()
     }
 
     #[cfg(test)]
@@ -380,9 +421,7 @@ impl SmallObjectStore {
     pub(crate) fn has_ownership_retries(&self, limit: OwnershipLimit) -> bool {
         let catalog = self.journal.model.0.read().unwrap();
         let retries = &catalog.ownership.as_ref().unwrap().retries;
-        self.ownership_is_current(limit)
-            && retries.epoch == limit.epoch
-            && !retries.addresses.is_empty()
+        self.ownership_is_current(limit) && retries.epoch == limit.epoch && !retries.is_empty()
     }
 
     pub(crate) fn ownership_retry_candidates(
@@ -397,8 +436,8 @@ impl SmallObjectStore {
             return (true, Vec::new());
         }
         let mut candidates = Vec::new();
-        let mut retries = retries.addresses.range(*cursor..);
-        for (&id, &address) in retries.by_ref().take(budget) {
+        let mut retries = retries.iter_from(*cursor);
+        for (id, address) in retries.by_ref().take(budget) {
             *cursor = id + 1;
             if let Some(mut candidate) = catalog.ownership_candidate_at(address) {
                 candidate.retry_id = Some(id);
@@ -410,7 +449,7 @@ impl SmallObjectStore {
 
     pub(crate) fn ownership_candidates(
         &self,
-        cursor: &mut OwnershipCursor,
+        cursor: &mut PublishedCursor,
         first_epoch: u64,
         limit: OwnershipLimit,
         mut budget: usize,
@@ -425,17 +464,12 @@ impl SmallObjectStore {
         if cursor.segment > limit.last_segment || !self.ownership_is_current(limit) {
             return (true, candidates);
         }
-        for (&logical, &physical) in catalog.published.range(cursor.segment..=limit.last_segment) {
+        for (logical, physical) in catalog.published_segments(cursor.segment..=limit.last_segment) {
             if budget == 0 {
                 return (false, candidates);
             }
-            if cursor.segment != logical || cursor.physical != physical {
+            if cursor.enter_segment(logical, physical) {
                 budget -= 1;
-                *cursor = OwnershipCursor {
-                    segment: logical,
-                    physical,
-                    offset: 0,
-                };
             }
             let default = SegmentAdmission::default();
             let admission = ownership.segments.get(&physical).unwrap_or(&default);
@@ -526,9 +560,9 @@ impl SmallStaleCursor {
         mut visit: impl FnMut(usize, u64, usize) -> bool,
     ) -> bool {
         let Some(end) = self.end.or_else(|| {
-            let (&segment, &physical) = catalog.published.last_key_value()?;
+            let (segment, physical) = catalog.last_published_segment()?;
             let offset = catalog.segment(physical)?.bytes;
-            Some(OwnershipCursor {
+            Some(PublishedCursor {
                 segment,
                 physical,
                 offset,
@@ -540,17 +574,11 @@ impl SmallStaleCursor {
         if self.next.segment > end.segment {
             return true;
         }
-        for (&segment, &physical) in catalog.published.range(self.next.segment..=end.segment) {
+        for (segment, physical) in catalog.published_segments(self.next.segment..=end.segment) {
             if budget == 0 {
                 return false;
             }
-            if self.next.segment != segment || self.next.physical != physical {
-                self.next = OwnershipCursor {
-                    segment,
-                    physical,
-                    offset: 0,
-                };
-            }
+            self.next.enter_segment(segment, physical);
             let records = &catalog.segment(physical).unwrap().records;
             let start = records.position(self.next.offset);
             // A replacement is sealed and kept the logical position of its
@@ -626,6 +654,68 @@ mod tests {
         store.policy().unwrap().remove(&CacheUnit::Whole(garbage));
     }
 
+    #[test]
+    fn ownership_retry_id_tracks_relocation_and_removal() {
+        let mut retries = OwnershipRetries::default();
+        let old = (1, 0);
+        let other = (1, 8);
+        let new = (2, 0);
+        let id = retries.register(old);
+        let other_id = retries.register(other);
+
+        retries.relocate(old, new);
+        assert!(!retries.contains(id, old));
+        assert_eq!(retries.register(new), id);
+        retries.remove(old);
+        assert!(retries.iter_from(id).eq([(id, new), (other_id, other)]));
+
+        retries.remove(new);
+        assert!(retries.iter_from(id).eq([(other_id, other)]));
+        assert!(retries.register(new) > other_id);
+    }
+
+    #[tokio::test]
+    async fn both_collectors_rescan_replaced_segment_from_start() {
+        let root = tempfile::tempdir().unwrap();
+        let store = compact_store(root.path());
+        store.init_ownership();
+        create_compaction_work(&store, 3).await;
+        let limit = store.ownership_limit(true).unwrap();
+        let now = crate::eviction::access_millis() + 1000;
+
+        let mut ownership = PublishedCursor::default();
+        let first = (0..8)
+            .find_map(|_| {
+                let (done, mut candidates) =
+                    store.ownership_candidates(&mut ownership, 0, limit, 1, |_| false);
+                assert!(!done);
+                candidates.pop()
+            })
+            .unwrap();
+        assert_eq!(first.unit, CacheUnit::Whole(block(1)));
+
+        let mut stale = SmallStaleCursor::default();
+        let (done, selected) = store.stale_candidates(&mut stale, now, 1, 8, 1, |_| true);
+        assert!(!done);
+        assert_eq!(selected[0].0.unit, first.unit);
+        assert!(store.maintain(true).await.unwrap());
+
+        let expected = [1, 2, 3].map(|n| CacheUnit::Whole(block(n)));
+        let (done, selected) = store.ownership_candidates(&mut ownership, 0, limit, 8, |_| false);
+        assert!(done);
+        assert!(selected
+            .into_iter()
+            .map(|candidate| candidate.unit)
+            .eq(expected.clone()));
+
+        let (done, selected) = store.stale_candidates(&mut stale, now, 1, 8, 8, |_| true);
+        assert!(done);
+        assert!(selected
+            .into_iter()
+            .map(|(candidate, _)| candidate.unit)
+            .eq(expected));
+    }
+
     #[tokio::test]
     async fn ownership_scans_mixed_admissions_across_relocation() {
         let root = tempfile::tempdir().unwrap();
@@ -636,7 +726,7 @@ mod tests {
         let limit = store.ownership_limit(true).unwrap();
         let scan = |first, limit| {
             store
-                .ownership_candidates(&mut OwnershipCursor::default(), first, limit, 8, |_| false)
+                .ownership_candidates(&mut PublishedCursor::default(), first, limit, 8, |_| false)
                 .1
         };
         drop(store.take_superseded_retries(limit));

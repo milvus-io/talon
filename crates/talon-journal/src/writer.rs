@@ -19,11 +19,13 @@ enum DurableReply<M: Machine> {
 
 fn apply<M: Machine>(
     machine: &mut M,
+    applied_lsn: &mut Lsn,
     lsn: Lsn,
     record: M::Record,
     reply: AppendReply<M>,
 ) -> io::Result<AppliedReply> {
     machine.apply(lsn, record)?;
+    *applied_lsn = lsn;
     Ok(match reply {
         AppendReply::Sequence(done) => AppliedReply::Sequence(done, lsn),
         AppendReply::Project(prepare) => AppliedReply::Project(prepare(machine, lsn)),
@@ -50,6 +52,7 @@ type WriteBatch<M> = LocalBoxFuture<'static, (Vec<Pending<M>>, io::Result<()>)>;
 pub(crate) async fn run<M: Machine>(
     mut disk: disk::Disk,
     mut machine: M,
+    recovered_lsn: Lsn,
     mut receive: mpsc::Receiver<Request<M>>,
     failed: &AtomicBool,
     policy: Arc<std::sync::RwLock<Option<Arc<dyn Maintenance>>>>,
@@ -63,7 +66,8 @@ pub(crate) async fn run<M: Machine>(
     let mut checkpoint_completion: Option<watch::Sender<bool>> = None;
     let mut pending_checkpoint: Option<watch::Sender<bool>> = None;
     let mut closed = false;
-    let mut next_lsn = disk.lsn;
+    let mut next_lsn = recovered_lsn;
+    let mut applied_lsn = recovered_lsn;
     let result=async {
         loop {
             if failed.load(Ordering::Acquire) {return Err(stopped());}
@@ -86,10 +90,16 @@ pub(crate) async fn run<M: Machine>(
                     disk.sync().await?;
                     let request=barrier.take().unwrap();
                     if let Command::Query(query)=request.command {query(&machine);}
-                } else if checkpoint.is_none() && (pending_checkpoint.is_some() || disk.offset>=disk.options.checkpoint_bytes) {
+                } else if checkpoint.is_none() && (pending_checkpoint.is_some() || disk.checkpoint_due()) {
                     let snapshot=machine.snapshot()?;
                     let generation=disk.rotate().await?;
-                    checkpoint=Some(disk.snapshot::<M>(generation,disk.lsn,snapshot,policy.read().unwrap().clone(),snapshot_slots.clone()));
+                    checkpoint = Some(disk.snapshot::<M>(
+                        generation,
+                        applied_lsn,
+                        snapshot,
+                        policy.read().unwrap().clone(),
+                        snapshot_slots.clone(),
+                    ));
                     checkpoint_completion=pending_checkpoint.take();
                 }
             }
@@ -100,7 +110,9 @@ pub(crate) async fn run<M: Machine>(
                     for pending in requests {
                         let reply = match pending.reply {
                             DurableReply::Applied(reply) => reply,
-                            DurableReply::Unapplied { record, lsn, reply } => apply(&mut machine, lsn, record, reply)?,
+                            DurableReply::Unapplied { record, lsn, reply } => {
+                                apply(&mut machine, &mut applied_lsn, lsn, record, reply)?
+                            }
                         };
                         reply.send();
                     }
@@ -122,14 +134,13 @@ pub(crate) async fn run<M: Machine>(
                                     _permits,
                                 });
                             } else {
-                                let reply = apply(&mut machine, lsn, record, reply)?;
+                                let reply = apply(&mut machine, &mut applied_lsn, lsn, record, reply)?;
                                 if ack == Ack::Durable {
                                     durable.push(Durable { reply: DurableReply::Applied(reply), _permits });
                                 } else {
                                     reply.send();
                                 }
                             }
-                            disk.lsn = lsn;
                             drop(bytes);
                         }
                     }
@@ -137,7 +148,7 @@ pub(crate) async fn run<M: Machine>(
                 // Do not extend the log beyond an unfinished batch. Ordering
                 // only apply/ack lets later pwrite calls leave an interior hole
                 // after process loss, which is not a recoverable torn tail.
-                request=receive.recv(), if !closed && write.is_none() && barrier.is_none() && (disk.offset<disk.options.checkpoint_bytes || checkpoint.is_some())=>{
+                request=receive.recv(), if !closed && write.is_none() && barrier.is_none() && (!disk.checkpoint_due() || checkpoint.is_some())=>{
                     let Some(request)=request else {closed=true;continue;};
                     if !matches!(request.command,Command::Append{..}) {barrier=Some(request);continue;}
                     let mut requests=vec![request];let mut bytes=Vec::new();let mut pending=Vec::new();
@@ -149,8 +160,7 @@ pub(crate) async fn run<M: Machine>(
                         if pending.len()>=256 || bytes.len()>=256<<10 {break;}
                         match receive.try_recv() {Ok(r) if matches!(r.command,Command::Append{..})=>requests.push(r),Ok(r)=>{barrier=Some(r);break;},Err(_)=>break}
                     }
-                    let offset=disk.offset;disk.offset=disk.offset.checked_add(bytes.len() as u64).ok_or_else(||invalid("journal offset overflow"))?;
-                    let write_io=disk.write(bytes.into(),offset);
+                    let write_io = disk.append(bytes.into())?;
                     write=Some(Box::pin(async move {(pending,write_io.await)}));
                 }
             }

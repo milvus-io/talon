@@ -345,6 +345,55 @@ async fn shared_machine_applies_only_after_successful_sync() {
     }
 }
 
+#[tokio::test]
+async fn checkpoint_recovers_applied_cut_and_tail_in_both_apply_modes() {
+    async fn check<const AFTER_SYNC: bool>() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = service(dir.path());
+        let open = |s: &Arc<JournalService>| {
+            s.open_stream(
+                "a".into(),
+                TestState::<AFTER_SYNC>::default(),
+                StreamOptions::default(),
+            )
+            .unwrap()
+        };
+        let handle = open(&s);
+        assert_eq!(handle.append((1, 1), Ack::Durable).await.unwrap(), 1);
+
+        let pause = Arc::new(Pause::default());
+        *handle.inner.control.sync_pause.lock().unwrap() = Some(pause.clone());
+        let append = {
+            let handle = handle.clone();
+            tokio::spawn(async move { handle.append((2, 2), Ack::Durable).await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), pause.entered.notified())
+            .await
+            .unwrap();
+        {
+            let checkpoint = handle.checkpoint();
+            tokio::pin!(checkpoint);
+            assert!(futures::poll!(&mut checkpoint).is_pending());
+            pause.resume.notify_one();
+            assert_eq!(append.await.unwrap().unwrap(), 2);
+            checkpoint.await.unwrap();
+        }
+
+        assert_eq!(handle.append((3, 3), Ack::Durable).await.unwrap(), 3);
+        drop((handle, s));
+        let s = service(dir.path());
+        let handle = open(&s);
+        assert_eq!(
+            handle.query(|m| Ok(m.0.clone())).await.unwrap(),
+            BTreeMap::from([(1, 1), (2, 2), (3, 3)])
+        );
+        assert_eq!(handle.append((4, 4), Ack::Durable).await.unwrap(), 4);
+    }
+
+    check::<false>().await;
+    check::<true>().await;
+}
+
 #[test]
 fn frames_reject_corrupt_headers_and_order_parallel_decode() {
     let bytes = frame::encode(1, &State::encode(&(1, 2)).unwrap()).unwrap();

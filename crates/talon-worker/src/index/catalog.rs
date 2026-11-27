@@ -98,13 +98,13 @@ impl BlockIndex {
                     std::iter::once((row.state, ())),
                     touch,
                 )?;
-                return Some((geometry.disk_id, read));
+                return Some((geometry.disk_id(), read));
             }
             let rows = (start.0..end.0)
                 .zip(geometry.page_rows_from(start.0, entries.inline_age(slot)))
                 .map_while(|(want, (found, row))| (want == found).then_some((row.state, ())));
             let read = PageReadGuard::acquire(self, slot, start.0, rows, touch)?;
-            (geometry.disk_id, read)
+            (geometry.disk_id(), read)
         };
         read.covers(end.0 - start.0).then_some((disk_id, read))
     }
