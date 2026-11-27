@@ -19,24 +19,15 @@ use std::sync::Arc;
 
 use talon_core::{BlockId, ObjectId, Version};
 
-use crate::coordinator_client::{CoordinatorClient, CoordinatorError};
+use crate::coordinator_client::CoordinatorClient;
 use crate::membership_cache::{MembershipCache, MembershipSnapshot};
 use crate::metrics::{ReadStats, ZoneMatch, ZoneReadObserver};
 use crate::placement_cache::PlacementCache;
 use crate::pool::ConnectionPool;
-use crate::range_stream::CacheReadError;
+pub use crate::read_error::BlockReadError;
+use crate::read_error::CacheReadError;
 use crate::read_plan::plan_read;
 use crate::worker_client::WorkerError;
-
-pub(crate) enum DetailedBlockReadError {
-    Block(BlockReadError),
-}
-
-impl From<BlockReadError> for DetailedBlockReadError {
-    fn from(error: BlockReadError) -> Self {
-        Self::Block(error)
-    }
-}
 
 /// Whether a miss follows the current origin or the block's exact version.
 #[derive(Clone, Copy)]
@@ -44,44 +35,6 @@ enum OriginReadMode {
     Current,
     ExactVersion(u64),
     ExactRange(u64),
-}
-
-/// Errors from a block read.
-#[derive(Debug, thiserror::Error)]
-pub enum BlockReadError {
-    /// Authoritative membership refresh failed.
-    #[error(transparent)]
-    Coordinator(#[from] CoordinatorError),
-    /// The most recent background discovery attempt failed.
-    #[error(transparent)]
-    Discovery(Arc<CoordinatorError>),
-    /// The worker fetch failed.
-    #[error(transparent)]
-    Worker(#[from] WorkerError),
-    #[error("worker {worker_id}, instance {instance_id} at {address}: {source}")]
-    Target {
-        worker_id: String,
-        instance_id: String,
-        address: String,
-        #[source]
-        source: WorkerError,
-    },
-    /// The cluster returned no owners for the block (empty cluster).
-    #[error("no owners for block")]
-    NoOwners,
-    /// All configured logical candidates failed, without refreshing discovery.
-    #[error("all replicas failed; last worker {worker_id}, instance {instance_id:?} at {worker}: {source}")]
-    AllReplicasFailed {
-        /// Last candidate's address when known, otherwise its logical worker ID.
-        worker: String,
-        /// Last candidate logical identity, including unavailable candidates.
-        worker_id: String,
-        /// Last observed instance identity, absent for offline or conflicting members.
-        instance_id: Option<String>,
-        /// Original failure, preserved for diagnostics and classification.
-        #[source]
-        source: WorkerError,
-    },
 }
 
 /// The coordinates of an open file needed to plan a read: its object identity,
@@ -233,10 +186,7 @@ impl BlockReader {
         offset_in_block: u32,
         len: u32,
     ) -> Result<Vec<u8>, CacheReadError> {
-        let snapshot = self
-            .membership_snapshot()
-            .await
-            .map_err(cache_block_error)?;
+        let snapshot = self.membership_snapshot().await?;
         let mut last = BlockReadError::NoOwners;
         for (target, candidate) in snapshot.candidates(block, self.replicas_k) {
             let worker = match candidate {
@@ -270,7 +220,7 @@ impl BlockReader {
             }
             last = snapshot.replica_error(target, error);
         }
-        Err(cache_block_error(last))
+        Err(last.into())
     }
 
     /// Admit one complete versioned block to its current primary owner.
@@ -283,11 +233,8 @@ impl BlockReader {
         object_len: u64,
         body: &[u8],
     ) -> Result<(), CacheReadError> {
-        let snapshot = self
-            .membership_snapshot()
-            .await
-            .map_err(cache_block_error)?;
-        let worker = snapshot.owner(block).map_err(cache_block_error)?;
+        let snapshot = self.membership_snapshot().await?;
+        let worker = snapshot.owner(block)?;
         worker
             .admit_cached_block(block, object_len, body)
             .await
@@ -308,13 +255,8 @@ impl BlockReader {
         offset_in_block: u32,
         len: u32,
     ) -> Result<Vec<u8>, BlockReadError> {
-        match self
-            .read_block_detailed_with_mode(block, offset_in_block, len, OriginReadMode::Current)
+        self.read_block_with_mode(block, offset_in_block, len, OriginReadMode::Current)
             .await
-        {
-            Ok(bytes) => Ok(bytes),
-            Err(DetailedBlockReadError::Block(error)) => Err(error),
-        }
     }
 
     /// Read `dst.len()` bytes at `offset_in_block` within `block` into `dst`.
@@ -474,14 +416,14 @@ impl BlockReader {
 
     /// Read one exact-version block slice while preserving the typed worker failure
     /// for the streaming frontend's fallback decision.
-    pub(crate) async fn read_block_detailed(
+    pub(crate) async fn read_exact_version_block(
         &self,
         block: &BlockId,
         offset_in_block: u32,
         len: u32,
         object_len: u64,
-    ) -> Result<Vec<u8>, DetailedBlockReadError> {
-        self.read_block_detailed_with_mode(
+    ) -> Result<Vec<u8>, BlockReadError> {
+        self.read_block_with_mode(
             block,
             offset_in_block,
             len,
@@ -490,13 +432,13 @@ impl BlockReader {
         .await
     }
 
-    async fn read_block_detailed_with_mode(
+    async fn read_block_with_mode(
         &self,
         block: &BlockId,
         offset_in_block: u32,
         len: u32,
         mode: OriginReadMode,
-    ) -> Result<Vec<u8>, DetailedBlockReadError> {
+    ) -> Result<Vec<u8>, BlockReadError> {
         let snapshot = self.membership_snapshot().await?;
         self.stats.record_cache_miss();
         let offset = block.offset + u64::from(offset_in_block);
@@ -545,11 +487,11 @@ impl BlockReader {
             };
             self.stats.record_worker_failure();
             if !replica_retryable(&error) {
-                return Err(snapshot.target_error(target, error).into());
+                return Err(snapshot.target_error(target, error));
             }
             last = snapshot.replica_error(target, error);
         }
-        Err(last.into())
+        Err(last)
     }
 
     /// Reconcile the cache against an observed placement version.
@@ -674,17 +616,6 @@ impl BlockReader {
 
     pub(crate) async fn membership_snapshot(&self) -> Result<MembershipSnapshot, BlockReadError> {
         self.discovery_refresh.snapshot().await
-    }
-}
-
-fn cache_block_error(error: BlockReadError) -> CacheReadError {
-    match error {
-        BlockReadError::Coordinator(error) => error.into(),
-        BlockReadError::Discovery(error) => error.as_ref().into(),
-        BlockReadError::Worker(error)
-        | BlockReadError::Target { source: error, .. }
-        | BlockReadError::AllReplicasFailed { source: error, .. } => error.into(),
-        other => CacheReadError::Unavailable(other.to_string()),
     }
 }
 
@@ -1630,17 +1561,10 @@ mod tests {
                         )
                         .await
                         .unwrap_err(),
-                    ReadApi::Detailed => {
-                        match reader
-                            .read_block_detailed(&block(), 7, 32, block().offset + 64)
-                            .await
-                        {
-                            Err(DetailedBlockReadError::Block(error)) => error,
-                            _ => {
-                                panic!("exhausted detailed read must preserve the aggregate error")
-                            }
-                        }
-                    }
+                    ReadApi::Detailed => reader
+                        .read_exact_version_block(&block(), 7, 32, block().offset + 64)
+                        .await
+                        .unwrap_err(),
                     ReadApi::Cached => unreachable!(),
                 };
                 let (expected_worker, expected_code, expected_message) = if k == 1 {
@@ -1824,7 +1748,7 @@ mod tests {
             ReadApi::Allocated => reader
                 .read_block(&block(), 7, 32)
                 .await
-                .map_err(cache_block_error),
+                .map_err(CacheReadError::from),
             ReadApi::Into | ReadApi::VersionedInto => {
                 let mut dst = vec![42; 32];
                 let n = if matches!(api, ReadApi::VersionedInto) {
@@ -1840,12 +1764,12 @@ mod tests {
                 } else {
                     reader.read_block_into(&block(), 7, &mut dst).await
                 }
-                .map_err(cache_block_error)?;
+                .map_err(CacheReadError::from)?;
                 assert_eq!(n, dst.len());
                 Ok(dst)
             }
             ReadApi::Detailed => reader
-                .read_block_detailed(&block(), 7, 32, block().offset + 64)
+                .read_exact_version_block(&block(), 7, 32, block().offset + 64)
                 .await
                 .map_err(Into::into),
             ReadApi::Cached => reader.read_cached_block(&block(), 7, 32).await,

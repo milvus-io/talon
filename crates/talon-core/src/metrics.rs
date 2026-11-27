@@ -100,7 +100,7 @@ impl Gauge {
 #[derive(Clone)]
 pub struct Histogram {
     bounds: Arc<Vec<f64>>,
-    // counts[i] = observations <= bounds[i]; counts[last] = +Inf bucket.
+    // Each observation increments only the first matching bucket, or +Inf.
     counts: Arc<Vec<AtomicU64>>,
     sum_bits: Arc<AtomicU64>,
     count: Arc<AtomicU64>,
@@ -165,6 +165,21 @@ impl Histogram {
     /// Sum of all observed values.
     pub fn sum(&self) -> f64 {
         f64::from_bits(self.sum_bits.load(Ordering::Relaxed))
+    }
+
+    /// Iterate over ascending upper bounds and their cumulative counts,
+    /// including the final positive-infinity bucket. Counts are read as the
+    /// iterator advances and may reflect concurrent observations.
+    pub fn cumulative_buckets(&self) -> impl Iterator<Item = (f64, u64)> + '_ {
+        self.bounds
+            .iter()
+            .copied()
+            .chain(std::iter::once(f64::INFINITY))
+            .zip(self.counts.iter())
+            .scan(0, |cumulative, (bound, count)| {
+                *cumulative += count.load(Ordering::Relaxed);
+                Some((bound, *cumulative))
+            })
     }
 }
 
@@ -296,22 +311,14 @@ impl Metrics {
                         );
                     }
                     Series::Histogram(h) => {
-                        let mut cumulative = 0u64;
-                        for (i, b) in h.bounds.iter().enumerate() {
-                            cumulative += h.counts[i].load(Ordering::Relaxed);
-                            let le = fmt_f64(*b);
+                        for (bound, cumulative) in h.cumulative_buckets() {
+                            let le = fmt_f64(bound);
                             let _ = writeln!(
                                 out,
                                 "{name}_bucket{} {cumulative}",
                                 fmt_labels(labels, &[("le", &le)])
                             );
                         }
-                        cumulative += h.counts[h.bounds.len()].load(Ordering::Relaxed);
-                        let _ = writeln!(
-                            out,
-                            "{name}_bucket{} {cumulative}",
-                            fmt_labels(labels, &[("le", "+Inf")])
-                        );
                         let _ = writeln!(
                             out,
                             "{name}_sum{} {}",
@@ -418,6 +425,10 @@ mod tests {
         h.observe(0.05); // <= 0.1
         h.observe(0.5); // <= 1.0
         h.observe(2.0); // +Inf
+        assert_eq!(
+            h.cumulative_buckets().collect::<Vec<_>>(),
+            vec![(0.1, 1), (1.0, 2), (f64::INFINITY, 3)]
+        );
         let out = m.render();
         assert!(out.contains("load_seconds_bucket{le=\"0.1\"} 1"));
         assert!(out.contains("load_seconds_bucket{le=\"1\"} 2"));

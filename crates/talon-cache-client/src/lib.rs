@@ -15,10 +15,11 @@ pub mod metrics;
 pub mod placement_cache;
 pub mod pool;
 pub mod range_stream;
+mod read_error;
 pub mod read_plan;
 pub mod worker_client;
 
-pub use block_reader::{BlockReadError, BlockReader, FileView};
+pub use block_reader::{BlockReader, FileView};
 pub use coordinator_client::{
     CoordinatorClient, CoordinatorError, ObjectStat, Placement, ResolvedPlacement,
 };
@@ -28,7 +29,8 @@ pub use metrics::{
 };
 pub use placement_cache::{Cached, PlacementCache, RefreshReason};
 pub use pool::{ConnectionPool, DEFAULT_CONNECT_TIMEOUT, DEFAULT_REQUEST_TIMEOUT};
-pub use range_stream::{CacheReadError, RangeChunkStream, DEFAULT_TRANSFER_CHUNK_BYTES};
+pub use range_stream::{RangeChunkStream, DEFAULT_TRANSFER_CHUNK_BYTES};
+pub use read_error::{BlockReadError, CacheReadError};
 pub use read_plan::{iter_read, plan_read, BlockSegment, ReadPlan};
 pub use worker_client::{WorkerClient, WorkerError, WorkerLoadError, WriteClient};
 

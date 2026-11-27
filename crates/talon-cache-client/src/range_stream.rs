@@ -9,127 +9,16 @@ use std::task::{Context, Poll};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use talon_core::{BlockId, ObjectId, Version};
+#[cfg(test)]
 use talon_transport::DataErrorCode;
 
-use crate::block_reader::{BlockReadError, DetailedBlockReadError};
-use crate::coordinator_client::CoordinatorError;
-use crate::worker_client::WorkerError;
+pub use crate::read_error::CacheReadError;
+#[cfg(test)]
+use crate::{BlockReadError, WorkerError};
 use crate::{BlockReader, FileView};
 
 /// Default maximum bytes held by one in-flight worker response.
 pub const DEFAULT_TRANSFER_CHUNK_BYTES: u32 = 4 * 1024 * 1024;
-
-/// A typed cache-read failure suitable for an HTTP routing decision.
-#[derive(Debug, thiserror::Error)]
-pub enum CacheReadError {
-    /// The requested range or stream configuration is invalid.
-    #[error("invalid cache request: {0}")]
-    InvalidRequest(String),
-    /// The authoritative object does not exist.
-    #[error("object not found: {0}")]
-    NotFound(String),
-    /// The block is absent and the selected route disabled origin fill.
-    #[error("cache miss: {0}")]
-    CacheMiss(String),
-    /// Cache infrastructure is unavailable.
-    #[error("cache unavailable: {0}")]
-    Unavailable(String),
-    /// Cache infrastructure exceeded its deadline.
-    #[error("cache timeout: {0}")]
-    Timeout(String),
-    /// The source version changed during the read.
-    #[error("source version mismatch: {0}")]
-    VersionMismatch(String),
-    /// The authoritative origin failed while a worker was filling the cache.
-    #[error("origin failure: {0}")]
-    Origin(String),
-    /// A wire/framing invariant was violated.
-    #[error("cache protocol failure: {0}")]
-    Protocol(String),
-    /// An explicitly typed worker-internal failure.
-    #[error("cache internal failure: {0}")]
-    Internal(String),
-    /// A legacy worker returned only an unclassified string.
-    #[error("unclassified legacy worker failure: {0}")]
-    Unknown(String),
-    /// The namespace exceeded its rate limit; the caller should back off and
-    /// retry. Never origin-fallback-eligible — falling back would evade the
-    /// limit.
-    #[error("namespace rate limit exceeded: {0}")]
-    RateLimited(String),
-}
-
-impl CacheReadError {
-    /// Whether direct-origin fallback may safely hide this cache-path failure.
-    ///
-    /// Policy must still opt into fallback. Correctness, origin, protocol, and
-    /// legacy-unknown failures remain visible rather than being guessed from
-    /// diagnostic text.
-    pub fn fallback_eligible(&self) -> bool {
-        matches!(self, Self::Unavailable(_) | Self::Timeout(_))
-    }
-}
-
-impl From<WorkerError> for CacheReadError {
-    fn from(error: WorkerError) -> Self {
-        match error {
-            WorkerError::Io(error) if error.kind() == std::io::ErrorKind::TimedOut => {
-                Self::Timeout(error.to_string())
-            }
-            WorkerError::Io(error) => Self::Unavailable(error.to_string()),
-            WorkerError::Remote(error) => match error.code {
-                DataErrorCode::Unknown => Self::Unknown(error.message),
-                DataErrorCode::InvalidRequest => Self::InvalidRequest(error.message),
-                DataErrorCode::NotFound => Self::NotFound(error.message),
-                DataErrorCode::CacheMiss => Self::CacheMiss(error.message),
-                DataErrorCode::Unavailable => Self::Unavailable(error.message),
-                DataErrorCode::Timeout => Self::Timeout(error.message),
-                DataErrorCode::VersionMismatch => Self::VersionMismatch(error.message),
-                DataErrorCode::Origin => Self::Origin(error.message),
-                DataErrorCode::Internal => Self::Internal(error.message),
-                DataErrorCode::RateLimited => Self::RateLimited(error.message),
-            },
-            other => Self::Protocol(other.to_string()),
-        }
-    }
-}
-
-impl From<CoordinatorError> for CacheReadError {
-    fn from(error: CoordinatorError) -> Self {
-        Self::from(&error)
-    }
-}
-
-impl From<&CoordinatorError> for CacheReadError {
-    fn from(error: &CoordinatorError) -> Self {
-        match error {
-            CoordinatorError::Remote(error) => WorkerError::Remote(error.clone()).into(),
-            CoordinatorError::Io(error) if error.kind() == std::io::ErrorKind::TimedOut => {
-                Self::Timeout(error.to_string())
-            }
-            CoordinatorError::Io(error) => Self::Unavailable(error.to_string()),
-            other => Self::Protocol(other.to_string()),
-        }
-    }
-}
-
-impl From<DetailedBlockReadError> for CacheReadError {
-    fn from(error: DetailedBlockReadError) -> Self {
-        match error {
-            DetailedBlockReadError::Block(BlockReadError::Coordinator(error)) => error.into(),
-            DetailedBlockReadError::Block(BlockReadError::Discovery(error)) => {
-                error.as_ref().into()
-            }
-            DetailedBlockReadError::Block(BlockReadError::Target { source: error, .. })
-            | DetailedBlockReadError::Block(BlockReadError::Worker(error))
-            | DetailedBlockReadError::Block(BlockReadError::AllReplicasFailed {
-                source: error,
-                ..
-            }) => error.into(),
-            DetailedBlockReadError::Block(error) => Self::Unavailable(error.to_string()),
-        }
-    }
-}
 
 struct StreamState {
     reader: BlockReader,
@@ -213,9 +102,8 @@ impl BlockReader {
             );
             let bytes = state
                 .reader
-                .read_block_detailed(&block, offset_in_block, take, state.object_len)
-                .await
-                .map_err(CacheReadError::from)?;
+                .read_exact_version_block(&block, offset_in_block, take, state.object_len)
+                .await?;
             if bytes.len() != take as usize {
                 return Err(CacheReadError::Protocol(format!(
                     "worker returned {} bytes for a {take}-byte chunk",
@@ -424,7 +312,7 @@ mod tests {
                 } else {
                     BlockReadError::Worker(source)
                 };
-                let error = CacheReadError::from(DetailedBlockReadError::Block(error));
+                let error = CacheReadError::from(error);
                 assert!(error.to_string().contains("original worker diagnostic"));
                 match code {
                     DataErrorCode::Timeout => {

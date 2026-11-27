@@ -81,9 +81,7 @@ impl Heartbeats {
 
     pub fn pending(&mut self, registry: &MemberRegistry) -> Vec<Heartbeat> {
         let members: HashMap<_, _> = registry
-            .members
-            .iter()
-            .filter(|member| !member.retired)
+            .active_members()
             .map(|member| (member.worker_id.as_str(), member.zone.as_ref()))
             .collect();
         self.entries.retain(|(id, _), entry| {

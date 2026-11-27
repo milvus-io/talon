@@ -47,7 +47,9 @@ pub struct GatewayReadiness {
 }
 
 impl GatewayReadiness {
-    fn new(mode: GatewayMode, security: GatewaySecurity) -> Self {
+    fn new(mode: GatewayMode, mut security: GatewaySecurity) -> Self {
+        security.authentication = false;
+        security.authorization = false;
         Self {
             mode,
             dependencies_ready: AtomicBool::new(true),
@@ -72,6 +74,14 @@ impl GatewayReadiness {
     /// Update the TLS readiness bit from the installed listener state.
     pub fn set_tls_ready(&self, ready: bool) {
         self.security.write().unwrap().tls = ready;
+    }
+
+    fn mark_authentication_ready(&self) {
+        self.security.write().unwrap().authentication = true;
+    }
+
+    fn mark_authorization_ready(&self) {
+        self.security.write().unwrap().authorization = true;
     }
 
     /// Whether the process should receive provider traffic.
@@ -141,12 +151,10 @@ impl GatewayRuntime {
     pub fn new_with_metrics(
         config: GatewayConfig,
         adapter: Arc<dyn GatewayAdapter>,
-        mut security: GatewaySecurity,
+        security: GatewaySecurity,
         metrics: GatewayMetrics,
     ) -> Result<Self, GatewayConfigError> {
         config.validate()?;
-        security.authentication = false;
-        security.authorization = false;
         if config.mode == GatewayMode::Development {
             tracing::warn!(
                 bind = %config.bind,
@@ -177,15 +185,13 @@ impl GatewayRuntime {
     /// Atomically install a compiled default-deny authorization policy.
     pub fn install_authorization(&self, policy: AuthorizationPolicy) {
         *self.authorization.write().unwrap() = Some(policy);
-        let mut security = self.readiness.security.write().unwrap();
-        security.authorization = true;
+        self.readiness.mark_authorization_ready();
     }
 
     /// Install a credential verifier and mark authentication ready.
     pub fn install_authentication(&self, authenticator: Arc<dyn GatewayAuthenticator>) {
         *self.authentication.write().unwrap() = Some(authenticator);
-        let mut security = self.readiness.security.write().unwrap();
-        security.authentication = true;
+        self.readiness.mark_authentication_ready();
     }
 
     /// Install a security audit destination.
@@ -194,7 +200,7 @@ impl GatewayRuntime {
     }
 
     fn enable_mtls_authentication(&self) {
-        self.readiness.security.write().unwrap().authentication = true;
+        self.readiness.mark_authentication_ready();
     }
 
     fn audit(&self, event: SecurityAuditEvent) {

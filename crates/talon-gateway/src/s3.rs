@@ -22,6 +22,7 @@ use talon_core::{Backend, ObjectId, Version};
 use tokio::io::AsyncWriteExt;
 
 use crate::authorization::RequestAuthorization;
+use crate::read_conditions::{byte_range, origin_conditions, RangeError};
 use crate::s3_delete_xml::{parse_delete_objects, DeleteXmlError};
 use crate::{
     AuthenticatedPrincipal, EffectiveDecision, FailureReason, GatewayAccess,
@@ -1281,49 +1282,16 @@ fn requested_range(
     headers: &HeaderMap,
     object_size: u64,
 ) -> Result<Option<(u64, u64)>, S3RequestError> {
-    let Some(value) = headers.get(header::RANGE) else {
-        return Ok(None);
-    };
-    let value = value
-        .to_str()
-        .map_err(|_| S3RequestError::invalid("InvalidArgument", "Range is not ASCII"))?;
-    if value.contains(',') {
-        return Err(S3RequestError::invalid_range(object_size));
-    }
-    let range = value
-        .strip_prefix("bytes=")
-        .ok_or_else(|| S3RequestError::invalid_range(object_size))?;
-    let (start, end) = range
-        .split_once('-')
-        .ok_or_else(|| S3RequestError::invalid_range(object_size))?;
-    if object_size == 0 {
-        return Err(S3RequestError::invalid_range(object_size));
-    }
-    if start.is_empty() {
-        let suffix = end
-            .parse::<u64>()
-            .ok()
-            .filter(|value| *value > 0)
-            .ok_or_else(|| S3RequestError::invalid_range(object_size))?;
-        return Ok(Some((object_size.saturating_sub(suffix), object_size - 1)));
-    }
-    let start = start
-        .parse::<u64>()
-        .map_err(|_| S3RequestError::invalid_range(object_size))?;
-    if start >= object_size {
-        return Err(S3RequestError::invalid_range(object_size));
-    }
-    let end = if end.is_empty() {
-        object_size - 1
-    } else {
-        end.parse::<u64>()
-            .map_err(|_| S3RequestError::invalid_range(object_size))?
-            .min(object_size - 1)
-    };
-    if end < start {
-        return Err(S3RequestError::invalid_range(object_size));
-    }
-    Ok(Some((start, end)))
+    headers
+        .get(header::RANGE)
+        .map(|value| byte_range(value, object_size))
+        .transpose()
+        .map_err(|error| match error {
+            RangeError::NonAscii => {
+                S3RequestError::invalid("InvalidArgument", "Range is not ASCII")
+            }
+            _ => S3RequestError::invalid_range(object_size),
+        })
 }
 
 fn if_range_matches(headers: &HeaderMap, metadata: &HttpResponse, etag: &str) -> bool {
@@ -1358,16 +1326,6 @@ fn required_u64_header(response: &HttpResponse, name: &str) -> Result<u64, S3Req
     required_header(response, name)?
         .parse::<u64>()
         .map_err(|_| S3RequestError::internal(format!("origin returned invalid {name}")))
-}
-
-fn origin_conditions(conditions: &[(String, String)], etag: &str) -> Vec<(String, String)> {
-    let mut output = conditions
-        .iter()
-        .filter(|(name, _)| !name.eq_ignore_ascii_case("if-match"))
-        .cloned()
-        .collect::<Vec<_>>();
-    output.push(("if-match".into(), format!("\"{etag}\"")));
-    output
 }
 
 struct ReadAccounting {

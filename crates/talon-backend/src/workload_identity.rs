@@ -23,11 +23,10 @@ use async_trait::async_trait;
 use crate::broker::{self, BrokerConfig, BrokerCredentials, BrokerFetch};
 use crate::credentials::{
     CredentialsFetch, CredentialsObserver, ProvideBearerToken, ProvideS3Credentials, RefreshPolicy,
-    RefreshingCredentials, StaticS3Credentials,
+    RefreshingCredentials, S3Credentials, StaticS3Credentials,
 };
 use crate::gcs::GcpBearerToken;
 use crate::http::{HttpClient, HttpRequest, Method};
-use crate::s3::S3Credentials;
 
 /// Environment lookup used by source resolution, injectable for tests.
 pub type EnvFn<'a> = &'a (dyn Fn(&str) -> Option<String> + Sync);

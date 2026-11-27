@@ -13,7 +13,64 @@ use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 
-use crate::s3::S3Credentials;
+/// Static S3 credentials. Secrets come from env/config, never logged.
+#[derive(Clone)]
+pub struct S3Credentials {
+    /// Access key id.
+    pub access_key_id: String,
+    /// Secret access key.
+    pub secret_access_key: String,
+    /// Optional session token (STS).
+    pub session_token: Option<String>,
+}
+
+/// GCS HMAC access ID and secret for XML API requests.
+///
+/// Deliberately omits `Debug` so formatting credentials cannot expose the secret.
+#[derive(Clone)]
+pub struct GcsHmacCredentials {
+    /// Access ID of a Google Cloud Storage HMAC key.
+    pub access_key_id: String,
+    /// Secret associated with the HMAC key.
+    pub secret_access_key: String,
+}
+
+/// An origin-issued Azure SAS query, preserved byte-for-byte after an optional
+/// leading `?`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AzureSas(String);
+
+impl AzureSas {
+    /// Validate the credential shape without verifying its signature.
+    pub fn new(raw: impl Into<String>) -> std::result::Result<Self, String> {
+        let raw = raw.into();
+        let query = raw.strip_prefix('?').unwrap_or(&raw);
+        if query.is_empty()
+            || query.contains('#')
+            || query.bytes().any(|byte| byte.is_ascii_control())
+        {
+            return Err("Azure SAS query credential is malformed".into());
+        }
+        let contains_key = |expected: &str| {
+            url::form_urlencoded::parse(query.as_bytes()).any(|(key, _)| key == expected)
+        };
+        if !contains_key("sig") || !contains_key("sv") {
+            return Err("Azure SAS query credential is incomplete".into());
+        }
+        Ok(Self(query.to_owned()))
+    }
+
+    /// Access the exact raw query for origin request construction.
+    pub fn expose_secret(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for AzureSas {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("AzureSas([REDACTED])")
+    }
+}
 
 /// Source of the S3-family credential triple used for SigV4 signing.
 #[async_trait]
@@ -46,7 +103,7 @@ pub trait ProvideBearerToken: Send + Sync {
 #[async_trait]
 pub trait ProvideSasToken: Send + Sync {
     /// Cheap point-in-time query credential; never performs HTTP.
-    fn current(&self) -> Arc<crate::AzureSas>;
+    fn current(&self) -> Arc<AzureSas>;
 
     /// Refresh request-driven credentials before generating an outgoing URL.
     async fn prepare(&self) -> Result<(), String> {
@@ -239,9 +296,9 @@ where
 
 impl<F> ProvideSasToken for RefreshingCredentials<F>
 where
-    F: CredentialsFetch<Value = crate::AzureSas>,
+    F: CredentialsFetch<Value = AzureSas>,
 {
-    fn current(&self) -> Arc<crate::AzureSas> {
+    fn current(&self) -> Arc<AzureSas> {
         self.snapshot()
     }
 }
