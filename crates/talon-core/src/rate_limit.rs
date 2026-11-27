@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::namespace_rules::{self, NamespaceRule};
 use crate::NamespaceId;
 
 /// A rate-limited traffic dimension for one namespace.
@@ -151,11 +152,33 @@ pub struct RateLimitPolicy {
     pub default: MetricLimits,
     /// Per-namespace overrides, keyed by [`NamespaceId`] name.
     pub overrides: HashMap<String, MetricLimits>,
+    /// Namespace rules used to resolve wildcard limits when there is no exact override.
     #[serde(skip)]
-    pub namespace_rules: Vec<crate::namespace_rules::NamespaceRule>,
+    pub namespace_rules: Vec<NamespaceRule>,
 }
 
 impl RateLimitPolicy {
+    /// Replace wildcard limits and overlay exact namespace limits. A namespace
+    /// limit can enable an otherwise disabled policy without reviving its limits.
+    pub(crate) fn apply_namespace_limits(
+        &mut self,
+        rules: &[NamespaceRule],
+        overrides: impl IntoIterator<Item = (String, MetricLimits)>,
+    ) {
+        self.namespace_rules = rules.to_vec();
+        let mut overrides = overrides.into_iter().peekable();
+        if !rules.iter().any(|rule| rule.config.rate_limits.is_some()) && overrides.peek().is_none()
+        {
+            return;
+        }
+        if !self.enabled {
+            self.default = MetricLimits::default();
+            self.overrides.clear();
+        }
+        self.enabled = true;
+        self.overrides.extend(overrides);
+    }
+
     /// The limits that apply to `namespace`: its override if present, else the
     /// default. Unattributed requests resolve to the `default` namespace override.
     pub fn limits_for(&self, namespace: &NamespaceId) -> MetricLimits {
@@ -163,12 +186,11 @@ impl RateLimitPolicy {
             .get(namespace.effective_name())
             .copied()
             .unwrap_or_else(|| {
-                crate::namespace_rules::resolve(
+                namespace_rules::resolve_field(
                     &self.namespace_rules,
-                    None,
                     namespace.effective_name(),
+                    |rule| rule.rate_limits,
                 )
-                .rate_limits
                 .unwrap_or(self.default)
             })
     }

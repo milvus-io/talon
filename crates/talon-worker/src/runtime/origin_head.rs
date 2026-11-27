@@ -139,16 +139,18 @@ impl super::WorkerRuntime {
             None => backend.head(object).await,
         }
     }
+}
 
+impl super::Worker {
     #[cfg(target_os = "linux")]
     pub(crate) fn start_background_heads(&self) {
-        if let Some(heads) = &self.background_heads {
+        if let Some(heads) = &self.default_runtime.background_heads {
             heads.start_on_ring();
         }
     }
 
     pub(crate) fn stop_background_heads(&self) {
-        if let Some(heads) = &self.background_heads {
+        if let Some(heads) = &self.default_runtime.background_heads {
             heads.stop();
         }
     }

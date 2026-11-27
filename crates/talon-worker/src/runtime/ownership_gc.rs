@@ -54,7 +54,7 @@ struct SmallPass {
     scan_done: bool,
     pending: VecDeque<SmallGcCandidate>,
     retry_cursor: Option<u64>,
-    attempt: Option<(SmallGcCandidate, u64, bool)>,
+    attempt: Option<(SmallGcCandidate, u64, u64)>,
 }
 
 impl SmallPass {
@@ -284,13 +284,14 @@ impl OwnershipGc {
                 worker.page_gc_metrics.ownership_checked.inc();
                 pass.attempt = Some((candidate, 0));
             }
-            let (candidate, paid) = self
+            let candidate = self
                 .pass
                 .as_ref()
                 .unwrap()
                 .attempt
                 .as_ref()
                 .unwrap()
+                .0
                 .clone();
             let success = if self.owns(&candidate.block)
                 || !worker.lru.contains_tracked_block(&candidate.block)
@@ -299,12 +300,9 @@ impl OwnershipGc {
             } else if !worker.lru.stale_candidate_is_current(&candidate) {
                 false
             } else {
-                if let Some(budget) = &worker.background_budget {
-                    let credits = budget.delete_slice(candidate.units as u64 - paid).await;
-                    self.pass.as_mut().unwrap().attempt.as_mut().unwrap().1 += credits;
-                    if paid + credits < candidate.units as u64 {
-                        return;
-                    }
+                let (_, paid) = self.pass.as_mut().unwrap().attempt.as_mut().unwrap();
+                if !worker.pay_gc_delete(candidate.units as u64, paid).await {
+                    return;
                 }
                 self.reclaim_block(worker, candidate.clone(), &view).await
             };
@@ -369,18 +367,15 @@ impl OwnershipGc {
                 let Some(revision) = candidate.observe_ownership(limit.epoch) else {
                     continue;
                 };
-                pass.attempt = Some((candidate, revision, false));
+                pass.attempt = Some((candidate, revision, 0));
             }
             let (candidate, revision, paid) = pass.attempt.as_mut().unwrap();
-            if !*paid {
-                if !candidate.ticket.gc_is_current(*revision) {
-                    pass.attempt = None;
-                    continue;
-                }
-                if let Some(budget) = &worker.background_budget {
-                    budget.delete().await;
-                }
-                *paid = true;
+            if *paid == 0 && !candidate.ticket.gc_is_current(*revision) {
+                pass.attempt = None;
+                continue;
+            }
+            if !worker.pay_gc_delete(1, paid).await {
+                return;
             }
             let Some(renewed) = worker
                 .membership_snapshot()

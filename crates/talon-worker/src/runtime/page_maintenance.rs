@@ -79,16 +79,11 @@ impl WorkerRuntime {
             })
             .map(|hours| hours * 3_600_000)
             .unwrap_or(config.tti_ms);
-        if effective_tti > 0 {
-            anyhow::ensure!(
-                self.paged.is_some() || self.small.as_ref().is_some(),
-                "TTI requires paged L2 or small-object storage"
-            );
-            anyhow::ensure!(
-                config.checkpoint_interval_ms <= effective_tti,
-                "checkpoint interval exceeds TTI"
-            );
-        }
+        talon_core::config::validate_tti_storage(
+            self.paged.is_some() || self.small.is_some(),
+            effective_tti,
+            config.checkpoint_interval_ms,
+        )?;
         if let Some(small) = self.small.as_ref() {
             small.enable_access_tracking()?;
         }

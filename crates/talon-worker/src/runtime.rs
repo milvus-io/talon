@@ -501,11 +501,30 @@ impl WorkerRuntime {
         self
     }
 
-    /// Publish tuning shared by existing and future namespace runtimes.
-    pub(crate) fn update_dynamic_settings(
+    pub(crate) fn apply_dynamic_settings(
         &self,
-        config: talon_core::dynamic_config::WorkerDynamicConfig,
-    ) {
+        previous: Option<&talon_core::dynamic_config::WorkerDynamicConfig>,
+        next: &talon_core::dynamic_config::WorkerDynamicConfig,
+    ) -> std::result::Result<(), String> {
+        self.validate_dynamic_tti(next)?;
+        if previous == Some(next) {
+            return Ok(());
+        }
+        let startup = self.rate_limiter.startup_policy();
+        let policy = next.effective_rate_limits(startup);
+        if previous.map_or(true, |current| {
+            current.effective_rate_limits(startup) != policy
+        }) {
+            self.rate_limiter
+                .update(policy)
+                .map_err(|e| e.to_string())?;
+        }
+        self.update_dynamic_settings(next.clone());
+        Ok(())
+    }
+
+    /// Publish tuning shared by existing and future namespace runtimes.
+    fn update_dynamic_settings(&self, config: talon_core::dynamic_config::WorkerDynamicConfig) {
         if let Some(registry) = self.registry() {
             registry.publish_settings(config);
         } else {
@@ -539,25 +558,24 @@ impl WorkerRuntime {
             .unwrap_or(self.page_gc_config.tti_ms)
     }
 
-    pub(crate) fn validate_dynamic_tti(
+    fn validate_dynamic_tti(
         &self,
         config: &talon_core::dynamic_config::WorkerDynamicConfig,
     ) -> Result<(), String> {
         if let Some(registry) = self.registry() {
             registry.validate_settings(config)?;
         }
-        let validate = |runtime: &Self| {
+        let validate = |runtime: &Self| -> std::result::Result<(), String> {
             if let Some(hours) = config
                 .settings_for(runtime.namespace.effective_name())
                 .page_tti_hours
-                .filter(|hours| *hours > 0)
             {
-                if runtime.paged.is_none() && runtime.small.is_none() {
-                    return Err("TTI requires paged L2 or small-object storage".to_string());
-                }
-                if runtime.page_gc_config.checkpoint_interval_ms > hours * 3_600_000 {
-                    return Err("checkpoint interval exceeds TTI".to_string());
-                }
+                talon_core::config::validate_tti_storage(
+                    runtime.paged.is_some() || runtime.small.is_some(),
+                    hours * 3_600_000,
+                    runtime.page_gc_config.checkpoint_interval_ms,
+                )
+                .map_err(|error| error.to_string())?;
             }
             Ok(())
         };
@@ -592,6 +610,15 @@ impl WorkerRuntime {
         )
     }
 
+    fn with_read_admission(
+        mut self,
+        namespace: talon_core::NamespaceId,
+        limiter: Arc<NamespaceRateLimiter>,
+    ) -> Self {
+        self.namespace = namespace;
+        self.with_rate_limiter(limiter)
+    }
+
     /// Attach a per-namespace rate limiter. Without this the runtime admits every
     /// request (the limiter is disabled).
     pub fn with_rate_limiter(mut self, limiter: Arc<NamespaceRateLimiter>) -> Self {
@@ -602,6 +629,27 @@ impl WorkerRuntime {
     /// The worker's per-namespace rate limiter.
     pub fn rate_limiter(&self) -> &NamespaceRateLimiter {
         &self.rate_limiter
+    }
+
+    /// Charge a read to the namespace selected for this runtime.
+    pub(crate) fn admit_read(
+        &self,
+        bytes: u64,
+    ) -> std::result::Result<(), crate::rate_limit::Throttled> {
+        self.rate_limiter.admit(&self.namespace, bytes)
+    }
+
+    /// Pay one bounded slice of an observed GC candidate's deletion cost.
+    async fn pay_gc_delete(&self, units: u64, paid: &mut u64) -> bool {
+        if *paid == units {
+            return true;
+        }
+        if let Some(budget) = &self.background_budget {
+            *paid += budget.delete_slice(units - *paid).await;
+        } else {
+            *paid = units;
+        }
+        *paid == units
     }
 
     /// The paged L2 page size, or `None` when paged mode is off.

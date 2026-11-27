@@ -328,11 +328,14 @@ pub(crate) struct BackgroundBudget {
 }
 impl BackgroundBudget {
     pub fn new(config: &WorkerConfig) -> Arc<Self> {
+        let byte_rate =
+            talon_core::config::background_io_bytes_per_sec(config.background_io_max_mb_per_sec)
+                .expect("validated background I/O rate");
         Arc::new(Self {
             io: Arc::new(Semaphore::new(config.background_io_concurrency)),
-            startup_byte_rate: config.background_io_max_mb_per_sec * 1_000_000,
+            startup_byte_rate: byte_rate,
             startup_delete_rate: config.background_delete_max_per_sec,
-            bytes: Rate::new(config.background_io_max_mb_per_sec * 1_000_000),
+            bytes: Rate::new(byte_rate),
             deletes: Rate::new(config.background_delete_max_per_sec),
             #[cfg(test)]
             charged_bytes: Default::default(),
@@ -344,7 +347,10 @@ impl BackgroundBudget {
         self.bytes.set_rate(
             config
                 .background_io_max_mb_per_sec
-                .map(|rate| rate * 1_000_000)
+                .map(|rate| {
+                    talon_core::config::background_io_bytes_per_sec(rate)
+                        .expect("validated background I/O rate")
+                })
                 .unwrap_or(self.startup_byte_rate),
         );
         self.deletes.set_rate(

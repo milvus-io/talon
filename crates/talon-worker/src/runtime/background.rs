@@ -16,11 +16,13 @@ pub struct WorkerBackground {
     scheduler: BackgroundHandle,
     worker: Arc<Worker>,
 }
-impl WorkerBackground {
+
+impl Worker {
     /// Start maintenance using validated configuration.
     /// Ownership cleanup requires the resolved persistent identity in `config.node_id`.
-    pub fn start(worker: Arc<Worker>, config: &WorkerConfig) -> Self {
-        let runtime = worker.default_runtime();
+    pub fn start_background(self: &Arc<Self>, config: &WorkerConfig) -> WorkerBackground {
+        let worker = self;
+        let runtime = &worker.default_runtime;
         let mut scheduler = BackgroundScheduler::new(config.background_task_concurrency)
             .with_metrics(runtime.metrics.registry.clone());
         let w = worker.clone();
@@ -186,7 +188,7 @@ impl WorkerBackground {
                     let states = states.clone();
                     let config = config.clone();
                     async move {
-                        let view = w.default_runtime().membership_snapshot()?;
+                        let view = w.default_runtime.membership_snapshot()?;
                         let membership = (view.generation, view.validity_epoch);
                         let mut states = states.lock().await;
                         let mut next = None;
@@ -229,20 +231,28 @@ impl WorkerBackground {
                 let cycle = cycle.clone();
                 async move {
                     let mut cycle = cycle.lock().await;
-                    cycle.tick(w.default_runtime()).await;
+                    cycle.tick(&w.default_runtime).await;
                     cycle.next_delay(period)
                 }
             });
         }
-        Self {
+        WorkerBackground {
             scheduler: scheduler.start(),
-            worker,
+            worker: worker.clone(),
         }
     }
+}
+
+impl WorkerBackground {
+    /// Start maintenance on the worker.
+    pub fn start(worker: Arc<Worker>, config: &WorkerConfig) -> Self {
+        worker.start_background(config)
+    }
+
     /// Stop scheduling maintenance as soon as the worker starts draining requests.
     pub fn begin_shutdown(&self) {
         self.scheduler.begin_shutdown();
-        self.worker.default_runtime().stop_background_heads();
+        self.worker.stop_background_heads();
     }
 
     /// Stop admission, finish active maintenance and owned mutations, then flush access metadata
