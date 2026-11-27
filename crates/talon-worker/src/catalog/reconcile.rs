@@ -1,5 +1,6 @@
 //! Startup-only data cleanup belongs to the residency adapter, not talon-journal.
 //! Each cleanup is idempotent and resolved durably before paths can be reused.
+use super::paged_paths::{disk_dir, page_file, remove_empty_disk_dir, staged_file};
 use super::*;
 use std::{fs, io};
 
@@ -36,20 +37,21 @@ impl Catalog {
                     remove(&path.with_extension(format!("blk.catalog.{transaction}")))?;
                     sync_dir(path.parent().unwrap())?;
                 } else {
-                    let dir = crate::paged_store::disk_dir(&root, disk_id);
+                    let dir = disk_dir(&root, disk_id);
                     match intent.operation {
                         Operation::Put { page, .. } | Operation::DeletePage { page } => {
-                            remove(&dir.join(format!("{page}.page")))?;
-                            remove(&dir.join(format!("{page}.page.catalog.{transaction}")))?;
+                            let path = page_file(&dir, page);
+                            remove(&path)?;
+                            remove(&staged_file(&path, transaction))?;
                             sync_dir(&dir)?;
-                            crate::paged_store::remove_empty_disk_dir(&dir)?;
+                            remove_empty_disk_dir(&dir)?;
                         }
                         Operation::DeleteBlock => {
                             let pages = futures::executor::block_on(tokio::task::unconstrained(
                                 self.pages(&intent.store, &intent.block),
                             ))?;
                             for page in pages {
-                                remove(&dir.join(format!("{page}.page")))?;
+                                remove(&page_file(&dir, page))?;
                             }
                             sync_dir(&dir)?;
                             match fs::remove_dir(&dir) {

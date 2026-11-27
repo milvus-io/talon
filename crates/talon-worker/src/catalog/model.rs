@@ -101,7 +101,7 @@ impl LiveModel {
             .read()
             .unwrap()
             .store_geometry(kind, id)?
-            .disk_id
+            .disk_id()
     }
 }
 
@@ -227,7 +227,7 @@ impl State {
             .iter()
             .filter_map(|(handle, b)| {
                 let geometry = directory.rows.geometry(handle, kind)?;
-                geometry.disk_id.is_some().then_some((&b.id, geometry))
+                geometry.is_persisted().then_some((&b.id, geometry))
             })
             .collect();
         Ok(Some(crate::recovery::map(blocks, threads, |(id, b)| {
@@ -235,7 +235,7 @@ impl State {
                 return StoredBlock {
                     meta: StoredMeta {
                         id: id.clone(),
-                        disk_id: b.disk_id,
+                        disk_id: b.disk_id(),
                         len: b.len(),
                         form: BlockForm::Whole,
                     },
@@ -251,7 +251,7 @@ impl State {
             StoredBlock {
                 meta: StoredMeta {
                     id: id.clone(),
-                    disk_id: b.disk_id,
+                    disk_id: b.disk_id(),
                     len: b.len(),
                     form: BlockForm::Paged {
                         page_size: store.page_size,
@@ -321,7 +321,7 @@ impl Iterator for Snapshot {
         let record = loop {
             if let Some(slab) = &mut self.slab {
                 while let Some(row) = slab.rows.get(slab.slot) {
-                    if let Some(row) = row.as_ref().filter(|row| row.geometry.disk_id.is_some()) {
+                    if let Some(row) = row.as_ref().filter(|row| row.geometry.is_persisted()) {
                         let pages: PageMap<_> = row
                             .geometry
                             .pages_after(slab.after)
@@ -333,7 +333,7 @@ impl Iterator for Snapshot {
                                 store: row.geometry.kind().unwrap().path().into(),
                                 block: Block {
                                     id: row.id.clone(),
-                                    disk_id: row.geometry.disk_id,
+                                    disk_id: row.geometry.disk_id(),
                                     len: row.geometry.len(),
                                     pages,
                                 },
@@ -496,7 +496,7 @@ impl Machine for State {
                         .and_then(|handle| rows.geometry_mut(handle, kind))
                         .ok_or_else(|| invalid("snapshot continuation without block"))?;
                     if previous.len() != block.len
-                        || previous.disk_id != block.disk_id
+                        || previous.disk_id() != block.disk_id
                         || previous.last_page() >= *block.pages.first_key_value().unwrap().0
                     {
                         return Err(invalid("invalid/duplicate snapshot page chunk"));

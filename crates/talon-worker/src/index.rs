@@ -1458,7 +1458,7 @@ impl BlockIndex {
             return Some(BlockSummary {
                 len: geometry.len(),
                 shape,
-                disk_id: geometry.disk_id,
+                disk_id: geometry.disk_id(),
             });
         }
         self.read_entry_with_policy(id, |entry, clock, legacy| {
@@ -1499,7 +1499,7 @@ impl BlockIndex {
             geometry
                 .policy_state(UnitKind::Whole)?
                 .touch(entries.clock(entries.slot(id)?));
-            return Some(geometry.disk_id);
+            return Some(geometry.disk_id());
         }
         self.read_entry_with_policy(id, |entry, clock, legacy| {
             let IndexedUnits::Whole(slot) = &entry.units else {

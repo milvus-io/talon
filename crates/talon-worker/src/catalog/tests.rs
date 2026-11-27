@@ -45,7 +45,7 @@ fn repeated_whole_put_preserves_canonical_identity() {
         let directory = state.live.directory.read().unwrap();
         let handle = directory.rows.handle(&block(0)).unwrap();
         let row = directory.rows.at(handle as usize - 1).unwrap();
-        assert_eq!(row.geometry.disk_id, DiskId::new(2, 0).ok());
+        assert_eq!(row.geometry.disk_id(), DiskId::new(2, 0).ok());
         if let Some(old) = previous {
             assert!(BlockKey::ptr_eq(&old, &row.id));
         }
@@ -115,7 +115,7 @@ fn descending_large_page_map_roundtrips_a_frozen_snapshot() {
     let row = directory.store_geometry(StoreKind::Paged, &id).unwrap();
     assert_eq!(row.page_count(), COUNT as usize + 1);
     assert_eq!(row.last_page(), COUNT + 1);
-    assert_eq!(row.disk_id, disk_id);
+    assert_eq!(row.disk_id(), disk_id);
     assert!(row.pages_after(None).eq((0..COUNT)
         .map(|page| (page, 4096))
         .chain([(COUNT + 1, u64::MAX)])));
@@ -367,6 +367,12 @@ fn frozen_snapshot_preserves_pages_and_pending_transaction_ids() {
         )
         .unwrap();
     state.apply(4, begin()).unwrap();
+    let sidecar = block(1);
+    let index = state.live.index(4);
+    index.publish_page(&sidecar, PageIndex(0), 4, 16, 4096, None);
+    assert!(index.get(&sidecar).is_some());
+    assert!(state.live.disk_id(StoreKind::Paged, &sidecar).is_none());
+    assert_eq!(state.entries("paged").unwrap().unwrap().len(), 1);
     let snapshot = state.snapshot().unwrap();
     // A later completion must copy the block instead of modifying the frozen
     // snapshot. This state is the one encoded concurrently with new appends.
@@ -386,6 +392,7 @@ fn frozen_snapshot_preserves_pages_and_pending_transaction_ids() {
             .unwrap();
     }
     let entries = restored.entries("paged").unwrap().unwrap();
+    assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].allocated, vec![(Some(PageIndex(0)), 4096)]);
     assert_eq!(entries[0].meta.disk_id, DiskId::new(2, 0).ok());
     assert_eq!(
@@ -429,7 +436,7 @@ async fn sibling_begins_share_the_same_disk_id_before_either_completes() {
     let disk_id = first.disk_id;
     assert_eq!(sibling.disk_id, disk_id);
     assert_ne!(other.disk_id, disk_id);
-    let dir = crate::paged_store::disk_dir(paged.root(), disk_id);
+    let dir = paged_paths::disk_dir(paged.root(), disk_id);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("0.page"), b"lost").unwrap();
     std::fs::write(dir.join("1.page"), b"kept").unwrap();
@@ -960,7 +967,8 @@ async fn pending_put_is_cleaned_by_exact_path_including_replaced_page() {
             .await
             .unwrap();
         let dir = paged.catalog_dir_for(&block(0)).unwrap();
-        assert_eq!(dir, crate::paged_store::disk_dir(paged.root(), id.disk_id));
+        assert_eq!(dir, paged_paths::disk_dir(paged.root(), id.disk_id));
+        assert_eq!(std::fs::read(dir.join("0.page")).unwrap(), b"old!");
         let temp = dir.join(format!("0.page.catalog.{}", id.id));
         std::fs::write(&temp, b"partial").unwrap();
         if checkpoint {

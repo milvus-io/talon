@@ -52,7 +52,7 @@ impl StoreKind {
 
 #[derive(Clone)]
 pub(crate) struct Geometry {
-    pub disk_id: Option<DiskId>,
+    disk_id: Option<DiskId>,
     pages: Pages,
 }
 
@@ -349,6 +349,14 @@ impl Geometry {
             },
         };
         Self { disk_id, pages }
+    }
+
+    pub fn disk_id(&self) -> Option<DiskId> {
+        self.disk_id
+    }
+
+    pub fn is_persisted(&self) -> bool {
+        self.disk_id.is_some()
     }
 
     pub fn kind(&self) -> Option<StoreKind> {

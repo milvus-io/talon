@@ -21,7 +21,10 @@
 //! the `(block, page)` context so the caller can trigger a page-level miss.
 //!
 
-use crate::catalog::DiskId;
+use crate::catalog::{
+    paged_paths::{disk_dir, page_file, remove_empty_disk_dir, staged_file},
+    DiskId,
+};
 use crate::fd_cache::{CachedFd, FdCache};
 use bytes::Bytes;
 use std::collections::hash_map::DefaultHasher;
@@ -46,23 +49,6 @@ pub(crate) fn block_dir(root: &Path, id: &BlockId) -> PathBuf {
     id.hash(&mut hasher);
     let hex = format!("{:016x}", hasher.finish());
     root.join(&hex[..2]).join(format!("{hex}.pages"))
-}
-
-pub(crate) fn disk_dir(root: &Path, id: DiskId) -> PathBuf {
-    // The legacy directory scanner must leave journal-managed files to replay.
-    id.path(root, "pages")
-}
-
-pub(crate) fn remove_empty_disk_dir(dir: &Path) -> std::io::Result<()> {
-    match std::fs::remove_dir(dir) {
-        Err(error) if error.raw_os_error() == Some(libc::ENOTEMPTY) => return Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        result => result?,
-    }
-    match std::fs::File::open(dir.parent().unwrap()) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        file => file?.sync_all(),
-    }
 }
 
 fn catalog_error(error: anyhow::Error) -> Error {
@@ -157,9 +143,9 @@ impl PagedBlockStore {
             .map_err(catalog_error)?;
         let disk_id = transaction.disk_id;
         let dir = disk_dir(&self.root, disk_id);
-        let path = dir.join(format!("{}.page", page.0));
+        let path = page_file(&dir, page.0);
         let invalidate = path.clone();
-        let staged = dir.join(format!("{}.page.catalog.{}", page.0, transaction.id));
+        let staged = staged_file(&path, transaction.id);
         let result: Result<u64> = if self.uring {
             let alignment = self.direct_alignment.expect("native store alignment");
             talon_uring::spawn_local(async move {
@@ -232,13 +218,12 @@ impl PagedBlockStore {
         self.fd_cache.invalidate_prefix(&dir);
         let result = spawn_blocking_io(move || {
             let (result, parent) = match operation {
-                crate::catalog::Operation::DeletePage { page } => (
-                    std::fs::remove_file(dir.join(format!("{page}.page"))),
-                    dir.clone(),
-                ),
+                crate::catalog::Operation::DeletePage { page } => {
+                    (std::fs::remove_file(page_file(&dir, page)), dir.clone())
+                }
                 crate::catalog::Operation::DeleteBlock => {
                     for page in pages {
-                        match std::fs::remove_file(dir.join(format!("{page}.page"))) {
+                        match std::fs::remove_file(page_file(&dir, page)) {
                             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                             result => result?,
                         }
@@ -450,7 +435,7 @@ impl PagedBlockStore {
 
     /// Path of a single page file within a block directory.
     fn page_path(&self, id: &BlockId, page: PageIndex) -> PathBuf {
-        self.dir_for(id).join(format!("{}.page", page.0))
+        page_file(&self.dir_for(id), page.0)
     }
 
     /// Sidecar metadata path for a paged block: `<block dir>/block.meta`.
@@ -685,7 +670,7 @@ impl PagedBlockStore {
     /// Whether a specific page is resident.
     pub fn has_page(&self, id: &BlockId, page: PageIndex) -> bool {
         self.read_dir(id, None)
-            .is_ok_and(|dir| dir.join(format!("{}.page", page.0)).exists())
+            .is_ok_and(|dir| page_file(&dir, page.0).exists())
     }
 
     /// Materialize (commit) one page's bytes via temp-file + rename.
@@ -792,7 +777,7 @@ impl PagedBlockStore {
         page: PageIndex,
         len: u64,
     ) -> Result<Bytes> {
-        let path = self.read_dir(id, disk_id)?.join(format!("{}.page", page.0));
+        let path = page_file(&self.read_dir(id, disk_id)?, page.0);
         let label = format!("{id} page {}", page.0);
         if self.uring {
             talon_uring::require_ring()?;
@@ -882,7 +867,7 @@ impl PagedBlockStore {
         id: &BlockId,
         page: PageIndex,
     ) -> Result<(Arc<OwnedFd>, u64)> {
-        let path = dir.join(format!("{}.page", page.0));
+        let path = page_file(dir, page.0);
         if let Some(hit) = self.fd_cache.get(&path) {
             return Ok((hit.fd, hit.len));
         }
@@ -986,7 +971,7 @@ impl PagedBlockStore {
             );
             let hit = self
                 .fd_cache
-                .open_native(dir.join(format!("{}.page", page.0)))
+                .open_native(page_file(&dir, page.0))
                 .await
                 .map_err(|error| {
                     crate::block_store::cache_read_error(error, format!("{id} page {}", page.0))

@@ -48,7 +48,7 @@ pub(super) struct Catalog {
     retired_segments: BTreeMap<u64, Arc<SegmentMeta>>,
     // Streams reserve physical IDs before publication. GC orders segments by
     // first publication, and a replacement inherits its source's position.
-    pub published: BTreeMap<u64, u64>,
+    published: BTreeMap<u64, u64>,
     publication_positions: HashMap<u64, u64>,
     pub shared: Arc<CatalogState>,
     active: bool,
@@ -423,6 +423,21 @@ impl Catalog {
             self.free_chunks.extend(chunks);
         }
         self.trim_index();
+    }
+
+    pub(super) fn published_segments(
+        &self,
+        range: std::ops::RangeInclusive<u64>,
+    ) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.published
+            .range(range)
+            .map(|(&logical, &physical)| (logical, physical))
+    }
+
+    pub(super) fn last_published_segment(&self) -> Option<(u64, u64)> {
+        self.published
+            .last_key_value()
+            .map(|(&logical, &physical)| (logical, physical))
     }
 
     pub fn replace_published_segment(&mut self, old: u64, new: u64) {

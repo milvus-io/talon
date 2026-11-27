@@ -326,14 +326,14 @@ enum PageIncarnation {
 impl PageIncarnation {
     fn of(rows: &PageSet<'_>) -> Self {
         match rows {
-            PageSet::Catalog(geometry, _) => Self::Catalog(geometry.disk_id),
+            PageSet::Catalog(geometry, _) => Self::Catalog(geometry.disk_id()),
             PageSet::Legacy(_, table, _) => Self::Legacy(Arc::downgrade(table)),
         }
     }
 
     fn matches(&self, rows: &PageSet<'_>) -> bool {
         match (self, rows) {
-            (Self::Catalog(disk), PageSet::Catalog(geometry, _)) => *disk == geometry.disk_id,
+            (Self::Catalog(disk), PageSet::Catalog(geometry, _)) => *disk == geometry.disk_id(),
             (Self::Legacy(old), PageSet::Legacy(_, table, _)) => old.as_ptr() == Arc::as_ptr(table),
             _ => false,
         }

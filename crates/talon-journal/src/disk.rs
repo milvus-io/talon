@@ -158,10 +158,9 @@ pub(crate) struct Disk {
     control: Arc<crate::tests::Control>,
     root: PathBuf,
     current: Current,
-    pub file: Rc<monoio::fs::File>,
-    pub offset: u64,
-    pub lsn: u64,
-    pub options: StreamOptions,
+    file: Rc<monoio::fs::File>,
+    offset: u64,
+    options: StreamOptions,
     accounting: Arc<Accounting>,
 }
 struct Recovered<M> {
@@ -302,7 +301,7 @@ impl Disk {
         options: StreamOptions,
         threads: usize,
         total: Arc<AtomicU64>,
-    ) -> io::Result<(Self, M)> {
+    ) -> io::Result<(Self, M, Lsn)> {
         let (send, wait) = oneshot::channel();
         std::thread::Builder::new()
             .name("journal-recover".into())
@@ -322,7 +321,6 @@ impl Disk {
                 root: r.root,
                 current: r.current,
                 offset: r.offset,
-                lsn: r.lsn,
                 file: Rc::new(file),
                 options,
                 accounting: Arc::new(Accounting {
@@ -331,15 +329,23 @@ impl Disk {
                 }),
             },
             r.machine,
+            r.lsn,
         ))
     }
-    pub fn write(&self, bytes: Bytes, offset: u64) -> LocalBoxFuture<'static, io::Result<()>> {
+    pub fn checkpoint_due(&self) -> bool {
+        self.offset >= self.options.checkpoint_bytes
+    }
+    pub fn append(&mut self, bytes: Bytes) -> io::Result<LocalBoxFuture<'static, io::Result<()>>> {
+        let offset = self.offset;
+        self.offset = offset
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| invalid("journal offset overflow"))?;
         let file = self.file.clone();
         let accounting = self.accounting.clone();
         let path = path(&self.root, false, *self.current.logs.last().unwrap());
         #[cfg(test)]
         let control = self.control.clone();
-        Box::pin(async move {
+        Ok(Box::pin(async move {
             #[cfg(test)]
             {
                 control.writes.fetch_add(1, Ordering::Relaxed);
@@ -356,7 +362,7 @@ impl Disk {
                 .unwrap_or(0);
             accounting.set(path, n.max(old));
             Ok(())
-        })
+        }))
     }
     pub fn sync(&self) -> LocalBoxFuture<'static, io::Result<()>> {
         let f = self.file.clone();

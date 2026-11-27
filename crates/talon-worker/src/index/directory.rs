@@ -352,7 +352,7 @@ impl Directory {
     ) -> Option<&Geometry> {
         self.rows
             .geometry(self.rows.handle(id)?, kind)
-            .filter(|geometry| geometry.disk_id.is_some())
+            .filter(|geometry| geometry.is_persisted())
     }
 
     pub(super) fn publish_sidecar_page(
@@ -379,7 +379,7 @@ impl Directory {
 
     pub(super) fn sidecar(&self, id: &dyn BlockIdentity) -> Option<(&BlockKey, &Geometry)> {
         let (key, geometry, entry) = self.resident(id)?;
-        (entry.sidecar_page_size != 0 && geometry.disk_id.is_none()).then_some((key, geometry))
+        (entry.sidecar_page_size != 0 && !geometry.is_persisted()).then_some((key, geometry))
     }
 
     fn usage(&self, handle: u32, page: Option<u32>) -> Usage {
@@ -458,7 +458,7 @@ impl Directory {
             }
             (Operation::Put { page, len }, Some(bytes)) => {
                 if let Some(row) = self.rows.geometry_mut(handle, kind) {
-                    debug_assert_eq!(row.disk_id, disk_id);
+                    debug_assert_eq!(row.disk_id(), disk_id);
                     let age = self.inline_ages.as_ref().and_then(|ages| ages.get(slot));
                     row.put(*len, *page, bytes, age);
                 } else {
