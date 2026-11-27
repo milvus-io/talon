@@ -1064,8 +1064,8 @@ mod tests {
             origin,
             config.block_size,
             config.capacity_bytes,
-            0,
-            0,
+            config.l1_capacity_bytes,
+            config.l1_page_size_bytes,
             WorkerMetrics::new(config.capacity_bytes),
         )
         .with_page_gc(PageGcConfig::from(&config))
@@ -1178,12 +1178,14 @@ mod tests {
 
     #[tokio::test]
     async fn whole_unlink_sync_failure_is_a_cache_miss_without_retiring_accounting() {
-        for paged in [false, true] {
+        for (paged, l1) in [(false, false), (false, true), (true, false), (true, true)] {
             let root = tempfile::tempdir().unwrap();
             let origin = Arc::new(CountingOrigin::default());
             let open = || {
                 runtime_with(root.path(), origin.clone(), |config| {
                     config.l2_page_size_bytes = if paged { 4 } else { 0 };
+                    config.l1_page_size_bytes = 4;
+                    config.l1_capacity_bytes = if l1 { 16 } else { 0 };
                 })
             };
             let (worker, catalog, _) = open();
@@ -1209,17 +1211,22 @@ mod tests {
             assert!(path.is_file());
             assert!(allocated > 0);
             assert!(worker.load_range_cached(&id, 0, 16, 16));
-            worker
-                .store
-                .get_range_at(&id, Some(address), 0, 16)
-                .await
-                .unwrap();
+            assert_eq!(
+                worker.serve_cached(&probe).await.unwrap(),
+                Bytes::from_static(&[1; 16])
+            );
+            assert_eq!(worker.l1_page_count(), if l1 { 4 } else { 0 });
 
             worker.store.fail_next_delete_parent_sync();
             let error = worker.store.delete(&id).await.unwrap_err();
             assert!(matches!(error, Error::Io(e) if e.raw_os_error() == Some(libc::EIO)));
             assert!(!path.exists(), "unlink completed before the sync fault");
             assert!(catalog.journal_stopped().await);
+
+            assert!(!worker.load_range_cached(&id, 0, 16, 16));
+            assert!(worker.load_block(&id, 16).await.is_err());
+            let after_load = origin.0.load(Ordering::Relaxed);
+            assert!(after_load > 0, "LOAD reached the origin before any GET");
 
             let error = worker.serve_cached(&probe).await.unwrap_err();
             assert!(error.is::<CacheMiss>(), "{error:#}");
@@ -1228,19 +1235,15 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none());
-            assert!(!worker.load_range_cached(&id, 0, 16, 16));
-            assert_eq!(origin.0.load(Ordering::Relaxed), 0);
+            assert_eq!(origin.0.load(Ordering::Relaxed), after_load);
             assert!(worker.serve_range(&request).await.is_err());
             let calls = origin.0.load(Ordering::Relaxed);
-            assert!(calls > 0, "GET reached the origin before refill failed");
+            assert!(calls > after_load, "GET reached the origin before refill failed");
             assert!(worker
                 .serve_versioned(&request, &id.version, 16)
                 .await
                 .is_err());
-            let after_versioned = origin.0.load(Ordering::Relaxed);
-            assert!(after_versioned > calls);
-            assert!(worker.load_block(&id, 16).await.is_err());
-            assert!(origin.0.load(Ordering::Relaxed) > after_versioned);
+            assert!(origin.0.load(Ordering::Relaxed) > calls);
 
             assert_eq!(catalog.disk_id("whole", &id).unwrap(), Some(address));
             assert_eq!(worker.lru.block_candidates(&id).len(), 1);
@@ -1253,6 +1256,32 @@ mod tests {
             assert_eq!(catalog.disk_id("whole", &id).unwrap(), None);
             assert_eq!(worker.resident_bytes(), 0);
         }
+    }
+
+    #[tokio::test]
+    async fn whole_missing_file_discovered_by_read_stays_hidden_until_recovery() {
+        let root = tempfile::tempdir().unwrap();
+        let (worker, catalog, _) = runtime(root.path());
+        let id = block();
+        worker
+            .commit_cached_block(&id, Bytes::from_static(&[1; 16]))
+            .await
+            .unwrap();
+        let address = catalog.disk_id("whole", &id).unwrap().unwrap();
+        let allocated = worker.resident_bytes();
+        catalog.poison();
+        let path = address.path(&worker.store.root().join("whole"), "blk");
+        std::fs::remove_file(path).unwrap();
+
+        assert!(worker.load_range_cached(&id, 0, 16, 16));
+        assert!(worker
+            .cached_block_range(&id, 0, 16)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!worker.load_range_cached(&id, 0, 16, 16));
+        assert_eq!(catalog.disk_id("whole", &id).unwrap(), Some(address));
+        assert_eq!(worker.resident_bytes(), allocated);
     }
 
     #[tokio::test]

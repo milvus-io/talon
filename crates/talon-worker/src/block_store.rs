@@ -348,6 +348,9 @@ impl WholeBlockStore {
                 let Some(address) = expected else {
                     return Ok(false);
                 };
+                if !store.whole_visible(Some(address)) {
+                    return Ok(false);
+                }
                 let path = store.path_for(address);
                 let check = path.clone();
                 if spawn_blocking_io(move || Ok(check.try_exists()?)).await? {
@@ -355,14 +358,10 @@ impl WholeBlockStore {
                 }
                 match store.delete_locked(&id).await {
                     Ok(()) => Ok(true),
+                    Err(_) if !store.whole_visible(Some(address)) => Ok(false),
                     Err(DeleteError::Catalog(error)) if store.catalog.journal_stopped().await => {
                         store.fd_cache.invalidate(&path);
-                        store
-                            .hidden_whole
-                            .get_or_init(Default::default)
-                            .write()
-                            .unwrap()
-                            .insert(address);
+                        store.hide_whole(address);
                         tracing::warn!(block = %id, %error, "hiding missing whole block until catalog recovery");
                         Ok(false)
                     }
@@ -385,7 +384,8 @@ impl WholeBlockStore {
         #[cfg(test)]
         crate::page_access_store::crash_barrier("whole_delete_begin")
             .map_err(|error| DeleteError::File(error.into()))?;
-        let path = self.path_for(transaction.disk_id);
+        let address = transaction.disk_id;
+        let path = self.path_for(address);
         let invalidate = path.clone();
         #[cfg(test)]
         let fail_parent_sync = self.fail_delete_parent_sync.clone();
@@ -396,25 +396,31 @@ impl WholeBlockStore {
             }
             #[cfg(test)]
             if fail_parent_sync.swap(false, std::sync::atomic::Ordering::Relaxed) {
-                return Err(std::io::Error::from_raw_os_error(libc::EIO).into());
+                return Ok(Err(std::io::Error::from_raw_os_error(libc::EIO)));
             }
-            match std::fs::File::open(path.parent().unwrap()) {
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                file => file?.sync_all()?,
-            }
-            Ok(())
+            // Only a sync error after unlink (or ENOENT) proves the file is absent.
+            Ok(match std::fs::File::open(path.parent().unwrap()) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                file => file.and_then(|file| file.sync_all()),
+            })
         })
         .await;
         self.fd_cache.invalidate(&invalidate);
         match result {
-            Ok(()) => {
+            Ok(Ok(())) => {
                 #[cfg(test)]
                 crate::page_access_store::crash_barrier("whole_deleted")
                     .map_err(|error| DeleteError::File(error.into()))?;
-                self.catalog
-                    .complete(transaction, 0)
-                    .await
-                    .map_err(DeleteError::Catalog)
+                let completed = self.catalog.complete(transaction, 0).await;
+                if completed.is_err() && self.catalog.journal_stopped().await {
+                    self.hide_whole(address);
+                }
+                completed.map_err(DeleteError::Catalog)
+            }
+            Ok(Err(error)) => {
+                self.hide_whole(address);
+                self.catalog.poison();
+                Err(DeleteError::File(error.into()))
             }
             Err(error) => {
                 self.catalog.poison();
@@ -434,6 +440,14 @@ impl WholeBlockStore {
 
     fn path_for(&self, disk_id: DiskId) -> PathBuf {
         disk_id.path(&self.root.join("whole"), "blk")
+    }
+
+    fn hide_whole(&self, disk_id: DiskId) {
+        self.hidden_whole
+            .get_or_init(Default::default)
+            .write()
+            .unwrap()
+            .insert(disk_id);
     }
 
     pub(crate) fn whole_visible(&self, disk_id: Option<DiskId>) -> bool {
