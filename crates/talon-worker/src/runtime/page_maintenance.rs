@@ -1238,7 +1238,10 @@ mod tests {
             assert_eq!(origin.0.load(Ordering::Relaxed), after_load);
             assert!(worker.serve_range(&request).await.is_err());
             let calls = origin.0.load(Ordering::Relaxed);
-            assert!(calls > after_load, "GET reached the origin before refill failed");
+            assert!(
+                calls > after_load,
+                "GET reached the origin before refill failed"
+            );
             assert!(worker
                 .serve_versioned(&request, &id.version, 16)
                 .await
