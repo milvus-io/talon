@@ -70,7 +70,8 @@ impl<'a> RequestOptions<'a> {
         }
     }
 
-    /// Set the complete JSON Broker descriptor with `url`, `request` and `origin.endpoint`.
+    /// Set the JSON Broker descriptor with `request` and `origin.endpoint`.
+    /// An omitted or empty `url` uses the worker's credential endpoint when configured.
     /// S3 providers also require `origin.region` for request signing.
     /// Preserves the namespace and trace parent; `None` clears the descriptor.
     /// JSON is validated before dispatch, including empty reads and loads.

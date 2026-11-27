@@ -22,12 +22,17 @@ pub const UNCHECKED_VERSION: &str = "__talon_unchecked__";
 /// A supported blob-storage backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Backend {
+    // Append new backends and preserve the existing wire and cache key tags.
     /// Amazon S3 (and S3-compatible stores).
-    S3,
+    S3 = 0,
     /// Google Cloud Storage.
-    Gcs,
+    Gcs = 1,
     /// Azure Blob Storage.
-    Azure,
+    Azure = 2,
+    /// Alibaba Cloud Object Storage Service.
+    Ali = 3,
+    /// Tencent Cloud Object Storage.
+    Tc = 4,
 }
 
 impl Backend {
@@ -37,7 +42,26 @@ impl Backend {
             Backend::S3 => "s3",
             Backend::Gcs => "gcs",
             Backend::Azure => "az",
+            Backend::Ali => "ali",
+            Backend::Tc => "tc",
         }
+    }
+
+    /// Decode the backend byte used in persisted cache keys.
+    pub fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            0 => Some(Self::S3),
+            1 => Some(Self::Gcs),
+            2 => Some(Self::Azure),
+            3 => Some(Self::Ali),
+            4 => Some(Self::Tc),
+            _ => None,
+        }
+    }
+
+    /// Whether this S3-compatible backend requires a configured storage endpoint.
+    pub fn requires_s3_endpoint(self) -> bool {
+        matches!(self, Self::Ali | Self::Tc)
     }
 }
 
@@ -55,6 +79,8 @@ impl FromStr for Backend {
             "s3" => Ok(Backend::S3),
             "gcs" => Ok(Backend::Gcs),
             "az" | "azure" => Ok(Backend::Azure),
+            "ali" => Ok(Backend::Ali),
+            "tc" => Ok(Backend::Tc),
             other => Err(Error::Other(format!("unknown backend: {other}"))),
         }
     }
@@ -246,6 +272,8 @@ mod tests {
             (Backend::S3, "/s3/my-bucket/data/checkpoint.bin"),
             (Backend::Gcs, "/gcs/my-bucket/data/checkpoint.bin"),
             (Backend::Azure, "/az/acct-container/data/checkpoint.bin"),
+            (Backend::Ali, "/ali/my-bucket/data/checkpoint.bin"),
+            (Backend::Tc, "/tc/my-bucket/data/checkpoint.bin"),
         ] {
             let obj = ObjectId::from_path(path).unwrap();
             assert_eq!(obj.backend, backend);

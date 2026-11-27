@@ -20,6 +20,7 @@ talon-telemetry.workspace = true
 talon-core.workspace = true
 # GCS answers listings with JSON (S3 and Azure use XML).
 serde_json.workspace = true
+arc-swap = "1.9"
 async-trait.workspace = true
 bytes.workspace = true
 futures.workspace = true

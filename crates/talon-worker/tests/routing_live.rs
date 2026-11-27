@@ -289,9 +289,10 @@ async fn live_dynamic_broker_worker_reads() {
             Backend::S3 => "backend = \"s3\"",
             Backend::Gcs => "backend = \"gcs\"",
             Backend::Azure => "backend = \"azure\"",
+            _ => unreachable!("live fixture uses S3, GCS or Azure object IDs"),
         };
         let keys = match backend {
-            Backend::S3 => "s3_region = \"us-east-1\"\ns3_access_key_id = \"STATIC_TEST\"\ns3_secret_access_key = \"fixture-only\"",
+            Backend::S3 | Backend::Ali | Backend::Tc => "s3_region = \"us-east-1\"\ns3_access_key_id = \"STATIC_TEST\"\ns3_secret_access_key = \"fixture-only\"",
             Backend::Gcs => "gcs_access_key_id = \"STATIC_TEST\"\ngcs_secret_access_key = \"fixture-only\"",
             Backend::Azure => "azure_account = \"fixtureaccount\"\nazure_shared_key = \"ZmFrZQ==\"",
         };

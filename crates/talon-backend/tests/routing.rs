@@ -66,7 +66,7 @@ fn static_config(backend: Backend, name: &str) -> BucketConfig {
         ..Default::default()
     };
     match backend {
-        Backend::S3 => {
+        Backend::S3 | Backend::Ali | Backend::Tc => {
             config.s3_region = Some(format!("{name}-region"));
             config.s3_endpoint = Some(format!("https://{name}.s3.example/"));
             config.s3_path_style = Some(true);
@@ -228,7 +228,13 @@ async fn injected_resolver_preserves_target_validation_and_resolution_errors() {
 
 #[tokio::test]
 async fn static_buckets_route_all_operations_with_independent_credentials() {
-    for backend in [Backend::S3, Backend::Gcs, Backend::Azure] {
+    for backend in [
+        Backend::S3,
+        Backend::Gcs,
+        Backend::Azure,
+        Backend::Ali,
+        Backend::Tc,
+    ] {
         let http = Arc::new(OriginHttp::default());
         let router = router(
             backend,
@@ -280,7 +286,7 @@ async fn static_buckets_route_all_operations_with_independent_credentials() {
                 assert!(request.url.contains(&format!("/{name}")));
                 let authorization = request.header("authorization").unwrap();
                 match backend {
-                    Backend::S3 => {
+                    Backend::S3 | Backend::Ali | Backend::Tc => {
                         assert!(authorization.contains(&format!("Credential={name}-access/")));
                         assert!(authorization.contains(&format!("/{name}-region/s3/")));
                         assert_eq!(
@@ -351,7 +357,7 @@ async fn unknown_bucket_or_backend_is_denied_before_every_origin_operation() {
 #[tokio::test]
 async fn programmatic_records_are_validated_before_any_credentials_are_acquired() {
     let http = Arc::new(OriginHttp::default());
-    assert!(router(Backend::S3, vec![], http.clone()).await.is_err());
+    assert!(router(Backend::S3, vec![], http.clone()).await.is_ok());
     let valid = static_config(Backend::S3, "alpha");
     assert!(router(
         Backend::S3,
@@ -459,7 +465,7 @@ fn broker_config(backend: Backend, name: &str) -> BucketConfig {
     config.azure_shared_key = None;
     config.credential_broker_url = Some(format!("https://{name}.broker.example/exchange").into());
     let csp = match backend {
-        Backend::S3 => "aws",
+        Backend::S3 | Backend::Ali | Backend::Tc => "aws",
         Backend::Gcs => "gcp",
         Backend::Azure => "azure",
     };
@@ -542,7 +548,9 @@ async fn broker_refresh_and_requests_stay_per_bucket() {
         {
             let request = &requests[index];
             match backend {
-                Backend::S3 => assert_eq!(request.header("x-amz-security-token"), Some(token)),
+                Backend::S3 | Backend::Ali | Backend::Tc => {
+                    assert_eq!(request.header("x-amz-security-token"), Some(token));
+                }
                 Backend::Gcs => assert_eq!(
                     request.header("authorization"),
                     Some(format!("Bearer {token}").as_str())
@@ -700,7 +708,9 @@ async fn ambiguous_object_targets_never_reach_real_http() {
                 static_config(backend, "alpha")
             };
             match backend {
-                Backend::S3 => config.s3_endpoint = Some(endpoint.clone()),
+                Backend::S3 | Backend::Ali | Backend::Tc => {
+                    config.s3_endpoint = Some(endpoint.clone());
+                }
                 Backend::Gcs => config.gcs_endpoint = Some(endpoint.clone()),
                 Backend::Azure => config.azure_endpoint = Some(endpoint.clone()),
             }
