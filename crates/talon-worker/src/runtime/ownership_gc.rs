@@ -1140,6 +1140,55 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rejected_ownership_unlink_returns_io_before_releasing_claim() {
+        let root = tempfile::tempdir().unwrap();
+        let (worker, fixture) = namespace_runtime_with_config(root.path(), true, |config| {
+            config.background_io_concurrency = 1;
+        });
+        let id = placed("b", 0);
+        fill(&worker, &id, true).await;
+        let allocated = worker.resident_bytes();
+        fixture.publish_managed(&worker);
+        let membership = worker.membership_snapshot().unwrap();
+        let candidate = worker
+            .lru
+            .first_ownership_candidate(0..worker.lru.ownership_admission_ceiling())
+            .unwrap();
+        let page = worker
+            .paged
+            .as_ref()
+            .unwrap()
+            .catalog_dir_for(&id)
+            .unwrap()
+            .join("0.page");
+        let (dropping, resume) = worker.index.page_work.pause_next_block_claim_drop();
+        let handle = tokio::runtime::Handle::current();
+        let unlink = tokio::task::block_in_place(|| {
+            // Force rejection at the last membership check, after acquisition
+            // of the claim. Hold the operation stripe during claim cleanup.
+            let _membership_writer = worker.membership.lock().unwrap();
+            handle.block_on(async {
+                let runtime = worker.default_runtime().clone();
+                let unlink = tokio::spawn(async move {
+                    runtime
+                        .unlink_stale_block_for(candidate, Some(membership))
+                        .await
+                });
+                let paused = tokio::time::timeout(Duration::from_secs(2), dropping).await;
+                let free_slots = worker.background_io_slots().available_permits();
+                let _ = resume.send(());
+                paused.unwrap().unwrap();
+                assert_eq!(free_slots, 1);
+                unlink
+            })
+        });
+        assert!(!unlink.await.unwrap());
+        assert_eq!(std::fs::read(page).unwrap(), [1; 16]);
+        assert_eq!(worker.logical_resident_bytes(), 32);
+        assert_eq!(worker.resident_bytes(), allocated);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ownership_callbacks_release_io_while_ordinary_directory_writer_is_held() {
         let mut observations = Vec::new();
         for (packed, hold_gate) in [(true, true), (false, true), (false, false)] {

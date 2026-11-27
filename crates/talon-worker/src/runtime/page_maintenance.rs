@@ -539,7 +539,7 @@ impl WorkerRuntime {
                     budget.delete_units(candidate.units as u64).await;
                 }
             }
-            let Some(_io) = runtime.acquire_background_io(ownership_deadline).await else { return false; };
+            let Some(io) = runtime.acquire_background_io(ownership_deadline).await else { return false; };
             let state = if ownership_deadline.is_some() {
                 runtime.page_lifecycle.mutation(BlockKey::new(&candidate.block))
             } else {
@@ -549,16 +549,22 @@ impl WorkerRuntime {
                 let Some(_gate) = before_deadline(ownership_deadline, state.lock()).await else { return false; };
                 if idle_at.is_some_and(|now| !candidate.is_idle(now.max(crate::eviction::access_millis()), runtime.current_tti_ms())) { return false; }
                 let id = &candidate.block;
-                let (claim, bytes) = if ownership_deadline.is_some() && runtime.index.uses_catalog() {
+                let claim;
+                // Claim cleanup can wait for the operation stripe. Return the
+                // shared I/O permit first, with the block gate still held.
+                let io_permit = io;
+                let bytes = if ownership_deadline.is_some() && runtime.index.uses_catalog() {
                     let Some(observed) = state.try_claim_catalog_ownership(&candidate) else { return false; };
-                    observed
+                    let (acquired, bytes) = observed;
+                    claim = acquired;
+                    bytes
                 } else {
                     if !runtime.lru.stale_candidate_is_current(&candidate) { return false; }
-                    let Some(claim) = state.claim_all_pages() else { return false; };
+                    let Some(acquired) = state.claim_all_pages() else { return false; };
+                    claim = acquired;
                     // A reader may have completed before the block claim.
                     if !runtime.lru.stale_candidate_is_current(&candidate) { return false; }
-                    let bytes = runtime.index.get(id).map_or(0, |meta| meta.resident_bytes());
-                    (claim, bytes)
+                    runtime.index.get(id).map_or(0, |meta| meta.resident_bytes())
                 };
                 let pages = claim.len();
                 let compact = if let Some(small) = &runtime.small {
@@ -596,6 +602,7 @@ impl WorkerRuntime {
                 runtime.invalidate_l1(id);
                 runtime.index.remove(id);
                 runtime.lru.remove_tracked_block(id);
+                drop(io_permit);
                 drop(claim);
                 runtime.metrics.record_eviction();
                 if pages > 0 {

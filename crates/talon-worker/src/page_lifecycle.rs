@@ -825,6 +825,14 @@ impl Drop for BlockPageClaim {
     fn drop(&mut self) {
         if let Some((slot, identity)) = self.operation {
             let mut active = self.work.operations(slot).lock().unwrap();
+            #[cfg(test)]
+            {
+                let barrier = self.work.block_claim_drop_barrier.lock().unwrap().take();
+                if let Some((dropping, resume)) = barrier {
+                    let _ = dropping.send(());
+                    let _ = resume.recv();
+                }
+            }
             if active.get((slot, BLOCK_CLAIM)) == Some(identity) {
                 active.remove((slot, BLOCK_CLAIM));
             }
@@ -1083,7 +1091,13 @@ pub(crate) struct PageWork {
     shards: OnceLock<Box<[Mutex<CheckpointShard>; SHARDS]>>,
     pending: Mutex<BTreeMap<usize, Pending>>,
     has_pending: AtomicBool,
+    #[cfg(test)]
+    block_claim_drop_barrier: Mutex<Option<BlockClaimDropBarrier>>,
 }
+
+#[cfg(test)]
+type BlockClaimDropBarrier = (tokio::sync::oneshot::Sender<()>, std::sync::mpsc::Receiver<()>);
+
 impl Default for PageWork {
     fn default() -> Self {
         Self {
@@ -1093,6 +1107,8 @@ impl Default for PageWork {
             shards: OnceLock::new(),
             pending: Mutex::default(),
             has_pending: AtomicBool::new(false),
+            #[cfg(test)]
+            block_claim_drop_barrier: Mutex::default(),
         }
     }
 }
@@ -1124,6 +1140,16 @@ impl PageWork {
             .active
             .get_or_init(|| Box::new(std::array::from_fn(|_| Mutex::default())))
             [slot % OPERATION_SHARDS]
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_next_block_claim_drop(
+        &self,
+    ) -> (tokio::sync::oneshot::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (dropping, wait_for_drop) = tokio::sync::oneshot::channel();
+        let (resume, wait_for_resume) = std::sync::mpsc::channel();
+        *self.block_claim_drop_barrier.lock().unwrap() = Some((dropping, wait_for_resume));
+        (wait_for_drop, resume)
     }
 
     #[cfg(test)]
