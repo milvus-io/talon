@@ -99,6 +99,72 @@ fn dense_segment_snapshot_restores_one_hundred_thousand_extents() {
 }
 
 #[test]
+fn snapshot_restore_reuses_long_prefixes_across_batches() {
+    use talon_journal::Machine;
+
+    let mut model = Model::default();
+    let shared = "路\0".repeat(246);
+    let mut offset = 0;
+    // Every pass exceeds the batch byte limit before any prefix repeats.
+    // The final character has a shared leading UTF-8 byte.
+    for suffix in 'Ā'..='ď' {
+        for group in 0..160 {
+            let key = id(&format!("group-{group:03}/{shared}{suffix}"));
+            model
+                .apply(Event::Insert {
+                    slot: 0,
+                    segment: 1,
+                    offset,
+                    record: Record {
+                        key: crate::small_store::key::SmallKey::new(&key),
+                        len: 1,
+                        checksum: Some(offset),
+                    },
+                })
+                .unwrap();
+            offset += 1;
+        }
+    }
+    let mut short = id("short");
+    short.object.bucket = "other-bucket".into();
+    model
+        .apply(Event::Insert {
+            slot: 0,
+            segment: 1,
+            offset,
+            record: Record {
+                key: crate::small_store::key::SmallKey::new(&short),
+                len: 1,
+                checksum: Some(offset),
+            },
+        })
+        .unwrap();
+    model.apply(Event::Seal { segment: 1 }).unwrap();
+    let original = &model.segments[&1].records;
+    assert!(original.retained_prefix_bytes() > 128 << 10);
+    assert!(original.key_parts(original.slots() - 1).0.is_empty());
+
+    let mut restored = Model::default();
+    let mut batches = 0;
+    for bytes in model.snapshot().unwrap() {
+        let record = Model::decode_snapshot(&bytes.unwrap()).unwrap();
+        batches += usize::from(matches!(record, super::snapshot::SnapshotRecord::Rows(_)));
+        restored.restore(record).unwrap();
+    }
+    restored.finish_snapshot_restore().unwrap();
+    assert!(batches > 16, "expected repeated prefixes across batches");
+    let recovered = &restored.segments[&1].records;
+    assert_eq!(recovered.slots(), original.slots());
+    for row in 0..original.slots() {
+        assert_eq!(recovered.key_parts(row), original.key_parts(row));
+    }
+    assert_eq!(
+        recovered.retained_prefix_bytes(),
+        original.retained_prefix_bytes()
+    );
+}
+
+#[test]
 fn sealed_snapshot_preserves_deleted_rows_and_frozen_prefix_dictionaries() {
     use talon_journal::Machine;
     let mut model = Model::default();

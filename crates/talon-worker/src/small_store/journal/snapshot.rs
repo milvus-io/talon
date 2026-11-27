@@ -316,6 +316,7 @@ pub(crate) struct Restore {
     allocator: bool,
     remaining: usize,
     extent_end: u64,
+    prefixes: HashMap<Box<[u8]>, u32>,
 }
 
 impl Restore {
@@ -365,11 +366,7 @@ pub(super) fn restore(model: &mut Model, record: SnapshotRecord) -> io::Result<(
                 return Err(invalid("small snapshot batch order or count"));
             }
             let segment = Arc::get_mut(last.get_mut()).expect("snapshot recovery owns its segment");
-            let prefix_ids = batch
-                .prefixes
-                .into_iter()
-                .map(|prefix| segment.records.append_snapshot_prefix(&batch.bytes[prefix]))
-                .collect::<io::Result<Vec<_>>>()?;
+            let mut prefix_ids = vec![None; batch.prefixes.len()];
             for row in &batch.rows {
                 let meta = row.meta;
                 let end = meta.offset + meta.stored_len();
@@ -379,16 +376,38 @@ pub(super) fn restore(model: &mut Model, record: SnapshotRecord) -> io::Result<(
                 {
                     return Err(invalid("small snapshot extent bounds or order"));
                 }
+                // Batches are validated in parallel and number prefixes
+                // locally. Intern each referenced byte span once per segment.
+                let prefix = if let Some(id) = row.prefix {
+                    let prefix_id = &mut prefix_ids[id];
+                    if prefix_id.is_none() {
+                        let bytes = &batch.bytes[batch.prefixes[id].clone()];
+                        let global_id = if let Some(&id) = state.prefixes.get(bytes) {
+                            id
+                        } else {
+                            let id = segment.records.append_snapshot_prefix(bytes)?;
+                            state.prefixes.insert(bytes.into(), id);
+                            id
+                        };
+                        *prefix_id = Some(global_id);
+                    }
+                    *prefix_id
+                } else {
+                    None
+                };
                 segment.records.append_snapshot_row(
                     meta,
-                    row.prefix.map(|id| prefix_ids[id]),
+                    prefix,
                     &batch.bytes[row.suffix.clone()],
                 )?;
                 state.extent_end = end;
             }
             state.remaining -= batch.rows.len();
-            if state.remaining == 0 && segment.sealed {
-                segment.records.freeze_snapshot();
+            if state.remaining == 0 {
+                state.prefixes.clear();
+                if segment.sealed {
+                    segment.records.freeze_snapshot();
+                }
             }
         }
     }

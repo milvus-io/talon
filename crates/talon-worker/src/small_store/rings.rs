@@ -21,7 +21,7 @@ pub struct SmallObjectStore {
     allocation_unit: u64,
     pub(super) access_checkpoint: tokio::sync::Mutex<()>,
     #[cfg(test)]
-    pub(super) access_pause: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+    pub(crate) access_pause: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     pub(super) access_dirty: Arc<super::access::DirtyQueue>,
     streams: RwLock<BTreeMap<usize, Stream>>,
     policy: std::sync::OnceLock<Arc<Lru>>,

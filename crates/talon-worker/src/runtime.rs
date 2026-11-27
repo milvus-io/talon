@@ -2873,13 +2873,17 @@ impl WorkerRuntime {
         }
     }
 
-    async fn checkpoint_small_access(&self) {
+    async fn checkpoint_small_access(&self, stop: Option<&tokio::sync::watch::Receiver<bool>>) {
         if let Some(small) = self.small.as_ref() {
             if let Err(error) = small
-                .checkpoint_access(self.background_budget.clone())
+                .checkpoint_access(self.background_budget.clone(), stop)
                 .await
             {
-                tracing::warn!(%error, "small object access checkpoint failed");
+                if error.kind() != std::io::ErrorKind::Interrupted
+                    || !stop.is_some_and(|stop| *stop.borrow())
+                {
+                    tracing::warn!(%error, "small object access checkpoint failed");
+                }
             }
         }
     }

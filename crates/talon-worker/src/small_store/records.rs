@@ -324,6 +324,11 @@ impl Records {
         self.keys.append_prefix(prefix)
     }
 
+    #[cfg(test)]
+    pub fn retained_prefix_bytes(&self) -> usize {
+        self.keys.retained_prefix_bytes()
+    }
+
     pub fn append_snapshot_row(
         &mut self,
         record: Metadata,

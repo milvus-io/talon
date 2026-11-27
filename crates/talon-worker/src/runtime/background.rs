@@ -113,12 +113,17 @@ impl WorkerBackground {
             );
             let last_checkpoint = Arc::new(Mutex::new(HashMap::new()));
             let last_small_checkpoint = Arc::new(Mutex::new(HashMap::new()));
+            let stop = scheduler.stop_signal();
             scheduler.register("access_checkpoint", period, move || {
                 let w = w.clone();
                 let last = last_checkpoint.clone();
                 let last_small = last_small_checkpoint.clone();
+                let stop = stop.clone();
                 async move {
                     for namespace in w.namespace_runtimes() {
+                        if *stop.borrow() {
+                            break;
+                        }
                         if due(
                             &last,
                             &namespace,
@@ -133,7 +138,7 @@ impl WorkerBackground {
                             &namespace,
                             namespace.page_gc_config.checkpoint_interval_ms,
                         ) {
-                            namespace.checkpoint_small_access().await;
+                            namespace.checkpoint_small_access(Some(&stop)).await;
                         }
                     }
                 }
@@ -254,9 +259,11 @@ impl WorkerBackground {
     /// using the same disk budget. External process shutdown deadlines still apply.
     pub async fn shutdown(self) {
         self.begin_shutdown();
+        let stop = self.scheduler.stop_signal();
         self.scheduler.shutdown().await;
         self.worker.drain_namespace_initializers().await;
-        for namespace in self.worker.namespace_runtimes() {
+        let namespaces = self.worker.namespace_runtimes();
+        for namespace in &namespaces {
             namespace.drain_page_mutations().await;
             if let Some(small) = &namespace.small {
                 // Seals make payloads replayable. WAL rotation and compaction
@@ -268,7 +275,9 @@ impl WorkerBackground {
                     tracing::warn!(%error, "small object shutdown seal failed");
                 }
             }
-            namespace.checkpoint_small_access().await;
+        }
+        for namespace in namespaces {
+            namespace.checkpoint_small_access(Some(&stop)).await;
             namespace.checkpoint_access_times().await;
             if let Err(error) = namespace.checkpoint_catalog().await {
                 tracing::error!(%error, "cache catalog shutdown checkpoint failed");

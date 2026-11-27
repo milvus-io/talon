@@ -78,6 +78,11 @@ pub(super) struct Keys {
 }
 
 impl Keys {
+    #[cfg(test)]
+    pub fn retained_prefix_bytes(&self) -> usize {
+        self.prefix_bytes.capacity()
+    }
+
     pub fn get(&self, row: usize) -> Option<(&[u8], &[u8])> {
         let span = if self.offsets.is_empty() {
             *self.rows.get(row)?

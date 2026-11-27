@@ -50,7 +50,7 @@ async fn clocks_are_allocated_only_when_enabled_and_restore_persisted_ages() {
             .unwrap();
         assert!(store.access(&id(2)).unwrap().last_access() > 0);
         store.maintain(true).await.unwrap();
-        store.checkpoint_access(None).await.unwrap();
+        store.checkpoint_access(None, None).await.unwrap();
     }
     let (store, policy) = untracked(root.path());
     assert_eq!(store.access(&id(1)).unwrap().last_access(), 0);
@@ -96,7 +96,7 @@ async fn put(store: &Arc<SmallObjectStore>, id: &BlockId) -> AccessHandle {
     store.access(id).unwrap()
 }
 async fn flush(store: &Arc<SmallObjectStore>) {
-    store.checkpoint_access(None).await.unwrap();
+    store.checkpoint_access(None, None).await.unwrap();
 }
 fn log(root: &Path) -> HashMap<CacheUnit, u64> {
     let bytes = std::fs::read(root.join(LOG)).unwrap();
@@ -121,12 +121,7 @@ fn open_compact(root: &Path) -> (Arc<SmallObjectStore>, Arc<Lru>) {
 }
 
 fn compact_age(store: &SmallObjectStore, key: &BlockId) -> u64 {
-    let catalog = store.journal.model.0.read().unwrap();
-    let slot = catalog
-        .find(&key.view(), super::super::lookup::VISIBLE)
-        .unwrap();
-    let (recency, time) = catalog.recency_at(slot).unwrap();
-    recency.time(time.load(Ordering::Relaxed))
+    store.compact_access_age(key)
 }
 
 fn set_compact_age(store: &SmallObjectStore, key: &BlockId, age: u64) {
@@ -583,7 +578,7 @@ async fn full_access_checkpoint_and_relocation_share_the_publication_boundary() 
         let checkpointing = || {
             let store = store.clone();
             let budget = budget.clone();
-            tokio::spawn(async move { store.checkpoint_access(Some(budget)).await.unwrap() })
+            tokio::spawn(async move { store.checkpoint_access(Some(budget), None).await.unwrap() })
         };
         let source_is_journaled = || {
             store
@@ -743,7 +738,7 @@ async fn compact_full_checkpoint_retries_after_sampling_with_one_io_permit() {
     let flush_with_budget = || async {
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            store.checkpoint_access(Some(budget.clone())),
+            store.checkpoint_access(Some(budget.clone()), None),
         )
         .await
         .expect("a full checkpoint must make progress with a single I/O permit")
@@ -947,7 +942,7 @@ async fn failed_append_retries_as_full_checkpoint() {
     flush(&store).await;
     access.touch();
     std::fs::remove_file(dir.path().join(LOG)).unwrap();
-    assert!(store.checkpoint_access(None).await.is_err());
+    assert!(store.checkpoint_access(None, None).await.is_err());
     assert!(store.journal.access_disk.lock().unwrap().full);
     flush(&store).await;
     assert_eq!(store.journal.access_disk.lock().unwrap().generation, 2);
@@ -968,7 +963,7 @@ async fn published_snapshot_ignores_previous_generation_log_after_restart() {
     store.journal.access_disk.lock().unwrap().full = true;
     // Fail after durable snapshot replacement, before the new log exists.
     std::fs::create_dir(dir.path().join("access.log.tmp")).unwrap();
-    assert!(store.checkpoint_access(None).await.is_err());
+    assert!(store.checkpoint_access(None, None).await.is_err());
     assert_eq!(std::fs::read(dir.path().join(LOG)).unwrap(), old_log);
     let last = access.last_access();
     drop(store);

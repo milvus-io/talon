@@ -4,12 +4,23 @@ use std::io::{BufReader, Read};
 
 const ROWS_PER_BATCH: usize = 512;
 const SNAPSHOT_MAGIC: &[u8; 8] = b"TLSA0003";
+const SNAPSHOT_TEMP: &str = "access.checkpoint.tmp";
 const DELTA_MAGIC: &[u8; 8] = b"TLSL0002";
 const ENTRY_BYTES: usize = 12;
 const GROUP_HEADER_BYTES: usize = 12;
 const FRAME_HEADER_BYTES: usize = 12;
 
 impl SmallObjectStore {
+    #[cfg(test)]
+    pub(crate) fn compact_access_age(&self, key: &talon_core::BlockId) -> u64 {
+        let catalog = self.journal.model.0.read().unwrap();
+        let slot = catalog
+            .find(&key.view(), super::super::lookup::VISIBLE)
+            .unwrap();
+        let (recency, time) = catalog.recency_at(slot).unwrap();
+        recency.time(time.load(Ordering::Relaxed))
+    }
+
     pub(crate) fn init_recency(&self) {
         let mut catalog = self.journal.model.0.write().unwrap();
         catalog.recency = Some(crate::small_store::recency::Recency::new(&catalog.model));
@@ -68,6 +79,14 @@ impl SmallObjectStore {
 
     pub(super) fn restore_compact_access(&self) {
         let started = Instant::now();
+        // A stopped rewrite may leave a partial file. Only the renamed
+        // checkpoint and its matching log are part of the durable generation.
+        let tmp = self.root.join(SNAPSHOT_TEMP);
+        if let Err(error) = std::fs::remove_file(&tmp) {
+            if error.kind() != io::ErrorKind::NotFound {
+                tracing::warn!(%error, path = %tmp.display(), "discarding temporary small access checkpoint failed");
+            }
+        }
         let catalog = self.journal.model.0.read().unwrap();
         let recency = catalog.recency.as_ref().unwrap();
         let result = (|| -> io::Result<(DiskState, usize)> {
@@ -137,20 +156,21 @@ impl SmallObjectStore {
     pub(super) async fn checkpoint_compact_access(
         &self,
         budget: Option<&crate::background::BackgroundBudget>,
+        stop: Option<&watch::Receiver<bool>>,
     ) -> io::Result<()> {
         // A relocation persists destination ages in this same generation
         // before making the replacement visible in the metadata WAL.
         let _relocation = self.journal.access_relocation.write().await;
-        let mut state = {
-            let mut disk = self.journal.access_disk.lock().unwrap();
-            let state = *disk;
-            // An error after sampling dirty rows requires a fresh snapshot.
-            // Keep the previous durable log end for any intervening move.
-            disk.full = true;
-            state
-        };
+        let mut state = *self.journal.access_disk.lock().unwrap();
         let full = state.full
             || state.log_bytes >= MIN_COMPACT_BYTES.max(state.snapshot_bytes.div_ceil(2));
+        if full && checkpoint_stopped(stop) {
+            return Ok(());
+        }
+        // A stopped or failed rewrite may already have sampled dirty rows.
+        // Retry from all live ages, keeping the durable log end for relocation.
+        self.journal.access_disk.lock().unwrap().full = true;
+        let stop = stop.filter(|_| full);
         let mut cursor: Address = (0, 0);
         let ceiling = self
             .journal
@@ -162,7 +182,7 @@ impl SmallObjectStore {
             .segments
             .last_key_value()
             .map_or((0, 0), |(&id, segment)| (id, segment.bytes));
-        let tmp = self.root.join("access.checkpoint.tmp");
+        let tmp = self.root.join(SNAPSHOT_TEMP);
         let mut fd = None;
         let mut offset = state.log_bytes;
         if full {
@@ -171,10 +191,7 @@ impl SmallObjectStore {
                 .checked_add(1)
                 .ok_or_else(|| invalid("access generation exhausted"))?;
             let file = {
-                let _io = match budget {
-                    Some(b) => Some(b.io().await),
-                    None => None,
-                };
+                let _io = access_grant(budget, 0, stop).await?;
                 disk_io::open(tmp.clone(), disk_io::Open::Replace).await?
             };
             self.write_access_chunks(
@@ -182,6 +199,7 @@ impl SmallObjectStore {
                 header(SNAPSHOT_MAGIC, state.generation).into(),
                 0,
                 budget,
+                stop,
             )
             .await?;
             offset = HEADER;
@@ -196,6 +214,9 @@ impl SmallObjectStore {
             }
         }
         loop {
+            if checkpoint_stopped(stop) {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
             let mut batch = AgeBatch::default();
             let done = {
                 let catalog = self.journal.model.0.read().unwrap();
@@ -224,15 +245,12 @@ impl SmallObjectStore {
             if !bytes.is_empty() {
                 if fd.is_none() {
                     self.journal.access_disk.lock().unwrap().log_truncate = true;
-                    let _io = match budget {
-                        Some(b) => Some(b.io().await),
-                        None => None,
-                    };
+                    let _io = access_grant(budget, 0, stop).await?;
                     fd = Some(open_log_for_append(&self.root, &mut state).await?);
                     offset = state.log_bytes;
                 }
                 let len = bytes.len() as u64;
-                self.write_access_chunks(fd.as_ref().unwrap(), bytes.into(), offset, budget)
+                self.write_access_chunks(fd.as_ref().unwrap(), bytes.into(), offset, budget, stop)
                     .await?;
                 offset += len;
             }
@@ -246,19 +264,15 @@ impl SmallObjectStore {
                 let mut footer = Vec::new();
                 format::frame(&mut footer, &[])?;
                 let len = footer.len() as u64;
-                self.write_access_chunks(&fd, footer.into(), offset, budget)
+                self.write_access_chunks(&fd, footer.into(), offset, budget, stop)
                     .await?;
                 offset += len;
             }
-            self.sync_access(fd, budget).await?;
+            self.sync_access(fd, budget, stop).await?;
             if full {
-                if let Some(b) = budget {
-                    b.bytes(HEADER as usize).await;
-                }
-                let _io = match budget {
-                    Some(b) => Some(b.io().await),
-                    None => None,
-                };
+                // Once rename starts, complete publishing both files with
+                // this grant even if shutdown arrives in the meantime.
+                let _io = access_grant(budget, HEADER as usize, stop).await?;
                 disk_io::rename(tmp, self.root.join(FILE)).await?;
                 state.snapshot_bytes = offset;
                 state.log_bytes = 0;

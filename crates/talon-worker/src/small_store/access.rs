@@ -8,6 +8,7 @@ mod tests;
 use super::*;
 use crate::eviction::AccessHandle;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use tokio::sync::{watch, OwnedSemaphorePermit};
 
 pub(super) const FILE: &str = "access.checkpoint";
 const LOG: &str = "access.log";
@@ -18,6 +19,39 @@ const HEADER: u64 = 16;
 const MIN_COMPACT_BYTES: u64 = 1 << 20;
 const MAX_DIRTY_KEYS: usize = 262_144;
 const MAX_DIRTY_BYTES: usize = 64 << 20;
+
+fn checkpoint_stopped(stop: Option<&watch::Receiver<bool>>) -> bool {
+    stop.is_some_and(|stop| *stop.borrow())
+}
+
+// Only race resource waits against shutdown. The caller keeps this grant
+// through any submitted I/O and its durable publication steps.
+async fn access_grant(
+    budget: Option<&crate::background::BackgroundBudget>,
+    bytes: usize,
+    stop: Option<&watch::Receiver<bool>>,
+) -> io::Result<Option<OwnedSemaphorePermit>> {
+    let grant = async {
+        if let Some(budget) = budget {
+            if bytes != 0 {
+                budget.bytes(bytes).await;
+            }
+            Some(budget.io().await)
+        } else {
+            None
+        }
+    };
+    if let Some(stop) = stop {
+        let mut stop = stop.clone();
+        tokio::select! {
+            biased;
+            _ = stop.wait_for(|stopped| *stopped) => Err(io::ErrorKind::Interrupted.into()),
+            permit = grant => Ok(permit),
+        }
+    } else {
+        Ok(grant.await)
+    }
+}
 
 #[derive(Default)]
 struct Pending {
@@ -282,23 +316,26 @@ impl SmallObjectStore {
     pub(crate) async fn checkpoint_access(
         self: &Arc<Self>,
         budget: Option<Arc<crate::background::BackgroundBudget>>,
+        stop: Option<&watch::Receiver<bool>>,
     ) -> io::Result<()> {
         let store = self.clone();
+        let stop = stop.cloned();
         self.tasks
             .run(async move {
                 let _gate = store.access_checkpoint.lock().await;
                 if store.has_recency() {
                     store.enable_access_tracking()?;
-                    return store.checkpoint_compact_access(budget.as_deref()).await;
+                    return store
+                        .checkpoint_compact_access(budget.as_deref(), stop.as_ref())
+                        .await;
                 }
                 let prepare = store.clone();
+                let prepare_stop = stop.clone();
                 let (mut state, full, bytes) =
                     tokio::task::spawn_blocking(move || -> io::Result<_> {
                         prepare.enable_access_tracking()?;
                         let mut state = *prepare.journal.access_disk.lock().unwrap();
                         let overflow = prepare.access_dirty.overflow.swap(false, Ordering::AcqRel);
-                        let pending =
-                            std::mem::take(&mut *prepare.access_dirty.pending.lock().unwrap());
                         let full = state.full
                             || overflow
                             || state.log_bytes
@@ -306,6 +343,11 @@ impl SmallObjectStore {
                         // Failure after consuming dirty state must retry from all live
                         // timestamps, including a partial append or ambiguous rename.
                         prepare.journal.access_disk.lock().unwrap().full = true;
+                        if full && checkpoint_stopped(prepare_stop.as_ref()) {
+                            return Err(io::ErrorKind::Interrupted.into());
+                        }
+                        let pending =
+                            std::mem::take(&mut *prepare.access_dirty.pending.lock().unwrap());
                         let mut bytes = Vec::new();
                         if full {
                             state.generation = state
@@ -314,6 +356,9 @@ impl SmallObjectStore {
                                 .ok_or_else(|| invalid("access generation exhausted"))?;
                             bytes = header(MAGIC, state.generation);
                             for stream in prepare.streams() {
+                                if checkpoint_stopped(prepare_stop.as_ref()) {
+                                    return Err(io::ErrorKind::Interrupted.into());
+                                }
                                 let entries: Vec<_> = stream
                                     .entries
                                     .read()
@@ -324,6 +369,9 @@ impl SmallObjectStore {
                                     })
                                     .collect();
                                 for (key, access) in entries {
+                                    if checkpoint_stopped(prepare_stop.as_ref()) {
+                                        return Err(io::ErrorKind::Interrupted.into());
+                                    }
                                     encode(&mut bytes, &key, access.sample_small())?;
                                 }
                             }
@@ -355,12 +403,15 @@ impl SmallObjectStore {
                 let written = full || !bytes.is_empty();
                 if full {
                     state.snapshot_bytes = bytes.len() as u64;
-                    store.publish_access(FILE, bytes, budget.as_deref()).await?;
+                    store
+                        .publish_access(FILE, bytes, budget.as_deref(), stop.as_ref())
+                        .await?;
                     store
                         .publish_access(
                             LOG,
                             header(LOG_MAGIC, state.generation).into(),
                             budget.as_deref(),
+                            None,
                         )
                         .await?;
                     state.log_bytes = HEADER;
@@ -372,6 +423,7 @@ impl SmallObjectStore {
                             bytes.clone(),
                             state.log_bytes,
                             budget.as_deref(),
+                            None,
                         )
                         .await?;
                     state.log_bytes += bytes.len() as u64;
@@ -396,9 +448,11 @@ impl SmallObjectStore {
         bytes: Bytes,
         offset: u64,
         budget: Option<&crate::background::BackgroundBudget>,
+        stop: Option<&watch::Receiver<bool>>,
     ) -> io::Result<()> {
-        self.write_access_chunks(&fd, bytes, offset, budget).await?;
-        self.sync_access(fd, budget).await
+        self.write_access_chunks(&fd, bytes, offset, budget, stop)
+            .await?;
+        self.sync_access(fd, budget, stop).await
     }
 
     async fn write_access_chunks(
@@ -407,16 +461,11 @@ impl SmallObjectStore {
         bytes: Bytes,
         offset: u64,
         budget: Option<&crate::background::BackgroundBudget>,
+        stop: Option<&watch::Receiver<bool>>,
     ) -> io::Result<()> {
         for start in (0..bytes.len()).step_by(64 << 10) {
             let end = (start + (64 << 10)).min(bytes.len());
-            if let Some(budget) = budget {
-                budget.bytes(end - start).await;
-            }
-            let _io = match budget {
-                Some(b) => Some(b.io().await),
-                None => None,
-            };
+            let _io = access_grant(budget, end - start, stop).await?;
             disk_io::write(fd.clone(), bytes.slice(start..end), offset + start as u64).await?;
         }
         Ok(())
@@ -426,11 +475,9 @@ impl SmallObjectStore {
         &self,
         fd: Arc<OwnedFd>,
         budget: Option<&crate::background::BackgroundBudget>,
+        stop: Option<&watch::Receiver<bool>>,
     ) -> io::Result<()> {
-        let _io = match budget {
-            Some(b) => Some(b.io().await),
-            None => None,
-        };
+        let _io = access_grant(budget, 0, stop).await?;
         disk_io::sync(fd).await
     }
 
@@ -439,23 +486,17 @@ impl SmallObjectStore {
         name: &str,
         bytes: Bytes,
         budget: Option<&crate::background::BackgroundBudget>,
+        stop: Option<&watch::Receiver<bool>>,
     ) -> io::Result<()> {
         let tmp = self.root.join(format!("{name}.tmp"));
-        let fd = disk_io::open(tmp.clone(), disk_io::Open::Replace).await?;
-        self.write_access(fd, bytes, 0, budget).await?;
-        self.rename_access(tmp, name, budget).await
-    }
-
-    async fn rename_access(
-        &self,
-        tmp: PathBuf,
-        name: &str,
-        budget: Option<&crate::background::BackgroundBudget>,
-    ) -> io::Result<()> {
-        let _io = match budget {
-            Some(b) => Some(b.io().await),
-            None => None,
+        let fd = {
+            let _io = access_grant(budget, 0, stop).await?;
+            disk_io::open(tmp.clone(), disk_io::Open::Replace).await?
         };
+        self.write_access_chunks(&fd, bytes, 0, budget, stop)
+            .await?;
+        self.sync_access(fd, budget, stop).await?;
+        let _io = access_grant(budget, 0, stop).await?;
         disk_io::rename(tmp, self.root.join(name)).await?;
         disk_io::sync_dir(self.root.clone()).await
     }

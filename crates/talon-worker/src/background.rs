@@ -37,6 +37,7 @@ pub struct BackgroundScheduler {
     tasks: Vec<Task>,
     concurrency: usize,
     metrics: Option<Metrics>,
+    stop: watch::Sender<bool>,
 }
 impl BackgroundScheduler {
     /// Construct a scheduler with a positive global task concurrency limit.
@@ -46,6 +47,7 @@ impl BackgroundScheduler {
             tasks: Vec::new(),
             concurrency,
             metrics: None,
+            stop: watch::channel(false).0,
         }
     }
     /// Attach the worker registry before registering tasks.
@@ -141,9 +143,14 @@ impl BackgroundScheduler {
             run: Box::new(move || Box::pin(run())),
         });
     }
+    pub(crate) fn stop_signal(&self) -> watch::Receiver<bool> {
+        self.stop.subscribe()
+    }
+
     /// Start dispatching. Stopping prevents admission, then finishes active batches.
     pub fn start(self) -> BackgroundHandle {
-        let (stop, stopped) = watch::channel(false);
+        let stop = self.stop.clone();
+        let stopped = self.stop_signal();
         let task = tokio::spawn(self.run(stopped));
         BackgroundHandle {
             stop,
@@ -253,6 +260,10 @@ pub struct BackgroundHandle {
     task: Option<tokio::task::JoinHandle<()>>,
 }
 impl BackgroundHandle {
+    pub(crate) fn stop_signal(&self) -> watch::Receiver<bool> {
+        self.stop.subscribe()
+    }
+
     /// Stop admitting new invocations while active tasks finish.
     pub fn begin_shutdown(&self) {
         let _ = self.stop.send(true);
