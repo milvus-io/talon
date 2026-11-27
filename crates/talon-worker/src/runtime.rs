@@ -1952,10 +1952,10 @@ impl WorkerRuntime {
                                 "page admission conflicts with small store residency for {id}"
                             );
                         }
-                        if matches!(
-                            runtime.index.summary(&id).map(|m| m.shape),
-                            Some(BlockShape::Whole)
-                        ) {
+                        if runtime.index.summary(&id).is_some_and(|meta| {
+                            matches!(meta.shape, BlockShape::Whole)
+                                && runtime.store.whole_visible(meta.disk_id)
+                        }) {
                             return Ok::<_, anyhow::Error>(());
                         }
                         let paged = runtime.paged.as_ref().expect("paged store").clone();
@@ -2126,7 +2126,7 @@ impl WorkerRuntime {
             self.metrics.record_l2_miss();
             return Ok(None);
         };
-        if !matches!(meta.shape, BlockShape::Whole) {
+        if !matches!(meta.shape, BlockShape::Whole) || !self.store.whole_visible(meta.disk_id) {
             self.metrics.record_l2_miss();
             return Ok(None);
         }
