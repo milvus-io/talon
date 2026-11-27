@@ -1163,7 +1163,7 @@ mod tests {
             .join("0.page");
         let (dropping, resume) = worker.index.page_work.pause_next_block_claim_drop();
         let handle = tokio::runtime::Handle::current();
-        let unlink = tokio::task::block_in_place(|| {
+        let unlinked = tokio::task::block_in_place(|| {
             // Force rejection at the last membership check, after acquisition
             // of the claim. Hold the operation stripe during claim cleanup.
             let _membership_writer = worker.membership.lock().unwrap();
@@ -1179,10 +1179,10 @@ mod tests {
                 let _ = resume.send(());
                 paused.unwrap().unwrap();
                 assert_eq!(free_slots, 1);
-                unlink
+                unlink.await.unwrap()
             })
         });
-        assert!(!unlink.await.unwrap());
+        assert!(!unlinked);
         assert_eq!(std::fs::read(page).unwrap(), [1; 16]);
         assert_eq!(worker.logical_resident_bytes(), 32);
         assert_eq!(worker.resident_bytes(), allocated);

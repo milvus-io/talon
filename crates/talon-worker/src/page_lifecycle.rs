@@ -1096,7 +1096,10 @@ pub(crate) struct PageWork {
 }
 
 #[cfg(test)]
-type BlockClaimDropBarrier = (tokio::sync::oneshot::Sender<()>, std::sync::mpsc::Receiver<()>);
+type BlockClaimDropBarrier = (
+    tokio::sync::oneshot::Sender<()>,
+    std::sync::mpsc::Receiver<()>,
+);
 
 impl Default for PageWork {
     fn default() -> Self {
@@ -1145,7 +1148,10 @@ impl PageWork {
     #[cfg(test)]
     pub(crate) fn pause_next_block_claim_drop(
         &self,
-    ) -> (tokio::sync::oneshot::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
         let (dropping, wait_for_drop) = tokio::sync::oneshot::channel();
         let (resume, wait_for_resume) = std::sync::mpsc::channel();
         *self.block_claim_drop_barrier.lock().unwrap() = Some((dropping, wait_for_resume));
