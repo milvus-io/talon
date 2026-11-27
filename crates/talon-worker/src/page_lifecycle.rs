@@ -595,15 +595,9 @@ impl PagedMutation {
         self.index.with_pages(&self.id, true, |slot, rows| {
             let Some(row) = rows.get(page.0) else { return };
             if fill {
-                if access.is_some_and(|access| row.touch(access)) {
-                    self.index.page_work.mark(&self.id, slot, now, false);
-                }
-                let state = row.state.load(Ordering::Relaxed);
-                row.state
-                    .store((state & !RETRY) | ACCESSED, Ordering::Release);
-                if state & RETRY != 0 {
-                    self.index.page_work.cancel_retry(slot, page.0);
-                }
+                self.index
+                    .page_work
+                    .finish_fill(&self.id, slot, page.0, row, access, now);
             } else {
                 row.restore(access);
             }
@@ -648,33 +642,11 @@ impl PagedMutation {
         reason: usize,
         flags: u32,
     ) -> Option<GcCandidate> {
-        if flags & (CLOSED | PINNED) != 0 {
-            return None;
-        }
-        let work = &self.index.page_work;
-        let mut active = work.operations(slot).lock().unwrap();
-        if active.get((slot, BLOCK_CLAIM)).is_some() {
-            return None;
-        }
-        state
-            .compare_exchange(
-                flags,
-                flags & !ACCESSED,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            )
-            .ok()?;
-        let identity = work.next_identity();
-        active.insert((slot, u64::from(page)), identity);
+        let lease = self.index.page_work.select_page(slot, page, state, flags)?;
         Some(GcCandidate {
             block: self.clone(),
             page: PageIndex(page),
-            lease: Arc::new(PageSelection {
-                work: work.clone(),
-                slot,
-                page,
-                identity,
-            }),
+            lease,
             reason,
         })
     }
@@ -686,31 +658,8 @@ impl PagedMutation {
         }
         self.index
             .with_pages(&self.id, false, |slot, rows| {
-                let Some(row) = rows.get(c.page.0) else {
-                    return false;
-                };
-                let mut active = work.operations(slot).lock().unwrap();
-                let flags = row.state.load(Ordering::Acquire);
-                if active.get((slot, BLOCK_CLAIM)).is_some()
-                    || !c.lease.current(&active, slot)
-                    || flags & (CLOSED | PINNED | ACCESSED) != 0
-                    || tti.is_some_and(|tti| !expired(row.age(), now, tti))
-                {
-                    return false;
-                }
-                if row
-                    .state
-                    .compare_exchange(flags, flags | CLOSED, Ordering::AcqRel, Ordering::Relaxed)
-                    .is_err()
-                {
-                    return false;
-                }
-                active.remove((slot, u64::from(c.page.0)));
-                active.insert(
-                    (slot, FIRST_CLOSED_PAGE + u64::from(c.page.0)),
-                    c.lease.identity,
-                );
-                true
+                rows.get(c.lease.page)
+                    .is_some_and(|row| work.claim_page(slot, row, &c.lease, now, tti))
             })
             .unwrap_or(false)
     }
@@ -721,21 +670,8 @@ impl PagedMutation {
             return;
         }
         self.index.with_pages(&self.id, true, |slot, rows| {
-            let Some(row) = rows.get(c.page.0) else {
-                return;
-            };
-            let mut active = work.operations(slot).lock().unwrap();
-            let key = (slot, FIRST_CLOSED_PAGE + u64::from(c.page.0));
-            if slot == c.lease.slot && active.get(key) == Some(c.lease.identity) {
-                row.state
-                    .fetch_update(Ordering::Release, Ordering::Relaxed, |flags| {
-                        Some((flags & !(CLOSED | RETRY)) | ((reason as u32 + 1) << RETRY_SHIFT))
-                    })
-                    .unwrap();
-                active.remove(key);
-                active.insert((slot, u64::from(c.page.0)), c.lease.identity);
-                drop(active);
-                work.schedule_retry(slot, c.page.0);
+            if let Some(row) = rows.get(c.lease.page) {
+                work.abort_page(slot, row, &c.lease, reason);
             }
         });
     }
@@ -1143,6 +1079,111 @@ impl PageWork {
             .active
             .get_or_init(|| Box::new(std::array::from_fn(|_| Mutex::default())))
             [slot % OPERATION_SHARDS]
+    }
+
+    // The caller holds the directory (and standalone page table) borrow
+    // before taking the operation stripe. A selection then names this row
+    // until it is superseded, closed by a claim, or removed.
+    fn select_page(
+        self: &Arc<Self>,
+        slot: usize,
+        page: u32,
+        state: &PageWord,
+        flags: u32,
+    ) -> Option<Arc<PageSelection>> {
+        if flags & (CLOSED | PINNED) != 0 {
+            return None;
+        }
+        let mut active = self.operations(slot).lock().unwrap();
+        if active.get((slot, BLOCK_CLAIM)).is_some() {
+            return None;
+        }
+        state
+            .compare_exchange(
+                flags,
+                flags & !ACCESSED,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .ok()?;
+        let identity = self.next_identity();
+        active.insert((slot, u64::from(page)), identity);
+        Some(Arc::new(PageSelection {
+            work: self.clone(),
+            slot,
+            page,
+            identity,
+        }))
+    }
+
+    fn claim_page(
+        &self,
+        slot: usize,
+        row: PageRow<'_>,
+        lease: &PageSelection,
+        now: u64,
+        tti: Option<u64>,
+    ) -> bool {
+        let mut active = self.operations(slot).lock().unwrap();
+        let flags = row.state.load(Ordering::Acquire);
+        if active.get((slot, BLOCK_CLAIM)).is_some()
+            || !lease.current(&active, slot)
+            || flags & (CLOSED | PINNED | ACCESSED) != 0
+            || tti.is_some_and(|tti| !expired(row.age(), now, tti))
+        {
+            return false;
+        }
+        if row
+            .state
+            .compare_exchange(flags, flags | CLOSED, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return false;
+        }
+        active.remove((slot, u64::from(lease.page)));
+        active.insert(
+            (slot, FIRST_CLOSED_PAGE + u64::from(lease.page)),
+            lease.identity,
+        );
+        true
+    }
+
+    // Abort and fill hold an exclusive row borrow. Release the operation
+    // stripe before entering the sparse retry queue.
+    fn abort_page(&self, slot: usize, row: PageRow<'_>, lease: &PageSelection, reason: usize) {
+        let mut active = self.operations(slot).lock().unwrap();
+        let key = (slot, FIRST_CLOSED_PAGE + u64::from(lease.page));
+        if slot == lease.slot && active.get(key) == Some(lease.identity) {
+            row.state
+                .fetch_update(Ordering::Release, Ordering::Relaxed, |flags| {
+                    Some((flags & !(CLOSED | RETRY)) | ((reason as u32 + 1) << RETRY_SHIFT))
+                })
+                .unwrap();
+            active.remove(key);
+            active.insert((slot, u64::from(lease.page)), lease.identity);
+            drop(active);
+            self.schedule_retry(slot, lease.page);
+        }
+    }
+
+    fn finish_fill(
+        &self,
+        id: &BlockKey,
+        slot: usize,
+        page: u32,
+        row: PageRow<'_>,
+        access: Option<u64>,
+        now: u64,
+    ) {
+        if access.is_some_and(|access| row.touch(access)) {
+            self.mark(id, slot, now, false);
+        }
+        let state = row.state.load(Ordering::Relaxed);
+        row.state
+            .store((state & !RETRY) | ACCESSED, Ordering::Release);
+        if state & RETRY != 0 {
+            self.cancel_retry(slot, page);
+        }
     }
 
     #[cfg(test)]
@@ -1937,16 +1978,9 @@ impl Drop for PageSnapshot {
         let Some(retry) = self.rollback.take() else {
             return;
         };
-        // A removed identity has its own tombstone. Retry a live identity's
-        // entire block, using its current ages even if it was recreated.
-        retry.index.with_page_slot(retry.slot, false, |id, _| {
-            if id == &self.block {
-                retry
-                    .index
-                    .page_work
-                    .mark(id, retry.slot, retry.oldest, true);
-            }
-        });
+        retry
+            .index
+            .retry_page_checkpoint(&self.block, retry.slot, retry.oldest);
     }
 }
 
@@ -2673,6 +2707,35 @@ mod tests {
         let (_, clean) = life.scan(&mut ScanCursor::default(), 10, 100, None, 10);
         assert!(clean.empty.is_empty());
         assert_eq!(life.dirty_summary(), (0, None));
+    }
+
+    #[test]
+    fn page_fill_clears_aborted_claim_retry_without_regressing_age() {
+        let life = PageLifecycle::new();
+        let id = id();
+        let block = life.block(&id);
+        let page = PageIndex(0);
+        block.register_fixture(page, Some(30), 30, false);
+        let candidate = block.candidate(page).unwrap();
+        assert!(block.claim(&candidate, 100, None));
+        block.abort(&candidate, 1);
+        assert!(life.index.page_work.has_pending.load(Ordering::Relaxed));
+        block.register(page, Some(10), 100, true);
+        assert_eq!(block.last_access(page.0), Some(30));
+        assert!(!life.index.page_work.has_pending.load(Ordering::Relaxed));
+        life.index
+            .with_pages(&id, false, |_, rows| {
+                assert!(!rows.get(page.0).unwrap().retry_pending());
+            })
+            .unwrap();
+        assert!(!block.claim(&candidate, 100, None));
+
+        let current = block.candidate(page).unwrap();
+        assert!(block.claim(&current, 100, None));
+        block.abort(&candidate, 1);
+        assert!(block.acquire(page).is_none());
+        block.abort(&current, 1);
+        assert!(block.acquire(page).is_some());
     }
 
     #[test]

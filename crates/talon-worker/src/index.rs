@@ -1081,6 +1081,16 @@ impl BlockIndex {
         }
     }
 
+    pub(crate) fn retry_page_checkpoint(&self, block: &BlockKey, slot: usize, oldest: u64) {
+        // A removed identity has its own tombstone. Retry a live identity's
+        // entire block, using its current ages even if it was recreated.
+        self.with_page_slot(slot, false, |id, _| {
+            if id == block {
+                self.page_work.mark(id, slot, oldest, true);
+            }
+        });
+    }
+
     /// Locate and inspect the next occupied slot under the same directory lock.
     pub(crate) fn scan_page_slot<T>(
         &self,

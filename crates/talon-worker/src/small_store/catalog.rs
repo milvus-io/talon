@@ -1,7 +1,7 @@
 use super::journal::{Event, Model, SegmentMeta};
-use super::lookup::{Lookup, POLICY, VISIBLE};
-use super::{Location, SegmentFile};
-use crate::eviction::{AccessHandle, PolicyEntry};
+use super::lookup::{Lookup, POLICY, REFERENCED, VISIBLE};
+use super::{Location, SegmentFile, StagedSegment};
+use crate::eviction::{AccessHandle, PolicyEntry, PolicyState};
 use crate::small_store::key::{SmallIdentity, SmallKey};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
@@ -14,10 +14,10 @@ use std::sync::{Arc, RwLock, Weak};
 pub(super) type Address = (u64, u64);
 
 pub(super) struct Retired {
-    pub slot: usize,
+    slot: usize,
     pub key: SmallKey,
-    pub location: Location,
-    pub live: bool,
+    location: Location,
+    live: bool,
     pub policy: Option<PolicyEntry>,
 }
 
@@ -34,7 +34,7 @@ pub(super) struct Catalog {
     pub access: HashMap<Address, AccessHandle>,
     pub(super) recency: Option<super::recency::Recency>,
     pub(super) ownership: Option<super::gc::Ownership>,
-    pub live: HashMap<usize, usize>,
+    live: HashMap<usize, usize>,
     pub compact_streams: HashSet<usize>,
     pub compact_totals: HashMap<usize, (u64, usize)>,
     #[cfg(test)]
@@ -43,8 +43,8 @@ pub(super) struct Catalog {
     pub pins: HashMap<Address, Arc<super::policy::SmallAccess>>,
     pub charges: HashMap<Address, u64>,
     pub revision: AtomicU64,
-    pub retired: HashMap<SmallKey, Retired>,
-    pub retired_addresses: BTreeMap<Address, SmallKey>,
+    retired: HashMap<SmallKey, Retired>,
+    retired_addresses: BTreeMap<Address, SmallKey>,
     retired_segments: BTreeMap<u64, Arc<SegmentMeta>>,
     // Streams reserve physical IDs before publication. GC orders segments by
     // first publication, and a replacement inherits its source's position.
@@ -56,7 +56,7 @@ pub(super) struct Catalog {
 
 #[derive(Default)]
 pub(super) struct CatalogState {
-    pub live_count: AtomicUsize,
+    live_count: AtomicUsize,
     pub last_publication: AtomicU64,
     pub ownership: super::gc::OwnershipEpoch,
 }
@@ -79,6 +79,22 @@ impl Default for LiveModel {
 }
 
 impl LiveModel {
+    pub(super) fn for_replay() -> Self {
+        let model = Self::default();
+        model.0.write().unwrap().model.next = 1;
+        model
+    }
+
+    pub(super) fn activate(&self) -> io::Result<Model> {
+        let mut catalog = self.0.write().unwrap();
+        catalog.activate()?;
+        Ok(catalog.model.clone())
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.1.live_count.load(Relaxed)
+    }
+
     pub fn lookup(&self, id: &dyn SmallIdentity) -> Option<Location> {
         let hash = super::records::key_hash(id);
         let encoded = super::key_codec::encode(id);
@@ -100,7 +116,7 @@ impl LiveModel {
                 .transpose();
         };
         let range = validate(record.len)?;
-        let loc = if catalog.recency.is_some() && catalog.compact_policy(slot, record.stream) {
+        let loc = if catalog.has_recency() && catalog.compact_policy(slot, record.stream) {
             let Some(loc) = catalog.payload_location(record, None) else {
                 return Ok(None);
             };
@@ -174,6 +190,23 @@ impl Catalog {
             .map(|(slot, _)| slot)
     }
 
+    pub(super) fn find_in_stream(
+        &self,
+        stream: usize,
+        id: &dyn SmallIdentity,
+        flags: u8,
+    ) -> Option<usize> {
+        let encoded = super::key_codec::encode(id);
+        self.lookup.find(self.hash(id), |handle, state| {
+            state & flags == flags
+                && self.row(handle).is_some_and(|(segment, _)| {
+                    self.segment(segment)
+                        .is_some_and(|meta| meta.slot == stream)
+                })
+                && self.matches(handle, &encoded)
+        })
+    }
+
     fn find_record(&self, hash: u32, encoded: &[u8], flags: u8) -> Option<(usize, ResolvedRecord)> {
         let mut resolved = None;
         let slot = self.lookup.find(hash, |handle, state| {
@@ -235,10 +268,50 @@ impl Catalog {
     }
 
     fn retired_location(&self, id: &dyn SmallIdentity) -> Option<Location> {
+        self.retired_location_in(id, None)
+    }
+
+    pub(super) fn retired_location_in(
+        &self,
+        id: &dyn SmallIdentity,
+        stream: Option<usize>,
+    ) -> Option<Location> {
+        self.retired
+            .get(id)
+            .filter(|entry| entry.live && stream.map_or(true, |stream| entry.slot == stream))
+            .map(|entry| entry.location.clone())
+    }
+
+    pub(super) fn retired_identity(&self, id: &dyn SmallIdentity) -> Option<SmallKey> {
+        self.retired.get(id).map(|entry| entry.key.clone())
+    }
+
+    pub(super) fn retired_at(&self, address: Address) -> Option<&Retired> {
+        self.retired_addresses
+            .get(&address)
+            .and_then(|key| self.retired.get(key))
+    }
+
+    pub(super) fn retired_offsets(
+        &self,
+        segment: u64,
+        offsets: std::ops::Range<u64>,
+    ) -> impl Iterator<Item = u64> + '_ {
+        self.retired_addresses
+            .range((segment, offsets.start)..(segment, offsets.end))
+            .map(|(&(_, offset), _)| offset)
+    }
+
+    pub(super) fn has_retired_ticket(
+        &self,
+        id: &dyn SmallIdentity,
+        ticket: &Arc<super::policy::SmallAccess>,
+    ) -> bool {
         self.retired
             .get(id)
             .filter(|entry| entry.live)
-            .map(|entry| entry.location.clone())
+            .and_then(|entry| entry.policy.as_ref()?.access.small())
+            .is_some_and(|current| Arc::ptr_eq(current, ticket))
     }
 
     pub fn location(&self, slot: usize) -> Option<Location> {
@@ -294,6 +367,341 @@ impl Catalog {
             checksum: record.checksum,
             access,
         })
+    }
+
+    pub(super) fn stream_len(&self, stream: usize) -> usize {
+        self.live.get(&stream).copied().unwrap_or_default()
+    }
+
+    pub(super) fn visible_count(&self) -> usize {
+        self.shared.live_count.load(Relaxed)
+    }
+
+    fn count_visibility(&mut self, stream: usize, visible: bool) {
+        let count = self.live.entry(stream).or_default();
+        if visible {
+            *count += 1;
+            self.shared.live_count.fetch_add(1, Relaxed);
+        } else {
+            *count -= 1;
+            self.shared.live_count.fetch_sub(1, Relaxed);
+        }
+    }
+
+    fn set_visible(&mut self, stream: usize, slot: usize, visible: bool) {
+        let flags = self.lookup.flags(slot);
+        if (flags & VISIBLE != 0) != visible {
+            self.lookup
+                .set_flags(slot, (flags & !VISIBLE) | if visible { VISIBLE } else { 0 });
+            self.count_visibility(stream, visible);
+        }
+    }
+
+    pub(super) fn restore_row(
+        &mut self,
+        stream: usize,
+        key: &dyn SmallIdentity,
+        location: Location,
+    ) -> io::Result<()> {
+        if self.find(key, VISIBLE).is_some() {
+            return Err(super::format::invalid("duplicate recovered object"));
+        }
+        let slot = self
+            .at((location.segment, location.offset))
+            .expect("journaled small object");
+        self.files.insert(location.segment, location.file);
+        self.publish_segment(location.segment);
+        self.set_visible(stream, slot, true);
+        Ok(())
+    }
+
+    fn prepare_row(&mut self, _stream: usize, _key: &SmallKey, location: &Location) -> usize {
+        self.activate().expect("validated small catalog");
+        let address = (location.segment, location.offset);
+        self.files.insert(address.0, location.file.clone());
+        #[cfg(test)]
+        if self.at(address).is_none() {
+            self.apply(Event::Insert {
+                slot: _stream,
+                segment: address.0,
+                offset: address.1,
+                record: super::journal::Record {
+                    key: _key.clone(),
+                    len: location.len,
+                    checksum: location.checksum,
+                },
+            })
+            .expect("test locator metadata");
+        }
+        self.at(address).expect("journaled small object")
+    }
+
+    pub(super) fn stage_row(
+        &mut self,
+        stream: usize,
+        key: &SmallKey,
+        location: Location,
+    ) -> Option<Location> {
+        let new = self.prepare_row(stream, key, &location);
+        let old = self.find_in_stream(stream, key, VISIBLE);
+        let previous = old.and_then(|slot| self.location_for_move(slot));
+        if let Some(old) = old.filter(|&old| old != new) {
+            self.set_visible(stream, old, false);
+            self.transfer_row(
+                old,
+                new,
+                self.address(old),
+                (location.segment, location.offset),
+            );
+        }
+        if let Some(access) = location.access.filter(Self::stores_access) {
+            self.attach_access(new, access);
+        }
+        previous
+    }
+
+    pub(super) fn publish_row(
+        &mut self,
+        stream: usize,
+        slot: usize,
+        address: Address,
+        stored_len: u64,
+    ) {
+        self.set_visible(stream, slot, true);
+        self.publish_segment(address.0);
+        if let Some(ownership) = &mut self.ownership {
+            // A tail append can bound the current ownership sweep.
+            let cutoff = (self.model.segments[&address.0].bytes == address.1 + stored_len)
+                .then_some(address.1);
+            ownership.admit(address, self.shared.ownership.admit(), cutoff);
+        }
+    }
+
+    pub(super) fn relocate_row(
+        &mut self,
+        stream: usize,
+        key: &SmallKey,
+        location: Location,
+        before_publish: impl FnOnce(),
+    ) -> Option<Location> {
+        let new = self.prepare_row(stream, key, &location);
+        let address = (location.segment, location.offset);
+        let old = self.find_in_stream(stream, key, VISIBLE);
+        let previous = old.and_then(|slot| self.location_for_move(slot));
+        let stored_len = location.stored_len();
+        if let (Some(old), Some(previous)) = (old, &previous) {
+            self.relocate_visible_row(
+                old,
+                new,
+                (previous.segment, previous.offset),
+                address,
+                before_publish,
+            );
+        } else {
+            before_publish();
+        }
+        if let Some(access) = location.access.filter(Self::stores_access) {
+            self.attach_access(new, access);
+        }
+        if previous.is_none() {
+            self.publish_row(stream, new, address, stored_len);
+        }
+        previous
+    }
+
+    pub(super) fn replace_segment(&mut self, old: u64, replacement: Option<&StagedSegment>) {
+        if let Some(new) = replacement {
+            self.files.insert(new.id, new.segment.file.clone());
+            for (&old_offset, record) in &new.records {
+                let old_address = (old, old_offset);
+                let new_address = (new.id, record.new_offset);
+                let old_slot = self.at(old_address).expect("reconciled source record");
+                let new_slot = self.at(new_address).expect("staged replacement record");
+                self.relocate_visible_row(old_slot, new_slot, old_address, new_address, || {});
+            }
+            self.replace_published_segment(old, new.id);
+        }
+        self.retire_segment(old);
+    }
+
+    fn relocate_visible_row(
+        &mut self,
+        old: usize,
+        new: usize,
+        old_address: Address,
+        new_address: Address,
+        before_publish: impl FnOnce(),
+    ) {
+        if old != new {
+            self.transfer_row(old, new, old_address, new_address);
+        }
+        if let Some(ownership) = &mut self.ownership {
+            ownership.relocate_retry(old_address, new_address);
+        }
+        before_publish();
+        // Both rows belong to the same stream. Keep its count and the
+        // lock-free total unchanged while moving visibility.
+        self.lookup.set_flags(new, self.lookup.flags(new) | VISIBLE);
+    }
+
+    fn transfer_row(&mut self, old: usize, new: usize, old_address: Address, new_address: Address) {
+        let flags = self.lookup.flags(old);
+        self.lookup
+            .set_flags(old, flags & !(VISIBLE | POLICY | REFERENCED));
+        self.relocate_recency(old_address, new);
+        self.relocate_policy(old_address, new_address, new);
+        if let Some(policy) = self.policy.remove(&old_address) {
+            self.policy.insert(new_address, policy);
+        }
+        if let Some(access) = self.access.remove(&old_address) {
+            self.access.insert(new_address, access);
+        }
+        self.lookup
+            .set_flags(new, self.lookup.flags(new) | flags & (POLICY | REFERENCED));
+    }
+
+    pub(super) fn remove_row(&mut self, stream: usize, id: &dyn SmallIdentity) -> Option<Location> {
+        if let Some(slot) = self.find_in_stream(stream, id, VISIBLE) {
+            let location = self.location(slot);
+            self.set_visible(stream, slot, false);
+            return location;
+        }
+        let retired = self.retired.get_mut(id)?;
+        if !retired.live {
+            return None;
+        }
+        retired.live = false;
+        let location = retired.location.clone();
+        self.retired_addresses
+            .remove(&(location.segment, location.offset));
+        self.prune_retired(id);
+        self.count_visibility(stream, false);
+        Some(location)
+    }
+
+    pub(super) fn policy_get(&self, stream: usize, id: &dyn SmallIdentity) -> Option<PolicyEntry> {
+        if let Some(slot) = self.find_in_stream(stream, id, POLICY) {
+            if self.compact_streams.contains(&stream) {
+                return Some(self.compact_entry(slot));
+            }
+            return self.policy.get(&self.address(slot)).cloned();
+        }
+        let mut entry = self.retired.get(id)?.policy.clone()?;
+        if let Some(ticket) = entry.access.small() {
+            entry.state = *ticket.state.lock().unwrap();
+        }
+        Some(entry)
+    }
+
+    pub(super) fn policy_insert(
+        &mut self,
+        slot: usize,
+        policy: PolicyEntry,
+    ) -> Option<AccessHandle> {
+        let address = self.metadata(self.lookup.handle(slot))?.0;
+        self.lookup
+            .set_flags(slot, self.lookup.flags(slot) | POLICY);
+        self.access.remove(&address);
+        let access = policy.access.clone();
+        self.policy.insert(address, policy);
+        Some(access)
+    }
+
+    pub(super) fn policy_update<T>(
+        &mut self,
+        stream: usize,
+        id: &dyn SmallIdentity,
+        update: impl FnOnce(&mut PolicyState) -> T,
+    ) -> Option<T> {
+        if let Some(slot) = self.find_in_stream(stream, id, POLICY) {
+            if self.compact_streams.contains(&stream) {
+                let entry = self.compact_entry(slot);
+                return Some(self.update_ticket(entry.access.small().unwrap(), true, update));
+            }
+            let address = self.address(slot);
+            return Some(update(&mut self.policy.get_mut(&address)?.state));
+        }
+        let policy = self.retired.get_mut(id)?.policy.as_mut()?;
+        if let Some(ticket) = policy.access.small().cloned() {
+            Some(self.update_ticket(&ticket, false, update))
+        } else {
+            Some(update(&mut policy.state))
+        }
+    }
+
+    pub(super) fn policy_remove(
+        &mut self,
+        stream: usize,
+        id: &dyn SmallIdentity,
+    ) -> Option<PolicyEntry> {
+        if let Some(slot) = self.find_in_stream(stream, id, POLICY) {
+            if self.compact_streams.contains(&stream) {
+                return Some(self.compact_remove(slot));
+            }
+            let address = self.address(slot);
+            self.lookup
+                .set_flags(slot, self.lookup.flags(slot) & !POLICY);
+            let policy = self.policy.remove(&address)?;
+            policy.access.retire();
+            return Some(policy);
+        }
+        let retired = self.retired.get_mut(id)?;
+        let mut policy = retired.policy.take()?;
+        let stream = retired.slot;
+        let address = (retired.location.segment, retired.location.offset);
+        if let Some(ticket) = policy.access.small() {
+            policy.state = *ticket.state.lock().unwrap();
+            self.compact_forget(address, stream, &policy);
+        } else {
+            policy.access.retire();
+        }
+        self.prune_retired(id);
+        Some(policy)
+    }
+
+    fn prune_retired(&mut self, id: &dyn SmallIdentity) {
+        if self
+            .retired
+            .get(id)
+            .is_some_and(|entry| !entry.live && entry.policy.is_none())
+        {
+            self.retired.remove(id);
+        }
+    }
+
+    fn retire_row(&mut self, address: Address, slot: usize, location: Location) {
+        let key = self.record(self.lookup.handle(slot)).unwrap().1.key;
+        let live = self.lookup.flags(slot) & VISIBLE != 0;
+        if live && self.ownership.is_some() {
+            self.retired_addresses.insert(address, key.clone());
+        }
+        let policy = self.policy.remove(&address).or_else(|| {
+            let access = location.access.as_ref()?;
+            let state = *access.small()?.state.lock().unwrap();
+            Some(PolicyEntry {
+                state,
+                access: access.clone(),
+            })
+        });
+        // A journal delete removes the indexed row. Its logical visibility
+        // and policy survive until the corresponding directory removals.
+        self.retired.insert(
+            key.clone(),
+            Retired {
+                slot: self.segment(address.0).unwrap().slot,
+                key,
+                location,
+                live,
+                policy,
+            },
+        );
+        self.access.remove(&address);
+    }
+
+    pub(super) fn address(&self, slot: usize) -> Address {
+        self.metadata(self.lookup.handle(slot))
+            .expect("small catalog row")
+            .0
     }
 
     fn reserve(&mut self, additional: usize) {
@@ -501,30 +909,7 @@ impl Catalog {
                 let address = (*segment, *offset);
                 if let Some(slot) = self.at(address) {
                     if let Some(location) = self.location(slot) {
-                        let key = self.record(self.lookup.handle(slot)).unwrap().1.key;
-                        let live = self.lookup.flags(slot) & VISIBLE != 0;
-                        if live && self.ownership.is_some() {
-                            self.retired_addresses.insert(address, key.clone());
-                        }
-                        let policy = self.policy.remove(&address).or_else(|| {
-                            let access = location.access.as_ref()?;
-                            let state = *access.small()?.state.lock().unwrap();
-                            Some(PolicyEntry {
-                                state,
-                                access: access.clone(),
-                            })
-                        });
-                        self.retired.insert(
-                            key.clone(),
-                            Retired {
-                                slot: self.segment(address.0).unwrap().slot,
-                                key,
-                                location,
-                                live,
-                                policy,
-                            },
-                        );
-                        self.access.remove(&address);
+                        self.retire_row(address, slot, location);
                     }
                 }
                 self.segment(*segment).map(|meta| {

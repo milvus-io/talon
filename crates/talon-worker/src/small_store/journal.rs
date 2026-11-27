@@ -29,7 +29,7 @@ pub(super) struct Journal {
     pub(super) model: LiveModel,
     pub(super) readers: Arc<tokio::sync::RwLock<()>>,
     // Full access snapshots sample a stable set of locations across batches.
-    pub(super) access_relocation: tokio::sync::RwLock<()>,
+    access_relocation: tokio::sync::RwLock<()>,
     pub(super) next: Arc<AtomicU64>,
     #[cfg(test)]
     pub(super) control: Arc<TestControl>,
@@ -74,8 +74,7 @@ impl Journal {
         std::fs::File::open(root.join("data"))?.sync_all()?;
         std::fs::File::open(&root)?.sync_all()?;
         let replay_started = std::time::Instant::now();
-        let shared = LiveModel::default();
-        shared.0.write().unwrap().model.next = 1;
+        let shared = LiveModel::for_replay();
         let handle = service.open_stream_with_maintenance(
             relative_metadata,
             shared.clone(),
@@ -84,11 +83,7 @@ impl Journal {
         )?;
         let replay_ms = replay_started.elapsed().as_secs_f64() * 1000.0;
         let clone_started = std::time::Instant::now();
-        let model = handle.query_blocking(|m| {
-            let mut catalog = m.0.write().unwrap();
-            catalog.activate()?;
-            Ok(catalog.model.clone())
-        })?;
+        let model = handle.query_blocking(LiveModel::activate)?;
         let clone_ms = clone_started.elapsed().as_secs_f64() * 1000.0;
         tracing::info!(root = %root.display(), segments = model.segments.len(),
             replay_ms, clone_ms, "small journal model restored");
@@ -222,6 +217,30 @@ impl Journal {
             .await
             .map(|_| ())
     }
+    /// Take this gate before an I/O permit and retain it through publication.
+    pub(super) async fn lock_segment_relocation(
+        &self,
+    ) -> Option<tokio::sync::RwLockReadGuard<'_, ()>> {
+        if self.model.has_recency() {
+            Some(self.access_relocation.read().await)
+        } else {
+            None
+        }
+    }
+
+    /// Full snapshots need stable physical locations across sampling batches.
+    /// Acquire this before taking any I/O permit.
+    pub(super) async fn lock_access_snapshot(
+        &self,
+        full: bool,
+    ) -> Option<tokio::sync::RwLockWriteGuard<'_, ()>> {
+        if full {
+            Some(self.access_relocation.write().await)
+        } else {
+            None
+        }
+    }
+
     pub async fn checkpoint(&self) -> io::Result<()> {
         self.handle
             .append(

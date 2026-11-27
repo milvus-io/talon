@@ -537,11 +537,7 @@ impl SmallObjectStore {
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.journal
-            .model
-            .1
-            .live_count
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.journal.model.len()
     }
 
     #[cfg(test)]

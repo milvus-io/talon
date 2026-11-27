@@ -1,15 +1,17 @@
 //! Access times live beside catalog rows. Journal snapshots share the packed
 //! records without retaining a copy of the live access times.
 
-use super::catalog::{Address, Catalog};
+use super::catalog::{Address, Catalog, LiveModel};
 use super::journal::Model;
-use crate::eviction::access_millis;
+use super::key::{SmallIdentity, SmallKey};
+use super::policy::SmallAccess;
+use crate::eviction::{access_millis, CacheUnit};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{
     AtomicU64,
     Ordering::{AcqRel, Acquire, Relaxed},
 };
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 const DIRTY: u64 = 1 << 63;
 // A hit clears this bit even when its millisecond timestamp is unchanged.
@@ -238,7 +240,99 @@ impl Change {
     }
 }
 
+impl LiveModel {
+    pub(super) fn init_recency(&self) {
+        let mut catalog = self.0.write().unwrap();
+        catalog.recency = Some(Recency::new(&catalog.model));
+    }
+
+    pub(super) fn has_recency(&self) -> bool {
+        self.0.read().unwrap().has_recency()
+    }
+
+    pub(super) fn recency_for_unlink(&self, nonblocking: bool) -> Option<bool> {
+        let catalog = super::read_for_unlink(&self.0, nonblocking)?;
+        Some(catalog.has_recency())
+    }
+
+    pub(super) fn recency_ceiling(&self) -> Option<Address> {
+        self.0.read().unwrap().recency_ceiling()
+    }
+
+    pub(super) fn sample_recency(
+        &self,
+        cursor: &mut Address,
+        ceiling: Address,
+        limit: usize,
+        full: bool,
+        mut visit: impl FnMut(SmallKey, u64) -> bool,
+    ) -> bool {
+        let catalog = self.0.read().unwrap();
+        let recency = catalog.recency.as_ref().unwrap();
+        let mut sample = |id, row| {
+            let Some(time) = recency.sample(id, row, full) else {
+                return true;
+            };
+            let (_, record) = catalog.segment(id).unwrap().records.get(row).unwrap();
+            visit(record.key, time)
+        };
+        if full {
+            catalog.visit_recency(cursor, ceiling, limit, |_, id, row| sample(id, row))
+        } else {
+            catalog.visit_dirty_recency(cursor, ceiling, limit, sample)
+        }
+    }
+
+    pub(super) fn idle_recency_candidates(
+        &self,
+        cursor: &mut IdleRecencyCursor,
+        now: u64,
+        age: u64,
+        scan: usize,
+        deletes: usize,
+    ) -> Vec<(CacheUnit, Arc<SmallAccess>)> {
+        let catalog = self.0.read().unwrap();
+        let Some(end) = cursor.end.or_else(|| catalog.recency_ceiling()) else {
+            return Vec::new();
+        };
+        // Freeze the active segment's extent as well as its ID. Otherwise a
+        // busy stream can keep the sweep from returning to older rows.
+        cursor.end = Some(end);
+        let mut candidates = Vec::new();
+        let done = catalog.visit_recency(&mut cursor.next, end, scan, |slot, id, row| {
+            let (recency, value) = catalog.recency_at(slot).unwrap();
+            if now.saturating_sub(recency.time(value.load(Relaxed))) > age {
+                let records = &catalog.segment(id).unwrap().records;
+                let (offset, record) = records
+                    .metadata(row)
+                    .map(|record| (record.offset, record))
+                    .unwrap();
+                let ticket = catalog.compact_access(slot, (id, offset), record.stored_len());
+                let ticket = ticket.small().unwrap();
+                if ticket.state.lock().unwrap().pins == 0 {
+                    let (_, record) = records.get(row).unwrap();
+                    candidates.push((record.key.view().cache_unit(), ticket.clone()));
+                }
+            }
+            candidates.len() < deletes
+        });
+        if done {
+            *cursor = IdleRecencyCursor::default();
+        }
+        candidates
+    }
+}
+
 impl Catalog {
+    pub(super) fn has_recency(&self) -> bool {
+        self.recency.is_some()
+    }
+
+    fn recency_ceiling(&self) -> Option<Address> {
+        let (&id, segment) = self.model.segments.last_key_value()?;
+        Some((id, segment.bytes))
+    }
+
     pub(super) fn recency_at(&self, slot: usize) -> Option<(&Recency, &AtomicU64)> {
         let (segment, row) = self.row(self.lookup.handle(slot))?;
         let recency = self.recency.as_ref()?;

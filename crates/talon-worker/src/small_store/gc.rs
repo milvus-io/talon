@@ -202,15 +202,7 @@ impl SmallGcCandidate {
                 return None;
             }
         } else {
-            let retained = || {
-                catalog
-                    .retired
-                    .get(&self.unit as &dyn SmallIdentity)
-                    .filter(|entry| entry.live)
-                    .and_then(|entry| entry.policy.as_ref()?.access.small())
-                    .is_some_and(|current| Arc::ptr_eq(current, ticket))
-            };
-            if slot.is_none() && !retained() {
+            if slot.is_none() && !catalog.has_retired_ticket(&self.unit, ticket) {
                 return None;
             }
             // Register under the same lock as the first observation. Re-admission
@@ -241,19 +233,12 @@ impl Catalog {
         address: Address,
         eligible: impl FnOnce(&CacheUnit) -> bool,
     ) -> Option<SmallGcCandidate> {
-        if let Some(key) = self.retired_addresses.get(&address) {
-            let unit = key.view().cache_unit();
+        if let Some(entry) = self.retired_at(address) {
+            let unit = entry.key.view().cache_unit();
             if !eligible(&unit) {
                 return None;
             }
-            let ticket = self
-                .retired
-                .get(key)?
-                .policy
-                .as_ref()?
-                .access
-                .small()?
-                .clone();
+            let ticket = entry.policy.as_ref()?.access.small()?.clone();
             return Some(SmallGcCandidate {
                 unit,
                 ticket,
@@ -484,9 +469,7 @@ impl SmallObjectStore {
                     .map(|row| records.offset_at(row))
                     .peekable();
                 let mut retired = catalog
-                    .retired_addresses
-                    .range((physical, cursor.offset)..(physical, end))
-                    .map(|(&(_, offset), _)| offset)
+                    .retired_offsets(physical, cursor.offset..end)
                     .peekable();
                 while let Some(offset) =
                     rows.peek().into_iter().chain(retired.peek()).min().copied()
@@ -524,7 +507,7 @@ impl SmallObjectStore {
         due: impl Fn(ObjectRef<'_>) -> bool,
     ) -> (bool, Vec<(SmallGcCandidate, u64)>) {
         let catalog = self.journal.model.0.read().unwrap();
-        if catalog.recency.is_none() {
+        if !catalog.has_recency() {
             return (true, Vec::new());
         }
         let mut candidates = Vec::new();
