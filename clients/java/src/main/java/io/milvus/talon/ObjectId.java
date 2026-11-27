@@ -7,9 +7,17 @@ public final class ObjectId {
 
     /** Backing stores, matching the namespaces the FUSE mount exposes. */
     public enum Backend {
-        S3,
-        GCS,
-        AZURE
+        S3("s3"),
+        GCS("gcs"),
+        AZURE("az"),
+        ALI("ali"),
+        TC("tc");
+
+        private final String scheme;
+
+        Backend(String scheme) {
+            this.scheme = scheme;
+        }
     }
 
     private final Backend backend;
@@ -25,14 +33,15 @@ public final class ObjectId {
     /**
      * Parse a {@code scheme://bucket/key} URI.
      *
-     * <p>Schemes match the FUSE mount's namespaces ({@code s3}, {@code gcs},
-     * {@code az}), so a path addresses the same object through either client.
+     * <p>Schemes match the FUSE mount's namespaces, so a path addresses the
+     * same object through either client.
      */
     public static ObjectId parse(String uri) {
         int sep = uri.indexOf("://");
         if (sep < 0) {
             throw new IllegalArgumentException(
-                    "expected a scheme://bucket/key URI, got \"" + uri + "\" (schemes: s3, gcs, az)");
+                    "expected a scheme://bucket/key URI, got \"" + uri
+                            + "\" (schemes: s3, gcs, az, ali, tc)");
         }
         String scheme = uri.substring(0, sep);
         String rest = uri.substring(sep + 3);
@@ -47,9 +56,15 @@ public final class ObjectId {
             case "az":
                 backend = Backend.AZURE;
                 break;
+            case "ali":
+                backend = Backend.ALI;
+                break;
+            case "tc":
+                backend = Backend.TC;
+                break;
             default:
                 throw new IllegalArgumentException(
-                        "unknown backend scheme \"" + scheme + "\"; expected s3, gcs, or az");
+                        "unknown backend scheme \"" + scheme + "\". Expected s3, gcs, az, ali, or tc");
         }
         int slash = rest.indexOf('/');
         if (slash < 0) {
@@ -101,7 +116,6 @@ public final class ObjectId {
 
     @Override
     public String toString() {
-        String scheme = backend == Backend.S3 ? "s3" : backend == Backend.GCS ? "gcs" : "az";
-        return scheme + "://" + bucket + "/" + key;
+        return backend.scheme + "://" + bucket + "/" + key;
     }
 }

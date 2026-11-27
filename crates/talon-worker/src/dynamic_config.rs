@@ -7,6 +7,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use talon_backend::routing::SharedBrokerEndpoint;
 use talon_core::dynamic_config::WorkerDynamicConfig;
 
 const RELOAD_INTERVAL: Duration = Duration::from_secs(5);
@@ -31,6 +32,7 @@ pub struct DynamicConfig {
     startup: Option<talon_core::WorkerConfig>,
     env: talon_core::WorkerConfigPatch,
     cli: talon_core::WorkerConfigPatch,
+    broker_endpoint: Option<SharedBrokerEndpoint>,
 }
 impl DynamicConfig {
     pub fn new(
@@ -47,7 +49,13 @@ impl DynamicConfig {
             startup: Some(startup),
             env,
             cli,
+            broker_endpoint: None,
         }
+    }
+
+    pub fn with_broker_endpoint(mut self, endpoint: Option<SharedBrokerEndpoint>) -> Self {
+        self.broker_endpoint = endpoint;
+        self
     }
 
     pub fn status(&self) -> ConfigReloadStatus {
@@ -65,6 +73,7 @@ impl DynamicConfig {
 
     pub fn apply_runtime(&mut self, text: &str, runtime: &WorkerRuntime) -> bool {
         let result = (|| -> Result<(), String> {
+            let mut broker_update = None;
             let (next, views) = if let Some(startup) = &self.startup {
                 let document = talon_core::dynamic_config::WorkerConfigDocument::parse(text)?;
                 let desired = talon_core::WorkerConfig::resolve(
@@ -115,13 +124,22 @@ impl DynamicConfig {
                         serde_json::to_value(limits).map_err(|e| e.to_string())?;
                 }
                 next.validate()?;
-                let pending: Vec<String> = desired_view
+                let mut pending: Vec<String> = desired_view
                     .as_object()
                     .unwrap()
                     .iter()
                     .filter(|(key, value)| effective.get(*key) != Some(*value))
                     .map(|(key, _)| key.clone())
                     .collect();
+                if desired.broker_origin != startup.broker_origin {
+                    pending.push("broker".into());
+                }
+                if self.broker_endpoint.is_some() && desired.credential_endpoint.is_some() {
+                    broker_update = desired.credential_endpoint;
+                } else if desired.credential_endpoint != startup.credential_endpoint {
+                    pending.push("credential_endpoint".into());
+                }
+                pending.sort_unstable();
                 (next, Some((effective, desired_view, pending)))
             } else {
                 (WorkerDynamicConfig::parse(text)?, None)
@@ -137,6 +155,11 @@ impl DynamicConfig {
                 }
                 runtime.update_dynamic_settings(next.clone());
                 self.status.config = Some(next);
+            }
+            if let (Some(current), Some(endpoint)) = (&self.broker_endpoint, broker_update) {
+                if current.load().as_ref() != &endpoint {
+                    current.store(Arc::new(endpoint));
+                }
             }
             if let Some((effective, desired, pending)) = views {
                 self.status.effective_config = Some(effective);

@@ -270,6 +270,51 @@ async fn compact_access_keeps_ages_through_row_compaction_and_relocation() {
     assert_eq!(compact_age(&store, &key), age);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn packed_no_deadline_deletes_defer_on_busy_mutation_registry() {
+    use crate::small_store::SmallStaleCursor;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (store, policy) = open_compact(dir.path());
+    let key = id(1);
+    store
+        .put(&key, Bytes::from_static(b"payload"))
+        .await
+        .unwrap();
+    store.maintain(true).await.unwrap();
+    let now = access_millis() + 30_000;
+    let age = 10_000;
+    let (unit, ticket) = store
+        .idle_recency_candidates(&mut IdleRecencyCursor::default(), now, age, 10, 10)
+        .pop()
+        .unwrap();
+    let (candidate, revision) = store
+        .stale_candidates(&mut SmallStaleCursor::default(), now, age, 10, 10, |_| true)
+        .1
+        .pop()
+        .unwrap();
+    let catalog_revision = store.catalog_revision();
+    let runtime = tokio::runtime::Handle::current();
+    // An accidental append fails the operation even if it leaves the row visible.
+    store.journal.control.fail.store(true, Ordering::Relaxed);
+    store.under_mutation_registry(|| {
+        runtime.block_on(async {
+            assert!(!store
+                .delete_idle(unit, ticket, move || (now, age))
+                .await
+                .unwrap());
+            assert!(!store
+                .delete_gc(candidate, revision, None, || true)
+                .await
+                .unwrap());
+        })
+    });
+    store.journal.control.fail.store(false, Ordering::Relaxed);
+    assert_eq!(store.catalog_revision(), catalog_revision);
+    assert_eq!(policy.len(), 1);
+    assert_eq!(store.read(&key).await.unwrap().unwrap(), b"payload"[..]);
+}
+
 #[tokio::test]
 async fn full_access_checkpoint_and_relocation_share_the_publication_boundary() {
     use std::time::Duration;
@@ -386,23 +431,27 @@ async fn full_access_checkpoint_and_relocation_share_the_publication_boundary() 
                 .unwrap());
         } else {
             let reader = store.journal.readers.read().await;
+            let pause = Arc::new(crate::small_store::tests::AppendPause::default());
+            *store.streams()[0].relocation_pause.lock().unwrap() = Some(pause.clone());
             let relocate = relocating();
-            tokio::time::timeout(Duration::from_secs(5), async {
-                while source_is_journaled() {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), pause.entered.notified())
+                .await
+                .unwrap();
+            assert!(!source_is_journaled());
             let mut checkpoint = checkpointing();
             assert!(
                 tokio::time::timeout(Duration::from_millis(20), &mut checkpoint)
                     .await
                     .is_err()
             );
+            pause.resume.notify_one();
+            tokio::time::timeout(Duration::from_secs(5), checkpoint)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!relocate.is_finished());
             drop(reader);
             assert!(relocate.await.unwrap());
-            checkpoint.await.unwrap();
         }
         assert_ne!(store.lookup_entry(&key).unwrap().unwrap().segment, source);
         drop(store);

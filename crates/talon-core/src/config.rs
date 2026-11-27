@@ -23,8 +23,8 @@ use std::path::PathBuf;
 
 use crate::status::MAX_STATUS_FIELD_BYTES;
 use crate::{
-    ControlTlsConfig, ControlTlsConfigPatch, Error, ObjectNamespace, ObjectNamespacePolicy,
-    RateLimitPolicy, Result,
+    Backend, ControlTlsConfig, ControlTlsConfigPatch, Error, ObjectNamespace,
+    ObjectNamespacePolicy, RateLimitPolicy, Result,
 };
 
 /// A configuration patch: a set of optionally-present overrides.
@@ -129,6 +129,7 @@ pub struct ConfigVar {
 #[serde(deny_unknown_fields)]
 pub struct BucketConfig {
     pub name: String,
+    #[serde(default)]
     pub credentials_source: String,
     pub s3_region: Option<String>,
     pub s3_endpoint: Option<String>,
@@ -158,7 +159,16 @@ pub struct BucketConfig {
 
 impl BucketConfig {
     /// Check a resolved record before constructing its backend or fetching credentials.
-    pub fn validate(&self, backend: crate::Backend) -> Result<()> {
+    pub fn validate(&self, backend: Backend) -> Result<()> {
+        self.validate_config(backend, Some(&self.credentials_source))
+    }
+
+    /// Validate bucket addressing and timeout for the worker's Pod IAM route.
+    pub fn validate_addressing(&self, backend: Backend) -> Result<()> {
+        self.validate_config(backend, None)
+    }
+
+    fn validate_config(&self, backend: Backend, credentials_source: Option<&str>) -> Result<()> {
         if self.credential_broker_timeout_ms == Some(0) {
             return Err(Error::Other(
                 "credential_broker_timeout_ms must be positive".into(),
@@ -175,7 +185,7 @@ impl BucketConfig {
                 "bucket name must be a nonempty, safe bucket/container component".into(),
             ));
         }
-        if !matches!(self.credentials_source.as_str(), "aksk" | "iam" | "broker") {
+        if credentials_source.is_some_and(|source| !matches!(source, "aksk" | "iam" | "broker")) {
             return Err(Error::Other(
                 "bucket credentials_source must be aksk, iam, or broker".into(),
             ));
@@ -188,13 +198,18 @@ impl BucketConfig {
             }
         };
         match backend {
-            crate::Backend::S3 => require(self.s3_region.as_deref(), "s3_region")?,
-            crate::Backend::Azure => require(self.azure_account.as_deref(), "azure_account")?,
-            crate::Backend::Gcs => {}
+            Backend::S3 | Backend::Ali | Backend::Tc => {
+                require(self.s3_region.as_deref(), "s3_region")?;
+                if backend.requires_s3_endpoint() {
+                    require(self.s3_endpoint.as_deref(), "s3_endpoint")?;
+                }
+            }
+            Backend::Azure => require(self.azure_account.as_deref(), "azure_account")?,
+            Backend::Gcs => {}
         }
-        match self.credentials_source.as_str() {
-            "aksk" => match backend {
-                crate::Backend::S3 => {
+        match credentials_source {
+            Some("aksk") => match backend {
+                Backend::S3 | Backend::Ali | Backend::Tc => {
                     require(self.s3_access_key_id.as_deref(), "s3_access_key_id")?;
                     require(
                         self.s3_secret_access_key
@@ -203,7 +218,7 @@ impl BucketConfig {
                         "s3_secret_access_key",
                     )?;
                 }
-                crate::Backend::Gcs => {
+                Backend::Gcs => {
                     require(self.gcs_access_key_id.as_deref(), "gcs_access_key_id")?;
                     require(
                         self.gcs_secret_access_key
@@ -212,14 +227,14 @@ impl BucketConfig {
                         "gcs_secret_access_key",
                     )?;
                 }
-                crate::Backend::Azure => require(
+                Backend::Azure => require(
                     self.azure_shared_key
                         .as_ref()
                         .map(|value| value.expose().as_str()),
                     "azure_shared_key",
                 )?,
             },
-            "broker" => {
+            Some("broker") => {
                 require(
                     self.credential_broker_url
                         .as_ref()
@@ -236,6 +251,22 @@ impl BucketConfig {
         }
         Ok(())
     }
+}
+
+/// Worker-wide Broker settings from the `[broker]` table.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrokerConfig {
+    /// Default Broker URL for requests without their own URL.
+    pub broker_endpoint: Option<Sensitive<String>>,
+    /// Per-attempt credential exchange timeout in milliseconds.
+    pub timeout_ms: Option<u64>,
+    pub s3_region: Option<String>,
+    pub s3_endpoint: Option<String>,
+    pub s3_path_style: Option<bool>,
+    pub gcs_endpoint: Option<String>,
+    pub azure_account: Option<String>,
+    pub azure_endpoint: Option<String>,
 }
 
 /// Fully-resolved worker configuration.
@@ -348,8 +379,7 @@ pub struct WorkerConfig {
     pub page_gc_delete_batch_size: usize,
     /// Maximum concurrent page GC deletion tasks.
     pub page_gc_io_concurrency: usize,
-    /// Object-store backend selector: `azure` (default), `s3`, or `gcs`. The
-    /// per-backend endpoint/credential fields below apply to the selected one.
+    /// Object-store backend and cloud selector for Broker IAM. Defaults to `azure`.
     pub backend: Option<String>,
     /// Explicit origins for the selected backend; absence preserves legacy routing.
     pub buckets: Option<Vec<BucketConfig>>,
@@ -392,7 +422,7 @@ pub struct WorkerConfig {
     /// deadline as a HEAD. `Some(0)` makes the deadline a flat
     /// `backend_timeout_floor_ms`.
     pub backend_min_throughput_bytes: Option<u64>,
-    /// S3 region (e.g. `us-east-1`). Required when `backend = s3`.
+    /// Region for S3 and S3-compatible backends (e.g. `us-east-1`).
     pub s3_region: Option<String>,
     /// S3 endpoint host override (e.g. a MinIO/LocalStack host). Defaults to the
     /// AWS regional endpoint. A value with an `http://` scheme selects plaintext.
@@ -417,6 +447,12 @@ pub struct WorkerConfig {
     /// Azure Storage Shared Key.
     #[serde(skip_serializing)]
     pub azure_shared_key: Option<Sensitive<String>>,
+    /// Worker Broker URL for Pod IAM when a request supplies no Broker descriptor.
+    #[serde(skip_serializing)]
+    pub credential_endpoint: Option<Sensitive<String>>,
+    /// Source storage overrides for the default Broker IAM route.
+    #[serde(skip_serializing)]
+    pub broker_origin: BucketConfig,
     /// Credential broker URL, which may contain authentication parameters.
     #[serde(skip_serializing)]
     pub credential_broker_url: Option<Sensitive<String>>,
@@ -474,16 +510,23 @@ pub struct NamespaceCacheConfig {
 }
 
 impl WorkerConfig {
+    /// Parse the Worker backend, including the cloud names accepted as configuration aliases.
+    pub fn resolved_backend(&self) -> Result<Backend> {
+        match self.backend.as_deref().unwrap_or("azure") {
+            "aws" | "s3" => Ok(Backend::S3),
+            "gcs" | "gcp" => Ok(Backend::Gcs),
+            "az" | "azure" | "blob" => Ok(Backend::Azure),
+            "oss" | "ali" => Ok(Backend::Ali),
+            "cos" | "tc" => Ok(Backend::Tc),
+            value => Err(Error::Other(format!("unknown backend: {value}"))),
+        }
+    }
+
     /// Resolve connection defaults and validate explicit origins without sharing credentials.
     pub fn resolved_buckets(&self) -> Result<Option<Vec<BucketConfig>>> {
-        let Some(buckets) = &self.buckets else {
+        let Some(buckets) = self.buckets.as_ref().filter(|buckets| !buckets.is_empty()) else {
             return Ok(None);
         };
-        if buckets.is_empty() {
-            return Err(Error::Other(
-                "buckets must not be empty when configured".into(),
-            ));
-        }
         if self.credentials_source.is_some()
             || self.s3_access_key_id.is_some()
             || self.s3_secret_access_key.is_some()
@@ -499,14 +542,14 @@ impl WorkerConfig {
                 "buckets cannot be combined with top-level credential fields".into(),
             ));
         }
-        let backend = self.backend.as_deref().unwrap_or("azure").parse()?;
+        let backend = self.resolved_backend()?;
         let mut names = std::collections::HashSet::new();
         let mut resolved = buckets.clone();
         for bucket in &mut resolved {
             // Only connection settings inherit. An explicit record always owns
             // its credential source, direct keys, and broker configuration.
             match backend {
-                crate::Backend::S3 => {
+                Backend::S3 | Backend::Ali | Backend::Tc => {
                     bucket.s3_region = bucket.s3_region.take().or_else(|| self.s3_region.clone());
                     bucket.s3_endpoint = bucket
                         .s3_endpoint
@@ -514,13 +557,13 @@ impl WorkerConfig {
                         .or_else(|| self.s3_endpoint.clone());
                     bucket.s3_path_style = bucket.s3_path_style.or(self.s3_path_style);
                 }
-                crate::Backend::Gcs => {
+                Backend::Gcs => {
                     bucket.gcs_endpoint = bucket
                         .gcs_endpoint
                         .take()
                         .or_else(|| self.gcs_endpoint.clone());
                 }
-                crate::Backend::Azure => {
+                Backend::Azure => {
                     bucket.azure_account = bucket
                         .azure_account
                         .take()
@@ -538,6 +581,75 @@ impl WorkerConfig {
             }
         }
         Ok(Some(resolved))
+    }
+
+    /// Resolve default and per-bucket source addresses for Broker Pod IAM.
+    pub fn resolved_broker(&self) -> Result<(BucketConfig, Vec<BucketConfig>)> {
+        let origin = &self.broker_origin;
+        let defaults = BucketConfig {
+            s3_region: origin.s3_region.clone().or_else(|| self.s3_region.clone()),
+            s3_endpoint: origin
+                .s3_endpoint
+                .clone()
+                .or_else(|| self.s3_endpoint.clone()),
+            s3_path_style: origin.s3_path_style.or(self.s3_path_style),
+            gcs_endpoint: origin
+                .gcs_endpoint
+                .clone()
+                .or_else(|| self.gcs_endpoint.clone()),
+            azure_account: origin
+                .azure_account
+                .clone()
+                .or_else(|| self.azure_account.clone()),
+            azure_endpoint: origin
+                .azure_endpoint
+                .clone()
+                .or_else(|| self.azure_endpoint.clone()),
+            credential_broker_timeout_ms: self.credential_broker_timeout_ms,
+            ..BucketConfig::default()
+        };
+        let mut buckets = self.buckets.clone().unwrap_or_default();
+        if buckets.is_empty() {
+            return Ok((defaults, buckets));
+        }
+        let backend = self.resolved_backend()?;
+        let mut names = std::collections::HashSet::new();
+        for bucket in &mut buckets {
+            match backend {
+                Backend::S3 | Backend::Ali | Backend::Tc => {
+                    bucket.s3_region = bucket
+                        .s3_region
+                        .take()
+                        .or_else(|| defaults.s3_region.clone());
+                    bucket.s3_endpoint = bucket
+                        .s3_endpoint
+                        .take()
+                        .or_else(|| defaults.s3_endpoint.clone());
+                    bucket.s3_path_style = bucket.s3_path_style.or(defaults.s3_path_style);
+                }
+                Backend::Gcs => {
+                    bucket.gcs_endpoint = bucket
+                        .gcs_endpoint
+                        .take()
+                        .or_else(|| defaults.gcs_endpoint.clone());
+                }
+                Backend::Azure => {
+                    bucket.azure_account = bucket
+                        .azure_account
+                        .take()
+                        .or_else(|| defaults.azure_account.clone());
+                    bucket.azure_endpoint = bucket
+                        .azure_endpoint
+                        .take()
+                        .or_else(|| defaults.azure_endpoint.clone());
+                }
+            }
+            bucket.validate_addressing(backend)?;
+            if !names.insert(bucket.name.clone()) {
+                return Err(Error::Other("duplicate bucket/container name".into()));
+            }
+        }
+        Ok((defaults, buckets))
     }
 
     /// Resolve cache settings without changing process-wide resource budgets.
@@ -684,6 +796,8 @@ impl Default for WorkerConfig {
             gcs_access_key_id: None,
             gcs_secret_access_key: None,
             azure_shared_key: None,
+            credential_endpoint: None,
+            broker_origin: BucketConfig::default(),
             credential_broker_url: None,
             credential_broker_request: None,
             credential_broker_timeout_ms: None,
@@ -835,6 +949,10 @@ pub struct WorkerConfigPatch {
     pub gcs_secret_access_key: Option<Sensitive<String>>,
     /// Override for [`WorkerConfig::azure_shared_key`].
     pub azure_shared_key: Option<Sensitive<String>>,
+    /// Optional `[broker]` table. Its fields take precedence over aliases in this layer.
+    pub broker: Option<BrokerConfig>,
+    /// Override for [`WorkerConfig::credential_endpoint`].
+    pub credential_endpoint: Option<Sensitive<String>>,
     /// Override for [`WorkerConfig::credential_broker_url`].
     pub credential_broker_url: Option<Sensitive<String>>,
     /// Optional `[credential_broker_request]` table, replaced as a whole by higher layers.
@@ -857,6 +975,8 @@ pub struct WorkerConfigPatch {
 
 impl Patch for WorkerConfigPatch {
     fn merge(self, base: Self) -> Self {
+        let broker = self.broker.unwrap_or_default();
+        let base_broker = base.broker.unwrap_or_default();
         Self {
             listen: self.listen.or(base.listen),
             advertise_addr: self.advertise_addr.or(base.advertise_addr),
@@ -974,9 +1094,25 @@ impl Patch for WorkerConfigPatch {
             gcs_access_key_id: self.gcs_access_key_id.or(base.gcs_access_key_id),
             gcs_secret_access_key: self.gcs_secret_access_key.or(base.gcs_secret_access_key),
             azure_shared_key: self.azure_shared_key.or(base.azure_shared_key),
+            broker: Some(BrokerConfig {
+                s3_region: broker.s3_region.or(base_broker.s3_region),
+                s3_endpoint: broker.s3_endpoint.or(base_broker.s3_endpoint),
+                s3_path_style: broker.s3_path_style.or(base_broker.s3_path_style),
+                gcs_endpoint: broker.gcs_endpoint.or(base_broker.gcs_endpoint),
+                azure_account: broker.azure_account.or(base_broker.azure_account),
+                azure_endpoint: broker.azure_endpoint.or(base_broker.azure_endpoint),
+                ..BrokerConfig::default()
+            }),
+            credential_endpoint: broker
+                .broker_endpoint
+                .or(self.credential_endpoint)
+                .or(base_broker.broker_endpoint)
+                .or(base.credential_endpoint),
             credential_broker_url: self.credential_broker_url.or(base.credential_broker_url),
-            credential_broker_timeout_ms: self
-                .credential_broker_timeout_ms
+            credential_broker_timeout_ms: broker
+                .timeout_ms
+                .or(self.credential_broker_timeout_ms)
+                .or(base_broker.timeout_ms)
                 .or(base.credential_broker_timeout_ms),
             credential_broker_request: self
                 .credential_broker_request
@@ -1138,7 +1274,7 @@ pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
     ConfigVar { env: "TALON_WORKER_WHOLE_FD_CACHE_CAPACITY", key: "whole_fd_cache_capacity", default: Some("1024"), cli: false, secret: false, help: "Worker-wide whole-block cached FD limit shared by all namespaces; 0 disables caching. Startup-only; active readers and sockets need additional FDs." },
     ConfigVar { env: "TALON_WORKER_PAGE_FD_CACHE_CAPACITY", key: "page_fd_cache_capacity", default: Some("16384"), cli: false, secret: false, help: "Worker-wide paged cached FD limit shared by all namespaces; 0 disables caching. Startup-only; active readers and sockets need additional FDs." },
     ConfigVar { env: "TALON_WORKER_BACKGROUND_TASK_CONCURRENCY", key: "background_task_concurrency", default: Some("2"), cli: false, secret: false, help: "Maximum concurrently running background maintenance tasks." },
-    ConfigVar { env: "TALON_WORKER_BACKGROUND_IO_CONCURRENCY", key: "background_io_concurrency", default: Some("4"), cli: false, secret: false, help: "Shared local disk I/O concurrency for background maintenance." },
+    ConfigVar { env: "TALON_WORKER_BACKGROUND_IO_CONCURRENCY", key: "background_io_concurrency", default: Some("4"), cli: false, secret: false, help: "Shared local disk I/O concurrency for background maintenance, including page and Small Store GC. Page GC pays deletion charges before taking an I/O slot." },
     ConfigVar { env: "TALON_WORKER_BACKGROUND_SCAN_BATCH_SIZE", key: "background_scan_batch_size", default: Some("65536"), cli: false, secret: false, help: "Maximum entries scanned per watermark eviction or stale GC batch." },
     ConfigVar { env: "TALON_WORKER_BACKGROUND_DELETE_BATCH_SIZE", key: "background_delete_batch_size", default: Some("1024"), cli: false, secret: false, help: "Maximum deletion candidates per watermark eviction or stale GC batch." },
     ConfigVar { env: "TALON_WORKER_BACKGROUND_IO_MAX_MB_PER_SEC", key: "background_io_max_mb_per_sec", default: Some("8"), cli: false, secret: false, help: "Shared background disk read/write MB/s (decimal); zero disables throttling." },
@@ -1184,7 +1320,7 @@ pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
     ConfigVar { env: "TALON_WORKER_FILE_CLEANUP_INTERVAL_HOURS", key: "file_cleanup_interval_hours", default: Some("1"), cli: false, secret: false, help: "Delay between complete file cleanup passes in hours, independent of page GC." },
     ConfigVar { env: "TALON_WORKER_PAGE_GC_SCAN_BATCH_SIZE", key: "page_gc_scan_batch_size", default: Some("65536"), cli: false, secret: false, help: "Maximum entries per watermark eviction or stale GC batch; does not limit page GC or file cleanup." },
     ConfigVar { env: "TALON_WORKER_PAGE_GC_DELETE_BATCH_SIZE", key: "page_gc_delete_batch_size", default: Some("1024"), cli: false, secret: false, help: "Maximum deletion candidates per watermark eviction or stale GC batch; does not limit page GC or file cleanup." },
-    ConfigVar { env: "TALON_WORKER_PAGE_GC_IO_CONCURRENCY", key: "page_gc_io_concurrency", default: Some("4"), cli: false, secret: false, help: "Maximum concurrent page GC deletion tasks." },
+    ConfigVar { env: "TALON_WORKER_PAGE_GC_IO_CONCURRENCY", key: "page_gc_io_concurrency", default: Some("4"), cli: false, secret: false, help: "Maximum concurrent deletion tasks within a page GC batch. This also sizes the fallback I/O semaphore for runtimes without a shared background budget." },
     ConfigVar {
         env: "TALON_WORKER_PAGED_MISS_RUN_CONCURRENCY",
         key: "paged_miss_run_concurrency",
@@ -1207,7 +1343,7 @@ pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
         default: Some("azure"),
         cli: false,
         secret: false,
-        help: "Object-store backend: azure (default), s3, or gcs.",
+        help: "Object-store backend and default Broker IAM cloud. Accepts `aws` or `s3`, `gcs` or `gcp`, `az`, `azure` or `blob`, `oss` or `ali`, and `cos` or `tc`.",
     },
     ConfigVar {
         env: "TALON_WORKER_AZURE_ACCOUNT",
@@ -1311,7 +1447,7 @@ pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
         default: None,
         cli: false,
         secret: false,
-        help: "S3 region (required when backend=s3).",
+        help: "Storage region for S3 and S3-compatible backends.",
     },
     ConfigVar {
         env: "TALON_WORKER_S3_ENDPOINT",
@@ -1378,12 +1514,20 @@ pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
         help: "Azure SAS token; env-only, never from a config file or logged.",
     },
     ConfigVar {
+        env: worker_env::CREDENTIAL_ENDPOINT,
+        key: "broker.broker_endpoint",
+        default: None,
+        cli: false,
+        secret: false,
+        help: "Full HTTP(S) Broker URL for requests without their own Broker URL. Requests without Broker parameters use Pod IAM. Accepts the top-level credential_endpoint alias. A watched Worker config can replace an existing URL. Enabling or disabling the default Broker requires a restart.",
+    },
+    ConfigVar {
         env: worker_env::CREDENTIAL_BROKER_TIMEOUT_MS,
-        key: "credential_broker_timeout_ms",
+        key: "broker.timeout_ms",
         default: Some("3000"),
         cli: false,
         secret: false,
-        help: "Positive per-attempt Broker credential request timeout in ms; does not change storage I/O timeouts.",
+        help: "Positive per-attempt Broker credential exchange timeout in ms. Accepts the top-level credential_broker_timeout_ms alias. Storage I/O timeouts are configured separately.",
     },
 ];
 
@@ -1464,6 +1608,7 @@ pub(crate) mod worker_env {
     pub const GCS_ACCESS_KEY_ID: &str = "TALON_WORKER_GCS_ACCESS_KEY_ID";
     pub const GCS_SECRET_ACCESS_KEY: &str = "TALON_WORKER_GCS_SECRET_ACCESS_KEY";
     pub const AZURE_SHARED_KEY: &str = "TALON_WORKER_AZURE_SHARED_KEY";
+    pub const CREDENTIAL_ENDPOINT: &str = "TALON_WORKER_CREDENTIAL_ENDPOINT";
     pub const CREDENTIAL_BROKER_URL: &str = "TALON_CREDENTIAL_BROKER_URL";
     pub const CREDENTIAL_BROKER_REQUEST: &str = "TALON_CREDENTIAL_BROKER_REQUEST";
     pub const CREDENTIAL_BROKER_TIMEOUT_MS: &str = "TALON_CREDENTIAL_BROKER_TIMEOUT_MS";
@@ -1686,6 +1831,9 @@ impl WorkerConfigPatch {
             gcs_secret_access_key: get_credential(worker_env::GCS_SECRET_ACCESS_KEY)
                 .map(Sensitive::from),
             azure_shared_key: get_credential(worker_env::AZURE_SHARED_KEY).map(Sensitive::from),
+            broker: None,
+            credential_endpoint: get_credential(worker_env::CREDENTIAL_ENDPOINT)
+                .map(Sensitive::from),
             credential_broker_timeout_ms: get_credential(worker_env::CREDENTIAL_BROKER_TIMEOUT_MS)
                 .map(|value| parse_u64(value, worker_env::CREDENTIAL_BROKER_TIMEOUT_MS))
                 .transpose()?,
@@ -1760,6 +1908,7 @@ impl WorkerConfig {
     ) -> Result<Self> {
         // Fold highest-first onto lower layers, then onto defaults.
         let merged = cli.merge(env).merge(file);
+        let broker = merged.broker.unwrap_or_default();
         let d = WorkerConfig::default();
         let listen = merged.listen.unwrap_or(d.listen);
         let advertise_addr = normalize_worker_advertise_addr(
@@ -1888,6 +2037,16 @@ impl WorkerConfig {
             gcs_access_key_id: merged.gcs_access_key_id.or(d.gcs_access_key_id),
             gcs_secret_access_key: merged.gcs_secret_access_key.or(d.gcs_secret_access_key),
             azure_shared_key: merged.azure_shared_key.or(d.azure_shared_key),
+            credential_endpoint: merged.credential_endpoint.or(d.credential_endpoint),
+            broker_origin: BucketConfig {
+                s3_region: broker.s3_region,
+                s3_endpoint: broker.s3_endpoint,
+                s3_path_style: broker.s3_path_style,
+                gcs_endpoint: broker.gcs_endpoint,
+                azure_account: broker.azure_account,
+                azure_endpoint: broker.azure_endpoint,
+                ..BucketConfig::default()
+            },
             credential_broker_url: merged.credential_broker_url.or(d.credential_broker_url),
             credential_broker_timeout_ms: merged
                 .credential_broker_timeout_ms
@@ -1955,7 +2114,19 @@ impl WorkerConfig {
 
     /// Fail fast on invalid configuration with an actionable message.
     pub fn validate(&self) -> Result<()> {
-        self.resolved_buckets()?;
+        self.resolved_backend()?;
+        if let Some(endpoint) = &self.credential_endpoint {
+            self.resolved_broker()?;
+            crate::request::validate_broker_url(endpoint.expose()).map_err(|_| {
+                Error::Other(
+                    "[broker].broker_endpoint (credential_endpoint) must be a full HTTP(S) URL \
+                     without userinfo or fragment"
+                        .into(),
+                )
+            })?;
+        } else {
+            self.resolved_buckets()?;
+        }
         if self.credential_broker_timeout_ms == Some(0) {
             return Err(Error::Other(
                 "credential_broker_timeout_ms must be positive".into(),
@@ -3037,11 +3208,36 @@ mod tests {
     }
 
     #[test]
+    fn worker_backend_accepts_cloud_names() {
+        for (selector, expected) in [
+            (None, Backend::Azure),
+            (Some("azure"), Backend::Azure),
+            (Some("az"), Backend::Azure),
+            (Some("blob"), Backend::Azure),
+            (Some("s3"), Backend::S3),
+            (Some("aws"), Backend::S3),
+            (Some("ali"), Backend::Ali),
+            (Some("oss"), Backend::Ali),
+            (Some("tc"), Backend::Tc),
+            (Some("cos"), Backend::Tc),
+            (Some("gcs"), Backend::Gcs),
+            (Some("gcp"), Backend::Gcs),
+        ] {
+            let cfg = WorkerConfig {
+                backend: selector.map(str::to_owned),
+                ..Default::default()
+            };
+            assert_eq!(cfg.resolved_backend().unwrap(), expected);
+        }
+    }
+
+    #[test]
     fn bucket_toml_accepts_explicit_per_bucket_credentials() {
         let patch = WorkerConfigPatch::from_toml(
             r#"
-backend = "s3"
-s3_region = "us-east-1"
+backend = "tc"
+s3_region = "ap-beijing"
+s3_endpoint = "https://storage.example"
 [[buckets]]
 name = "static-bucket"
 credentials_source = "aksk"
@@ -3157,13 +3353,14 @@ credentials_source = "iam"
     }
 
     #[test]
-    fn bucket_list_rejects_empty_duplicates_and_unsafe_names() {
+    fn bucket_list_allows_empty_and_rejects_duplicates_and_unsafe_names() {
         let mut cfg = WorkerConfig {
             backend: Some("gcs".into()),
             buckets: Some(Vec::new()),
             ..Default::default()
         };
-        assert!(cfg.validate().is_err());
+        assert!(cfg.validate().is_ok());
+        assert!(cfg.resolved_buckets().unwrap().is_none());
         for name in [
             "", ".", "..", "a/b", "a\\b", "a?b", "a#b", "a%b", "a b", "a\nb", "a\0b",
         ] {
@@ -3194,6 +3391,96 @@ credentials_source = "iam"
             .unwrap_err()
             .to_string()
             .contains("duplicate"));
+    }
+
+    #[test]
+    fn worker_broker_iam_validates_bucket_addressing_without_static_credentials() {
+        let patch = WorkerConfigPatch::from_toml(
+            r#"
+backend = "tc"
+s3_region = "ap-shanghai"
+s3_endpoint = "https://storage.example"
+s3_path_style = false
+
+[broker]
+broker_endpoint = "https://broker.example/exchange"
+timeout_ms = 17
+s3_region = "ap-beijing"
+s3_path_style = true
+
+[[buckets]]
+name = "first"
+
+[[buckets]]
+name = "second"
+credentials_source = "aksk"
+s3_region = "ap-guangzhou"
+s3_path_style = false
+"#,
+        )
+        .unwrap();
+        let mut cfg = WorkerConfig::resolve(patch, Default::default(), Default::default()).unwrap();
+        let (_, buckets) = cfg.resolved_broker().unwrap();
+        assert_eq!(buckets.len(), 2);
+        assert_eq!(buckets[0].s3_region.as_deref(), Some("ap-beijing"));
+        assert_eq!(
+            buckets[0].s3_endpoint.as_deref(),
+            Some("https://storage.example")
+        );
+        assert_eq!(buckets[0].s3_path_style, Some(true));
+        assert_eq!(buckets[1].s3_region.as_deref(), Some("ap-guangzhou"));
+        assert_eq!(buckets[1].s3_path_style, Some(false));
+        assert_eq!(buckets[1].credentials_source, "aksk");
+
+        let worker_region = cfg.s3_region.take();
+        cfg.validate().unwrap();
+        cfg.s3_region = worker_region;
+        cfg.broker_origin.s3_region = None;
+        let (defaults, _) = cfg.resolved_broker().unwrap();
+        assert_eq!(defaults.s3_region.as_deref(), Some("ap-shanghai"));
+        cfg.s3_region = None;
+        assert!(cfg
+            .resolved_broker()
+            .unwrap_err()
+            .to_string()
+            .contains("s3_region"));
+    }
+
+    #[test]
+    fn broker_azure_origin_defaults_apply_only_to_iam_routes() {
+        let patch = WorkerConfigPatch::from_toml(
+            r#"
+backend = "azure"
+azure_account = "workeraccount"
+azure_endpoint = "https://storage.example"
+
+[broker]
+broker_endpoint = "https://broker.example/exchange"
+azure_account = "brokeraccount"
+
+[[buckets]]
+name = "first"
+credentials_source = "iam"
+
+[[buckets]]
+name = "second"
+credentials_source = "iam"
+azure_account = "bucketaccount"
+"#,
+        )
+        .unwrap();
+        let cfg = WorkerConfig::resolve(patch, Default::default(), Default::default()).unwrap();
+        let (_, buckets) = cfg.resolved_broker().unwrap();
+        assert_eq!(buckets[0].azure_account.as_deref(), Some("brokeraccount"));
+        assert_eq!(
+            buckets[0].azure_endpoint.as_deref(),
+            Some("https://storage.example")
+        );
+        assert_eq!(buckets[1].azure_account.as_deref(), Some("bucketaccount"));
+
+        let buckets = cfg.resolved_buckets().unwrap().unwrap();
+        assert_eq!(buckets[0].azure_account.as_deref(), Some("workeraccount"));
+        assert_eq!(buckets[1].azure_account.as_deref(), Some("bucketaccount"));
     }
 
     #[test]
@@ -3245,13 +3532,13 @@ credentials_source = "iam"
             assert!(cfg.validate().is_err(), "accepted noncanonical source");
         }
         for invalid in [
-            "[[buckets]]\nname = 'bucket'",
             "[[buckets]]\ncredentials_source = 'iam'",
             "[[buckets]]\nname = 'bucket'\ncredentials_source = 'iam'\nunknown = 'value'",
         ] {
             assert!(WorkerConfigPatch::from_toml(invalid).is_err());
         }
         for (backend, fields) in [
+            ("gcs", ""),
             ("s3", "credentials_source = 'iam'"),
             ("azure", "credentials_source = 'iam'"),
             ("s3", "credentials_source = 'aksk'\ns3_region = 'us-east-1'"),
@@ -3318,7 +3605,8 @@ credentials_source = "iam"
             (key == "TALON_WORKER_BUCKETS").then(|| "[]".into())
         })
         .unwrap();
-        assert!(WorkerConfig::resolve(file, replace_with_empty, Default::default()).is_err());
+        let cfg = WorkerConfig::resolve(file, replace_with_empty, Default::default()).unwrap();
+        assert!(cfg.resolved_buckets().unwrap().is_none());
     }
 
     #[test]
@@ -3444,6 +3732,54 @@ tenant = "example"
                 }
             }
         }
+    }
+
+    #[test]
+    fn broker_table_resolves_with_top_level_aliases_and_environment_overrides() {
+        let file_url = "https://file-broker.example/exchange?token=private-marker";
+        let env_url = "https://env-broker.example/exchange?token=private-marker";
+        let env = WorkerConfigPatch::from_env_with(|key| match key {
+            worker_env::CREDENTIAL_ENDPOINT => Some(env_url.to_owned()),
+            worker_env::CREDENTIAL_BROKER_TIMEOUT_MS => Some("29".to_owned()),
+            _ => None,
+        })
+        .unwrap();
+        for input in [
+            format!("credential_endpoint = '{file_url}'\ncredential_broker_timeout_ms = 17"),
+            format!(
+                "credential_endpoint = 'https://legacy-broker.example/exchange'\ncredential_broker_timeout_ms = 12\n[broker]\nbroker_endpoint = '{file_url}'\ntimeout_ms = 17"
+            ),
+        ] {
+            let file = WorkerConfigPatch::from_toml(&input).unwrap();
+            assert!(!format!("{file:?}").contains("private-marker"));
+            let config = WorkerConfig::resolve(file.clone(), Default::default(), Default::default())
+                .unwrap();
+            assert_eq!(config.credential_endpoint.unwrap().expose(), file_url);
+            assert_eq!(config.credential_broker_timeout_ms, Some(17));
+
+            let config = WorkerConfig::resolve(file, env.clone(), Default::default()).unwrap();
+            assert_eq!(config.credential_endpoint.as_ref().unwrap().expose(), env_url);
+            assert_eq!(config.credential_broker_timeout_ms, Some(29));
+            assert!(!format!("{config:?}").contains("private-marker"));
+            assert!(serde_json::to_value(&config)
+                .unwrap()
+                .get("credential_endpoint")
+                .is_none());
+        }
+
+        assert!(WorkerConfigPatch::from_toml(
+            "[[broker]]\nbroker_endpoint = 'https://broker.example/'"
+        )
+        .is_err());
+        let invalid = WorkerConfigPatch::from_toml(
+            "[broker]\nbroker_endpoint = 'https://private-marker@broker.example/exchange'",
+        )
+        .unwrap();
+        let error = WorkerConfig::resolve(invalid, Default::default(), Default::default())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("[broker].broker_endpoint"));
+        assert!(!error.contains("private-marker"));
     }
 
     #[test]

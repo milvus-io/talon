@@ -1,4 +1,4 @@
-use super::catalog::{Catalog, LiveModel};
+use super::catalog::{Address, Catalog, LiveModel};
 use super::lookup::{POLICY, REFERENCED, VISIBLE};
 use super::Location;
 use crate::eviction::{AccessHandle, PolicyEntry, PolicyState};
@@ -277,21 +277,48 @@ impl Directory {
         self.relocate_row(&mut catalog, key, location)
     }
 
-    pub(super) fn replace_segment(
-        &mut self,
-        old: u64,
-        replacement: Option<u64>,
-        moved: Vec<(SmallKey, Location)>,
-    ) {
-        let model = self.catalog.clone();
-        let mut catalog = model.0.write().unwrap();
-        for (key, location) in moved {
-            self.relocate_row(&mut catalog, key, location);
-        }
+    pub(super) fn replace_segment(&mut self, old: u64, replacement: Option<&super::StagedSegment>) {
+        let mut catalog = self.catalog.0.write().unwrap();
         if let Some(new) = replacement {
-            catalog.replace_published_segment(old, new);
+            catalog.files.insert(new.id, new.segment.file.clone());
+            for (&old_offset, record) in &new.records {
+                let old_address = (old, old_offset);
+                let new_address = (new.id, record.new_offset);
+                let old_slot = catalog.at(old_address).expect("reconciled source record");
+                let new_slot = catalog.at(new_address).expect("staged replacement record");
+                Self::transfer_row(&mut catalog, old_slot, old_address, new_slot, new_address);
+                let flags = catalog.lookup.flags(new_slot);
+                catalog.lookup.set_flags(new_slot, flags | VISIBLE);
+                if let Some(ownership) = &mut catalog.ownership {
+                    ownership.relocate_retry(old_address, new_address);
+                }
+            }
+            catalog.replace_published_segment(old, new.id);
         }
         catalog.retire_segment(old);
+    }
+
+    fn transfer_row(
+        catalog: &mut Catalog,
+        old_slot: usize,
+        old_address: Address,
+        new_slot: usize,
+        new_address: Address,
+    ) {
+        let flags = catalog.lookup.flags(old_slot);
+        catalog
+            .lookup
+            .set_flags(old_slot, flags & !(VISIBLE | POLICY | REFERENCED));
+        catalog.relocate_recency(old_address, new_slot);
+        catalog.relocate_policy(old_address, new_address, new_slot);
+        if let Some(policy) = catalog.policy.remove(&old_address) {
+            catalog.policy.insert(new_address, policy);
+        }
+        if let Some(access) = catalog.access.remove(&old_address) {
+            catalog.access.insert(new_address, access);
+        }
+        let flags = catalog.lookup.flags(new_slot) | flags & (POLICY | REFERENCED);
+        catalog.lookup.set_flags(new_slot, flags);
     }
 
     fn relocate_row(
@@ -350,24 +377,11 @@ impl Directory {
         let old = old_slot.and_then(|slot| catalog.location_for_move(slot));
         if let Some(old_slot) = old_slot.filter(|old| *old != slot) {
             let old_address = catalog.metadata(catalog.lookup.handle(old_slot)).unwrap().0;
-            let flags = catalog.lookup.flags(old_slot);
-            catalog
-                .lookup
-                .set_flags(old_slot, flags & !(VISIBLE | POLICY | REFERENCED));
+            Self::transfer_row(catalog, old_slot, old_address, slot, address);
             *catalog.live.entry(self.slot).or_default() -= 1;
             if !relocating {
                 catalog.shared.live_count.fetch_sub(1, Relaxed);
             }
-            catalog.relocate_recency(old_address, slot);
-            catalog.relocate_policy(old_address, address, slot);
-            if let Some(policy) = catalog.policy.remove(&old_address) {
-                catalog.policy.insert(address, policy);
-            }
-            if let Some(access) = catalog.access.remove(&old_address) {
-                catalog.access.insert(address, access);
-            }
-            let flags = catalog.lookup.flags(slot) | flags & (POLICY | REFERENCED);
-            catalog.lookup.set_flags(slot, flags);
         }
         if let Some(access) = location
             .access

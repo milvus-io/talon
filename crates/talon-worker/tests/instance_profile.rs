@@ -114,11 +114,14 @@ async fn reply(State(fixture): State<Fixture>, request: Request) -> Response {
             Backend::S3 => "aws",
             Backend::Gcs => "gcp",
             Backend::Azure => "azure",
+            _ => unreachable!("unexpected provider in instance profile fixture"),
         };
         assert_eq!(request["csp"], csp);
         assert_eq!(request["durationSeconds"], 3600);
         let (ak, sk, token) = match backend {
-            Backend::S3 => ("INSTANCEAK", "fixture-secret", "fixture-session"),
+            Backend::S3 | Backend::Ali | Backend::Tc => {
+                ("INSTANCEAK", "fixture-secret", "fixture-session")
+            }
             Backend::Gcs => ("", "", "managed-token"),
             Backend::Azure => ("fixtureaccount", "", "sv=fixture&sig=fixed-sas"),
         };
@@ -161,14 +164,14 @@ async fn reply(State(fixture): State<Fixture>, request: Request) -> Response {
                         && request.uri().query() == Some("sv=fixture&sig=fixed-sas")
                 }
                 Backend::Gcs => authorization == "Bearer fixed-token",
-                Backend::S3 => unreachable!(),
+                _ => unreachable!("legacy fixed token fixture only supports GCS and Azure"),
             };
             if !valid {
                 return StatusCode::FORBIDDEN.into_response();
             }
         } else if let Some(backend) = fixture.aksk {
             let valid = match backend {
-                Backend::S3 => {
+                Backend::S3 | Backend::Ali | Backend::Tc => {
                     authorization.starts_with("AWS4-HMAC-SHA256 Credential=STATICAK/")
                         && authorization.contains("/us-west-2/s3/aws4_request")
                         && token == fixture.session_token.then_some("configured-session")
@@ -236,6 +239,7 @@ fn start_worker(
         Backend::S3 => (format!("backend = \"s3\"\ns3_region = \"us-west-2\"\ns3_endpoint = \"http://{origin}\"\ns3_path_style = true"), "aws-instance-profile", "AWS_EC2_METADATA_SERVICE_ENDPOINT"),
         Backend::Azure => (format!("backend = \"azure\"\nazure_account = \"fixtureaccount\"\nazure_endpoint = \"http://{origin}\""), "azure-managed-identity", "TALON_AZURE_IMDS_ENDPOINT"),
         Backend::Gcs => (format!("backend = \"gcs\"\ngcs_endpoint = \"http://{origin}\""), "gcp-metadata", "GCE_METADATA_HOST"),
+        _ => unreachable!("unexpected provider in instance profile fixture"),
     };
     std::fs::write(
         &config,
@@ -330,6 +334,7 @@ cache_dirs = [{}]
                     .env("TALON_WORKER_GCS_ACCESS_KEY_ID", "HMACAK")
                     .env("TALON_WORKER_GCS_SECRET_ACCESS_KEY", "fixture-hmac-secret");
             }
+            _ => unreachable!("unexpected provider in instance profile fixture"),
         }
     }
     if mode == IdentityMode::LegacyAnonymous {
@@ -380,7 +385,7 @@ cache_dirs = [{}]
         let auth = match mode {
             IdentityMode::TomlAkSk | IdentityMode::TomlEnvOverride => {
                 let keys = match backend {
-                    Backend::S3 => "s3_access_key_id = \"STATICAK\"\ns3_secret_access_key = \"fixture-static-secret\"\ns3_session_token = \"configured-session\"",
+                    Backend::S3 | Backend::Ali | Backend::Tc => "s3_access_key_id = \"STATICAK\"\ns3_secret_access_key = \"fixture-static-secret\"\ns3_session_token = \"configured-session\"",
                     Backend::Gcs => "gcs_access_key_id = \"HMACAK\"\ngcs_secret_access_key = \"fixture-hmac-secret\"",
                     Backend::Azure => "azure_shared_key = \"Zml4dHVyZS1zaGFyZWQta2V5\"",
                 };
@@ -397,6 +402,7 @@ cache_dirs = [{}]
                     Backend::S3 => "csp = \"aws\"\nregion = \"us-west-2\"\nroleArn = \"fixture-role\"",
                     Backend::Gcs => "csp = \"gcp\"\ngcpServiceAccountEmail = \"fixture@example.iam.gserviceaccount.com\"",
                     Backend::Azure => "csp = \"azure\"\nregion = \"westus3\"\nbucket = \"example-bucket\"\nazureClientId = \"fixture-client\"\nazureTenantId = \"fixture-tenant\"\nazureAccountName = \"fixtureaccount\"",
+                    _ => unreachable!("unexpected provider in instance profile fixture"),
                 };
                 format!("credentials_source = \"broker\"\ncredential_broker_url = \"http://{origin}/broker\"\n[credential_broker_request]\n{fields}\ndurationSeconds = 3600\n")
             }
@@ -706,6 +712,7 @@ async fn worker_reads_one_bucket(backend: Backend, mode: IdentityMode) {
             "/fixtureaccount/example-bucket/key",
         ),
         Backend::Gcs => ("/computeMetadata/", 1, "/example-bucket/key"),
+        _ => unreachable!("unexpected provider in instance profile fixture"),
     };
     assert_eq!(
         paths.iter().filter(|p| p.starts_with(prefix)).count(),

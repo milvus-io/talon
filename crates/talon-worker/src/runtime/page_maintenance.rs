@@ -22,12 +22,21 @@ struct PreparedCheckpoint {
 }
 
 impl WorkerRuntime {
-    pub(super) async fn background_io(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        match &self.background_budget {
-            Some(budget) => Some(budget.io().await),
-            None => None,
-        }
+    pub(super) fn background_io_slots(&self) -> &Arc<tokio::sync::Semaphore> {
+        self.background_budget
+            .as_ref()
+            .map_or(&self.fallback_background_io, |budget| budget.io_slots())
     }
+
+    pub(super) async fn acquire_background_io(
+        &self,
+        deadline: Option<Instant>,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        before_deadline(deadline, self.background_io_slots().clone().acquire_owned())
+            .await
+            .map(|permit| permit.expect("background I/O semaphore remains open"))
+    }
+
     async fn background_delete(&self) {
         if let Some(budget) = &self.background_budget {
             budget.delete().await;
@@ -92,7 +101,7 @@ impl WorkerRuntime {
         self.page_gc_metrics
             .checkpoint_interval
             .set(config.checkpoint_interval_ms as f64 / 1000.0);
-        self.page_gc_io = Arc::new(tokio::sync::Semaphore::new(config.io_concurrency));
+        self.fallback_background_io = Arc::new(tokio::sync::Semaphore::new(config.io_concurrency));
         self.page_gc_config = config;
         Ok(self)
     }
@@ -154,16 +163,8 @@ impl WorkerRuntime {
         deletes: usize,
     ) -> crate::page_gc::CleanupReport {
         let runtime = self.clone();
-        let permit = self
-            .page_gc_io
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("page cleanup semaphore closed");
         self.page_mutations
             .run(async move {
-                let _permit = permit;
-                let _background_io = runtime.background_io().await;
                 let report = runtime
                     .page_cleanup
                     .lock()
@@ -173,6 +174,7 @@ impl WorkerRuntime {
                         scans,
                         deletes,
                         runtime.background_budget.as_deref(),
+                        || runtime.acquire_background_io(None),
                     )
                     .await;
                 runtime
@@ -302,11 +304,9 @@ impl WorkerRuntime {
         target: u64,
     ) -> Option<u64> {
         let runtime = self.clone();
-        let permit = self.page_gc_io.clone().acquire_owned().await.ok()?;
         self.page_mutations.run(async move {
-            let _permit = permit;
             runtime.background_delete().await;
-            let _background_io = runtime.background_io().await;
+            let _io = runtime.acquire_background_io(None).await?;
             let block = &candidate.block;
             let _gate = block.lock().await;
             if capacity.as_ref().is_some_and(|ticket| !runtime.lru.candidate_is_current(ticket)) {
@@ -367,7 +367,7 @@ impl WorkerRuntime {
         self.page_mutations
             .run(async move {
                 runtime.background_delete().await;
-                let _background_io = runtime.background_io().await;
+                let _io = runtime.acquire_background_io(None).await;
                 let _gate = block.lock().await;
                 if block.has_pages() {
                     return;
@@ -441,13 +441,7 @@ impl WorkerRuntime {
         self.page_mutations
             .run(async move {
                 runtime.background_delete().await;
-                let _permit = runtime
-                    .page_gc_io
-                    .clone()
-                    .acquire_owned()
-                    .await
-                    .expect("page GC semaphore closed");
-                let _background_io = runtime.background_io().await;
+                let _io = runtime.acquire_background_io(None).await;
                 let block = unit.block().clone();
                 let whole = matches!(&unit, CacheUnit::Whole(_));
                 let state = runtime.page_lifecycle.block(&block);
@@ -489,14 +483,7 @@ impl WorkerRuntime {
         self.page_mutations
             .run(async move {
                 let deadline = membership.as_ref().map(|view| view.valid_until);
-                let Some(permit) =
-                    before_deadline(deadline, runtime.page_gc_io.clone().acquire_owned()).await
-                else {
-                    return;
-                };
-                let _permit = permit.expect("page GC semaphore closed");
-                let Some(_background_io) = before_deadline(deadline, runtime.background_io()).await
-                else {
+                let Some(_io) = runtime.acquire_background_io(deadline).await else {
                     return;
                 };
                 let block = candidate.unit.block().clone();
@@ -547,14 +534,12 @@ impl WorkerRuntime {
         self.page_mutations.run(async move {
             let ownership_deadline = membership.as_ref().map(|view| view.valid_until);
             let reason = if ownership_deadline.is_some() { 4 } else { 3 };
-            let Some(permit) = before_deadline(ownership_deadline, runtime.page_gc_io.clone().acquire_owned()).await else { return false; };
-            let _permit = permit.expect("page GC semaphore closed");
             if ownership_deadline.is_none() && !prepaid {
                 if let Some(budget) = &runtime.background_budget {
                     budget.delete_units(candidate.units as u64).await;
                 }
             }
-            let Some(_background_io) = before_deadline(ownership_deadline, runtime.background_io()).await else { return false; };
+            let Some(_io) = runtime.acquire_background_io(ownership_deadline).await else { return false; };
             let state = if ownership_deadline.is_some() {
                 runtime.page_lifecycle.mutation(BlockKey::new(&candidate.block))
             } else {
@@ -665,7 +650,7 @@ impl WorkerRuntime {
                         let runtime = self.clone();
                         self.page_mutations.run(async move {
                             runtime.background_delete().await;
-                            let _background_io = runtime.background_io().await;
+                            let _io = runtime.acquire_background_io(None).await;
                             let _gate = state.lock().await;
                             if reason == 1 && (runtime.capacity_bytes == 0 || runtime.resident_bytes() <= target) {
                                 return;
@@ -687,7 +672,7 @@ impl WorkerRuntime {
                         self.page_mutations
                         .run(async move {
                             runtime.background_delete().await;
-                            let _background_io = runtime.background_io().await;
+                            let _io = runtime.acquire_background_io(None).await;
                             let _gate = state.lock().await;
                             if reason == 1
                                 && (runtime.capacity_bytes == 0
@@ -753,7 +738,7 @@ impl WorkerRuntime {
                 let shard = cursor.shard;
                 cursor.shard = (shard + 1) % SHARDS;
                 let remaining = if all { SHARDS - step } else { SHARDS - shard };
-                let _background_io = runtime.background_io().await;
+                let _io = runtime.acquire_background_io(None).await;
                 let result = runtime.checkpoint_shard(shard, remaining, &mut cursor.inventory).await;
                 match result {
                     Ok((blocks, bytes)) => {

@@ -114,11 +114,7 @@ impl BlockKey {
         let mut text = String::with_capacity(
             16 + id.object.bucket.len() + id.object.object_path.len() + id.version.len(),
         );
-        text.push(match id.object.backend {
-            Backend::S3 => 's',
-            Backend::Gcs => 'g',
-            Backend::Azure => 'a',
-        });
+        text.push(char::from(id.object.backend as u8));
         if id.block_size.is_power_of_two() {
             text.push(char::from(id.block_size.trailing_zeros() as u8));
         } else {
@@ -153,12 +149,7 @@ impl BlockKey {
 impl BlockIdentity for BlockKey {
     fn view(&self) -> BlockRef<'_> {
         let bytes = self.0.as_bytes();
-        let backend = match bytes[0] {
-            b's' => Backend::S3,
-            b'g' => Backend::Gcs,
-            b'a' => Backend::Azure,
-            _ => unreachable!("unrecognized block key backend"),
-        };
+        let backend = Backend::from_tag(bytes[0]).expect("packed block key backend");
         let mut fields = &bytes[2..];
         let block_size = if bytes[1] == WIDE_BLOCK_SIZE {
             read_number(&mut fields) as u32
@@ -222,19 +213,23 @@ mod tests {
 
     #[test]
     fn packed_keys_preserve_exact_identity_and_json() {
-        let key = |bucket, path, version| {
+        let key = |backend, bucket, path, version| {
             BlockId::new(
-                ObjectId::new(Backend::Azure, bucket, path),
+                ObjectId::new(backend, bucket, path),
                 17,
                 123,
                 Version::new(version),
             )
         };
         let ids = [
-            key("a", "bc", "d"),
-            key("ab", "c", "d"),
-            key("a", "b", "cd"),
-            key("桶", "路径/é", "版本"),
+            key(Backend::Azure, "a", "bc", "d"),
+            key(Backend::S3, "a", "bc", "d"),
+            key(Backend::Gcs, "a", "bc", "d"),
+            key(Backend::Ali, "a", "bc", "d"),
+            key(Backend::Tc, "a", "bc", "d"),
+            key(Backend::Azure, "ab", "c", "d"),
+            key(Backend::Azure, "a", "b", "cd"),
+            key(Backend::Azure, "桶", "路径/é", "版本"),
             BlockId::new(
                 ObjectId::new(Backend::Gcs, "桶".repeat(2048), "路径/é".repeat(1024)),
                 u64::MAX,

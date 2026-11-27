@@ -42,12 +42,7 @@ fn object_field<'a, 'b: 'a>(input: &mut &'b [u8], scratch: &'a mut Vec<u8>) -> &
 }
 
 fn backend(tag: u8) -> Backend {
-    match tag & 0x1f {
-        0 => Backend::S3,
-        1 => Backend::Gcs,
-        2 => Backend::Azure,
-        _ => unreachable!("encoded small-object backend"),
-    }
+    Backend::from_tag(tag & 0x1f).expect("encoded small-object backend")
 }
 
 pub(super) fn object<'a>(
@@ -74,12 +69,7 @@ pub(super) fn encode(id: &dyn SmallIdentity) -> Vec<u8> {
         && version
             .iter()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b));
-    let backend = match id.object.backend {
-        Backend::S3 => 0,
-        Backend::Gcs => 1,
-        Backend::Azure => 2,
-    };
-    let tag = backend
+    let tag = id.object.backend as u8
         | if id.kind == UnitKind::ExactRange {
             0x80
         } else {
@@ -150,10 +140,17 @@ pub(super) fn decode(mut input: &[u8]) -> SmallKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::small_store::format;
 
     #[test]
     fn round_trip_preserves_every_identity_field() {
-        for backend in [Backend::S3, Backend::Gcs, Backend::Azure] {
+        for backend in [
+            Backend::S3,
+            Backend::Gcs,
+            Backend::Azure,
+            Backend::Ali,
+            Backend::Tc,
+        ] {
             for path in [
                 "",
                 "a\0b",
@@ -173,7 +170,16 @@ mod tests {
                     };
                     for kind in [UnitKind::Whole, UnitKind::ExactRange] {
                         let key = SmallRef { block: key, kind };
-                        assert_eq!(decode(&encode(&key)).view(), key);
+                        let encoded = encode(&key);
+                        assert_eq!(decode(&encoded).view(), key);
+                        let mut bucket = Vec::new();
+                        let mut object_path = Vec::new();
+                        assert_eq!(
+                            object(&encoded, &mut bucket, &mut object_path),
+                            key.block.object
+                        );
+                        let persisted = format::key(&key).unwrap();
+                        assert_eq!(format::view(&persisted).unwrap(), key);
                     }
                 }
             }

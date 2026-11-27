@@ -98,6 +98,8 @@ final class Messages {
     static final int BACKEND_S3 = 0;
     static final int BACKEND_GCS = 1;
     static final int BACKEND_AZURE = 2;
+    static final int BACKEND_ALI = 3;
+    static final int BACKEND_TC = 4;
 
     // NodeRole enum tags.
     static final int ROLE_COORDINATOR = 0;
@@ -157,6 +159,10 @@ final class Messages {
                 return BACKEND_GCS;
             case AZURE:
                 return BACKEND_AZURE;
+            case ALI:
+                return BACKEND_ALI;
+            case TC:
+                return BACKEND_TC;
             default:
                 throw new ProtocolException("unhandled backend: " + backend);
         }
@@ -170,6 +176,10 @@ final class Messages {
                 return ObjectId.Backend.GCS;
             case BACKEND_AZURE:
                 return ObjectId.Backend.AZURE;
+            case BACKEND_ALI:
+                return ObjectId.Backend.ALI;
+            case BACKEND_TC:
+                return ObjectId.Backend.TC;
             default:
                 throw new ProtocolException("unknown backend tag: " + tag);
         }

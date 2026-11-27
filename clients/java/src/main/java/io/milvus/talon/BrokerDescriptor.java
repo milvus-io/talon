@@ -34,11 +34,14 @@ final class BrokerDescriptor {
         }
         BrokerJson parsed = new BrokerJson(json);
         try {
-            URI endpoint = new URI(parsed.descriptor());
-            if (!("http".equalsIgnoreCase(endpoint.getScheme()) || "https".equalsIgnoreCase(endpoint.getScheme()))
-                    || endpoint.getHost() == null || endpoint.getRawUserInfo() != null
-                    || endpoint.getRawFragment() != null || endpoint.getPort() > 65535) {
-                throw invalidBroker();
+            String url = parsed.descriptor();
+            if (url != null && !url.isEmpty()) {
+                URI endpoint = new URI(url);
+                if (!("http".equalsIgnoreCase(endpoint.getScheme()) || "https".equalsIgnoreCase(endpoint.getScheme()))
+                        || endpoint.getHost() == null || endpoint.getRawUserInfo() != null
+                        || endpoint.getRawFragment() != null || endpoint.getPort() > 65535) {
+                    throw invalidBroker();
+                }
             }
         } catch (URISyntaxException | IllegalArgumentException ignored) {
             // URI/parser exceptions can embed the URL or credential body.
@@ -95,7 +98,7 @@ final class BrokerDescriptor {
                 expect('}');
             }
             peek();
-            if (url == null || !request || !origin || position != input.length()) throw invalidBroker();
+            if (!request || !origin || position != input.length()) throw invalidBroker();
             if (csp != null && S3_CLOUDS.contains(csp) && !hasRegion) throw invalidBroker();
             return url;
         }

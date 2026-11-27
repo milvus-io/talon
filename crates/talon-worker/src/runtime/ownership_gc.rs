@@ -1076,7 +1076,6 @@ mod tests {
         let mut candidate = candidates.pop().unwrap();
         let revision = candidate.observe_ownership(limit.epoch).unwrap();
         let state = worker.page_lifecycle.block(&id);
-        let gc_permits = worker.page_gc_io.available_permits();
         let budget = worker.background_budget.as_ref().unwrap();
         let io_permits = budget.available_io();
         let handle = tokio::runtime::Handle::current();
@@ -1089,7 +1088,6 @@ mod tests {
                     .await;
                 assert!(worker.membership_is_current(&membership));
                 assert!(state.lock().now_or_never().is_some());
-                assert_eq!(worker.page_gc_io.available_permits(), gc_permits);
                 assert_eq!(budget.available_io(), io_permits);
             });
         });
@@ -1119,7 +1117,6 @@ mod tests {
         let mut candidate = candidates.pop().unwrap();
         let revision = candidate.observe_ownership(limit.epoch).unwrap();
         let state = worker.page_lifecycle.block(&id);
-        let gc_permits = worker.page_gc_io.available_permits();
         let budget = worker.background_budget.as_ref().unwrap();
         let io_permits = budget.available_io();
         let handle = tokio::runtime::Handle::current();
@@ -1132,7 +1129,6 @@ mod tests {
                     .await;
                 assert!(worker.membership_is_current(&membership));
                 assert!(state.lock().now_or_never().is_some());
-                assert_eq!(worker.page_gc_io.available_permits(), gc_permits);
                 assert_eq!(budget.available_io(), io_permits);
             });
         });
@@ -1202,7 +1198,7 @@ mod tests {
                 None
             };
             let budget = worker.background_budget.as_ref().unwrap();
-            let full = (worker.page_gc_io.available_permits(), budget.available_io());
+            let full = budget.available_io();
             let (held, ready) = tokio::sync::oneshot::channel();
             let (release, released) = std::sync::mpsc::channel();
             let index = worker.index.clone();
@@ -1239,9 +1235,7 @@ mod tests {
             let callback = tokio::spawn(invoke(view));
             let borrowed = tokio::time::timeout_at(expires.into(), async {
                 if hold_gate {
-                    while worker.page_gc_io.available_permits() == full.0
-                        || budget.available_io() == full.1
-                    {
+                    while budget.available_io() == full {
                         tokio::time::sleep(Duration::from_millis(1)).await;
                     }
                 }
@@ -1249,12 +1243,7 @@ mod tests {
             .await
             .is_ok();
             tokio::time::sleep_until((expires + Duration::from_millis(100)).into()).await;
-            let observed = (
-                borrowed,
-                callback.is_finished(),
-                worker.page_gc_io.available_permits(),
-                budget.available_io(),
-            );
+            let observed = (borrowed, callback.is_finished(), budget.available_io());
             let resident = if let Some(path) = &path {
                 path.exists()
             } else {
@@ -1278,7 +1267,7 @@ mod tests {
             assert!(resident, "expired membership must leave the payload intact");
             assert_eq!(
                 observed,
-                (true, true, full.0, full.1),
+                (true, true, full),
                 "packed={packed} gate={hold_gate}"
             );
         }
@@ -1292,7 +1281,6 @@ mod tests {
         let small = worker.small.as_ref().unwrap();
         small.put(&id, Bytes::from_static(b"packed")).await.unwrap();
         let mut gc = fixture.gc_managed(&worker);
-        let gc_permits = worker.page_gc_io.available_permits();
         let budget = worker.background_budget.as_ref().unwrap();
         let io_permits = budget.available_io();
         let (held, ready) = tokio::sync::oneshot::channel();
@@ -1315,9 +1303,7 @@ mod tests {
             let round = gc.run_round(&worker);
             tokio::pin!(round);
             let borrowed = async {
-                while worker.page_gc_io.available_permits() == gc_permits
-                    || budget.available_io() == io_permits
-                {
+                while budget.available_io() == io_permits {
                     tokio::time::sleep(Duration::from_millis(1)).await;
                 }
             };
@@ -1330,7 +1316,6 @@ mod tests {
             (
                 result.is_ok(),
                 worker.membership_snapshot().is_none(),
-                worker.page_gc_io.available_permits(),
                 budget.available_io(),
             )
         };
@@ -1340,8 +1325,8 @@ mod tests {
         worker.page_mutations.drain().await;
         assert_eq!(
             finished,
-            (true, true, gc_permits, io_permits),
-            "expired ownership callback and both permits must finish before the registry unlocks"
+            (true, true, io_permits),
+            "expired ownership callback must release I/O before the registry unlocks"
         );
         assert_eq!(small.ownership_retry_count(), 1);
         assert_eq!(worker.page_gc_metrics.ownership_attempted.get(), 1);
@@ -1594,9 +1579,9 @@ mod tests {
             .await
             .unwrap();
         let permit = worker
-            .page_gc_io
+            .background_io_slots()
             .clone()
-            .acquire_many_owned(worker.page_gc_config.io_concurrency as u32)
+            .acquire_many_owned(worker.background_io_slots().available_permits() as u32)
             .await
             .unwrap();
         let mut gc = fixture.gc_managed(&worker);

@@ -11,7 +11,8 @@ use std::{
     sync::{Arc, RwLock},
     time::Duration,
 };
-use talon_core::{Error, ObjectId, WorkerConfig};
+use talon_core::backend::BackgroundRoute;
+use talon_core::{BackendStore, Error, ObjectId, WorkerConfig};
 
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 const MAX_HEADS: usize = 32;
@@ -202,8 +203,7 @@ impl StaleGc {
         if self.positive_heads.prune(clock()) {
             return Some(Duration::ZERO);
         }
-        // Recovery has no Broker configuration. Only a request may bind the
-        // backend; local maintenance remains active while origin GC waits.
+        // A recovered credential scope waits for a foreground request to bind it.
         if !worker.backend.get()?.ready_for_background() {
             return None;
         }
@@ -363,7 +363,8 @@ impl StaleGc {
             &mut self.pending
         };
         let now = clock();
-        let mut groups: HashMap<ObjectId, Vec<Candidate>> = HashMap::new();
+        let mut routes = HashMap::new();
+        let mut groups: HashMap<ObjectId, (Arc<dyn BackendStore>, Vec<Candidate>)> = HashMap::new();
         {
             let checked = self.positive_heads.checked.read().unwrap();
             while let Some(candidate) = pending.front() {
@@ -374,24 +375,42 @@ impl StaleGc {
                 if head_due(&checked, candidate.object().view(), now)
                     && candidate.is_current(worker)
                 {
-                    groups
-                        .entry(candidate.object().clone())
-                        .or_default()
-                        .push(candidate);
+                    let object = candidate.object();
+                    // Decide once per bucket for this batch before queuing HEADs.
+                    let store = routes
+                        .entry((object.backend, object.bucket.clone()))
+                        .or_insert_with(|| {
+                            match backend.background_route(object.backend, &object.bucket) {
+                                BackgroundRoute::Current => Some(backend.clone()),
+                                BackgroundRoute::Bound(store) => Some(store),
+                                BackgroundRoute::Skip => None,
+                            }
+                        });
+                    if let Some(store) = store {
+                        groups
+                            .entry(object.clone())
+                            .or_insert_with(|| (store.clone(), Vec::new()))
+                            .1
+                            .push(candidate);
+                    }
                 }
             }
         }
         let heads = &self.heads;
-        let work =
-            futures::stream::iter(groups.into_iter().map(|(object, candidates)| async move {
+        let mut work = Vec::with_capacity(groups.len());
+        for (object, (store, candidates)) in groups {
+            work.push(async move {
                 // Origin QPS is independent of local disk pacing and scan slicing.
                 heads.charge(1).await;
-                let result =
-                    tokio::time::timeout(Duration::from_secs(5), worker.background_head(&object))
-                        .await;
+                let result = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    worker.background_head(store, &object),
+                )
+                .await;
                 (object, candidates, result)
-            }));
-        let mut work = work.buffer_unordered(self.concurrency);
+            });
+        }
+        let mut work = futures::stream::iter(work).buffer_unordered(self.concurrency);
         while let Some((object, candidates, result)) = work.next().await {
             match result {
                 Ok(Ok(_)) => {
@@ -430,11 +449,25 @@ mod tests {
         objects: std::sync::Mutex<Vec<ObjectId>>,
         mode: AtomicUsize, // 0 missing, 1 exists, 2 forbidden, 3 timeout
         hold: AtomicBool,
+        unavailable: AtomicBool,
+        unavailable_bucket: Option<&'static str>,
         entered: tokio::sync::Notify,
         release: tokio::sync::Notify,
     }
     #[async_trait::async_trait]
     impl BackendStore for Origin {
+        fn ready_for_background(&self) -> bool {
+            !self.unavailable.load(Ordering::Relaxed)
+        }
+
+        fn background_route(&self, _: Backend, bucket: &str) -> BackgroundRoute {
+            if self.ready_for_background() && self.unavailable_bucket != Some(bucket) {
+                BackgroundRoute::Current
+            } else {
+                BackgroundRoute::Skip
+            }
+        }
+
         async fn fetch_range(&self, _: &ObjectId, _: u64, _: u64) -> talon_core::Result<Bytes> {
             panic!("GC must not fetch data")
         }
@@ -1169,6 +1202,35 @@ mod tests {
             }
             assert_eq!(r.logical_resident_bytes(), 0);
         }
+    }
+
+    #[tokio::test]
+    async fn stale_gc_skips_scopes_without_a_binding() {
+        let root = tempfile::tempdir().unwrap();
+        let origin = Arc::new(Origin {
+            unavailable: AtomicBool::new(true),
+            unavailable_bucket: Some("cold"),
+            ..Default::default()
+        });
+        let worker = runtime(root.path(), false, origin.clone());
+        let warm = block(0);
+        fill(&worker, &warm, false).await;
+        for key in ["first", "second"] {
+            let mut cold = block(0);
+            cold.object = ObjectId::new(Backend::S3, "cold", key);
+            fill(&worker, &cold, false).await;
+        }
+        let mut gc = StaleGc::default();
+        let now = cold_now();
+        assert!(gc.run_slice_with_clock(&worker, || now).await.is_none());
+        assert!(gc.round_now.is_none());
+        assert_eq!(origin.calls.load(Ordering::Relaxed), 0);
+        assert_eq!(worker.logical_resident_bytes(), 96);
+
+        origin.unavailable.store(false, Ordering::Relaxed);
+        gc.run_round_at(&worker, now).await;
+        assert_eq!(*origin.objects.lock().unwrap(), [warm.object]);
+        assert_eq!(worker.logical_resident_bytes(), 64);
     }
 
     #[tokio::test]

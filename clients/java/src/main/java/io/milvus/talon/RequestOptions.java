@@ -55,8 +55,9 @@ public final class RequestOptions {
     }
 
     /**
-     * Select a credential broker using the complete JSON descriptor
+     * Select a credential broker using the JSON descriptor
      * {@code {"url": "...", "request": {...}, "origin": {"endpoint": "..."}}}, preserving namespace and tracing.
+     * An omitted or empty {@code url} uses the worker's credential endpoint when configured.
      * Every cloud requires an origin object with a nonblank endpoint. AWS, Alibaba Cloud,
      * Tencent Cloud and Huawei Cloud also require a nonblank {@code origin.region};
      * {@code request.region} only selects the Broker region and cannot substitute for it.
