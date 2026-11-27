@@ -39,6 +39,7 @@ struct OwnershipPass {
     // Observed block and deletion credits already paid.
     attempt: Option<(StaleBlockCandidate, u64)>,
     block_round_done: bool,
+    small_next: bool,
     small: Option<SmallPass>,
 }
 
@@ -55,6 +56,7 @@ struct SmallPass {
     pending: VecDeque<SmallGcCandidate>,
     retry_cursor: Option<u64>,
     attempt: Option<(SmallGcCandidate, u64, bool)>,
+    round_done: bool,
 }
 
 impl SmallPass {
@@ -67,6 +69,7 @@ impl SmallPass {
             pending: VecDeque::new(),
             retry_cursor: None,
             attempt: None,
+            round_done: false,
         }
     }
 }
@@ -211,10 +214,11 @@ impl OwnershipGc {
                 cursor,
                 retry_cursor: range.start,
                 scanning: !range.is_empty(),
+                block_round_done: self.supplement.is_some() && range.is_empty(),
                 range,
                 retries: BTreeMap::new(),
                 attempt: None,
-                block_round_done: false,
+                small_next: false,
                 small,
             });
             self.round_ended = false;
@@ -222,21 +226,28 @@ impl OwnershipGc {
         if self.round_ended {
             let pass = self.pass.as_mut().unwrap();
             pass.retry_cursor = pass.range.start;
-            pass.block_round_done = false;
+            pass.block_round_done = self.supplement.is_some() && pass.range.is_empty();
             if let Some(small) = &mut pass.small {
                 small.retry_cursor = Some(0);
+                small.round_done = false;
             }
         }
         self.round_ended = false;
-        let pass = self.pass.as_ref().unwrap();
-        // A Small-only supplement, including its retry rounds, has no
-        // ordinary admission revisions to examine.
-        if pass.block_round_done || (self.supplement.is_some() && pass.range.is_empty()) {
+        let pass = self.pass.as_mut().unwrap();
+        let small_has_work = pass.small.as_ref().is_some_and(|small| !small.round_done);
+        if pass.block_round_done || (pass.small_next && small_has_work) {
+            pass.small_next = false;
             if worker.membership_is_current(&view) {
                 self.run_small_slice(worker, &view).await;
             }
             return;
         }
+        // An uncovered supplement may have to visit the entire ordinary
+        // directory. Give Small discovery a turn after each such slice.
+        pass.small_next = small_has_work
+            && self.supplement.is_some()
+            && pass.scanning
+            && matches!(pass.cursor, OwnershipScan::Occupied(_));
         let started = Instant::now();
         for _ in 0..64 {
             if !worker.membership_is_current(&view) {
@@ -255,7 +266,8 @@ impl OwnershipGc {
                     };
                     let Some(candidate) = step else {
                         pass.scanning = false;
-                        self.finish_block_round(worker, &view);
+                        pass.block_round_done = true;
+                        self.finish_round_if_ready(worker, &view);
                         return;
                     };
                     #[cfg(test)]
@@ -269,7 +281,8 @@ impl OwnershipGc {
                 } else {
                     let Some((&revision, retry)) = pass.retries.range(pass.retry_cursor..).next()
                     else {
-                        self.finish_block_round(worker, &view);
+                        pass.block_round_done = true;
+                        self.finish_round_if_ready(worker, &view);
                         return;
                     };
                     pass.retry_cursor = revision + 1;
@@ -321,14 +334,6 @@ impl OwnershipGc {
         }
     }
 
-    fn finish_block_round(&mut self, worker: &WorkerRuntime, view: &MembershipSnapshot) {
-        let pass = self.pass.as_mut().unwrap();
-        pass.block_round_done = true;
-        if pass.small.is_none() {
-            self.finish_round(worker, view, false);
-        }
-    }
-
     async fn run_small_slice(&mut self, worker: &WorkerRuntime, view: &Arc<MembershipSnapshot>) {
         let small = worker.small.as_ref().unwrap();
         let pass = self.pass.as_mut().unwrap().small.as_mut().unwrap();
@@ -361,8 +366,8 @@ impl OwnershipGc {
             if pass.attempt.is_none() {
                 let Some(mut candidate) = pass.pending.pop_front() else {
                     if pass.scan_done {
-                        let retries = small.has_ownership_retries(pass.limit);
-                        self.finish_round(worker, view, retries);
+                        pass.round_done = true;
+                        self.finish_round_if_ready(worker, view);
                     }
                     return;
                 };
@@ -399,14 +404,19 @@ impl OwnershipGc {
         }
     }
 
-    fn finish_round(
-        &mut self,
-        worker: &WorkerRuntime,
-        view: &MembershipSnapshot,
-        small_retries: bool,
-    ) {
+    fn finish_round_if_ready(&mut self, worker: &WorkerRuntime, view: &MembershipSnapshot) {
         let pass = self.pass.as_ref().unwrap();
+        if !pass.block_round_done || pass.small.as_ref().is_some_and(|small| !small.round_done) {
+            return;
+        }
         self.round_ended = true;
+        let small_retries = pass.small.as_ref().is_some_and(|pass| {
+            worker
+                .small
+                .as_ref()
+                .unwrap()
+                .has_ownership_retries(pass.limit)
+        });
         if pass.retries.is_empty() && !small_retries {
             self.completed_generation = view.generation;
             self.completed_limit = pass.range.end;
@@ -891,6 +901,62 @@ mod tests {
         gc.run_slice(&worker).await;
         assert!(!small.contains(&packed));
         assert_eq!(gc.discovery_visits, 1);
+    }
+
+    #[tokio::test]
+    async fn uncovered_ownership_supplement_reclaims_packed_before_ordinary_scan_ends() {
+        let root = tempfile::tempdir().unwrap();
+        let (worker, fixture) = namespace_runtime(root.path(), true);
+        let table = CachePlacementTable::new(&["a", "b"].map(|name| NodeInfo {
+            id: NodeId::new(name),
+            address: String::new(),
+            role: NodeRole::Worker,
+        }));
+        for id in (0..)
+            .map(block)
+            .filter(|id| table.primary(id).unwrap().id.0 == "a")
+            .take(130)
+        {
+            worker
+                .commit_fetched_page(&id, PageIndex(0), 32, Bytes::from_static(&[1; 16]))
+                .await
+                .unwrap();
+        }
+        let mut gc = fixture.gc_managed(&worker);
+        let late = placed("b", 0);
+        fill(&worker, &late, true).await;
+        gc.run_round(&worker).await;
+        let range = gc.completed_limit..worker.index.ownership_admission_ceiling();
+        assert!(!range.is_empty());
+        assert!(!worker.index.ownership_changes_cover(&range));
+
+        let packed = packed_placed("b", 0);
+        let small = worker.small.as_ref().unwrap();
+        small
+            .put(&packed, Bytes::from_static(b"packed"))
+            .await
+            .unwrap();
+        gc.next_supplement = tokio::time::Instant::now();
+        gc.run_slice(&worker).await;
+        let pass = gc.pass.as_ref().unwrap();
+        assert_eq!(pass.range, range);
+        let OwnershipScan::Occupied(slots) = &pass.cursor else {
+            panic!("uncovered supplement must scan occupied slots");
+        };
+        assert!(slots.start > 0 && !slots.is_empty());
+        let cursor = slots.clone();
+        assert!(small.contains(&packed));
+
+        gc.run_slice(&worker).await;
+        assert!(!small.contains(&packed));
+        let pass = gc.pass.as_ref().unwrap();
+        assert!(matches!(&pass.cursor, OwnershipScan::Occupied(slots) if slots == &cursor));
+        assert!(pass.scanning);
+        assert!(worker.index.get(&late).is_some());
+        gc.run_round(&worker).await;
+        assert!(worker.index.get(&late).is_none());
+        assert_eq!(gc.completed_limit, range.end);
+        assert!(gc.pass.is_none());
     }
 
     #[tokio::test]

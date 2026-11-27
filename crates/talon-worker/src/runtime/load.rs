@@ -183,7 +183,7 @@ impl WorkerRuntime {
         failures
     }
 
-    /// Trust published residency metadata; LOAD does not verify cache files.
+    /// Trust published residency metadata and any confirmed Whole file misses.
     pub(super) fn load_range_cached(
         &self,
         block: &BlockId,
@@ -212,6 +212,9 @@ impl WorkerRuntime {
             return false;
         }
         if matches!(meta.shape, BlockShape::Whole) {
+            if !self.store.whole_visible(meta.disk_id) {
+                return false;
+            }
             self.record_l2_hit();
             return true;
         }

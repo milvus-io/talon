@@ -27,7 +27,7 @@ pub(crate) const DIRECTORY: &str = ".paged-catalog";
 const TRANSACTIONS: usize = 1024;
 
 /// A block's shard and first durable Begin sequence, local to one catalog.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(transparent)]
 pub(crate) struct DiskId(NonZeroU64);
 
@@ -130,6 +130,10 @@ impl Catalog {
 
     pub(crate) fn poison(&self) {
         self.journal.poison();
+    }
+
+    pub(crate) async fn journal_stopped(&self) -> bool {
+        self.journal.query(|_| Ok(())).await.is_err()
     }
 
     pub(crate) fn recover(&self, path: &str) -> anyhow::Result<Option<Vec<StoredBlock>>> {

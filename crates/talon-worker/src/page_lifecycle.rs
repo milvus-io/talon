@@ -1384,6 +1384,8 @@ pub(crate) struct PageLifecycle {
     checkpoints: Vec<Arc<tokio::sync::Mutex<()>>>,
     #[cfg(test)]
     checkpoint_inventory_work: [std::sync::atomic::AtomicUsize; 2],
+    #[cfg(test)]
+    inventory_batch_hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 fn disk_shard_key(id: &BlockKey) -> usize {
@@ -1407,6 +1409,8 @@ impl PageLifecycle {
             checkpoints: (0..SHARDS).map(|_| Arc::default()).collect(),
             #[cfg(test)]
             checkpoint_inventory_work: Default::default(),
+            #[cfg(test)]
+            inventory_batch_hook: Default::default(),
             gates: Arc::new(MutationGates {
                 blocks: tokio::sync::Mutex::default(),
                 directories: (0..DIRECTORY_SHARDS).map(|_| Arc::default()).collect(),
@@ -1600,6 +1604,15 @@ impl PageLifecycle {
     fn count_inventory_batch(&self, visits: usize) {
         self.checkpoint_inventory_work[0].fetch_add(visits, Ordering::Relaxed);
         self.checkpoint_inventory_work[1].fetch_add(1, Ordering::Relaxed);
+        let hook = self.inventory_batch_hook.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
+    pub fn after_inventory_batch(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.inventory_batch_hook.lock().unwrap() = Some(Box::new(hook));
     }
 
     #[cfg(test)]

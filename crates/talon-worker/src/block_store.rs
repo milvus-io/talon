@@ -22,12 +22,13 @@ use crate::fd_cache::FdCache;
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, RwLock};
 use talon_core::{BlockHandle, BlockId, BlockMeta, Error, ObjectStore, PageIndex, Result};
 
 fn catalog_error(error: anyhow::Error) -> Error {
@@ -91,6 +92,24 @@ pub struct WholeBlockStore {
     standalone: bool,
     mutations: Arc<crate::page_gc::Mutations>,
     gates: Arc<[tokio::sync::RwLock<()>; 64]>,
+    // Confirmed absent files whose durable rows remain owned by a stopped catalog.
+    hidden_whole: Arc<OnceLock<RwLock<HashSet<DiskId>>>>,
+    #[cfg(test)]
+    fail_delete_parent_sync: Arc<std::sync::atomic::AtomicBool>,
+}
+
+enum DeleteError {
+    Catalog(anyhow::Error),
+    File(Error),
+}
+
+impl From<DeleteError> for Error {
+    fn from(error: DeleteError) -> Self {
+        match error {
+            DeleteError::Catalog(error) => catalog_error(error),
+            DeleteError::File(error) => error,
+        }
+    }
 }
 
 impl WholeBlockStore {
@@ -305,6 +324,9 @@ impl WholeBlockStore {
             standalone: false,
             mutations: Arc::new(crate::page_gc::Mutations::new(true)),
             gates: Arc::new(std::array::from_fn(|_| tokio::sync::RwLock::new(()))),
+            hidden_whole: Arc::default(),
+            #[cfg(test)]
+            fail_delete_parent_sync: Arc::default(),
         })
     }
 
@@ -323,19 +345,33 @@ impl WholeBlockStore {
                 if store.catalog.disk_id(&store.catalog_path, &id)? != expected {
                     return Ok(false);
                 }
-                if let Some(address) = expected {
-                    let path = store.path_for(address);
-                    if spawn_blocking_io(move || Ok(path.try_exists()?)).await? {
-                        return Ok(false);
-                    }
+                let Some(address) = expected else {
+                    return Ok(false);
+                };
+                if !store.whole_visible(Some(address)) {
+                    return Ok(false);
                 }
-                store.delete_locked(&id).await?;
-                Ok(true)
+                let path = store.path_for(address);
+                let check = path.clone();
+                if spawn_blocking_io(move || Ok(check.try_exists()?)).await? {
+                    return Ok(false);
+                }
+                match store.delete_locked(&id).await {
+                    Ok(()) => Ok(true),
+                    Err(_) if !store.whole_visible(Some(address)) => Ok(false),
+                    Err(DeleteError::Catalog(error)) if store.catalog.journal_stopped().await => {
+                        store.fd_cache.invalidate(&path);
+                        store.hide_whole(address);
+                        tracing::warn!(block = %id, %error, "hiding missing whole block until catalog recovery");
+                        Ok(false)
+                    }
+                    Err(error) => Err(error.into()),
+                }
             })
             .await
     }
 
-    async fn delete_locked(&self, id: &BlockId) -> Result<()> {
+    async fn delete_locked(&self, id: &BlockId) -> std::result::Result<(), DeleteError> {
         let transaction = self
             .catalog
             .begin(
@@ -344,36 +380,51 @@ impl WholeBlockStore {
                 crate::catalog::Operation::DeleteBlock,
             )
             .await
-            .map_err(catalog_error)?;
+            .map_err(DeleteError::Catalog)?;
         #[cfg(test)]
-        crate::page_access_store::crash_barrier("whole_delete_begin")?;
-        let path = self.path_for(transaction.disk_id);
+        crate::page_access_store::crash_barrier("whole_delete_begin")
+            .map_err(|error| DeleteError::File(error.into()))?;
+        let address = transaction.disk_id;
+        let path = self.path_for(address);
         let invalidate = path.clone();
+        #[cfg(test)]
+        let fail_parent_sync = self.fail_delete_parent_sync.clone();
         let result = spawn_blocking_io(move || {
             match std::fs::remove_file(&path) {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 result => result?,
             }
-            match std::fs::File::open(path.parent().unwrap()) {
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                file => file?.sync_all()?,
+            #[cfg(test)]
+            if fail_parent_sync.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                return Ok(Err(std::io::Error::from_raw_os_error(libc::EIO)));
             }
-            Ok(())
+            // Only a sync error after unlink (or ENOENT) proves the file is absent.
+            Ok(match std::fs::File::open(path.parent().unwrap()) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                file => file.and_then(|file| file.sync_all()),
+            })
         })
         .await;
         self.fd_cache.invalidate(&invalidate);
         match result {
-            Ok(()) => {
+            Ok(Ok(())) => {
                 #[cfg(test)]
-                crate::page_access_store::crash_barrier("whole_deleted")?;
-                self.catalog
-                    .complete(transaction, 0)
-                    .await
-                    .map_err(catalog_error)
+                crate::page_access_store::crash_barrier("whole_deleted")
+                    .map_err(|error| DeleteError::File(error.into()))?;
+                let completed = self.catalog.complete(transaction, 0).await;
+                if completed.is_err() && self.catalog.journal_stopped().await {
+                    self.hide_whole(address);
+                }
+                completed.map_err(DeleteError::Catalog)
+            }
+            Ok(Err(error)) => {
+                self.hide_whole(address);
+                self.catalog.poison();
+                Err(DeleteError::File(error.into()))
             }
             Err(error) => {
                 self.catalog.poison();
-                Err(error)
+                Err(DeleteError::File(error))
             }
         }
     }
@@ -391,6 +442,27 @@ impl WholeBlockStore {
         disk_id.path(&self.root.join("whole"), "blk")
     }
 
+    fn hide_whole(&self, disk_id: DiskId) {
+        self.hidden_whole
+            .get_or_init(Default::default)
+            .write()
+            .unwrap()
+            .insert(disk_id);
+    }
+
+    pub(crate) fn whole_visible(&self, disk_id: Option<DiskId>) -> bool {
+        match (self.hidden_whole.get(), disk_id) {
+            (Some(hidden), Some(disk_id)) => !hidden.read().unwrap().contains(&disk_id),
+            _ => true,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_delete_parent_sync(&self) {
+        self.fail_delete_parent_sync
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     fn read_path(&self, id: &BlockId, indexed: Option<DiskId>) -> Result<PathBuf> {
         let disk_id = match (self.standalone, indexed) {
             // A standalone store may receive a DiskId from an unrelated index.
@@ -398,6 +470,7 @@ impl WholeBlockStore {
             (false, Some(disk_id)) => Some(disk_id),
             (false, None) => self.catalog.disk_id(&self.catalog_path, id)?,
         }
+        .filter(|disk_id| self.whole_visible(Some(*disk_id)))
         .ok_or_else(|| Error::NotFound(id.to_string()))?;
         Ok(self.path_for(disk_id))
     }
@@ -583,7 +656,7 @@ impl ObjectStore for WholeBlockStore {
         self.mutations
             .run(async move {
                 let _gate = store.gate(&id).write().await;
-                store.delete_locked(&id).await
+                store.delete_locked(&id).await.map_err(Into::into)
             })
             .await
     }

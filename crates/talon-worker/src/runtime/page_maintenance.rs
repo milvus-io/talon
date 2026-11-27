@@ -21,6 +21,14 @@ struct PreparedCheckpoint {
     bytes: Vec<u8>,
 }
 
+struct CheckpointPlan {
+    ceiling: usize,
+    membership: u64,
+    journal: crate::page_access_shard::JournalState,
+    removed: Vec<BlockId>,
+    slots: Vec<u32>,
+}
+
 impl WorkerRuntime {
     pub(super) fn background_io_slots(&self) -> &Arc<tokio::sync::Semaphore> {
         self.background_budget
@@ -745,7 +753,6 @@ impl WorkerRuntime {
                 let shard = cursor.shard;
                 cursor.shard = (shard + 1) % SHARDS;
                 let remaining = if all { SHARDS - step } else { SHARDS - shard };
-                let _io = runtime.acquire_background_io(None).await;
                 let result = runtime.checkpoint_shard(shard, remaining, &mut cursor.inventory).await;
                 match result {
                     Ok((blocks, bytes)) => {
@@ -782,15 +789,42 @@ impl WorkerRuntime {
         let _guard = gate.lock().await;
         let worker = self.clone();
         let mut round_inventory = inventory.take();
-        let (round_inventory, prepared) = tokio::task::spawn_blocking(move || {
-            let prepared = worker.prepare_checkpoint(shard, remaining, &mut round_inventory);
-            (round_inventory, prepared)
+        let (round_inventory, plan) = tokio::task::spawn_blocking(move || {
+            let life = &worker.page_lifecycle;
+            let (ceiling, membership, dirty) = life.checkpoint_start(shard);
+            let journal = dirty.then(|| life.checkpoint_journal(shard, membership));
+            if round_inventory.is_none() && journal.as_ref().is_some_and(|(j, _)| j.compact()) {
+                round_inventory = Some(CheckpointInventory::gather(life, shard, remaining));
+            }
+            // Retire this shard's slots on its turn, including clean and delta ticks.
+            let slots = round_inventory
+                .as_mut()
+                .map(|inventory| inventory.take_shard(shard));
+            let plan = journal.map(|(journal, removed)| CheckpointPlan {
+                ceiling,
+                membership,
+                journal,
+                removed,
+                slots: if journal.compact() {
+                    slots.unwrap_or_default()
+                } else {
+                    Vec::new()
+                },
+            });
+            (round_inventory, plan)
         })
         .await
-        .expect("access checkpoint preparation panicked");
-        // The remaining shards belong to the round, regardless of whether
-        // this shard can prepare or publish its checkpoint.
+        .expect("access checkpoint inventory panicked");
+        // Keep the remaining inventory even if this shard fails to prepare or publish.
         *inventory = round_inventory;
+        let Some(plan) = plan else {
+            return Ok((0, 0));
+        };
+        let _io = self.acquire_background_io(None).await;
+        let worker = self.clone();
+        let prepared = tokio::task::spawn_blocking(move || worker.prepare_checkpoint(shard, plan))
+            .await
+            .expect("access checkpoint preparation panicked");
         let Some(PreparedCheckpoint {
             membership,
             snapshots,
@@ -828,28 +862,17 @@ impl WorkerRuntime {
     fn prepare_checkpoint(
         &self,
         shard: usize,
-        remaining: usize,
-        inventory: &mut Option<CheckpointInventory>,
+        plan: CheckpointPlan,
     ) -> anyhow::Result<Option<PreparedCheckpoint>> {
         let life = &self.page_lifecycle;
-        let (mut ceiling, mut membership, dirty) = life.checkpoint_start(shard);
-        let (journal, removed) = life.checkpoint_journal(shard, membership);
-        let full = dirty && journal.compact();
-        if full && inventory.is_none() {
-            *inventory = Some(CheckpointInventory::gather(life, shard, remaining));
-        }
-        // Retire this shard's slots on its turn, including clean and delta ticks.
-        let slots = inventory
-            .as_mut()
-            .map(|inventory| inventory.take_shard(shard));
-        if !dirty {
-            return Ok(None);
-        }
-        let slots = if full {
-            slots.unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+        let CheckpointPlan {
+            mut ceiling,
+            mut membership,
+            journal,
+            removed,
+            slots,
+        } = plan;
+        let full = journal.compact();
         if full {
             // The inventory can predate this gate by many ticks. Capture
             // the shard cut after gathering it, under directory -> shard order.
@@ -975,6 +998,7 @@ mod tests {
     use crate::catalog::Catalog;
     use crate::page_access_store::CacheRootLock;
     use bytes::Bytes;
+    use std::sync::atomic::Ordering;
     use talon_core::{ObjectStat, WorkerConfig};
 
     struct UnusedOrigin;
@@ -991,7 +1015,15 @@ mod tests {
     }
 
     fn runtime(root: &Path) -> (WorkerRuntime, Arc<Catalog>, WorkerConfig) {
-        let config = WorkerConfig {
+        runtime_with(root, Arc::new(UnusedOrigin), |_| {})
+    }
+
+    fn runtime_with(
+        root: &Path,
+        origin: Arc<dyn BackendStore>,
+        configure: impl FnOnce(&mut WorkerConfig),
+    ) -> (WorkerRuntime, Arc<Catalog>, WorkerConfig) {
+        let mut config = WorkerConfig {
             small_object_threshold_bytes: 0,
             block_size: 16,
             capacity_bytes: 1 << 20,
@@ -1000,6 +1032,7 @@ mod tests {
             page_tti_hours: 0,
             ..Default::default()
         };
+        configure(&mut config);
         let lock = Arc::new(CacheRootLock::acquire(root).unwrap());
         let scope = root.join("default/shared");
         std::fs::create_dir_all(&scope).unwrap();
@@ -1007,14 +1040,15 @@ mod tests {
         let catalog =
             Catalog::with_service(&service, &scope, crate::catalog::transaction_budget(), None)
                 .unwrap();
-        let path = "paged";
-        catalog
-            .register(path, config.l2_page_size_bytes as u32)
-            .unwrap();
-        let paged = PagedBlockStore::open(scope.join(path), config.l2_page_size_bytes as u32)
-            .unwrap()
-            .with_catalog(catalog.clone(), path.into())
-            .with_root_lock(lock.clone());
+        let page_size = config.l2_page_size_bytes as u32;
+        let paged = (page_size != 0).then(|| {
+            let path = "paged";
+            catalog.register(path, page_size).unwrap();
+            PagedBlockStore::open(scope.join(path), page_size)
+                .unwrap()
+                .with_catalog(catalog.clone(), path.into())
+                .with_root_lock(lock.clone())
+        });
         let worker = WorkerRuntime::new_with_l1(
             WholeBlockStore::open_with_catalog(
                 &scope,
@@ -1024,14 +1058,14 @@ mod tests {
                 catalog.clone(),
             )
             .unwrap(),
-            Some(paged),
-            Arc::new(catalog.index(config.l2_page_size_bytes as u32)),
+            paged,
+            Arc::new(catalog.index(page_size)),
             Arc::new(InFlightLoads::new()),
-            Arc::new(UnusedOrigin),
+            origin,
             config.block_size,
             config.capacity_bytes,
-            0,
-            0,
+            config.l1_capacity_bytes,
+            config.l1_page_size_bytes,
             WorkerMetrics::new(config.capacity_bytes),
         )
         .with_page_gc(PageGcConfig::from(&config))
@@ -1111,6 +1145,146 @@ mod tests {
             assert!(!worker.lru.is_empty());
             assert_eq!(worker.resident_bytes(), allocated);
         }
+    }
+
+    #[derive(Default)]
+    struct CountingOrigin(std::sync::atomic::AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl BackendStore for CountingOrigin {
+        async fn fetch_range(&self, _: &ObjectId, _: u64, len: u64) -> talon_core::Result<Bytes> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(Bytes::from(vec![3; len as usize]))
+        }
+
+        async fn fetch_range_if_match(
+            &self,
+            object: &ObjectId,
+            offset: u64,
+            len: u64,
+            version: Option<&Version>,
+        ) -> talon_core::Result<Bytes> {
+            assert_eq!(version, Some(&block().version));
+            self.fetch_range(object, offset, len).await
+        }
+
+        async fn head(&self, _: &ObjectId) -> talon_core::Result<ObjectStat> {
+            Ok(ObjectStat {
+                len: 16,
+                version: block().version,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn whole_unlink_sync_failure_is_a_cache_miss_without_retiring_accounting() {
+        for (paged, l1) in [(false, false), (false, true), (true, false), (true, true)] {
+            let root = tempfile::tempdir().unwrap();
+            let origin = Arc::new(CountingOrigin::default());
+            let open = || {
+                runtime_with(root.path(), origin.clone(), |config| {
+                    config.l2_page_size_bytes = if paged { 4 } else { 0 };
+                    config.l1_page_size_bytes = 4;
+                    config.l1_capacity_bytes = if l1 { 16 } else { 0 };
+                })
+            };
+            let (worker, catalog, _) = open();
+            let id = block();
+            let request = RangeRequest {
+                object: id.object.clone(),
+                offset: 0,
+                len: 16,
+            };
+            let probe = CachedRangeRequest {
+                object: id.object.clone(),
+                version: id.version.clone(),
+                offset: 0,
+                len: 16,
+            };
+            worker
+                .commit_cached_block(&id, Bytes::from_static(&[1; 16]))
+                .await
+                .unwrap();
+            let address = catalog.disk_id("whole", &id).unwrap().unwrap();
+            let path = address.path(&worker.store.root().join("whole"), "blk");
+            let allocated = worker.resident_bytes();
+            assert!(path.is_file());
+            assert!(allocated > 0);
+            assert!(worker.load_range_cached(&id, 0, 16, 16));
+            assert_eq!(
+                worker.serve_cached(&probe).await.unwrap(),
+                Bytes::from_static(&[1; 16])
+            );
+            assert_eq!(worker.l1_page_count(), if l1 { 4 } else { 0 });
+
+            worker.store.fail_next_delete_parent_sync();
+            let error = worker.store.delete(&id).await.unwrap_err();
+            assert!(matches!(error, Error::Io(e) if e.raw_os_error() == Some(libc::EIO)));
+            assert!(!path.exists(), "unlink completed before the sync fault");
+            assert!(catalog.journal_stopped().await);
+
+            assert!(!worker.load_range_cached(&id, 0, 16, 16));
+            assert!(worker.load_block(&id, 16).await.is_err());
+            let after_load = origin.0.load(Ordering::Relaxed);
+            assert!(after_load > 0, "LOAD reached the origin before any GET");
+
+            let error = worker.serve_cached(&probe).await.unwrap_err();
+            assert!(error.is::<CacheMiss>(), "{error:#}");
+            assert!(worker
+                .cached_block_range(&id, 0, 16)
+                .await
+                .unwrap()
+                .is_none());
+            assert_eq!(origin.0.load(Ordering::Relaxed), after_load);
+            assert!(worker.serve_range(&request).await.is_err());
+            let calls = origin.0.load(Ordering::Relaxed);
+            assert!(
+                calls > after_load,
+                "GET reached the origin before refill failed"
+            );
+            assert!(worker
+                .serve_versioned(&request, &id.version, 16)
+                .await
+                .is_err());
+            assert!(origin.0.load(Ordering::Relaxed) > calls);
+
+            assert_eq!(catalog.disk_id("whole", &id).unwrap(), Some(address));
+            assert_eq!(worker.lru.block_candidates(&id).len(), 1);
+            assert_eq!(worker.resident_bytes(), allocated);
+            worker.drain_page_mutations().await;
+            drop(worker);
+            drop(catalog);
+
+            let (worker, catalog, _) = open();
+            assert_eq!(catalog.disk_id("whole", &id).unwrap(), None);
+            assert_eq!(worker.resident_bytes(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn whole_missing_file_discovered_by_read_stays_hidden_until_recovery() {
+        let root = tempfile::tempdir().unwrap();
+        let (worker, catalog, _) = runtime(root.path());
+        let id = block();
+        worker
+            .commit_cached_block(&id, Bytes::from_static(&[1; 16]))
+            .await
+            .unwrap();
+        let address = catalog.disk_id("whole", &id).unwrap().unwrap();
+        let allocated = worker.resident_bytes();
+        catalog.poison();
+        let path = address.path(&worker.store.root().join("whole"), "blk");
+        std::fs::remove_file(path).unwrap();
+
+        assert!(worker.load_range_cached(&id, 0, 16, 16));
+        assert!(worker
+            .cached_block_range(&id, 0, 16)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!worker.load_range_cached(&id, 0, 16, 16));
+        assert_eq!(catalog.disk_id("whole", &id).unwrap(), Some(address));
+        assert_eq!(worker.resident_bytes(), allocated);
     }
 
     #[tokio::test]
@@ -1218,12 +1392,14 @@ mod tests {
         let path = address.path(&worker.store.root().join("whole"), "blk");
         std::fs::remove_file(&path).unwrap();
         std::os::unix::fs::symlink(&path, &path).unwrap();
+        catalog.poison();
 
         let error = worker
             .forget_missing_l2_parent(&id, Some(address))
             .await
             .unwrap_err();
         assert!(matches!(error, talon_core::Error::Io(e) if e.raw_os_error() == Some(libc::ELOOP)));
+        assert!(worker.load_range_cached(&id, 0, 16, 16));
         assert_eq!(catalog.disk_id("whole", &id).unwrap(), Some(address));
         assert_eq!(worker.lru.block_candidates(&id).len(), 1);
     }
@@ -1299,6 +1475,63 @@ mod tests {
         let snapshot =
             crate::page_access_shard::load(&dir, shard, paged.page_size(), now + 1).unwrap();
         assert!(!snapshot.records.contains_key(&id));
+        assert_eq!(worker.page_lifecycle.dirty_summary(), (0, None));
+    }
+
+    #[tokio::test]
+    async fn checkpoint_inventory_leaves_io_permit_free_and_survives_shard_failure() {
+        use crate::page_access_shard::{load, FILE_NAME};
+        use crate::page_lifecycle::disk_shard;
+
+        let root = tempfile::tempdir().unwrap();
+        let (worker, _, _) = runtime_with(root.path(), Arc::new(UnusedOrigin), |config| {
+            config.page_gc_io_concurrency = 1;
+        });
+        let [first, second] = [0, 1].map(|shard| {
+            (0..)
+                .map(|offset| BlockId {
+                    offset: offset * 16,
+                    ..block()
+                })
+                .find(|id| disk_shard(id) == shard)
+                .unwrap()
+        });
+        let paged = worker.paged.as_ref().unwrap();
+        let at = worker.page_clock.now();
+        worker.page_clock.set(at);
+        for id in [&first, &second] {
+            worker
+                .commit_fetched_page(id, PageIndex(0), 16, Bytes::from_static(b"data"))
+                .await
+                .unwrap();
+        }
+        let obstructed = paged.root().join("00").join(FILE_NAME);
+        std::fs::create_dir(&obstructed).unwrap();
+        let io = worker.background_io_slots().clone();
+        worker.page_lifecycle.after_inventory_batch(move || {
+            let _permit = io
+                .try_acquire()
+                .expect("inventory must leave the only I/O permit free");
+        });
+
+        let report = worker.checkpoint_next_shard().await;
+        assert_eq!(report.failures, 1);
+        assert!(worker.page_lifecycle.checkpoint_start(0).2);
+        let work = worker.page_lifecycle.checkpoint_inventory_work();
+        assert_eq!(work, (2, 1));
+
+        let report = worker.checkpoint_next_shard().await;
+        assert_eq!((report.failures, report.blocks), (0, 1));
+        assert_eq!(worker.page_lifecycle.checkpoint_inventory_work(), work);
+        let saved = load(&paged.root().join("01"), 1, paged.page_size(), at).unwrap();
+        assert_eq!(saved.records[&second].records[&0], at);
+        assert!(!worker.page_lifecycle.checkpoint_start(1).2);
+
+        std::fs::remove_dir(&obstructed).unwrap();
+        let report = worker.checkpoint_access_times().await;
+        assert_eq!((report.failures, report.blocks), (0, 1));
+        let saved = load(&paged.root().join("00"), 0, paged.page_size(), at).unwrap();
+        assert_eq!(saved.records[&first].records[&0], at);
         assert_eq!(worker.page_lifecycle.dirty_summary(), (0, None));
     }
 
