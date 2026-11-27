@@ -97,8 +97,9 @@ fn runtime_with_tracking(
     let store = WholeBlockStore::open(root).unwrap();
     let index = Arc::new(BlockIndex::new());
     store.restore_index(&index).unwrap();
-    let mut worker = WorkerRuntime::new_with_l1_policy(
+    let worker = WorkerRuntime::new_with_l1_policy(
         store,
+        paged.then(|| PagedBlockStore::open(root.join("paged"), 1024).unwrap()),
         small,
         index,
         Arc::new(InFlightLoads::new()),
@@ -111,9 +112,6 @@ fn runtime_with_tracking(
         tracking,
         false,
     );
-    if paged {
-        worker = worker.with_paged_store(PagedBlockStore::open(root.join("paged"), 1024).unwrap());
-    }
     (backend, worker)
 }
 fn request() -> RangeRequest {
@@ -936,7 +934,7 @@ async fn small_tti_background_and_shutdown_checkpoint_without_paged_cache() {
             .restore(crate::eviction::access_millis() - 60_000);
         let w = Arc::new(w);
         let service = WorkerBackground::start(
-            w.clone(),
+            Worker::standalone(w.clone()),
             &WorkerConfig {
                 page_tti_hours: tti_ms / 3_600_000,
                 stale_gc_enabled: false,
@@ -1188,7 +1186,7 @@ async fn small_capacity_shares_pending_reclaim_credit_across_namespaces() {
         ranges: Mutex::new(Vec::new()),
     });
     let lock = Arc::new(crate::page_access_store::CacheRootLock::acquire(dir.path()).unwrap());
-    let worker = WorkerRuntime::open_namespaces(
+    let worker = Worker::open_namespaces(
         &config,
         lock,
         origin,
@@ -1954,7 +1952,7 @@ async fn compact_exact_idle_eviction_preserves_coexisting_l1_page() {
         ..Default::default()
     };
     let lock = Arc::new(crate::page_access_store::CacheRootLock::acquire(dir.path()).unwrap());
-    let root = WorkerRuntime::open_namespaces(
+    let root = Worker::open_namespaces(
         &config,
         lock,
         Arc::new(ExactLargeOrigin(Mutex::new(Vec::new()))),
@@ -2028,7 +2026,7 @@ async fn exact_reads_over_tcp_cover_miss_sendfile_hit_and_oversize_rejection() {
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
         let (socket, _) = listener.accept().await.unwrap();
-        crate::tokio_conn::handle_conn(socket, worker, obs)
+        crate::tokio_conn::handle_conn(socket, Worker::standalone(worker), obs)
             .await
             .unwrap();
     });

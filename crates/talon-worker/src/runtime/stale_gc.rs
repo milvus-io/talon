@@ -413,6 +413,7 @@ impl StaleGc {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Worker;
     use crate::{
         BlockIndex, CacheUnit, InFlightLoads, PagedBlockStore, WholeBlockStore, WorkerMetrics,
     };
@@ -473,20 +474,18 @@ mod tests {
         for entry in store.scan_allocated().unwrap() {
             index.commit_stored(entry);
         }
-        let r = WorkerRuntime::new(
+        WorkerRuntime::new_with_l1(
             store,
+            paged.then(|| PagedBlockStore::open(root.join("paged"), 16).unwrap()),
             index,
             Arc::new(InFlightLoads::new()),
             origin,
             32,
             0,
+            0,
+            0,
             WorkerMetrics::new(0),
-        );
-        if paged {
-            r.with_paged_store(PagedBlockStore::open(root.join("paged"), 16).unwrap())
-        } else {
-            r
-        }
+        )
     }
     async fn fill(r: &WorkerRuntime, id: &BlockId, paged: bool) {
         if paged {
@@ -505,8 +504,17 @@ mod tests {
         access_millis() + DAY_MS + 1
     }
 
-    fn compact_runtime(root: &std::path::Path, paged: bool, origin: Arc<Origin>) -> WorkerRuntime {
-        let config = WorkerConfig {
+    fn compact_runtime(root: &std::path::Path, paged: bool, origin: Arc<Origin>) -> Worker {
+        compact_runtime_with_config(root, paged, origin, |_| {})
+    }
+
+    fn compact_runtime_with_config(
+        root: &std::path::Path,
+        paged: bool,
+        origin: Arc<Origin>,
+        configure: impl FnOnce(&mut WorkerConfig),
+    ) -> Worker {
+        let mut config = WorkerConfig {
             backend: Some("s3".into()),
             block_size: 32,
             l1_page_size_bytes: 16,
@@ -514,9 +522,10 @@ mod tests {
             page_tti_hours: 2,
             ..Default::default()
         };
+        configure(&mut config);
         assert!(config.stale_gc_enabled && config.ownership_gc_enabled);
         let lock = Arc::new(crate::page_access_store::CacheRootLock::acquire(root).unwrap());
-        WorkerRuntime::open_namespaces(&config, lock, origin, WorkerMetrics::new(0)).unwrap()
+        Worker::open_namespaces(&config, lock, origin, WorkerMetrics::new(0)).unwrap()
     }
 
     #[tokio::test]
@@ -604,9 +613,10 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let origin = Arc::new(Origin::default());
         origin.mode.store(1, Ordering::Relaxed);
-        let mut worker = compact_runtime(root.path(), false, origin.clone());
-        worker.page_gc_config.scan_batch_size = 1;
-        worker.page_gc_config.delete_batch_size = 1;
+        let worker = compact_runtime_with_config(root.path(), false, origin.clone(), |config| {
+            config.background_scan_batch_size = 1;
+            config.background_delete_batch_size = 1;
+        });
         let small = worker.small.as_ref().unwrap();
         let whole = block(0);
         let mut other_version = block(1);
@@ -689,10 +699,20 @@ mod tests {
         for backend_ready in [true, false] {
             let root = tempfile::tempdir().unwrap();
             let origin = Arc::new(Origin::default());
-            let mut worker = compact_runtime(root.path(), false, origin.clone());
             if !backend_ready {
-                worker.backend = Arc::default();
+                let scope = format!("v1-{}", "a".repeat(64));
+                std::fs::create_dir_all(root.path().join("pending/scopes").join(scope)).unwrap();
             }
+            let process = compact_runtime(root.path(), false, origin.clone());
+            let worker = if backend_ready {
+                process.default_runtime().clone()
+            } else {
+                process
+                    .namespace_runtimes()
+                    .into_iter()
+                    .find(|runtime| runtime.backend.get().is_none())
+                    .unwrap()
+            };
             let mut gc = StaleGc::default();
             for row in 0..1025 {
                 gc.positive_heads
@@ -764,8 +784,9 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let origin = Arc::new(Origin::default());
         origin.mode.store(2, Ordering::Relaxed);
-        let mut worker = compact_runtime(root.path(), false, origin.clone());
-        worker.page_gc_config.delete_batch_size = 1;
+        let worker = compact_runtime_with_config(root.path(), false, origin.clone(), |config| {
+            config.background_delete_batch_size = 1;
+        });
         let small = worker.small.as_ref().unwrap();
         let cooled = ObjectId::new(Backend::S3, "bucket", "cooled\0☃");
         for n in 0..8 {
@@ -809,8 +830,9 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let origin = Arc::new(Origin::default());
         origin.mode.store(1, Ordering::Relaxed);
-        let mut worker = compact_runtime(root.path(), false, origin.clone());
-        worker.page_gc_config.scan_batch_size = 1;
+        let worker = compact_runtime_with_config(root.path(), false, origin.clone(), |config| {
+            config.background_scan_batch_size = 1;
+        });
         let ordinary = block(0);
         fill(&worker, &ordinary, false).await;
         let exact = CacheUnit::ExactRange(ordinary.clone());
@@ -982,7 +1004,8 @@ mod tests {
             )
             .unwrap(),
         );
-        let handler = crate::uring_conn::RingConnHandler::new(worker.clone(), obs);
+        let handler =
+            crate::uring_conn::RingConnHandler::new(Worker::standalone(worker.clone()), obs);
         let stop = Arc::new(AtomicBool::new(false));
         // Stop even if an assertion unwinds, so a failed test cannot leave rings running.
         struct Stop(Arc<AtomicBool>);
@@ -1472,7 +1495,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let r = Arc::new(runtime(root.path(), false, Arc::new(Origin::default())));
         let service = super::super::WorkerBackground::start(
-            r.clone(),
+            Worker::standalone(r.clone()),
             &talon_core::WorkerConfig {
                 ownership_gc_enabled: false,
                 ..Default::default()

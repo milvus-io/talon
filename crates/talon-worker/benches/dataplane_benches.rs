@@ -247,7 +247,8 @@ fn spawn_uring_server(
     drop(probe);
 
     let admission = talon_worker::ConnectionAdmission::new(128, observability.metrics().clone());
-    let h = talon_worker::uring_conn::RingConnHandler::new(runtime, observability);
+    let worker = talon_worker::Worker::standalone(runtime);
+    let h = talon_worker::uring_conn::RingConnHandler::new(worker, observability);
     let serve_addr = addr.clone();
     std::thread::spawn(move || {
         let _ = talon_worker::uring_serve::serve(serve_addr, 1, admission, h, handle);

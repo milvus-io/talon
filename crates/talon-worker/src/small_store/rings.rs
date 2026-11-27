@@ -215,6 +215,7 @@ impl SmallObjectStore {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn set_background_budget(&self, budget: Arc<crate::background::BackgroundBudget>) {
         self.journal.set_budget(budget);
     }

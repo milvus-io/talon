@@ -1166,18 +1166,14 @@ impl Lru {
         self.inner.lock().unwrap().index.policy_scan_ceiling()
     }
 
-    pub(crate) fn capture_ownership_ceiling(&self, topology_change: bool) -> u64 {
+    /// Constant-time check for cache admissions since an ownership sweep.
+    #[cfg(test)]
+    pub(crate) fn ownership_admission_ceiling(&self) -> u64 {
         self.inner
             .lock()
             .unwrap()
             .index
-            .capture_ownership_ceiling(topology_change)
-    }
-
-    /// Constant-time check for cache admissions since an ownership sweep.
-    #[cfg(test)]
-    pub(crate) fn ownership_admission_ceiling(&self) -> u64 {
-        self.inner.lock().unwrap().index.compact.admission_ceiling()
+            .ownership_admission_ceiling()
     }
 
     pub(crate) fn stale_candidate_is_current(&self, candidate: &StaleBlockCandidate) -> bool {

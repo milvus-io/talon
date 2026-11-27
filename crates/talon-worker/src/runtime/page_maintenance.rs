@@ -94,7 +94,6 @@ impl WorkerRuntime {
             .set(config.checkpoint_interval_ms as f64 / 1000.0);
         self.page_gc_io = Arc::new(tokio::sync::Semaphore::new(config.io_concurrency));
         self.page_gc_config = config;
-        self.page_gc_configured = true;
         Ok(self)
     }
 
@@ -350,7 +349,12 @@ impl WorkerRuntime {
             // removes the block row when its last page is gone.
             if !paged.journaled() && !last_sidecar_page && !block.has_pages() {
                 match paged.delete_block_async(id).await {
-                    Ok(()) => { block.cleanup_finished(); if runtime.index.get(id).is_some_and(|m| matches!(m.form, BlockForm::Paged {..})) {runtime.index.remove(id);} }
+                    Ok(()) => {
+                        block.cleanup_finished();
+                        if runtime.index.summary(id).is_some_and(|m| matches!(m.shape, BlockShape::Paged { .. })) {
+                            runtime.index.remove(id);
+                        }
+                    }
                     Err(error) => {runtime.page_gc_metrics.delete_errors.inc(); tracing::warn!(block = %id, %error, "empty page directory cleanup failed");}
                 }
             }
@@ -377,8 +381,8 @@ impl WorkerRuntime {
                         block.cleanup_finished();
                         if runtime
                             .index
-                            .get(&id)
-                            .is_some_and(|m| matches!(m.form, BlockForm::Paged { .. }))
+                            .summary(&id)
+                            .is_some_and(|m| matches!(m.shape, BlockShape::Paged { .. }))
                         {
                             runtime.index.remove(&id);
                         }
@@ -1019,7 +1023,7 @@ mod tests {
             .unwrap()
             .with_catalog(catalog.clone(), path.into())
             .with_root_lock(lock.clone());
-        let worker = WorkerRuntime::new(
+        let worker = WorkerRuntime::new_with_l1(
             WholeBlockStore::open_with_catalog(
                 &scope,
                 Arc::new(crate::fd_cache::FdCache::new(
@@ -1028,14 +1032,16 @@ mod tests {
                 catalog.clone(),
             )
             .unwrap(),
+            Some(paged),
             Arc::new(catalog.index(config.l2_page_size_bytes as u32)),
             Arc::new(InFlightLoads::new()),
             Arc::new(UnusedOrigin),
             config.block_size,
             config.capacity_bytes,
+            0,
+            0,
             WorkerMetrics::new(config.capacity_bytes),
         )
-        .with_paged_store(paged)
         .with_page_gc(PageGcConfig::from(&config))
         .unwrap();
         (worker, catalog, config)

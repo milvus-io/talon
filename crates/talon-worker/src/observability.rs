@@ -687,7 +687,7 @@ impl WorkerReadiness {
 /// Shared worker observability state exposed to HTTP and heartbeats.
 pub struct WorkerObservability {
     config_reload: std::sync::RwLock<crate::dynamic_config::ConfigReloadStatus>,
-    namespace_runtime: std::sync::OnceLock<std::sync::Weak<crate::WorkerRuntime>>,
+    namespace_runtime: std::sync::OnceLock<std::sync::Weak<crate::Worker>>,
     node: NodeInfo,
     cluster_id: String,
     admin_address: String,
@@ -770,7 +770,7 @@ impl WorkerObservability {
     }
 
     /// Aggregate residency across the worker's namespaces.
-    pub fn attach_namespace_runtime(&self, worker: &Arc<crate::WorkerRuntime>) {
+    pub fn attach_namespace_runtime(&self, worker: &Arc<crate::Worker>) {
         let _ = self.namespace_runtime.set(Arc::downgrade(worker));
     }
 

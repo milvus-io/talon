@@ -157,6 +157,10 @@ impl OwnershipGc {
         if self.pass.is_none() {
             let (range, small) = if view.generation != self.completed_generation {
                 self.supplement = None;
+                // Keep any history newer than the event cutoff across generations.
+                // A first pickup can start past that cutoff; a supplement with
+                // an uncovered interval scans occupied slots.
+                worker.index.start_ownership_changes();
                 // Each namespace retains its own publication boundaries.
                 let limits = view
                     .scan_limits
@@ -495,6 +499,7 @@ impl OwnershipGc {
 
 #[cfg(test)]
 mod tests {
+    use crate::Worker;
 
     use super::*;
     use crate::{
@@ -657,20 +662,18 @@ mod tests {
         for entry in store.scan_allocated().unwrap() {
             index.commit_stored(entry);
         }
-        let r = WorkerRuntime::new(
+        WorkerRuntime::new_with_l1(
             store,
+            paged.then(|| PagedBlockStore::open(root.join("paged"), 16).unwrap()),
             index,
             Arc::new(InFlightLoads::new()),
             origin,
             32,
             0,
+            0,
+            0,
             WorkerMetrics::new(0),
-        );
-        if paged {
-            r.with_paged_store(PagedBlockStore::open(root.join("paged"), 16).unwrap())
-        } else {
-            r
-        }
+        )
     }
     async fn fill(r: &WorkerRuntime, id: &BlockId, paged: bool) {
         if paged {
@@ -700,8 +703,8 @@ mod tests {
                 },
             }
         }
-        fn publish(&self, worker: &WorkerRuntime) {
-            let view = self.members.lock().unwrap().as_ref().map(|ids| {
+        fn view(&self) -> Option<talon_core::worker_membership::WorkerDiscovery> {
+            self.members.lock().unwrap().as_ref().map(|ids| {
                 discovery(
                     &ids.iter()
                         .map(|id| ZonedNodeInfo {
@@ -714,8 +717,21 @@ mod tests {
                         })
                         .collect::<Vec<_>>(),
                 )
-            });
-            worker.update_membership(view, Instant::now()).unwrap();
+            })
+        }
+        fn publish(&self, worker: &WorkerRuntime) {
+            worker
+                .update_membership(self.view(), Instant::now())
+                .unwrap();
+        }
+        fn publish_managed(&self, worker: &Worker) {
+            worker
+                .update_membership(self.view(), Instant::now())
+                .unwrap();
+        }
+        fn gc_managed(&self, worker: &Worker) -> OwnershipGc {
+            self.publish_managed(worker);
+            OwnershipGc::new(&self.config)
         }
         fn gc(&self, worker: &WorkerRuntime) -> OwnershipGc {
             self.publish(worker);
@@ -757,10 +773,15 @@ mod tests {
             .unwrap()
     }
 
-    fn namespace_runtime(
+    fn namespace_runtime(root: &std::path::Path, paged: bool) -> (Arc<Worker>, MembershipFixture) {
+        namespace_runtime_with_config(root, paged, |_| {})
+    }
+
+    fn namespace_runtime_with_config(
         root: &std::path::Path,
         paged: bool,
-    ) -> (Arc<WorkerRuntime>, MembershipFixture) {
+        configure: impl FnOnce(&mut WorkerConfig),
+    ) -> (Arc<Worker>, MembershipFixture) {
         let mut fixture = MembershipFixture::new();
         fixture.config.block_size = 32;
         fixture.config.small_object_threshold_bytes = 1 << 20;
@@ -769,9 +790,10 @@ mod tests {
         fixture.config.l1_capacity_bytes = 0;
         fixture.config.page_tti_hours = 0;
         fixture.config.backend = Some("s3".into());
+        configure(&mut fixture.config);
         let lock = Arc::new(crate::page_access_store::CacheRootLock::acquire(root).unwrap());
         let worker = Arc::new(
-            WorkerRuntime::open_namespaces(
+            Worker::open_namespaces(
                 &fixture.config,
                 lock,
                 Arc::new(Origin::default()),
@@ -780,6 +802,31 @@ mod tests {
             .unwrap(),
         );
         (worker, fixture)
+    }
+
+    #[tokio::test]
+    async fn membership_publication_and_wakeup_do_not_wait_for_directory_writer() {
+        let root = tempfile::tempdir().unwrap();
+        let (worker, fixture) = namespace_runtime(root.path(), true);
+        let wake = worker.membership_changed.subscribe();
+        let publisher = worker.clone();
+        let (done, published) = std::sync::mpsc::channel();
+        std::thread::scope(|threads| {
+            let (start, held) = std::sync::mpsc::channel();
+            let attempt = threads.spawn(move || {
+                held.recv().unwrap();
+                fixture.publish_managed(&publisher);
+                done.send(()).unwrap();
+            });
+            let completed_with_writer_held = worker.index.with_directory_writer(|_| {
+                start.send(()).unwrap();
+                published.recv_timeout(Duration::from_secs(2))
+            });
+            attempt.join().unwrap();
+            completed_with_writer_held.unwrap();
+        });
+        assert!(wake.has_changed().unwrap());
+        assert_eq!(worker.membership_snapshot().unwrap().generation, 1);
     }
 
     #[tokio::test]
@@ -813,7 +860,7 @@ mod tests {
             }
             put(directory, &refill);
         });
-        let mut gc = fixture.gc(&worker);
+        let mut gc = fixture.gc_managed(&worker);
         gc.run_round(&worker).await;
         assert_eq!(gc.discovery_visits, rows);
         gc.discovery_visits = 0;
@@ -861,7 +908,7 @@ mod tests {
         assert!(worker.index.is_empty());
         assert_eq!(worker.block_count(), 2);
         let pin = worker.lru.pin_guard(CacheUnit::Whole(unowned.clone()));
-        fixture.publish(&worker);
+        fixture.publish_managed(&worker);
         let mut gc = OwnershipGc::new(&fixture.config);
         gc.run_round(&worker).await;
         assert!(worker.contains_block(&unowned));
@@ -887,13 +934,11 @@ mod tests {
     #[tokio::test]
     async fn packed_ownership_first_attempt_is_revoked_by_immutable_put() {
         let root = tempfile::tempdir().unwrap();
-        let (mut worker, fixture) = namespace_runtime(root.path(), false);
-        let budget = crate::background::BackgroundBudget::new(&WorkerConfig {
-            background_delete_max_per_sec: 1,
-            background_io_max_mb_per_sec: 0,
-            ..Default::default()
+        let (worker, fixture) = namespace_runtime_with_config(root.path(), false, |config| {
+            config.background_delete_max_per_sec = 1;
+            config.background_io_max_mb_per_sec = 0;
         });
-        Arc::get_mut(&mut worker).unwrap().background_budget = Some(budget.clone());
+        let budget = worker.background_budget.as_ref().unwrap();
         let payload = Bytes::from_static(b"packed");
         let put = talon_transport::data::CachedBlockPutRequest {
             block: packed_placed("b", 0),
@@ -905,7 +950,7 @@ mod tests {
             .await
             .unwrap();
         let small = worker.small.as_ref().unwrap();
-        let mut gc = fixture.gc(&worker);
+        let mut gc = fixture.gc_managed(&worker);
         let generation = worker.membership_snapshot().unwrap().generation;
         tokio::time::pause();
         gc.run_slice(&worker).await;
@@ -940,13 +985,11 @@ mod tests {
     #[tokio::test]
     async fn packed_ownership_retry_does_not_reregister_after_immutable_put() {
         let root = tempfile::tempdir().unwrap();
-        let (mut worker, fixture) = namespace_runtime(root.path(), false);
-        let budget = crate::background::BackgroundBudget::new(&WorkerConfig {
-            background_delete_max_per_sec: 1,
-            background_io_max_mb_per_sec: 0,
-            ..Default::default()
+        let (worker, fixture) = namespace_runtime_with_config(root.path(), false, |config| {
+            config.background_delete_max_per_sec = 1;
+            config.background_io_max_mb_per_sec = 0;
         });
-        Arc::get_mut(&mut worker).unwrap().background_budget = Some(budget.clone());
+        let budget = worker.background_budget.as_ref().unwrap();
         let payload = Bytes::from_static(b"packed");
         let puts = [0, 1].map(|n| talon_transport::data::CachedBlockPutRequest {
             block: packed_placed("b", n),
@@ -966,7 +1009,7 @@ mod tests {
                 .pin_guard(CacheUnit::Whole(put.block.clone()))
                 .unwrap()
         });
-        let mut gc = fixture.gc(&worker);
+        let mut gc = fixture.gc_managed(&worker);
         let generation = worker.membership_snapshot().unwrap().generation;
         gc.run_round(&worker).await;
         assert_eq!(small.ownership_retry_count(), 2);
@@ -1022,7 +1065,7 @@ mod tests {
         let id = packed_placed("b", 0);
         let small = worker.small.as_ref().unwrap();
         small.put(&id, Bytes::from_static(b"packed")).await.unwrap();
-        fixture.publish(&worker);
+        fixture.publish_managed(&worker);
         let membership = worker.membership_snapshot().unwrap();
         let limit = membership.scan_limits[&worker.cache_identity]
             .small
@@ -1065,7 +1108,7 @@ mod tests {
         let id = packed_placed("b", 0);
         let small = worker.small.as_ref().unwrap();
         small.put(&id, Bytes::from_static(b"packed")).await.unwrap();
-        fixture.publish(&worker);
+        fixture.publish_managed(&worker);
         let membership = worker.membership_snapshot().unwrap();
         let limit = membership.scan_limits[&worker.cache_identity]
             .small
@@ -1117,7 +1160,7 @@ mod tests {
             } else {
                 fill(&worker, &id, true).await;
             }
-            fixture.publish(&worker);
+            fixture.publish_managed(&worker);
             let mut packed_attempt = None;
             let mut ordinary_attempt = None;
             let path = if packed {
@@ -1225,7 +1268,7 @@ mod tests {
 
             println!("packed={packed} gate={hold_gate} held_writer={observed:?} expected_full={full:?} resident={resident}");
             observations.push((packed, hold_gate, observed, full, resident));
-            fixture.publish(&worker);
+            fixture.publish_managed(&worker);
             invoke(worker.membership_snapshot().unwrap()).await;
             assert!(!path
                 .as_ref()
@@ -1248,7 +1291,7 @@ mod tests {
         let id = packed_placed("b", 0);
         let small = worker.small.as_ref().unwrap();
         small.put(&id, Bytes::from_static(b"packed")).await.unwrap();
-        let mut gc = fixture.gc(&worker);
+        let mut gc = fixture.gc_managed(&worker);
         let gc_permits = worker.page_gc_io.available_permits();
         let budget = worker.background_budget.as_ref().unwrap();
         let io_permits = budget.available_io();
@@ -1303,7 +1346,7 @@ mod tests {
         assert_eq!(small.ownership_retry_count(), 1);
         assert_eq!(worker.page_gc_metrics.ownership_attempted.get(), 1);
 
-        fixture.publish(&worker);
+        fixture.publish_managed(&worker);
         gc.run_round(&worker).await;
         // Renewal lets the interrupted discovery round finish. The next
         // scheduled round uses the indexed retry after the usual delay.
@@ -1324,7 +1367,7 @@ mod tests {
         let original = packed_placed("b", 0);
         let payload = Bytes::from_static(b"packed");
         small.put(&original, payload.clone()).await.unwrap();
-        let mut gc = fixture.gc(&worker);
+        let mut gc = fixture.gc_managed(&worker);
         // Re-admission leaves the segment eligible for discovery of later rows.
         small.put(&original, payload).await.unwrap();
         let paged = placed("b", 0);
@@ -1357,7 +1400,7 @@ mod tests {
                     .lru
                     .pin_guard(CacheUnit::Whole(foreign.clone()))
                     .unwrap();
-                fixture.publish(&worker);
+                fixture.publish_managed(&worker);
                 collector.run_round(&worker).await;
                 assert_eq!(small.ownership_retry_count(), 1);
                 drop(pin);
@@ -1371,7 +1414,7 @@ mod tests {
             );
             assert_eq!(small.read(&foreign).await.unwrap(), Some(payload.clone()));
             if !selected {
-                fixture.publish(&worker);
+                fixture.publish_managed(&worker);
             }
             let generation = worker.membership_snapshot().unwrap().generation;
             for _ in 0..2 {
@@ -1402,7 +1445,7 @@ mod tests {
         small.fail_next_delete_after_journal(&ids[0]);
         assert!(small.delete(&ids[0]).await.is_err());
         let charge = worker.logical_resident_bytes();
-        let mut collector = fixture.gc(&worker);
+        let mut collector = fixture.gc_managed(&worker);
         for _ in 0..2 {
             collector.run_round(&worker).await;
             assert_eq!(small.ownership_retry_count(), ids.len());
@@ -1447,7 +1490,7 @@ mod tests {
             .iter()
             .map(|id| worker.lru.pin_guard(CacheUnit::Whole(id.clone())).unwrap())
             .collect();
-        let mut collector = fixture.gc(&worker);
+        let mut collector = fixture.gc_managed(&worker);
         collector.run_slice(&worker).await;
         collector.run_slice(&worker).await;
         assert_eq!(small.ownership_retry_count(), protected.len());
@@ -1508,7 +1551,7 @@ mod tests {
         small.put(&id, Bytes::from_static(b"packed")).await.unwrap();
         let view = small.under_catalog_writer(|| {
             assert_eq!(worker.block_count(), 1);
-            fixture.publish(&worker);
+            fixture.publish_managed(&worker);
             worker.membership_snapshot().unwrap()
         });
 
@@ -1556,14 +1599,14 @@ mod tests {
             .acquire_many_owned(worker.page_gc_config.io_concurrency as u32)
             .await
             .unwrap();
-        let mut gc = fixture.gc(&worker);
+        let mut gc = fixture.gc_managed(&worker);
         let run = gc.run_round(&worker);
         let change = async {
             while worker.page_mutations.active_count() == 0 {
                 tokio::task::yield_now().await;
             }
             *fixture.members.lock().unwrap() = Some(vec!["a"]);
-            fixture.publish(&worker);
+            fixture.publish_managed(&worker);
             drop(permit);
         };
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -1584,7 +1627,7 @@ mod tests {
         for id in &ordinary {
             fill(&worker, id, true).await;
         }
-        let mut gc = fixture.gc(&worker);
+        let mut gc = fixture.gc_managed(&worker);
         gc.run_round(&worker).await;
         assert!(gc.pass.is_none());
         assert_eq!(worker.lru.block_scan_ceiling(), ordinary.len());
@@ -1632,13 +1675,13 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let (worker, fixture) = namespace_runtime(root.path(), false);
         *fixture.members.lock().unwrap() = Some(vec!["a"]);
-        let mut gc = fixture.gc(&worker);
+        let mut gc = fixture.gc_managed(&worker);
         gc.run_round(&worker).await;
         gc.next_supplement = tokio::time::Instant::now();
         let old_view = gc.prepare_ownership(&worker).unwrap();
 
         *fixture.members.lock().unwrap() = Some(vec!["a", "b"]);
-        fixture.publish(&worker);
+        fixture.publish_managed(&worker);
         let late = packed_placed("b", 0);
         worker
             .commit_cached_block(&late, Bytes::from_static(b"late"))
@@ -1676,7 +1719,7 @@ mod tests {
             small.read(&id).await.unwrap(),
             Some(Bytes::from_static(b"packed"))
         );
-        let mut gc = fixture.gc(&worker);
+        let mut gc = fixture.gc_managed(&worker);
         gc.run_round(&worker).await;
         assert!(!small.contains(&id));
     }
@@ -1695,7 +1738,7 @@ mod tests {
             fill(&worker, &unowned, paged).await;
             fill(&named, &owned, paged).await;
             fill(&named, &unowned, paged).await;
-            fixture.publish(&worker);
+            fixture.publish_managed(&worker);
             let original = worker.membership_snapshot().unwrap();
             assert!(Arc::ptr_eq(
                 &original,
@@ -1707,13 +1750,16 @@ mod tests {
             );
             let late_fill = placed("b", 1);
             fill(&named, &late_fill, paged).await;
+            let late_range =
+                original.scan_limits["analytics"].block..named.index.ownership_admission_ceiling();
+            assert!(!late_range.is_empty());
             worker.update_membership(None, Instant::now()).unwrap();
             assert!(named.membership_snapshot().is_none());
             let mut default_gc = OwnershipGc::new(&fixture.config);
             let mut named_gc = OwnershipGc::new(&fixture.config);
             named_gc.run_round(&named).await;
             assert!(named.index.get(&unowned).is_some());
-            fixture.publish(&worker);
+            fixture.publish_managed(&worker);
             assert_eq!(
                 named.membership_snapshot().unwrap().scan_limits,
                 original.scan_limits
@@ -1724,6 +1770,10 @@ mod tests {
             assert!(named.index.get(&unowned).is_none());
             assert!(named.index.get(&owned).is_some());
             assert!(named.index.get(&late_fill).is_some());
+            // GC started after the late fill. The event keeps its published
+            // cutoff and the supplement must discover the uncovered revision.
+            assert_eq!(named_gc.completed_limit, late_range.start);
+            assert!(!named.index.ownership_changes_cover(&late_range));
             let late = worker
                 .for_namespace(&talon_core::NamespaceId::named("late"))
                 .await
@@ -1740,6 +1790,14 @@ mod tests {
             assert!(named.index.get(&late_fill).is_none());
             assert!(named.index.get(&owned).is_some());
             assert!(late.index.is_empty());
+            let next_fill = placed("b", 2);
+            fill(&named, &next_fill, paged).await;
+            let fresh_range = late_range.end..named.index.ownership_admission_ceiling();
+            assert!(named.index.ownership_changes_cover(&fresh_range));
+            named_gc.next_supplement = tokio::time::Instant::now();
+            named_gc.run_round(&named).await;
+            assert!(named.index.get(&next_fill).is_none());
+            assert!(!named.index.ownership_changes_cover(&fresh_range));
         }
     }
 
@@ -1774,7 +1832,7 @@ mod tests {
                     crate::page_access_store::CacheRootLock::acquire(root.path()).unwrap(),
                 );
                 let restarted = Arc::new(
-                    WorkerRuntime::open_namespaces(
+                    Worker::open_namespaces(
                         &fixture.config,
                         lock,
                         Arc::new(Origin::default()),
@@ -1815,7 +1873,7 @@ mod tests {
             .unwrap();
         let unowned = placed("b", 0);
         fill(&named, &unowned, false).await;
-        fixture.publish(&worker);
+        fixture.publish_managed(&worker);
         let service = super::super::WorkerBackground::start(worker.clone(), &fixture.config);
         let completed = worker.metrics.registry.counter(
             "talon_worker_background_task_completed_total",
@@ -1951,7 +2009,7 @@ mod tests {
     async fn supplement_retries_keep_bounds_across_membership_outage() {
         let root = tempfile::tempdir().unwrap();
         let (r, fixture) = namespace_runtime(root.path(), true);
-        let mut gc = fixture.gc(&r);
+        let mut gc = fixture.gc_managed(&r);
         gc.run_round(&r).await;
         let old = placed("b", 0);
         let later = placed("b", 1);
@@ -1967,7 +2025,7 @@ mod tests {
         gc.run_round(&r).await;
         assert_eq!(gc.next_delay(&r), None);
         assert_eq!(gc.supplement, Some(bounds.clone()));
-        fixture.publish(&r);
+        fixture.publish_managed(&r);
         drop(reader);
         gc.run_round(&r).await;
         assert!(r.index.get(&old).is_none());
@@ -2008,7 +2066,7 @@ mod tests {
     async fn cancelled_supplement_keeps_bounds_and_defers_later_page_fills() {
         let root = tempfile::tempdir().unwrap();
         let (r, fixture) = namespace_runtime(root.path(), true);
-        let mut gc = fixture.gc(&r);
+        let mut gc = fixture.gc_managed(&r);
         gc.run_round(&r).await;
         let old = placed("b", 0);
         let rewritten = placed("b", 1);
@@ -2575,13 +2633,13 @@ mod tests {
                 assert!(config.ownership_gc_enabled);
                 config.background_scan_batch_size = 1;
                 (
-                    super::super::WorkerBackground::start(r.clone(), &config),
+                    super::super::WorkerBackground::start(Worker::standalone(r.clone()), &config),
                     3600,
                 )
             } else {
                 (
                     super::super::WorkerBackground::start(
-                        r.clone(),
+                        Worker::standalone(r.clone()),
                         &WorkerConfig {
                             ownership_gc_enabled: false,
                             ..Default::default()

@@ -56,6 +56,16 @@ pub(crate) struct Geometry {
     pages: Pages,
 }
 
+#[cfg(test)]
+thread_local! {
+    static PAGE_ROWS_VISITED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_page_rows_visited() -> usize {
+    PAGE_ROWS_VISITED.replace(0)
+}
+
 #[derive(Clone)]
 enum Pages {
     Empty,
@@ -251,6 +261,8 @@ impl PageRows {
     }
 
     fn at(&self, position: usize) -> (u32, u64) {
+        #[cfg(test)]
+        PAGE_ROWS_VISITED.set(PAGE_ROWS_VISITED.get() + 1);
         match self {
             Self::Compact(rows) => rows[position].unpack(),
             Self::Wide(rows) => rows[position],

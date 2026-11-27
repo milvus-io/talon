@@ -48,6 +48,17 @@ pub enum Presence {
     Miss,
 }
 
+pub(crate) struct BlockSummary {
+    pub len: u64,
+    pub shape: BlockShape,
+    pub disk_id: Option<DiskId>,
+}
+
+pub(crate) enum BlockShape {
+    Whole,
+    Paged { page_size: u32 },
+}
+
 /// A thread-safe index of resident blocks.
 #[derive(Default)]
 pub struct BlockIndex {
@@ -462,18 +473,14 @@ impl BlockIndex {
         self.with_slot_ceiling(std::convert::identity)
     }
 
-    pub(crate) fn enable_ownership_changes(&self) {
-        self.entries.write().unwrap().enable_ownership_changes();
+    pub(crate) fn ownership_admission_ceiling(&self) -> u64 {
+        self.compact.admission_ceiling()
     }
 
-    pub(crate) fn capture_ownership_ceiling(&self, topology_change: bool) -> u64 {
-        if !self.catalog {
-            return self.compact.admission_ceiling();
+    pub(crate) fn start_ownership_changes(&self) {
+        if self.catalog {
+            self.entries.write().unwrap().start_ownership_changes();
         }
-        self.entries
-            .write()
-            .unwrap()
-            .capture_ownership_ceiling(topology_change)
     }
 
     pub(crate) fn ownership_changes_cover(&self, range: &std::ops::Range<u64>) -> bool {
@@ -481,10 +488,12 @@ impl BlockIndex {
     }
 
     pub(crate) fn retire_ownership_changes(&self, cutoff: u64) {
-        self.entries
-            .write()
-            .unwrap()
-            .retire_ownership_changes(cutoff);
+        if self.catalog {
+            self.entries
+                .write()
+                .unwrap()
+                .retire_ownership_changes(cutoff);
+        }
     }
 
     pub(crate) fn ownership_change_step(
@@ -1419,33 +1428,59 @@ impl BlockIndex {
         self.read_entry(id, |entry| entry.metadata().into())
     }
 
-    /// Resolve metadata and mark a whole-block read in the same index lookup.
-    pub(crate) fn get_and_touch(&self, id: &BlockId) -> Option<BlockMeta> {
-        self.get_and_touch_at(id).map(|(meta, _)| meta)
+    /// Read geometry without building a presence bitmap or materializing the key.
+    pub(crate) fn summary(&self, id: &BlockId) -> Option<BlockSummary> {
+        self.read_summary(id, false)
     }
 
-    pub(crate) fn get_and_touch_at(&self, id: &BlockId) -> Option<(BlockMeta, Option<DiskId>)> {
+    /// Resolve geometry and mark a whole-block read in the same index lookup.
+    pub(crate) fn summary_and_touch(&self, id: &BlockId) -> Option<BlockSummary> {
+        self.read_summary(id, true)
+    }
+
+    fn read_summary(&self, id: &BlockId, touch_whole: bool) -> Option<BlockSummary> {
         if self.catalog {
             let entries = self.entries.read().unwrap();
-            let (key, geometry, entry) = entries.resident(id)?;
-            if geometry.kind() == Some(StoreKind::Whole) {
-                geometry
-                    .policy_state(UnitKind::Whole)?
-                    .touch(entries.clock(entries.slot(id)?));
-            }
-            return Some((
-                catalog::metadata(key, geometry, entries.page_size(entry)),
-                geometry.disk_id,
-            ));
+            let slot = entries.slot(id)?;
+            let (_, geometry, entry) = entries.resident_at(slot)?;
+            let shape = if geometry.kind() == Some(StoreKind::Whole) {
+                if touch_whole {
+                    geometry
+                        .policy_state(UnitKind::Whole)?
+                        .touch(entries.clock(slot));
+                }
+                BlockShape::Whole
+            } else {
+                BlockShape::Paged {
+                    page_size: entries.page_size(entry),
+                }
+            };
+            return Some(BlockSummary {
+                len: geometry.len(),
+                shape,
+                disk_id: geometry.disk_id,
+            });
         }
         self.read_entry_with_policy(id, |entry, clock, legacy| {
-            if let IndexedUnits::Whole(slot) = &entry.units {
-                slot.access.touch(clock);
-                if let Some(access) = legacy.and_then(|p| p.access(UnitKind::Whole)) {
-                    access.touch();
+            let shape = match &entry.units {
+                IndexedUnits::Whole(slot) => {
+                    if touch_whole {
+                        slot.access.touch(clock);
+                        if let Some(access) = legacy.and_then(|p| p.access(UnitKind::Whole)) {
+                            access.touch();
+                        }
+                    }
+                    BlockShape::Whole
                 }
+                IndexedUnits::Paged(_) => BlockShape::Paged {
+                    page_size: entry.meta.page_size,
+                },
+            };
+            BlockSummary {
+                len: entry.meta.len,
+                shape,
+                disk_id: entry.meta.disk_id,
             }
-            (entry.metadata().into(), entry.meta.disk_id)
         })
     }
 
@@ -2744,7 +2779,7 @@ mod tests {
                 .is_some());
             assert!(candidates.iter().all(|c| !lru.candidate_is_current(c)));
             let candidate = lru.block_candidates(&whole).pop().unwrap();
-            assert!(index.get_and_touch(&whole).is_some());
+            assert!(index.summary_and_touch(&whole).is_some());
             assert!(!lru.candidate_is_current(&candidate));
         }
     }

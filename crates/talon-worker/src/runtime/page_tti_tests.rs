@@ -56,9 +56,7 @@ fn request(offset: u64, len: u64) -> RangeRequest {
     }
 }
 fn runtime(root: &Path, l1: bool, capacity: u64, tti: u64) -> WorkerRuntime {
-    let (worker, paged) = runtime_before_paged_setup(root, l1, capacity);
-    worker
-        .with_paged_store(paged)
+    runtime_with_paged_store(root, l1, capacity)
         .with_page_gc(PageGcConfig {
             tti_ms: tti,
             checkpoint_interval_ms: 10,
@@ -67,19 +65,16 @@ fn runtime(root: &Path, l1: bool, capacity: u64, tti: u64) -> WorkerRuntime {
         .unwrap()
 }
 
-fn runtime_before_paged_setup(
-    root: &Path,
-    l1: bool,
-    capacity: u64,
-) -> (WorkerRuntime, PagedBlockStore) {
+fn runtime_with_paged_store(root: &Path, l1: bool, capacity: u64) -> WorkerRuntime {
     let capacity = capacity.div_ceil(16) * disk_unit();
     let paged = PagedBlockStore::open(root.join("paged"), 16).unwrap();
     let index = Arc::new(BlockIndex::new());
     for entry in paged.scan_allocated().unwrap() {
         index.commit_stored(entry);
     }
-    let worker = WorkerRuntime::new_with_l1(
+    WorkerRuntime::new_with_l1(
         WholeBlockStore::open(root.join("whole")).unwrap(),
+        Some(paged),
         index,
         Arc::new(InFlightLoads::new()),
         Arc::new(Origin::default()),
@@ -88,8 +83,7 @@ fn runtime_before_paged_setup(
         if l1 { 256 } else { 0 },
         16,
         WorkerMetrics::new(capacity),
-    );
-    (worker, paged)
+    )
 }
 async fn collect_all(r: &WorkerRuntime) -> u64 {
     let report = r.gc_once().await;
@@ -217,6 +211,7 @@ async fn checkpoint_membership_scheduled_full_ticks_share_sparse_inventory() {
     directory.write().unwrap().attach(16);
     let r = WorkerRuntime::new_with_l1(
         WholeBlockStore::open(root.path().join("whole")).unwrap(),
+        Some(PagedBlockStore::open(root.path().join("paged"), 16).unwrap()),
         Arc::new(BlockIndex::from_catalog(directory.clone())),
         Arc::new(InFlightLoads::new()),
         Arc::new(Origin::default()),
@@ -226,7 +221,6 @@ async fn checkpoint_membership_scheduled_full_ticks_share_sparse_inventory() {
         16,
         WorkerMetrics::new(0),
     )
-    .with_paged_store(PagedBlockStore::open(root.path().join("paged"), 16).unwrap())
     .with_page_gc(PageGcConfig::default())
     .unwrap();
     r.page_clock.set(20_000);
@@ -308,7 +302,7 @@ async fn scheduled_checkpoint_keeps_inventory_across_shard_failures() {
         ..Default::default()
     };
     let open = || {
-        WorkerRuntime::open_namespaces(
+        Worker::open_namespaces(
             &config,
             Arc::new(CacheRootLock::acquire(root.path()).unwrap()),
             Arc::new(Origin::default()),
@@ -389,7 +383,7 @@ async fn checkpoint_membership_explicit_flush_includes_admission_before_later_ga
         ..Default::default()
     };
     let open = || {
-        WorkerRuntime::open_namespaces(
+        Worker::open_namespaces(
             &config,
             Arc::new(CacheRootLock::acquire(root.path()).unwrap()),
             Arc::new(Origin::default()),
@@ -736,7 +730,7 @@ async fn background_service_collects_without_requests_and_shutdown_checkpoints()
     let r = Arc::new(r);
     r.page_clock.set(10101);
     let service = crate::runtime::WorkerBackground::start(
-        r.clone(),
+        Worker::standalone(r.clone()),
         &talon_core::WorkerConfig {
             ownership_gc_enabled: false,
             ..Default::default()
@@ -1102,7 +1096,7 @@ async fn file_cleanup_runs_independently_of_gc_interval() {
         background_delete_max_per_sec: 0,
         ..Default::default()
     };
-    let service = crate::runtime::WorkerBackground::start(r.clone(), &config);
+    let service = crate::runtime::WorkerBackground::start(Worker::standalone(r.clone()), &config);
     // Wait for both startup passes, so removing a newly created orphan requires
     // a later cleanup invocation while GC is still waiting for its next interval.
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -1185,7 +1179,7 @@ async fn orphan_cleanup_retries_with_tti_disabled_and_preserves_live_snapshots()
     r.page_gc_config.interval_ms = 1;
     let r = Arc::new(r);
     let service = crate::runtime::WorkerBackground::start(
-        r.clone(),
+        Worker::standalone(r.clone()),
         &talon_core::WorkerConfig {
             ownership_gc_enabled: false,
             ..Default::default()
@@ -1236,7 +1230,7 @@ async fn orphan_cleanup_covers_unindexed_directories_with_paged_reads_disabled()
     r.page_gc_config.interval_ms = 1;
     let r = Arc::new(r);
     let service = crate::runtime::WorkerBackground::start(
-        r.clone(),
+        Worker::standalone(r.clone()),
         &talon_core::WorkerConfig {
             ownership_gc_enabled: false,
             ..Default::default()
@@ -1265,7 +1259,7 @@ async fn background_cleanup_discovers_startup_residue_without_a_foreground_pass(
     std::fs::write(&temporary, b"partial").unwrap();
     let r = Arc::new(r);
     let service = crate::runtime::WorkerBackground::start(
-        r.clone(),
+        Worker::standalone(r.clone()),
         &talon_core::WorkerConfig {
             ownership_gc_enabled: false,
             stale_gc_enabled: false,
@@ -1846,18 +1840,16 @@ async fn disabled_tti_restores_checkpointed_access_after_restart() {
 }
 
 #[tokio::test]
-async fn page_gc_configured_before_paged_store_checkpoints_and_restores_access() {
+async fn paged_constructor_checkpoints_and_restores_access() {
     let root = tempfile::tempdir().unwrap();
     let open = || {
-        let (worker, paged) = runtime_before_paged_setup(root.path(), false, 0);
-        worker
+        runtime_with_paged_store(root.path(), false, 0)
             .with_page_gc(PageGcConfig {
                 tti_ms: 0,
                 checkpoint_interval_ms: 10,
                 ..Default::default()
             })
             .unwrap()
-            .with_paged_store(paged)
     };
     let worker = open();
     worker.page_clock.set(10_000);

@@ -27,44 +27,10 @@ impl Lru {
         blocks: usize,
         track_blocks: bool,
     ) -> Self {
-        let workers = if units.len() < 4096 {
-            1
-        } else {
-            std::thread::available_parallelism()
-                .map_or(1, usize::from)
-                .min(2)
-        };
-        Self::recover(index, units, blocks, workers, track_blocks)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn assert_empty_ordinary_policy(&self) {
-        let inner = self.inner.lock().unwrap();
-        assert_eq!(inner.legacy_units, 0);
-        assert_eq!(inner.index.compact.totals().1, 0);
-        assert_eq!(inner.index.policy_scan_ceiling(), 0);
-    }
-
-    #[cfg(test)]
-    fn recover_with_workers(units: Vec<RecoveredUnit>, blocks: usize, workers: usize) -> Self {
-        Self::recover(
-            Arc::new(crate::BlockIndex::new()),
-            units,
-            blocks,
-            workers,
-            true,
-        )
-    }
-
-    fn recover(
-        index: Arc<crate::BlockIndex>,
-        units: Vec<RecoveredUnit>,
-        blocks: usize,
-        workers: usize,
-        track_blocks: bool,
-    ) -> Self {
         let started = std::time::Instant::now();
+        let mut total_bytes = 0u64;
         for unit in &units {
+            total_bytes = total_bytes.saturating_add(unit.bytes);
             let revision = index.compact.next_revision();
             index.compact.admitted_at(revision);
             index.policy_insert(
@@ -96,14 +62,11 @@ impl Lru {
                 );
             }
         }
-        let total_bytes = units
-            .iter()
-            .fold(0u64, |total, u| total.saturating_add(u.bytes));
-        let clock = units.len() as u64;
+        let legacy_units = units.len();
         let lru = Self {
             inner: Mutex::new(Inner {
                 index,
-                legacy_units: units.len(),
+                legacy_units,
                 capacity_hand: (0, 0),
                 track_blocks,
                 track_small_clock: track_blocks,
@@ -119,14 +82,21 @@ impl Lru {
         drop(units);
         tracing::info!(
             blocks,
-            legacy_units = clock,
+            legacy_units,
             resident_units = lru.inner.lock().unwrap().index.compact.totals().1,
-            workers,
             elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
             temporary_drop_ms = drop_started.elapsed().as_secs_f64() * 1000.0,
             "cache policy indexes completed"
         );
         lru
+    }
+
+    #[cfg(test)]
+    pub(crate) fn assert_empty_ordinary_policy(&self) {
+        let inner = self.inner.lock().unwrap();
+        assert_eq!(inner.legacy_units, 0);
+        assert_eq!(inner.index.compact.totals().1, 0);
+        assert_eq!(inner.index.policy_scan_ceiling(), 0);
     }
 }
 
@@ -168,39 +138,37 @@ mod tests {
 
     #[test]
     fn bulk_independent_keys_match_admission() {
-        for workers in 1..=3 {
-            let first = block(10);
-            let mut second = first.clone();
-            second.version = Version::new("v2");
-            let ordinary = Lru::new();
-            let units = [&first, &second]
-                .into_iter()
-                .map(|id| {
-                    let unit = CacheUnit::Whole(id.clone());
-                    let access = ordinary.insert_with_policy(unit.clone(), 100, true);
-                    RecoveredUnit {
-                        independent: true,
-                        unit: unit.into(),
-                        bytes: 100,
-                        access,
-                    }
-                })
-                .collect();
-            let recovered = Lru::recover_with_workers(units, 2, workers);
-            {
-                let a = ordinary.inner.lock().unwrap();
-                let b = recovered.inner.lock().unwrap();
-                assert_eq!(b.index.policy_versioned_count(&first), 0);
-                assert_eq!(b.index.policy_versioned_count(&second), 0);
-                assert_eq!(a.legacy_bytes, b.legacy_bytes);
-            }
-            assert!(recovered.superseded_candidates(&second).is_empty());
-            assert_eq!(recovered.block_candidates(&first).len(), 1);
-            recovered.remove_block(&first);
-            assert_eq!(recovered.block_candidates(&second).len(), 1);
-            recovered.remove_block(&second);
-            assert!(recovered.is_empty());
+        let first = block(10);
+        let mut second = first.clone();
+        second.version = Version::new("v2");
+        let ordinary = Lru::new();
+        let units = [&first, &second]
+            .into_iter()
+            .map(|id| {
+                let unit = CacheUnit::Whole(id.clone());
+                let access = ordinary.insert_with_policy(unit.clone(), 100, true);
+                RecoveredUnit {
+                    independent: true,
+                    unit: unit.into(),
+                    bytes: 100,
+                    access,
+                }
+            })
+            .collect();
+        let recovered = Lru::from_recovered(Arc::new(crate::BlockIndex::new()), units, 2, true);
+        {
+            let a = ordinary.inner.lock().unwrap();
+            let b = recovered.inner.lock().unwrap();
+            assert_eq!(b.index.policy_versioned_count(&first), 0);
+            assert_eq!(b.index.policy_versioned_count(&second), 0);
+            assert_eq!(a.legacy_bytes, b.legacy_bytes);
         }
+        assert!(recovered.superseded_candidates(&second).is_empty());
+        assert_eq!(recovered.block_candidates(&first).len(), 1);
+        recovered.remove_block(&first);
+        assert_eq!(recovered.block_candidates(&second).len(), 1);
+        recovered.remove_block(&second);
+        assert!(recovered.is_empty());
     }
 
     #[test]
@@ -214,60 +182,58 @@ mod tests {
             (CacheUnit::Page(old.clone(), PageIndex(255)), 4096),
             (CacheUnit::Whole(new.clone()), 31),
         ];
-        for workers in 1..=3 {
-            let ordinary = Lru::new();
-            let mut shared = HashMap::new();
-            let units = input
-                .iter()
-                .map(|(unit, bytes)| {
-                    ordinary.insert(unit.clone(), *bytes);
-                    let access = shared
-                        .entry(unit.block().clone())
-                        .or_insert_with(AccessHandle::default);
-                    RecoveredUnit {
-                        independent: false,
-                        unit: unit.clone().into(),
-                        bytes: *bytes,
-                        access: access.sibling(),
-                    }
-                })
-                .collect();
-            let recovered = Lru::recover_with_workers(units, 3, workers);
-            {
-                let a = ordinary.inner.lock().unwrap();
-                let b = recovered.inner.lock().unwrap();
-                assert_eq!(a.legacy_units, b.legacy_units);
-                assert_eq!(
-                    a.index.compact.admission_ceiling(),
-                    b.index.compact.admission_ceiling()
-                );
-                assert_eq!(a.legacy_bytes, b.legacy_bytes);
-                for (unit, _) in &input {
-                    let entry = a.index.policy_get(unit).unwrap();
-                    let restored = b.index.policy_get(unit).unwrap();
-                    assert_eq!(
-                        (entry.bytes, entry.revision, entry.pins),
-                        (restored.bytes, restored.revision, restored.pins)
-                    );
-                    let activity = b.index.policy_block_get(unit.block()).unwrap();
-                    assert_eq!(restored.access.last_access(), activity.last_access);
+        let ordinary = Lru::new();
+        let mut shared = HashMap::new();
+        let units = input
+            .iter()
+            .map(|(unit, bytes)| {
+                ordinary.insert(unit.clone(), *bytes);
+                let access = shared
+                    .entry(unit.block().clone())
+                    .or_insert_with(AccessHandle::default);
+                RecoveredUnit {
+                    independent: false,
+                    unit: unit.clone().into(),
+                    bytes: *bytes,
+                    access: access.sibling(),
                 }
+            })
+            .collect();
+        let recovered = Lru::from_recovered(Arc::new(crate::BlockIndex::new()), units, 3, true);
+        {
+            let a = ordinary.inner.lock().unwrap();
+            let b = recovered.inner.lock().unwrap();
+            assert_eq!(a.legacy_units, b.legacy_units);
+            assert_eq!(
+                a.index.compact.admission_ceiling(),
+                b.index.compact.admission_ceiling()
+            );
+            assert_eq!(a.legacy_bytes, b.legacy_bytes);
+            for (unit, _) in &input {
+                let entry = a.index.policy_get(unit).unwrap();
+                let restored = b.index.policy_get(unit).unwrap();
+                assert_eq!(
+                    (entry.bytes, entry.revision, entry.pins),
+                    (restored.bytes, restored.revision, restored.pins)
+                );
+                let activity = b.index.policy_block_get(unit.block()).unwrap();
+                assert_eq!(restored.access.last_access(), activity.last_access);
             }
-            for lru in [&ordinary, &recovered] {
-                assert!(lru.pin(&input[0].0));
-                assert_eq!(lru.evict_superseded(&new), vec![input[2].0.clone()]);
-                lru.unpin(&input[0].0);
-                let candidate = lru.block_candidates(&old).pop().unwrap();
-                lru.touch(&input[0].0);
-                assert!(!lru.candidate_is_current(&candidate));
-                lru.remove_block(&old);
-                lru.insert(input[0].0.clone(), 7);
-                assert_eq!(lru.total_bytes(), 57);
-                assert_eq!(lru.len(), 3);
-                assert_eq!(lru.evict_to_fit(0).len(), 3);
-                assert_eq!(lru.total_bytes(), 0);
-                assert!(lru.is_empty());
-            }
+        }
+        for lru in [&ordinary, &recovered] {
+            assert!(lru.pin(&input[0].0));
+            assert_eq!(lru.evict_superseded(&new), vec![input[2].0.clone()]);
+            lru.unpin(&input[0].0);
+            let candidate = lru.block_candidates(&old).pop().unwrap();
+            lru.touch(&input[0].0);
+            assert!(!lru.candidate_is_current(&candidate));
+            lru.remove_block(&old);
+            lru.insert(input[0].0.clone(), 7);
+            assert_eq!(lru.total_bytes(), 57);
+            assert_eq!(lru.len(), 3);
+            assert_eq!(lru.evict_to_fit(0).len(), 3);
+            assert_eq!(lru.total_bytes(), 0);
+            assert!(lru.is_empty());
         }
     }
 
@@ -287,7 +253,8 @@ mod tests {
             let second = CacheUnit::Page(id.clone(), PageIndex(19));
             let lru = if recover {
                 let shared = AccessHandle::default();
-                Lru::recover_with_workers(
+                Lru::from_recovered(
+                    Arc::new(crate::BlockIndex::new()),
                     vec![
                         RecoveredUnit {
                             independent: false,
@@ -303,7 +270,7 @@ mod tests {
                         },
                     ],
                     1,
-                    2,
+                    true,
                 )
             } else {
                 let lru = Lru::new();

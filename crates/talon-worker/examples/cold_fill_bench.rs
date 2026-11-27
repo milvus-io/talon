@@ -91,18 +91,18 @@ async fn run(args: &Args) -> anyhow::Result<()> {
         fetches: AtomicU64::new(0),
     });
     let index = Arc::new(BlockIndex::new());
-    let worker = Arc::new(
-        WorkerRuntime::new(
-            WholeBlockStore::open(root.path().join("whole"))?,
-            Arc::clone(&index),
-            Arc::new(InFlightLoads::new()),
-            Arc::clone(&origin) as Arc<dyn BackendStore>,
-            BLOCK_BYTES,
-            object_bytes * 2,
-            WorkerMetrics::new(object_bytes * 2),
-        )
-        .with_paged_store(PagedBlockStore::open(&paged_root, args.page_bytes)?),
-    );
+    let worker = Arc::new(WorkerRuntime::new_with_l1(
+        WholeBlockStore::open(root.path().join("whole"))?,
+        Some(PagedBlockStore::open(&paged_root, args.page_bytes)?),
+        Arc::clone(&index),
+        Arc::new(InFlightLoads::new()),
+        Arc::clone(&origin) as Arc<dyn BackendStore>,
+        BLOCK_BYTES,
+        object_bytes * 2,
+        0,
+        0,
+        WorkerMetrics::new(object_bytes * 2),
+    ));
     let object = ObjectId::new(Backend::S3, "cold-fill-bench", "object");
     let mut elapsed_seconds = 0.0;
     for first in (0..args.pages).step_by(args.interval_pages as usize) {

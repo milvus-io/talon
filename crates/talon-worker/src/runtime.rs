@@ -10,6 +10,7 @@ mod background;
 mod cache_routing;
 mod load;
 mod namespaces;
+pub use namespaces::Worker;
 mod origin_head;
 mod ownership_gc;
 mod stale_gc;
@@ -34,7 +35,7 @@ use talon_transport::data::{CachedBlockPutRequest, CachedRangeRequest, RangeRequ
 use talon_transport::frame::{HEADER_LEN, MAX_PAYLOAD_LEN};
 use talon_transport::{codec, ControlMessage, ObjectEntry, MAX_CONTROL_PAYLOAD_LEN};
 
-use crate::{catalog::DiskId, data_error::CacheMiss};
+use crate::{catalog::DiskId, data_error::CacheMiss, index::BlockShape};
 use crate::{
     miss::touched_pages, BlockIndex, CacheUnit, InFlightLoads, LoadKey, Lru, MemoryInsert,
     MemoryStore, NamespaceRateLimiter, PagedBlockStore, WholeBlockStore, WorkerMetrics,
@@ -101,7 +102,6 @@ pub struct WorkerRuntime {
     membership_changed: tokio::sync::watch::Sender<()>,
     namespace: talon_core::NamespaceId,
     cache_identity: namespaces::CacheIdentity,
-    namespaces: Option<Arc<namespaces::NamespaceRuntimes>>,
     namespace_parent: std::sync::Weak<namespaces::NamespaceRuntimes>,
     /// Fine-grained DRAM page cache. L1 is inclusive: every page has an L2
     /// whole-block parent.
@@ -150,7 +150,6 @@ pub struct WorkerRuntime {
     page_lifecycle: Arc<PageLifecycle>,
     page_clock: Arc<AccessClock>,
     page_gc_config: PageGcConfig,
-    page_gc_configured: bool,
     page_gc_metrics: PageGcMetrics,
     page_mutations: Arc<Mutations>,
     page_gc_io: Arc<tokio::sync::Semaphore>,
@@ -204,6 +203,7 @@ impl WorkerRuntime {
     ) -> Self {
         Self::new_with_l1(
             store,
+            None,
             index,
             inflight,
             backend,
@@ -219,6 +219,7 @@ impl WorkerRuntime {
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_l1(
         store: WholeBlockStore,
+        paged: Option<PagedBlockStore>,
         index: Arc<BlockIndex>,
         inflight: Arc<InFlightLoads>,
         backend: Arc<dyn BackendStore>,
@@ -230,6 +231,7 @@ impl WorkerRuntime {
     ) -> Self {
         Self::new_with_l1_policy(
             store,
+            paged,
             None,
             index,
             inflight,
@@ -247,6 +249,7 @@ impl WorkerRuntime {
     #[allow(clippy::too_many_arguments)]
     fn new_with_l1_policy(
         store: WholeBlockStore,
+        paged: Option<PagedBlockStore>,
         small: Option<Arc<SmallObjectStore>>,
         index: Arc<BlockIndex>,
         inflight: Arc<InFlightLoads>,
@@ -293,6 +296,10 @@ impl WorkerRuntime {
         ));
         metrics.set_l1_capacity(l1_capacity_bytes);
         let page_lifecycle = Arc::new(PageLifecycle::with_index(index.clone(), false));
+        let cleanup_root = paged.as_ref().map_or_else(
+            || store.root().join("paged"),
+            |paged| paged.root().to_owned(),
+        );
         // Residency gauges may already include other namespaces sharing these metrics.
         Self {
             membership: Arc::new(Mutex::new(None)),
@@ -302,15 +309,14 @@ impl WorkerRuntime {
                 &talon_core::NamespaceId::default(),
                 None,
             ),
-            namespaces: None,
             namespace_parent: std::sync::Weak::new(),
             l1,
             page_cleanup: Arc::new(tokio::sync::Mutex::new(
-                crate::page_cleanup::CleanupCursor::new(store.root().join("paged")),
+                crate::page_cleanup::CleanupCursor::new(cleanup_root),
             )),
             store: Arc::new(store),
             small,
-            paged: None,
+            paged: paged.map(Arc::new),
             index,
             inflight,
             load_slots: Arc::new(tokio::sync::Semaphore::new(8)),
@@ -332,7 +338,6 @@ impl WorkerRuntime {
             page_lifecycle,
             page_clock: Arc::new(AccessClock::new()),
             page_gc_config: PageGcConfig::default(),
-            page_gc_configured: false,
             page_mutations: Arc::new(Mutations::default()),
             page_gc_io: Arc::new(tokio::sync::Semaphore::new(4)),
             background_budget: None,
@@ -349,10 +354,11 @@ impl WorkerRuntime {
     /// Missing or invalid observations expire the previous snapshot. Its topology
     /// and admission boundary survive failures so recovery cannot widen a sweep.
     /// Logical membership changes capture a block boundary and wake maintenance.
-    pub fn update_membership(
+    fn publish_membership(
         &self,
         view: Option<talon_core::worker_membership::WorkerDiscovery>,
         observed: Instant,
+        capture_limits: impl FnOnce() -> HashMap<namespaces::CacheIdentity, OwnershipLimits>,
     ) -> anyhow::Result<()> {
         let snapshot = (|| {
             let Some(view) = view else {
@@ -403,23 +409,7 @@ impl WorkerRuntime {
                                 .checked_add(1)
                                 .expect("membership generation exhausted")
                         }),
-                        Arc::new(if let Some(registry) = self.registry() {
-                            registry
-                                .snapshot()
-                                .iter()
-                                .map(|worker| {
-                                    (
-                                        worker.cache_identity.clone(),
-                                        worker.capture_ownership_limits(),
-                                    )
-                                })
-                                .collect()
-                        } else {
-                            HashMap::from([(
-                                self.cache_identity.clone(),
-                                self.capture_ownership_limits(),
-                            )])
-                        }),
+                        Arc::new(capture_limits()),
                     )
                 } else {
                     let old = held.as_ref().expect("unchanged membership");
@@ -447,9 +437,20 @@ impl WorkerRuntime {
         }
     }
 
+    #[cfg(test)]
+    fn update_membership(
+        &self,
+        view: Option<talon_core::worker_membership::WorkerDiscovery>,
+        observed: Instant,
+    ) -> anyhow::Result<()> {
+        self.publish_membership(view, observed, || {
+            HashMap::from([(self.cache_identity.clone(), self.capture_ownership_limits())])
+        })
+    }
+
     fn capture_ownership_limits(&self) -> OwnershipLimits {
         OwnershipLimits {
-            block: self.lru.capture_ownership_ceiling(true),
+            block: self.index.ownership_admission_ceiling(),
             small: self
                 .small
                 .as_ref()
@@ -469,7 +470,7 @@ impl WorkerRuntime {
             return None;
         }
         Some(OwnershipLimits {
-            block: self.lru.capture_ownership_ceiling(false),
+            block: self.index.ownership_admission_ceiling(),
             small: self
                 .small
                 .as_ref()
@@ -489,24 +490,6 @@ impl WorkerRuntime {
     fn membership_is_current(&self, expected: &Arc<MembershipSnapshot>) -> bool {
         self.membership_snapshot()
             .is_some_and(|current| current.generation == expected.generation)
-    }
-
-    /// Enable paged L2: cache individual pages instead of whole blocks.
-    ///
-    /// With this set, a read that misses fetches only the pages it touches from
-    /// the origin and commits them as per-page files, so a point query into a
-    /// 256 MiB block costs one page (256 KiB by default) of backend traffic and
-    /// of local disk rather than the whole block. Eviction reclaims individual
-    /// pages, leaving the block's other pages intact.
-    pub fn with_paged_store(mut self, paged: PagedBlockStore) -> Self {
-        self.page_cleanup = Arc::new(tokio::sync::Mutex::new(
-            crate::page_cleanup::CleanupCursor::new(paged.root().to_owned()),
-        ));
-        if self.page_gc_configured {
-            self.restore_paged_access(&paged);
-        }
-        self.paged = Some(Arc::new(paged));
-        self
     }
 
     /// Bound independent page-miss runs polled concurrently by one read.
@@ -542,32 +525,6 @@ impl WorkerRuntime {
                     .set(runtime.current_tti_ms() as f64 / 1000.0);
             }
         }
-    }
-
-    pub fn effective_namespace_settings(
-        &self,
-        namespace: &talon_core::NamespaceId,
-        config: Option<&talon_core::dynamic_config::WorkerDynamicConfig>,
-    ) -> Result<talon_core::dynamic_config::NamespaceDynamicConfig, String> {
-        let startup = self
-            .registry()
-            .ok_or("namespace registry unavailable")?
-            .namespace_config(namespace)?;
-        let tuning = config
-            .map(|config| config.settings_for(namespace.effective_name()))
-            .unwrap_or_default();
-        let policy = config.map_or_else(
-            || startup.rate_limits.clone(),
-            |config| config.effective_rate_limits(&startup.rate_limits),
-        );
-        Ok(talon_core::dynamic_config::NamespaceDynamicConfig {
-            rate_limits: Some(if policy.enabled {
-                policy.limits_for(namespace)
-            } else {
-                Default::default()
-            }),
-            page_tti_hours: Some(tuning.page_tti_hours.unwrap_or(startup.page_tti_hours)),
-        })
     }
 
     fn current_tti_ms(&self) -> u64 {
@@ -964,15 +921,15 @@ impl WorkerRuntime {
             let block = self.block_for(&request.object, cursor, &request.version);
             let offset = cursor - block.offset;
             let take = (block.offset + block_size).min(end) - cursor;
-            let Some(meta) = self.index.get(&block) else {
+            let Some(meta) = self.index.summary(&block) else {
                 return Err(CacheMiss.into());
             };
-            let piece = match meta.form {
-                BlockForm::Whole => self
+            let piece = match meta.shape {
+                BlockShape::Whole => self
                     .cached_block_range(&block, offset, take)
                     .await?
                     .ok_or(CacheMiss)?,
-                BlockForm::Paged { page_size, .. } => {
+                BlockShape::Paged { page_size } => {
                     let available = available_range_len(meta.len, offset, take)?;
                     if available != take {
                         return Err(CacheMiss.into());
@@ -1996,8 +1953,8 @@ impl WorkerRuntime {
                             );
                         }
                         if matches!(
-                            runtime.index.get(&id).map(|m| m.form),
-                            Some(BlockForm::Whole)
+                            runtime.index.summary(&id).map(|m| m.shape),
+                            Some(BlockShape::Whole)
                         ) {
                             return Ok::<_, anyhow::Error>(());
                         }
@@ -2079,7 +2036,7 @@ impl WorkerRuntime {
     /// a `HEAD`.
     async fn block_len(&self, object: &ObjectId, block: &BlockId) -> anyhow::Result<u64> {
         let block_size = self.block_size as u64;
-        if let Some(meta) = self.index.get(block) {
+        if let Some(meta) = self.index.summary(block) {
             return Ok(meta.len);
         }
         let object_len = match self.cached_object_len(object, &block.version) {
@@ -2162,17 +2119,18 @@ impl WorkerRuntime {
         offset: u64,
         len: u64,
     ) -> anyhow::Result<Option<bytes::Bytes>> {
-        let Some((meta, disk_id)) = self.index.get_and_touch_at(block) else {
+        let Some(meta) = self.index.summary_and_touch(block) else {
             if self.l1.is_enabled() {
                 self.metrics.record_l1_miss();
             }
             self.metrics.record_l2_miss();
             return Ok(None);
         };
-        if !matches!(meta.form, BlockForm::Whole) {
+        if !matches!(meta.shape, BlockShape::Whole) {
             self.metrics.record_l2_miss();
             return Ok(None);
         }
+        let disk_id = meta.disk_id;
         let len = available_range_len(meta.len, offset, len)?;
         if self.l1.is_enabled() {
             match self.l1.get_range(block, offset, len) {
@@ -2239,7 +2197,7 @@ impl WorkerRuntime {
         self.small
             .as_ref()
             .is_some_and(|s| s.contains(block) || s.contains(&CacheUnit::ExactRange(block.clone())))
-            || self.index.get(block).is_some()
+            || self.index.summary(block).is_some()
     }
 
     async fn cached_small_range(
@@ -2511,7 +2469,7 @@ impl WorkerRuntime {
                         let state = runtime.page_lifecycle.block(&id);
                         let gate = state.lock().await;
                         let independent = runtime.accepts_small(&id, len);
-                        if independent && runtime.index.get(&id).is_some() {
+                        if independent && runtime.index.summary(&id).is_some() {
                             anyhow::bail!(
                                 "small admission conflicts with ordinary store residency for {id}"
                             );
@@ -3265,8 +3223,9 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let backend = Arc::new(BucketBackend::default());
         // No configured_backend: bucket validation must also protect this runtime.
-        let mut runtime = WorkerRuntime::new_with_l1(
+        let runtime = WorkerRuntime::new_with_l1(
             WholeBlockStore::open(root.path()).unwrap(),
+            paged.then(|| PagedBlockStore::open(root.path().join("paged"), 4).unwrap()),
             Arc::new(BlockIndex::new()),
             Arc::new(InFlightLoads::new()),
             backend.clone(),
@@ -3276,10 +3235,6 @@ mod tests {
             4,
             WorkerMetrics::new(1024),
         );
-        if paged {
-            runtime = runtime
-                .with_paged_store(PagedBlockStore::open(root.path().join("paged"), 4).unwrap());
-        }
         (root, backend, runtime)
     }
 
@@ -3834,6 +3789,7 @@ mod tests {
     ) -> WorkerRuntime {
         WorkerRuntime::new_with_l1(
             WholeBlockStore::open(root).unwrap(),
+            None,
             Arc::new(BlockIndex::new()),
             Arc::new(InFlightLoads::new()),
             backend,
@@ -3994,6 +3950,7 @@ mod tests {
         });
         let runtime = WorkerRuntime::new_with_l1(
             WholeBlockStore::open(&root).unwrap(),
+            None,
             Arc::new(BlockIndex::new()),
             Arc::new(InFlightLoads::new()),
             backend,
@@ -4044,6 +4001,7 @@ mod tests {
         let metrics = WorkerMetrics::new(1024);
         let runtime = WorkerRuntime::new_with_l1(
             WholeBlockStore::open(&root).unwrap(),
+            None,
             Arc::new(BlockIndex::new()),
             Arc::new(InFlightLoads::new()),
             backend,
@@ -4095,6 +4053,7 @@ mod tests {
         });
         let runtime = WorkerRuntime::new_with_l1(
             store,
+            None,
             index,
             Arc::new(InFlightLoads::new()),
             Arc::new(RampBackend {
@@ -4216,6 +4175,7 @@ mod tests {
         }
         let restarted = WorkerRuntime::new_with_l1(
             store,
+            None,
             index,
             Arc::new(InFlightLoads::new()),
             Arc::clone(&backend) as Arc<dyn BackendStore>,
@@ -4334,6 +4294,7 @@ mod tests {
         let metrics = WorkerMetrics::new(1024);
         let runtime = WorkerRuntime::new_with_l1(
             WholeBlockStore::open(&root).unwrap(),
+            None,
             Arc::new(BlockIndex::new()),
             Arc::new(InFlightLoads::new()),
             backend,
@@ -4448,37 +4409,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn whole_namespace_with_standalone_paged_store_retains_and_reclaims_a_fill() {
+    async fn standalone_paged_store_retains_and_reclaims_a_fill() {
         use std::os::unix::fs::MetadataExt;
 
         let root = tempfile::tempdir().unwrap();
-        let sidecar = tempfile::tempdir().unwrap();
-        let config = talon_core::WorkerConfig {
-            backend: Some("s3".into()),
-            l1_capacity_bytes: 0,
-            l2_page_size_bytes: 0,
-            small_object_threshold_bytes: 0,
-            ..Default::default()
-        };
+        let block_size = talon_core::WorkerConfig::default().block_size;
         let origin = Arc::new(MockBackend {
             calls: AtomicUsize::new(0),
         });
         let lock = Arc::new(crate::page_access_store::CacheRootLock::acquire(root.path()).unwrap());
-        let runtime =
-            WorkerRuntime::open_namespaces(&config, lock, origin.clone(), WorkerMetrics::new(0))
-                .unwrap()
-                .with_paged_store(PagedBlockStore::open(sidecar.path(), 4096).unwrap());
+        let service = crate::catalog::service(lock).unwrap();
+        let catalog = crate::catalog::Catalog::with_service(
+            &service,
+            root.path(),
+            crate::catalog::transaction_budget(),
+            None,
+        )
+        .unwrap();
+        let store = WholeBlockStore::open_with_catalog(
+            root.path(),
+            Arc::new(crate::fd_cache::FdCache::new(8)),
+            catalog.clone(),
+        )
+        .unwrap();
+        let runtime = WorkerRuntime::new_with_l1(
+            store,
+            Some(PagedBlockStore::open(root.path().join("paged"), 4096).unwrap()),
+            Arc::new(catalog.index(0)),
+            Arc::new(InFlightLoads::new()),
+            origin.clone(),
+            block_size,
+            0,
+            0,
+            0,
+            WorkerMetrics::new(0),
+        );
         let request = RangeRequest {
             object: ObjectId::new(Backend::S3, "bucket", "ok"),
             offset: 0,
             len: 8,
         };
-        let block = BlockId::new(
-            request.object.clone(),
-            0,
-            config.block_size,
-            Version::new("v1"),
-        );
+        let block = BlockId::new(request.object.clone(), 0, block_size, Version::new("v1"));
         let probe = CachedRangeRequest {
             object: request.object.clone(),
             version: block.version.clone(),
@@ -5102,6 +5073,7 @@ mod tests {
         });
         let runtime = WorkerRuntime::new_with_l1(
             WholeBlockStore::open(&root).unwrap(),
+            None,
             Arc::new(BlockIndex::new()),
             Arc::new(InFlightLoads::new()),
             Arc::clone(&backend) as Arc<dyn BackendStore>,
@@ -5193,6 +5165,7 @@ mod tests {
         });
         let runtime = WorkerRuntime::new_with_l1(
             WholeBlockStore::open(&root).unwrap(),
+            None,
             Arc::new(BlockIndex::new()),
             Arc::new(InFlightLoads::new()),
             Arc::clone(&backend) as Arc<dyn BackendStore>,
@@ -5309,13 +5282,21 @@ mod tests {
         }
     }
 
-    fn cond_runtime(backend: Arc<CondBackend>, root: &PathBuf, ttl: Duration) -> WorkerRuntime {
-        WorkerRuntime::new(
+    fn cond_runtime(
+        backend: Arc<CondBackend>,
+        root: &PathBuf,
+        ttl: Duration,
+        paged: bool,
+    ) -> WorkerRuntime {
+        WorkerRuntime::new_with_l1(
             WholeBlockStore::open(root).unwrap(),
+            paged.then(|| PagedBlockStore::open(root.join("paged"), 4).unwrap()),
             Arc::new(BlockIndex::new()),
             Arc::new(InFlightLoads::new()),
             backend as Arc<dyn BackendStore>,
             8,
+            0,
+            0,
             0,
             WorkerMetrics::new(1024),
         )
@@ -5334,7 +5315,7 @@ mod tests {
             fetches: AtomicUsize::new(0),
             enforce_precondition: false,
         });
-        let runtime = cond_runtime(Arc::clone(&backend), &root, Duration::from_secs(60));
+        let runtime = cond_runtime(Arc::clone(&backend), &root, Duration::from_secs(60), false);
 
         for _ in 0..3 {
             let _ = runtime.serve_range(&request("obj")).await.unwrap();
@@ -5365,7 +5346,7 @@ mod tests {
             fetches: AtomicUsize::new(0),
             enforce_precondition: true,
         });
-        let runtime = cond_runtime(Arc::clone(&backend), &root, Duration::from_secs(60));
+        let runtime = cond_runtime(Arc::clone(&backend), &root, Duration::from_secs(60), false);
 
         // block0 (offset 0): resolves v1, caches block0 under v1.
         let obj = ObjectId::new(Backend::Azure, "container", "obj");
@@ -5401,11 +5382,7 @@ mod tests {
             fetches: AtomicUsize::new(0),
             enforce_precondition: true,
         });
-        let mut runtime = cond_runtime(Arc::clone(&backend), &root, Duration::from_secs(60));
-        if paged {
-            runtime =
-                runtime.with_paged_store(PagedBlockStore::open(root.join("paged"), 4).unwrap());
-        }
+        let runtime = cond_runtime(Arc::clone(&backend), &root, Duration::from_secs(60), paged);
         let missing_offset = if paged { 4 } else { 8 };
         let object = ObjectId::new(Backend::Azure, "container", "obj");
         let request = |offset| RangeRequest {
@@ -5484,11 +5461,7 @@ mod tests {
                 fetches: AtomicUsize::new(0),
                 enforce_precondition: true,
             });
-            let mut runtime = cond_runtime(backend.clone(), &root, Duration::from_secs(60));
-            if paged {
-                runtime =
-                    runtime.with_paged_store(PagedBlockStore::open(root.join("paged"), 4).unwrap());
-            }
+            let runtime = cond_runtime(backend.clone(), &root, Duration::from_secs(60), paged);
             let request = RangeRequest {
                 object: ObjectId::new(Backend::Azure, "container", "obj"),
                 offset: 8,
@@ -5546,8 +5519,7 @@ mod tests {
             fetches: AtomicUsize::new(0),
             enforce_precondition: true,
         });
-        let runtime = cond_runtime(Arc::clone(&backend), &root, Duration::from_secs(60))
-            .with_paged_store(PagedBlockStore::open(root.join("paged"), 4).unwrap());
+        let runtime = cond_runtime(Arc::clone(&backend), &root, Duration::from_secs(60), true);
         // The replacement is shorter than this old-generation range. Its size
         // must not turn the read into a successful short read or seed old metadata.
         let request = RangeRequest {
@@ -5787,16 +5759,18 @@ mod tests {
         capacity_bytes: u64,
         metrics: WorkerMetrics,
     ) -> WorkerRuntime {
-        WorkerRuntime::new(
+        WorkerRuntime::new_with_l1(
             WholeBlockStore::open(root.join("whole")).unwrap(),
+            Some(PagedBlockStore::open(root.join("paged"), page_size).unwrap()),
             Arc::new(BlockIndex::new()),
             Arc::new(InFlightLoads::new()),
             backend,
             block_size,
             capacity_bytes.div_ceil(u64::from(page_size)) * disk_unit(),
+            0,
+            0,
             metrics,
         )
-        .with_paged_store(PagedBlockStore::open(root.join("paged"), page_size).unwrap())
         .with_version_ttl(Duration::ZERO)
     }
 
@@ -6184,16 +6158,18 @@ mod tests {
         assert_eq!(index.logical_resident_bytes(), 128);
         assert_eq!(index.resident_bytes(), 2 * disk_unit());
 
-        let runtime = WorkerRuntime::new(
+        let runtime = WorkerRuntime::new_with_l1(
             WholeBlockStore::open(root.join("whole")).unwrap(),
+            Some(paged),
             index,
             Arc::new(InFlightLoads::new()),
             Arc::clone(&backend) as Arc<dyn BackendStore>,
             1024,
             0,
+            0,
+            0,
             metrics,
         )
-        .with_paged_store(paged)
         .with_version_ttl(Duration::ZERO);
 
         // Both previously-cached pages serve without new backend traffic.
@@ -6259,6 +6235,7 @@ mod tests {
     ) -> WorkerRuntime {
         WorkerRuntime::new_with_l1(
             WholeBlockStore::open(root.join("whole")).unwrap(),
+            Some(PagedBlockStore::open(root.join("paged"), page_size).unwrap()),
             Arc::new(BlockIndex::new()),
             Arc::new(InFlightLoads::new()),
             backend,
@@ -6268,7 +6245,6 @@ mod tests {
             u64::from(page_size),
             metrics,
         )
-        .with_paged_store(PagedBlockStore::open(root.join("paged"), page_size).unwrap())
         .with_version_ttl(Duration::ZERO)
     }
 

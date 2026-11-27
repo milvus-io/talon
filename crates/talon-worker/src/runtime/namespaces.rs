@@ -219,6 +219,7 @@ impl NamespaceRuntimes {
         let runtime_started = Instant::now();
         let mut worker = WorkerRuntime::new_with_l1_policy(
             store,
+            paged,
             small,
             index,
             Arc::new(InFlightLoads::new()),
@@ -235,7 +236,6 @@ impl NamespaceRuntimes {
         .with_rate_limiter(self.limiter.clone())
         .with_paged_miss_run_concurrency(config.paged_miss_run_concurrency);
         if config.ownership_gc_enabled {
-            worker.index.enable_ownership_changes();
             if let Some(small) = &worker.small {
                 small.init_ownership();
             }
@@ -256,11 +256,6 @@ impl NamespaceRuntimes {
             config.l1_page_size_bytes,
             self.l1_budget.clone(),
         ));
-        let page_states_started = Instant::now();
-        if let Some(paged) = paged {
-            worker = worker.with_paged_store(paged);
-        }
-        let page_states_ms = page_states_started.elapsed().as_secs_f64() * 1000.0;
         let page_gc_started = Instant::now();
         let mut gc = PageGcConfig::from(&config);
         gc.scan_batch_size = gc.scan_batch_size.min(config.background_scan_batch_size);
@@ -268,7 +263,7 @@ impl NamespaceRuntimes {
             .delete_batch_size
             .min(config.background_delete_batch_size);
         worker = worker.with_page_gc(gc)?;
-        tracing::info!(root = %root.display(), page_states_ms,
+        tracing::info!(root = %root.display(),
             page_gc_ms = page_gc_started.elapsed().as_secs_f64() * 1000.0,
             "cache runtime page recovery phases");
         tracing::info!(root = %root.display(),
@@ -276,7 +271,6 @@ impl NamespaceRuntimes {
             "cache runtime restored");
         worker.membership = self.membership.clone();
         worker.membership_changed = self.membership_changed.clone();
-        worker.namespace = namespace.normalized();
         worker.cache_identity = CacheIdentity::new(namespace, scope);
         worker.namespace_parent = Arc::downgrade(self);
         worker.load_slots = self.load_slots.clone();
@@ -388,10 +382,79 @@ impl WorkerRuntime {
         &self.namespace
     }
 
+    pub(super) fn registry(&self) -> Option<Arc<NamespaceRuntimes>> {
+        self.namespace_parent.upgrade()
+    }
+}
+
+/// Process-wide namespace routing and cache runtime ownership.
+pub struct Worker {
+    default_runtime: Arc<WorkerRuntime>,
+    registry: Option<Arc<NamespaceRuntimes>>,
+}
+
+impl Worker {
+    /// Build a worker around a single runtime for tests and local tools.
+    pub fn standalone(runtime: Arc<WorkerRuntime>) -> Arc<Self> {
+        Arc::new(Self {
+            default_runtime: runtime,
+            registry: None,
+        })
+    }
+
+    pub fn default_runtime(&self) -> &Arc<WorkerRuntime> {
+        &self.default_runtime
+    }
+
+    pub fn update_membership(
+        &self,
+        view: Option<talon_core::worker_membership::WorkerDiscovery>,
+        observed: Instant,
+    ) -> anyhow::Result<()> {
+        self.default_runtime.publish_membership(view, observed, || {
+            self.namespace_runtimes()
+                .iter()
+                .map(|runtime| {
+                    (
+                        runtime.cache_identity.clone(),
+                        runtime.capture_ownership_limits(),
+                    )
+                })
+                .collect()
+        })
+    }
+
     pub(super) async fn drain_namespace_initializers(&self) {
-        if let Some(registry) = self.registry() {
+        if let Some(registry) = &self.registry {
             registry.initializers.drain().await;
         }
+    }
+
+    pub fn effective_namespace_settings(
+        &self,
+        namespace: &talon_core::NamespaceId,
+        config: Option<&talon_core::dynamic_config::WorkerDynamicConfig>,
+    ) -> Result<talon_core::dynamic_config::NamespaceDynamicConfig, String> {
+        let startup = self
+            .registry
+            .as_ref()
+            .ok_or("namespace registry unavailable")?
+            .namespace_config(namespace)?;
+        let tuning = config
+            .map(|config| config.settings_for(namespace.effective_name()))
+            .unwrap_or_default();
+        let policy = config.map_or_else(
+            || startup.rate_limits.clone(),
+            |config| config.effective_rate_limits(&startup.rate_limits),
+        );
+        Ok(talon_core::dynamic_config::NamespaceDynamicConfig {
+            rate_limits: Some(if policy.enabled {
+                policy.limits_for(namespace)
+            } else {
+                Default::default()
+            }),
+            page_tti_hours: Some(tuning.page_tti_hours.unwrap_or(startup.page_tti_hours)),
+        })
     }
 
     /// Open configured namespaces and every persisted credential scope under one locked root.
@@ -539,29 +602,20 @@ impl WorkerRuntime {
                 }
             }
         }
-        let mut worker = (**registry
-            .workers
-            .read()
-            .unwrap()
-            .get(DEFAULT_NAMESPACE)
-            .unwrap())
-        .clone();
-        worker.namespaces = Some(registry);
-        Ok(worker)
+        let default_runtime = registry.workers.read().unwrap()[DEFAULT_NAMESPACE].clone();
+        Ok(Self {
+            default_runtime,
+            registry: Some(registry),
+        })
     }
 
     /// Resolve an explicit identity, inheriting the global cache policy when absent.
     pub async fn for_namespace(
-        self: &Arc<Self>,
+        &self,
         namespace: &NamespaceId,
-    ) -> anyhow::Result<Arc<Self>> {
+    ) -> anyhow::Result<Arc<WorkerRuntime>> {
         namespace.validate()?;
-        if let Some(registry) = self
-            .namespaces
-            .as_ref()
-            .cloned()
-            .or_else(|| self.namespace_parent.upgrade())
-        {
+        if let Some(registry) = &self.registry {
             if let Some(worker) = registry
                 .workers
                 .read()
@@ -575,39 +629,27 @@ impl WorkerRuntime {
                 .await
         } else {
             anyhow::ensure!(
-                namespace.effective_name() == self.namespace.effective_name(),
+                namespace.effective_name() == self.default_runtime.namespace.effective_name(),
                 "runtime has no namespace registry"
             );
-            Ok(self.clone())
+            Ok(self.default_runtime.clone())
         }
     }
 
     /// Snapshot every namespace and credential scope for maintenance and process metrics.
-    pub fn namespace_runtimes(self: &Arc<Self>) -> Vec<Arc<Self>> {
-        match self
-            .namespaces
-            .as_ref()
-            .cloned()
-            .or_else(|| self.namespace_parent.upgrade())
-        {
+    pub fn namespace_runtimes(&self) -> Vec<Arc<WorkerRuntime>> {
+        match &self.registry {
             Some(registry) => registry.snapshot(),
-            None => vec![self.clone()],
+            None => vec![self.default_runtime.clone()],
         }
-    }
-
-    pub(super) fn registry(&self) -> Option<Arc<NamespaceRuntimes>> {
-        self.namespaces
-            .as_ref()
-            .cloned()
-            .or_else(|| self.namespace_parent.upgrade())
     }
 
     /// Resolve namespace and credential metadata consistently for every operation.
     pub async fn for_request(
-        self: &Arc<Self>,
+        &self,
         header: &talon_transport::FrameHeader,
         payload: &[u8],
-    ) -> Result<Arc<Self>, talon_transport::DataPlaneError> {
+    ) -> Result<Arc<WorkerRuntime>, talon_transport::DataPlaneError> {
         use talon_transport::{data, DataErrorCode, DataPlaneError, MsgType, HEADER_LEN};
         let (namespace, broker) = (|| -> anyhow::Result<_> {
             let (metadata, _) = talon_transport::envelope::decode(header, payload)?;
@@ -662,9 +704,10 @@ impl WorkerRuntime {
                     message: error.to_string(),
                 })?;
             let result = async {
-                self.ensure_configured_backend(backend)?;
+                self.default_runtime.ensure_configured_backend(backend)?;
                 let registry = self
-                    .registry()
+                    .registry
+                    .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("runtime has no credential scope registry"))?;
                 let resolved = registry
                     .backend
@@ -693,6 +736,15 @@ impl WorkerRuntime {
                 code: DataErrorCode::Internal,
                 message: error.to_string(),
             })
+    }
+}
+
+#[cfg(test)]
+impl std::ops::Deref for Worker {
+    type Target = WorkerRuntime;
+
+    fn deref(&self) -> &WorkerRuntime {
+        &self.default_runtime
     }
 }
 
@@ -839,7 +891,7 @@ mod tests {
         root: &Path,
         cfg: &WorkerConfig,
         enabled: bool,
-    ) -> anyhow::Result<WorkerRuntime> {
+    ) -> anyhow::Result<Worker> {
         use crate::cache_reset::{classify_open_error, open_or_reset};
         let lock = Arc::new(CacheRootLock::acquire(root)?);
         let cfg = &WorkerConfig {
@@ -854,7 +906,7 @@ mod tests {
                 cfg.l2_page_size_bytes,
             )
             .map_err(classify_open_error)?;
-            WorkerRuntime::open_namespaces(
+            Worker::open_namespaces(
                 cfg,
                 lock,
                 Arc::new(Origin::default()),
@@ -1136,7 +1188,7 @@ mod tests {
             .put_page(&block(16), PageIndex(0), Bytes::from_static(b"data"))
             .unwrap();
         let lock = Arc::new(CacheRootLock::acquire(dir.path()).unwrap());
-        let error = WorkerRuntime::open_namespaces(
+        let error = Worker::open_namespaces(
             &cfg,
             lock,
             Arc::new(Origin::default()),
@@ -1152,10 +1204,10 @@ mod tests {
             "rejected old caches are untouched"
         );
     }
-    fn open(root: &Path, config: &WorkerConfig, backend: Arc<Origin>) -> Arc<WorkerRuntime> {
+    fn open(root: &Path, config: &WorkerConfig, backend: Arc<Origin>) -> Arc<Worker> {
         let lock = Arc::new(CacheRootLock::acquire(root).unwrap());
         Arc::new(
-            WorkerRuntime::open_namespaces(
+            Worker::open_namespaces(
                 config,
                 lock,
                 backend,
@@ -1738,11 +1790,7 @@ page_tti_hours = 2
         }
     }
 
-    fn open_broker(
-        root: &Path,
-        config: &WorkerConfig,
-        http: Arc<CredentialHttp>,
-    ) -> Arc<WorkerRuntime> {
+    fn open_broker(root: &Path, config: &WorkerConfig, http: Arc<CredentialHttp>) -> Arc<Worker> {
         let resolver = talon_backend::DefaultBackendResolver::new(
             Backend::S3,
             http.clone(),
@@ -1751,7 +1799,7 @@ page_tti_hours = 2
         )
         .with_legacy_backend(Arc::new(Origin::default()));
         Arc::new(
-            WorkerRuntime::open_namespaces(
+            Worker::open_namespaces(
                 config,
                 Arc::new(CacheRootLock::acquire(root).unwrap()),
                 Arc::new(talon_backend::BackendRouter::new(
@@ -1781,7 +1829,7 @@ page_tti_hours = 2
     }
 
     async fn select_broker(
-        worker: &Arc<WorkerRuntime>,
+        worker: &Worker,
         external_id: &str,
         mut frame: Vec<u8>,
     ) -> Result<Arc<WorkerRuntime>, talon_transport::DataPlaneError> {
@@ -1806,9 +1854,28 @@ page_tti_hours = 2
             }
             let http = Arc::new(CredentialHttp::default());
             let root = open_broker(dir.path(), &cfg, http.clone());
+            let frame = data::encode_request(0, &request()).unwrap();
+            let header = talon_transport::FrameHeader::decode(&frame).unwrap();
+            let shared = root
+                .for_request(&header, &frame[talon_transport::HEADER_LEN..])
+                .await
+                .unwrap();
+            assert!(Arc::ptr_eq(root.default_runtime(), &shared));
+            assert!(Arc::ptr_eq(
+                &shared,
+                &root.for_namespace(&NamespaceId::default()).await.unwrap(),
+            ));
+            assert_eq!(shared.paged_page_size(), paged.then_some(4));
             let a = select_broker(&root, "a", data::encode_request(1, &request()).unwrap())
                 .await
                 .unwrap();
+            assert!(!Arc::ptr_eq(&shared, &a));
+            assert_eq!(a.paged_page_size(), shared.paged_page_size());
+            assert!(root
+                .namespace_runtimes()
+                .iter()
+                .any(|runtime| Arc::ptr_eq(runtime, &a)));
+            drop(shared);
             assert_eq!(
                 match a.serve(&request()).await.unwrap() {
                     ServeOutcome::Bytes(bytes) => bytes.to_vec(),
@@ -1853,6 +1920,7 @@ page_tti_hours = 2
             )
             .await
             .unwrap();
+            assert!(Arc::ptr_eq(&b, &load));
             load.load_block(&block(16), 16).await.unwrap();
             assert_eq!(b.serve_cached(&cached).await.unwrap().to_vec(), [84; 4]);
             assert_eq!(a.serve_cached(&cached).await.unwrap().to_vec(), [42; 4]);
@@ -2827,7 +2895,7 @@ page_tti_hours = 2
         drop(partial);
         drop(root);
         let lock = Arc::new(CacheRootLock::acquire(dir.path()).unwrap());
-        assert!(WorkerRuntime::open_namespaces(
+        assert!(Worker::open_namespaces(
             &config(),
             lock,
             Arc::new(Origin::default()),
@@ -3141,7 +3209,11 @@ page_tti_hours = 2
             .await
             .unwrap();
         let identities = [
-            ("default/shared".to_owned(), root.clone(), b"root"),
+            (
+                "default/shared".to_owned(),
+                root.default_runtime().clone(),
+                b"root",
+            ),
             ("a/shared".to_owned(), a, b"name"),
             (format!("a/scopes/{scope}"), scoped, b"cred"),
         ];
@@ -3210,7 +3282,7 @@ page_tti_hours = 2
         let legacy = dir.path().join(crate::catalog::DIRECTORY);
         std::fs::create_dir(&legacy).unwrap();
         std::fs::write(legacy.join("CURRENT"), b"old root-level metadata").unwrap();
-        let error = WorkerRuntime::open_namespaces(
+        let error = Worker::open_namespaces(
             &config(),
             Arc::new(CacheRootLock::acquire(dir.path()).unwrap()),
             Arc::new(Origin::default()),
@@ -3362,7 +3434,7 @@ page_tti_hours = 2
             },
         );
         let lock = Arc::new(CacheRootLock::acquire(dir.path()).unwrap());
-        assert!(WorkerRuntime::open_namespaces(
+        assert!(Worker::open_namespaces(
             &config,
             lock,
             Arc::new(Origin::default()),

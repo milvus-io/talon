@@ -212,21 +212,12 @@ impl Directory {
         }
     }
 
-    pub(super) fn enable_ownership_changes(&mut self) {
-        self.ownership_changes.enabled = true;
-    }
-
-    pub(super) fn capture_ownership_ceiling(&mut self, topology_change: bool) -> u64 {
-        let cutoff = self.compact.admission_ceiling();
-        if self.ownership_changes.enabled {
-            if topology_change {
-                self.ownership_changes.floor = None;
-                self.ownership_changes.pending.clear();
-                self.ownership_changes.overflow = 0..0;
-            }
-            self.ownership_changes.floor.get_or_insert(cutoff);
-        }
-        cutoff
+    pub(super) fn start_ownership_changes(&mut self) {
+        // The directory writer serializes this floor with admission recording.
+        // GC scans occupied slots if its cutoff predates this history.
+        self.ownership_changes
+            .floor
+            .get_or_insert_with(|| self.compact.admission_ceiling());
     }
 
     pub(super) fn ownership_changes_cover(&self, range: &Range<u64>) -> bool {
@@ -251,8 +242,8 @@ impl Directory {
         {
             changes.pending.pop_first();
         }
-        if changes.pending.is_empty() {
-            changes.pending.clear();
+        if let Some(floor) = &mut changes.floor {
+            *floor = (*floor).max(cutoff);
         }
         changes.overflow.start = changes.overflow.start.max(cutoff).min(changes.overflow.end);
     }
@@ -295,19 +286,12 @@ impl Directory {
         }
         self.rows.restore_shadows();
         self.page_size = Some(page_size);
-        let total = self
-            .rows
-            .iter()
-            .fold(Usage::default(), |mut total, (handle, _)| {
-                let usage = self.usage(handle, None);
-                total.blocks += usage.blocks;
-                total.pages += usage.pages;
-                total.bytes += usage.bytes;
-                total
-            });
-        self.blocks = total.blocks;
-        self.pages = total.pages;
-        self.bytes = total.bytes;
+        for (handle, _) in self.rows.iter() {
+            let usage = self.usage(handle, None);
+            self.blocks += u64::from(usage.kind.is_some());
+            self.pages += usage.pages;
+            self.bytes += usage.bytes;
+        }
     }
 
     pub fn page_size(&self, entry: &DirectoryEntry) -> u32 {
@@ -406,41 +390,27 @@ impl Directory {
         else {
             return Usage::default();
         };
-        let paged = geometry.kind() == Some(StoreKind::Paged);
-        let bytes = if let Some(page) = page.filter(|_| paged) {
-            u128::from(geometry.allocation(page).unwrap_or(0))
-        } else {
+        let kind = geometry.kind();
+        let paged = kind == Some(StoreKind::Paged);
+        let units = geometry.page_count() as u64;
+        let (bytes, affected_policy_units) = if let Some(page) = page.filter(|_| paged) {
             geometry
-                .pages_after(None)
-                .map(|(_, bytes)| u128::from(bytes))
-                .sum()
-        };
-        Usage {
-            blocks: 1,
-            pages: if paged {
-                geometry.page_count() as u64
-            } else {
-                0
-            },
-            bytes,
-        }
-    }
-
-    fn policy_usage(&self, handle: u32, page: Option<u32>) -> (u128, u64) {
-        let Some((_, geometry, _)) = self.resident_at(handle as usize - 1) else {
-            return (0, 0);
-        };
-        match page.filter(|_| geometry.kind() == Some(StoreKind::Paged)) {
-            Some(page) => geometry
                 .allocation(page)
-                .map_or((0, 0), |bytes| (u128::from(bytes), 1)),
-            None => (
+                .map_or((0, 0), |bytes| (u128::from(bytes), 1))
+        } else {
+            (
                 geometry
                     .pages_after(None)
                     .map(|(_, bytes)| u128::from(bytes))
                     .sum(),
-                geometry.page_count() as u64,
-            ),
+                units,
+            )
+        };
+        Usage {
+            kind,
+            pages: if paged { units } else { 0 },
+            bytes,
+            affected_policy_units,
         }
     }
 
@@ -472,8 +442,6 @@ impl Directory {
         let slot = handle as usize - 1;
         self.ensure_clock(slot);
         self.ensure_inline_age(slot);
-        let old_kind = self.resident_at(slot).and_then(|(_, row, _)| row.kind());
-        let before_policy = self.catalog_policy.then(|| self.policy_usage(handle, page));
         let putting = allocated.is_some()
             && matches!(
                 operation,
@@ -556,33 +524,30 @@ impl Directory {
                 }
             }
         }
-        if let Some(before_policy) = before_policy {
-            let new_kind = self.resident_at(slot).and_then(|(_, row, _)| row.kind());
-            if old_kind != new_kind || old_kind == Some(kind) {
-                let after_policy = self.policy_usage(handle, page);
-                let unit = page.map(|page| UnitKind::Page(PageIndex(page)));
-                if let Some(unit) = unit.filter(|_| old_kind == new_kind) {
-                    self.compact.invalidate(slot, unit);
-                } else {
-                    self.compact.invalidate_block(slot);
-                }
-                if new_kind == Some(kind) && putting {
-                    let geometry = self.resident_at(slot).unwrap().1;
-                    geometry
-                        .policy_state(unit.unwrap_or(UnitKind::Whole))
-                        .unwrap()
-                        .publish();
-                    self.record_catalog_admission(slot);
-                } else if new_kind.is_none() {
-                    self.clear_clock(slot);
-                }
-                self.compact.replace(
-                    before_policy.0,
-                    before_policy.1,
-                    after_policy.0,
-                    after_policy.1,
-                );
+        let after = self.usage(handle, page);
+        if self.catalog_policy && (before.kind != after.kind || before.kind == Some(kind)) {
+            let unit = page.map(|page| UnitKind::Page(PageIndex(page)));
+            if let Some(unit) = unit.filter(|_| before.kind == after.kind) {
+                self.compact.invalidate(slot, unit);
+            } else {
+                self.compact.invalidate_block(slot);
             }
+            if after.kind == Some(kind) && putting {
+                let geometry = self.resident_at(slot).unwrap().1;
+                geometry
+                    .policy_state(unit.unwrap_or(UnitKind::Whole))
+                    .unwrap()
+                    .publish();
+                self.record_catalog_admission(slot);
+            } else if after.kind.is_none() {
+                self.clear_clock(slot);
+            }
+            self.compact.replace(
+                before.bytes,
+                before.affected_policy_units,
+                after.bytes,
+                after.affected_policy_units,
+            );
         }
         if !putting {
             if let Some(entry) = self.runtime.get_mut(&slot).filter(|entry| {
@@ -596,8 +561,8 @@ impl Directory {
             self.runtime.remove(&slot);
             self.release(id, slot);
         }
-        let after = self.usage(handle, page);
-        self.blocks = self.blocks - before.blocks + after.blocks;
+        self.blocks =
+            self.blocks - u64::from(before.kind.is_some()) + u64::from(after.kind.is_some());
         self.pages = self.pages - before.pages + after.pages;
         self.bytes = self.bytes - before.bytes + after.bytes;
     }
@@ -611,7 +576,6 @@ const MAX_OWNERSHIP_CHANGES: usize = 4096;
 
 #[derive(Default)]
 struct OwnershipChanges {
-    enabled: bool,
     floor: Option<u64>,
     pending: BTreeMap<u64, u32>,
     overflow: Range<u64>,
@@ -675,9 +639,11 @@ impl CatalogRevisions {
 
 #[derive(Default)]
 struct Usage {
-    blocks: u64,
+    kind: Option<StoreKind>,
+    // Index pages cover the whole visible block, even for a one-page change.
     pages: u64,
     bytes: u128,
+    affected_policy_units: u64,
 }
 
 #[cfg(test)]
@@ -716,18 +682,18 @@ mod tests {
         directory.attach(16);
         directory.reset_clocks(true);
         directory.enable_catalog_policy();
-        directory.enable_ownership_changes();
         let first = id(0);
         put(&mut directory, &first, 0);
         assert!(directory.ownership_changes.pending.is_empty());
 
-        let floor = directory.capture_ownership_ceiling(true);
+        directory.start_ownership_changes();
+        let floor = directory.compact.admission_ceiling();
         for _ in 0..100 {
             put(&mut directory, &first, 1);
         }
         assert_eq!(directory.ownership_changes.pending.len(), 1);
         let retired_slot = directory.slot(&first).unwrap();
-        let cutoff = directory.capture_ownership_ceiling(false);
+        let cutoff = directory.compact.admission_ceiling();
         assert_eq!(
             directory.next_ownership_change(&(floor..cutoff)),
             Some((cutoff - 1, retired_slot))
@@ -749,11 +715,11 @@ mod tests {
         assert_eq!(directory.ownership_changes.pending.len(), 1);
         assert!(directory.next_ownership_change(&(floor..cutoff)).is_none());
 
-        let covered_end = directory.capture_ownership_ceiling(false);
+        let covered_end = directory.compact.admission_ceiling();
         for n in 2..=2 * MAX_OWNERSHIP_CHANGES {
             put(&mut directory, &id(n), 0);
         }
-        let end = directory.capture_ownership_ceiling(false);
+        let end = directory.compact.admission_ceiling();
         assert!(directory.ownership_changes_cover(&(cutoff..covered_end)));
         assert!(!directory.ownership_changes_cover(&(covered_end..end)));
         assert_eq!(
@@ -769,8 +735,9 @@ mod tests {
 
         directory.retire_ownership_changes(end);
         assert!(directory.ownership_changes.pending.is_empty());
+        assert!(!directory.ownership_changes_cover(&(floor..end)));
         put(&mut directory, &id(1), 1);
-        let next = end..directory.capture_ownership_ceiling(false);
+        let next = end..directory.compact.admission_ceiling();
         assert!(directory.ownership_changes_cover(&next));
         assert_eq!(
             directory.next_ownership_change(&next),

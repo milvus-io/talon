@@ -205,13 +205,13 @@ impl WorkerRuntime {
             }
             return false;
         }
-        let Some(meta) = self.index.get_and_touch(block) else {
+        let Some(meta) = self.index.summary_and_touch(block) else {
             return false;
         };
         if offset.checked_add(len).map_or(true, |end| end > meta.len) {
             return false;
         }
-        if matches!(meta.form, BlockForm::Whole) {
+        if matches!(meta.shape, BlockShape::Whole) {
             self.record_l2_hit();
             return true;
         }
@@ -349,28 +349,27 @@ mod tests {
             fetches: AtomicUsize::new(0),
             heads: AtomicUsize::new(0),
         });
-        let (root, runtime) = setup_backend(paged, backend.clone());
+        let (root, runtime) = setup_backend(paged.then_some(4), backend.clone());
         (root, backend, runtime)
     }
 
     fn setup_backend(
-        paged: bool,
+        page_size: Option<u32>,
         backend: Arc<dyn BackendStore>,
     ) -> (tempfile::TempDir, WorkerRuntime) {
         let root = tempfile::tempdir().unwrap();
-        let mut runtime = WorkerRuntime::new(
+        let runtime = WorkerRuntime::new_with_l1(
             WholeBlockStore::open(root.path()).unwrap(),
+            page_size.map(|size| PagedBlockStore::open(root.path().join("paged"), size).unwrap()),
             Arc::new(BlockIndex::new()),
             Arc::new(InFlightLoads::new()),
             backend,
             8,
             1024 * disk_unit(),
+            0,
+            0,
             WorkerMetrics::new(1024 * disk_unit()),
         );
-        if paged {
-            runtime = runtime
-                .with_paged_store(PagedBlockStore::open(root.path().join("paged"), 4).unwrap());
-        }
         (root, runtime)
     }
 
@@ -495,7 +494,7 @@ mod tests {
     async fn default_budget_allows_more_than_eight_block_fills() {
         for paged in [false, true] {
             let origin = Origin::new(206, 0, 0);
-            let (_root, runtime) = setup_backend(paged, origin.backend());
+            let (_root, runtime) = setup_backend(paged.then_some(4), origin.backend());
             let clone = runtime.clone();
             let task = tokio::spawn(async move { clone.batch_load(&assignments(0, 16)).await });
             origin.wait_for_calls(16).await;
@@ -509,14 +508,11 @@ mod tests {
     #[tokio::test]
     async fn one_block_pipelines_ranges_within_budget_and_handles_short_tail() {
         let origin = Origin::new(206, 0, 0);
-        let (root, mut runtime) = setup_backend(false, origin.backend());
+        let (_root, mut runtime) = setup_backend(Some(1 << 20), origin.backend());
         runtime.block_size = 16 << 20;
         runtime.capacity_bytes = 64 << 20;
         runtime.l1 = Arc::new(MemoryStore::with_limits(32 << 20, 1 << 20));
-        let runtime = runtime
-            .with_paged_store(PagedBlockStore::open(root.path().join("pages"), 1 << 20).unwrap())
-            .with_load_inflight_bytes(8 << 20)
-            .unwrap();
+        let runtime = runtime.with_load_inflight_bytes(8 << 20).unwrap();
         let mut id = block(0);
         id.block_size = runtime.block_size;
         let len = (10 << 20) + 123;
@@ -568,7 +564,7 @@ mod tests {
     #[tokio::test]
     async fn sub_window_budget_aligns_pages_and_handles_partial_page() {
         let origin = Origin::new(206, 0, 100);
-        let (_root, runtime) = setup_backend(true, origin.backend());
+        let (_root, runtime) = setup_backend(Some(4), origin.backend());
         // Five bytes fit one four-byte page, not the usual 4 MiB range.
         let runtime = runtime.with_load_inflight_bytes(5).unwrap();
         runtime.load_block(&block(0), 7).await.unwrap();
@@ -580,7 +576,7 @@ mod tests {
     #[tokio::test]
     async fn parallel_page_write_errors_drain_and_return_the_budget() {
         let origin = Origin::new(206, 0, 100);
-        let (_root, runtime) = setup_backend(true, origin.backend());
+        let (_root, runtime) = setup_backend(Some(4), origin.backend());
         let runtime = runtime.with_load_inflight_bytes(16).unwrap();
         let dir = runtime.paged.as_ref().unwrap().dir_for(&block(0));
         std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
@@ -607,7 +603,7 @@ mod tests {
     async fn cancelled_load_keeps_budget_until_blocked_disk_commit_finishes() {
         for paged in [false, true] {
             let origin = Origin::new(206, 0, 100);
-            let (_root, runtime) = setup_backend(paged, origin.backend());
+            let (_root, runtime) = setup_backend(paged.then_some(4), origin.backend());
             let runtime = runtime.with_load_inflight_bytes(8).unwrap();
             let state = runtime.page_lifecycle.block(&block(0));
             let gate = state.lock().await;
@@ -640,7 +636,7 @@ mod tests {
     async fn batches_and_single_loads_share_byte_budget() {
         for paged in [false, true] {
             let origin = Origin::new(206, 0, 0);
-            let (_root, runtime) = setup_backend(paged, origin.backend());
+            let (_root, runtime) = setup_backend(paged.then_some(4), origin.backend());
             let runtime = runtime.with_load_inflight_bytes(64).unwrap();
             let clone = runtime.clone();
             let task = tokio::spawn(async move {
@@ -702,7 +698,7 @@ mod tests {
         for paged in [false, true] {
             for status in [429, 503] {
                 let origin = Origin::new(status, 2, 100);
-                let (_root, runtime) = setup_backend(paged, origin.backend());
+                let (_root, runtime) = setup_backend(paged.then_some(4), origin.backend());
                 let requests = assignments(0, 3);
                 let batch = runtime.batch_load(&requests);
                 tokio::pin!(batch);
@@ -746,7 +742,7 @@ mod tests {
         for paged in [false, true] {
             for (status, calls) in [(429, 4), (503, 4), (403, 1), (404, 1), (412, 1)] {
                 let origin = Origin::new(status, usize::MAX, 100);
-                let (_root, runtime) = setup_backend(paged, origin.backend());
+                let (_root, runtime) = setup_backend(paged.then_some(4), origin.backend());
                 let failures = runtime.batch_load(&assignments(0, 3)).await.unwrap();
                 assert_eq!(failures.len(), 1);
                 assert_eq!(failures[0].index, 0);
@@ -782,7 +778,7 @@ mod tests {
     async fn failed_batch_continues_scheduling_beyond_its_window() {
         for paged in [false, true] {
             let origin = Origin::new(404, usize::MAX, 100);
-            let (_root, runtime) = setup_backend(paged, origin.backend());
+            let (_root, runtime) = setup_backend(paged.then_some(4), origin.backend());
             let failures = runtime.batch_load(&assignments(0, 16)).await.unwrap();
             assert_eq!(failures.len(), 1);
             assert_eq!(failures[0].index, 0);
@@ -846,7 +842,7 @@ mod tests {
             let address = listener.local_addr().unwrap();
             let server = tokio::spawn(async move {
                 let (stream, _) = listener.accept().await.unwrap();
-                crate::tokio_conn::handle_conn(stream, worker, server_obs)
+                crate::tokio_conn::handle_conn(stream, Worker::standalone(worker), server_obs)
                     .await
                     .unwrap();
             });
@@ -1067,7 +1063,7 @@ mod tests {
     async fn cached_loads_bypass_exhausted_payload_budget_without_populating_l1() {
         // Cover whole files, page files, and whole files retained by a paged worker.
         for mode in 0..3 {
-            let (root, backend, runtime) = setup(mode == 1);
+            let (_root, backend, runtime) = setup(mode != 0);
             let mut runtime = runtime.with_load_inflight_bytes(8).unwrap();
             let requests: Vec<_> = [(0, 8), (8, 8), (16, 5)]
                 .into_iter()
@@ -1076,10 +1072,20 @@ mod tests {
                     len,
                 })
                 .collect();
-            assert!(runtime.batch_load(&requests).await.unwrap().is_empty());
             if mode == 2 {
-                runtime = runtime
-                    .with_paged_store(PagedBlockStore::open(root.path().join("paged"), 4).unwrap());
+                for request in &requests {
+                    let range = RangeRequest {
+                        object: request.block.object.clone(),
+                        offset: request.block.offset,
+                        len: request.len,
+                    };
+                    runtime
+                        .warm_whole_block(&range, &request.block, request.len)
+                        .await
+                        .unwrap();
+                }
+            } else {
+                assert!(runtime.batch_load(&requests).await.unwrap().is_empty());
             }
             // LOAD trusts published metadata, even if files disappear outside
             // the cache lifecycle. This also prevents fd-based probes regressing.
@@ -1164,6 +1170,81 @@ mod tests {
             assert_eq!(runtime.inflight_loads(), 0);
             assert!(runtime.load_range_cached(&target, 0, 8, 8));
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn single_page_load_does_not_walk_the_catalog_block() {
+        use crate::catalog::{take_page_rows_visited, Operation, StoreKind};
+        use crate::index::Directory;
+        use std::sync::RwLock;
+
+        const BLOCK: u32 = 256 << 20;
+        const PAGE: u32 = 4096;
+        const RESIDENT_PAGES: u32 = 4096;
+        let root = tempfile::tempdir().unwrap();
+        let mut target = block(0);
+        target.block_size = BLOCK;
+        let mut directory = Directory::default();
+        directory.attach(PAGE);
+        // Seed a wide catalog block without writing payloads. LOAD hits only
+        // need published residency, including for a prefix of the block.
+        for page in 0..RESIDENT_PAGES {
+            directory.apply(
+                &target,
+                StoreKind::Paged,
+                &Operation::Put {
+                    page,
+                    len: u64::from(BLOCK),
+                },
+                None,
+                Some(u64::from(PAGE)),
+            );
+        }
+        let index = Arc::new(BlockIndex::from_catalog(Arc::new(RwLock::new(directory))));
+        let backend = Arc::new(Backend {
+            changed: AtomicBool::new(false),
+            fetches: AtomicUsize::new(0),
+            heads: AtomicUsize::new(0),
+        });
+        let runtime = WorkerRuntime::new_with_l1(
+            WholeBlockStore::open(root.path()).unwrap(),
+            Some(PagedBlockStore::open(root.path().join("paged"), PAGE).unwrap()),
+            index.clone(),
+            Arc::new(InFlightLoads::new()),
+            backend.clone(),
+            BLOCK,
+            u64::from(BLOCK),
+            0,
+            0,
+            WorkerMetrics::new(u64::from(BLOCK)),
+        )
+        .with_load_inflight_bytes(u64::from(PAGE))
+        .unwrap();
+        runtime.page_lifecycle.enable_access_tracking();
+        let lifecycle = runtime.page_lifecycle.block(&target);
+        assert_eq!(lifecycle.last_access(0), None);
+        let _budget = runtime.load_bytes.acquire_many(PAGE).await.unwrap();
+
+        take_page_rows_visited();
+        let BlockForm::Paged { present, .. } = index.get(&target).unwrap().form else {
+            panic!("expected paged block metadata");
+        };
+        assert_eq!(present.count(), RESIDENT_PAGES);
+        assert_eq!(take_page_rows_visited(), RESIDENT_PAGES as usize);
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            runtime.load_block(&target, u64::from(PAGE)),
+        )
+        .await
+        .expect("a resident page needs no payload reservation")
+        .unwrap();
+        assert_eq!(take_page_rows_visited(), 0, "LOAD enumerated page rows");
+        assert_eq!(backend.fetches.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.heads.load(Ordering::SeqCst), 0);
+        assert!(lifecycle.last_access(0).is_some());
+        assert!(lifecycle.candidate(PageIndex(0)).is_some());
+        assert_eq!(lifecycle.last_access(1), None);
     }
 
     #[tokio::test]

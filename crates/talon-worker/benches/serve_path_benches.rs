@@ -115,6 +115,7 @@ async fn warm_runtime(root: &PathBuf) -> Arc<WorkerRuntime> {
 async fn warm_l1_runtime(root: &PathBuf) -> Arc<WorkerRuntime> {
     let runtime = Arc::new(WorkerRuntime::new_with_l1(
         WholeBlockStore::open(root).unwrap(),
+        None,
         Arc::new(BlockIndex::new()),
         Arc::new(InFlightLoads::new()),
         Arc::new(RampBackend) as Arc<dyn BackendStore>,
@@ -363,6 +364,7 @@ const PAGED_BLOCK_BYTES: u32 = 16 << 20;
 async fn warm_paged_runtime(root: &std::path::Path, span: u64, l1: bool) -> Arc<WorkerRuntime> {
     let base = WorkerRuntime::new_with_l1(
         WholeBlockStore::open(root.join("whole")).unwrap(),
+        Some(PagedBlockStore::open(root.join("paged"), PAGE_BYTES).unwrap()),
         Arc::new(BlockIndex::new()),
         Arc::new(InFlightLoads::new()),
         Arc::new(RampBackend) as Arc<dyn BackendStore>,
@@ -371,8 +373,7 @@ async fn warm_paged_runtime(root: &std::path::Path, span: u64, l1: bool) -> Arc<
         if l1 { 256 << 20 } else { 0 },
         if l1 { u64::from(PAGE_BYTES) } else { 0 },
         WorkerMetrics::new(1 << 30),
-    )
-    .with_paged_store(PagedBlockStore::open(root.join("paged"), PAGE_BYTES).unwrap());
+    );
     let runtime = Arc::new(base);
     // Warm every page the benchmark range will touch.
     let warm = RangeRequest {

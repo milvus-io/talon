@@ -31,7 +31,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::data_error::encode_runtime_error;
-use crate::{send_file_range, ServeOutcome, WorkerObservability, WorkerRuntime, DEFAULT_CHUNK};
+use crate::{
+    send_file_range, ServeOutcome, Worker, WorkerObservability, WorkerRuntime, DEFAULT_CHUNK,
+};
 
 // Source version and its caller-supplied total length.
 type PinnedVersion = (Version, u64);
@@ -113,7 +115,7 @@ fn decode_cached_range_with_namespace(
 /// Serve data-plane range and cache-only probe requests until EOF.
 pub async fn handle_conn(
     mut stream: TcpStream,
-    worker: Arc<WorkerRuntime>,
+    worker: Arc<Worker>,
     observability: Arc<WorkerObservability>,
 ) -> anyhow::Result<()> {
     let stopped = observability.shutdown().stopped();
@@ -178,7 +180,7 @@ async fn handle_request(
     mut stream: TcpStream,
     header: &FrameHeader,
     payload: &[u8],
-    worker: &Arc<WorkerRuntime>,
+    worker: &Worker,
     observability: &Arc<WorkerObservability>,
     request_started: Instant,
 ) -> anyhow::Result<Option<TcpStream>> {

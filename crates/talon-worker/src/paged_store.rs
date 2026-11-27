@@ -373,7 +373,10 @@ impl PagedBlockStore {
         .await
     }
     /// Retain the root lease through detached blocking disk mutations.
-    pub fn with_root_lock(mut self, lock: Arc<crate::page_access_store::CacheRootLock>) -> Self {
+    pub(crate) fn with_root_lock(
+        mut self,
+        lock: Arc<crate::page_access_store::CacheRootLock>,
+    ) -> Self {
         self.root_lock = Some(lock);
         self
     }

@@ -12,6 +12,8 @@ mod tests;
 use crate::{index::StoredBlock, page_access_store::CacheRootLock};
 pub(crate) use model::Operation;
 use model::{valid_store, LiveModel, Record, State};
+#[cfg(test)]
+pub(crate) use rows::take_page_rows_visited;
 pub(crate) use rows::{BlockRow, BlockRows, Geometry, StoreKind};
 use std::{
     num::NonZeroU64,

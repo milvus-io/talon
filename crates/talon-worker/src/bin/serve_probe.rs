@@ -165,6 +165,7 @@ async fn warm_runtime(root: &std::path::Path, span_end: u64, l1_mib: u64) -> Arc
     let l1_bytes = l1_mib * (1 << 20);
     let base = WorkerRuntime::new_with_l1(
         WholeBlockStore::open(root.join("whole")).unwrap(),
+        Some(PagedBlockStore::open(root.join("paged"), PAGE_BYTES).unwrap()),
         Arc::new(BlockIndex::new()),
         Arc::new(InFlightLoads::new()),
         Arc::new(RampBackend) as Arc<dyn BackendStore>,
@@ -177,8 +178,7 @@ async fn warm_runtime(root: &std::path::Path, span_end: u64, l1_mib: u64) -> Arc
             0
         },
         WorkerMetrics::new(1 << 30),
-    )
-    .with_paged_store(PagedBlockStore::open(root.join("paged"), PAGE_BYTES).unwrap());
+    );
     let runtime = Arc::new(base);
     // Warm every page the load will touch, so measurements see cache hits only.
     let page = u64::from(PAGE_BYTES);

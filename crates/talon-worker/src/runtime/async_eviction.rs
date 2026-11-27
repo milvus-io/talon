@@ -211,6 +211,7 @@ impl WorkerRuntime {
 mod tests {
     use super::*;
     use crate::runtime::disk_unit;
+    use crate::Worker;
     use crate::{
         BlockIndex, CacheUnit, InFlightLoads, PagedBlockStore, WholeBlockStore, WorkerMetrics,
     };
@@ -236,20 +237,18 @@ mod tests {
         for entry in store.scan_allocated().unwrap() {
             index.commit_stored(entry);
         }
-        let r = WorkerRuntime::new(
+        WorkerRuntime::new_with_l1(
             store,
+            paged.then(|| PagedBlockStore::open(root.join("paged"), 16).unwrap()),
             index,
             Arc::new(InFlightLoads::new()),
             Arc::new(UnusedOrigin),
             16,
             capacity,
+            0,
+            0,
             WorkerMetrics::new(capacity),
-        );
-        if paged {
-            r.with_paged_store(PagedBlockStore::open(root.join("paged"), 16).unwrap())
-        } else {
-            r
-        }
+        )
     }
 
     fn block(n: u64) -> BlockId {
@@ -285,7 +284,7 @@ mod tests {
         root: &Path,
         paged: bool,
         low_watermark: f64,
-    ) -> (Arc<WorkerRuntime>, WorkerConfig, Vec<Arc<WorkerRuntime>>) {
+    ) -> (Arc<Worker>, WorkerConfig, Vec<Arc<WorkerRuntime>>) {
         let config = WorkerConfig {
             small_object_threshold_bytes: 0,
             block_size: 16,
@@ -298,7 +297,7 @@ mod tests {
         };
         let lock = Arc::new(crate::page_access_store::CacheRootLock::acquire(root).unwrap());
         let worker = Arc::new(
-            WorkerRuntime::open_namespaces(
+            Worker::open_namespaces(
                 &config,
                 lock,
                 Arc::new(UnusedOrigin),
@@ -643,7 +642,8 @@ mod tests {
             stale_gc_enabled: false,
             ..Default::default()
         };
-        let service = crate::runtime::WorkerBackground::start(r.clone(), &config);
+        let service =
+            crate::runtime::WorkerBackground::start(Worker::standalone(r.clone()), &config);
         tokio::time::timeout(Duration::from_secs(3), async {
             while r.resident_bytes() > 2 * disk_unit() {
                 tokio::task::yield_now().await;
@@ -667,7 +667,8 @@ mod tests {
             ownership_gc_enabled: false,
             ..Default::default()
         };
-        let service = crate::runtime::WorkerBackground::start(r.clone(), &config);
+        let service =
+            crate::runtime::WorkerBackground::start(Worker::standalone(r.clone()), &config);
         tokio::time::timeout(Duration::from_secs(2), async {
             while r.resident_bytes() > 8 * disk_unit() {
                 tokio::task::yield_now().await;
@@ -706,7 +707,7 @@ mod tests {
         tokio::task::yield_now().await;
         assert_eq!(r.resident_bytes(), 9 * disk_unit());
         let disabled = crate::runtime::WorkerBackground::start(
-            r.clone(),
+            Worker::standalone(r.clone()),
             &WorkerConfig {
                 async_eviction_enabled: false,
                 ownership_gc_enabled: false,
@@ -737,7 +738,8 @@ mod tests {
                 ownership_gc_enabled: false,
                 ..Default::default()
             };
-            let service = crate::runtime::WorkerBackground::start(r.clone(), &config);
+            let service =
+                crate::runtime::WorkerBackground::start(Worker::standalone(r.clone()), &config);
             tokio::time::timeout(Duration::from_secs(2), async {
                 while r.page_mutations.active_count() == 0 {
                     tokio::task::yield_now().await;

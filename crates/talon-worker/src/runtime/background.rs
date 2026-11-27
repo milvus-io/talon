@@ -1,6 +1,6 @@
 //! Worker maintenance registrations; scheduling policy lives in `background`.
 use super::{
-    async_eviction::EvictionCycle, namespaces::CacheIdentity, ownership_gc::OwnershipGc,
+    async_eviction::EvictionCycle, namespaces::CacheIdentity, ownership_gc::OwnershipGc, Worker,
     WorkerRuntime,
 };
 use crate::background::{BackgroundBudget, BackgroundHandle, BackgroundScheduler};
@@ -14,31 +14,15 @@ use talon_core::WorkerConfig;
 /// Unified worker GC, checkpoint, disk cleanup, and capacity eviction lifecycle.
 pub struct WorkerBackground {
     scheduler: BackgroundHandle,
-    worker: Arc<WorkerRuntime>,
+    worker: Arc<Worker>,
 }
 impl WorkerBackground {
     /// Start maintenance using validated configuration.
     /// Ownership cleanup requires the resolved persistent identity in `config.node_id`.
-    pub fn start(worker: Arc<WorkerRuntime>, config: &WorkerConfig) -> Self {
-        let mut background = (*worker).clone();
-        let budget = background
-            .background_budget
-            .get_or_insert_with(|| BackgroundBudget::new(config))
-            .clone();
-        if let Some(small) = &background.small {
-            small.set_background_budget(budget);
-        }
-        background.page_gc_config.scan_batch_size = background
-            .page_gc_config
-            .scan_batch_size
-            .min(config.background_scan_batch_size);
-        background.page_gc_config.delete_batch_size = background
-            .page_gc_config
-            .delete_batch_size
-            .min(config.background_delete_batch_size);
-        let worker = Arc::new(background);
+    pub fn start(worker: Arc<Worker>, config: &WorkerConfig) -> Self {
+        let runtime = worker.default_runtime();
         let mut scheduler = BackgroundScheduler::new(config.background_task_concurrency)
-            .with_metrics(worker.metrics.registry.clone());
+            .with_metrics(runtime.metrics.registry.clone());
         let w = worker.clone();
         scheduler.register("small_object_gc", Duration::from_secs(1), move || {
             let w = w.clone();
@@ -51,7 +35,7 @@ impl WorkerBackground {
                 }
             }
         });
-        let gc = &worker.page_gc_config;
+        let gc = &runtime.page_gc_config;
         let global_gc = crate::page_gc::PageGcConfig::from(config);
         let period = Duration::from_millis(
             worker
@@ -196,13 +180,13 @@ impl WorkerBackground {
             let w = worker.clone();
             scheduler.register_triggered(
                 "ownership_gc",
-                worker.membership_changed.subscribe(),
+                runtime.membership_changed.subscribe(),
                 move || {
                     let w = w.clone();
                     let states = states.clone();
                     let config = config.clone();
                     async move {
-                        let view = w.membership_snapshot()?;
+                        let view = w.default_runtime().membership_snapshot()?;
                         let membership = (view.generation, view.validity_epoch);
                         let mut states = states.lock().await;
                         let mut next = None;
@@ -233,9 +217,9 @@ impl WorkerBackground {
                 },
             );
         }
-        if config.async_eviction_enabled && worker.capacity_bytes > 0 {
+        if config.async_eviction_enabled && runtime.capacity_bytes > 0 {
             let cycle = Arc::new(tokio::sync::Mutex::new(EvictionCycle::new(
-                worker.capacity_bytes,
+                runtime.capacity_bytes,
                 config,
             )));
             let w = worker.clone();
@@ -245,7 +229,7 @@ impl WorkerBackground {
                 let cycle = cycle.clone();
                 async move {
                     let mut cycle = cycle.lock().await;
-                    cycle.tick(&w).await;
+                    cycle.tick(w.default_runtime()).await;
                     cycle.next_delay(period)
                 }
             });
@@ -258,7 +242,7 @@ impl WorkerBackground {
     /// Stop scheduling maintenance as soon as the worker starts draining requests.
     pub fn begin_shutdown(&self) {
         self.scheduler.begin_shutdown();
-        self.worker.stop_background_heads();
+        self.worker.default_runtime().stop_background_heads();
     }
 
     /// Stop admission, finish active maintenance and owned mutations, then flush access metadata

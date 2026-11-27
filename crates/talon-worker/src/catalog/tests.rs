@@ -749,16 +749,19 @@ async fn replay_restores_exact_residency_and_allocation_without_listing_data() {
     let root = tempfile::tempdir().unwrap();
     let catalog = open(root.path());
     let paged = store(&catalog);
-    let index = catalog.index(4);
+    let index = Arc::new(catalog.index(4));
+    let policy = index.restore_lru();
     let id = block(0);
     let (first, sibling) = tokio::join!(
-        paged.commit_page(&id, PageIndex(0), 16, Bytes::from_static(b"aaaa")),
-        paged.commit_page(&id, PageIndex(2), 16, Bytes::from_static(b"bbbb")),
+        paged.commit_page_payload(&id, PageIndex(0), 16, Bytes::from_static(b"aaaa").into()),
+        paged.commit_page_payload(&id, PageIndex(2), 16, Bytes::from_static(b"bbbb").into()),
     );
-    first.unwrap();
-    sibling.unwrap();
+    let (first, _) = first.unwrap();
+    let (sibling, _) = sibling.unwrap();
     assert_eq!(index.len(), 1);
     assert_eq!(index.page_count(), 2);
+    assert_eq!(index.resident_bytes(), first + sibling);
+    assert_eq!((policy.total_bytes(), policy.len()), (first + sibling, 2));
     assert_eq!(
         index.presence(&id, PageIndex(0), PageIndex(1)),
         crate::Presence::PageHit
@@ -767,15 +770,29 @@ async fn replay_restores_exact_residency_and_allocation_without_listing_data() {
         index.presence(&id, PageIndex(0), PageIndex(3)),
         crate::Presence::PageMiss
     );
-    paged
-        .commit_page(&block(1), PageIndex(1), 12, Bytes::from_static(b"cccc"))
+    let (other, _) = paged
+        .commit_page_payload(
+            &block(1),
+            PageIndex(1),
+            12,
+            Bytes::from_static(b"cccc").into(),
+        )
         .await
         .unwrap();
     paged
         .evict_page_async(&block(0), PageIndex(0))
         .await
         .unwrap();
-    paged.delete_block_async(&block(1)).await.unwrap();
+    assert_eq!(index.len(), 2);
+    assert_eq!(index.page_count(), 2);
+    assert_eq!(index.resident_bytes(), sibling + other);
+    assert_eq!((policy.total_bytes(), policy.len()), (sibling + other, 2));
+    paged
+        .evict_page_async(&block(1), PageIndex(1))
+        .await
+        .unwrap();
+    assert_eq!(index.len(), 1);
+    assert_eq!((policy.total_bytes(), policy.len()), (sibling, 1));
     let dir = paged.catalog_dir_for(&block(0)).unwrap();
     assert!(dir.join("2.page").exists());
     assert!(!dir.join("block.meta").exists());
@@ -783,12 +800,14 @@ async fn replay_restores_exact_residency_and_allocation_without_listing_data() {
     assert_eq!(before.len(), 1);
     assert_eq!(before[0].allocated.len(), 1);
     let expected = before[0].allocated.clone();
+    assert_eq!(expected[0].1, sibling);
     assert_eq!(index.resident_bytes(), expected[0].1);
     assert_eq!(
         index.snapshot_units(),
         [(id.clone(), expected[0].0, expected[0].1)]
     );
     assert_eq!(index.page_count(), 1);
+    drop(policy);
     drop(index);
     drop(paged);
     drop(catalog);
@@ -820,15 +839,29 @@ async fn shared_slots_keep_store_addresses_and_reused_generations_distinct() {
     )
     .unwrap();
     let paged = store(&catalog);
-    let index = catalog.index(4);
-    let id = block(0);
-    whole.put(&id, Bytes::from_static(b"abcd")).await.unwrap();
+    let index = Arc::new(catalog.index(4));
+    let policy = index.restore_lru();
+    let mut id = block(0);
+    id.block_size = 16 << 10;
+    let whole_data = Bytes::from(vec![b'a'; 8192]);
+    whole.put(&id, whole_data.clone()).await.unwrap();
+    let whole_bytes = catalog.recover("whole").unwrap().unwrap()[0].allocated[0].1;
+    assert_eq!(
+        (index.len(), index.page_count(), index.resident_bytes()),
+        (1, 0, whole_bytes)
+    );
+    assert_eq!((policy.total_bytes(), policy.len()), (whole_bytes, 1));
     let whole_disk = catalog.disk_id("whole", &id).unwrap().unwrap();
     let key = index.shared_identity(&id).unwrap();
     assert_eq!(index.whole_and_touch(&id), Some(Some(whole_disk)));
 
-    paged
-        .commit_page(&id, PageIndex(1), 16, Bytes::from_static(b"efgh"))
+    let (page_bytes, _) = paged
+        .commit_page_payload(
+            &id,
+            PageIndex(1),
+            whole_data.len() as u64,
+            Bytes::from_static(b"efgh").into(),
+        )
         .await
         .unwrap();
     let page_disk = catalog.disk_id("paged", &id).unwrap().unwrap();
@@ -836,23 +869,42 @@ async fn shared_slots_keep_store_addresses_and_reused_generations_distinct() {
     assert!(key.ptr_eq(&index.shared_identity(&id).unwrap()));
     assert_eq!(index.len(), 1);
     assert_eq!(index.page_count(), 1);
-    assert_eq!(
-        whole.get_bytes(&id).await.unwrap(),
-        Bytes::from_static(b"abcd")
-    );
+    assert_eq!(index.resident_bytes(), page_bytes);
+    assert_eq!((policy.total_bytes(), policy.len()), (page_bytes, 1));
+    assert_eq!(whole.get_bytes(&id).await.unwrap(), whole_data);
     assert_eq!(
         paged.get_page_bytes(&id, PageIndex(1), 4).await.unwrap(),
         Bytes::from_static(b"efgh")
     );
 
     catalog.checkpoint().await.unwrap();
-    drop((paged, whole, index, catalog));
+    drop((paged, whole, index, catalog, policy));
 
     let catalog = open(root.path());
-    let index = catalog.index(4);
+    let index = Arc::new(catalog.index(4));
+    let policy = index.restore_lru();
     assert_eq!(catalog.disk_id("whole", &id).unwrap(), Some(whole_disk));
     assert_eq!(catalog.disk_id("paged", &id).unwrap(), Some(page_disk));
     assert_eq!(index.page_count(), 1);
+    let paged = store(&catalog);
+    paged.delete_block_async(&id).await.unwrap();
+    assert!(index.is_empty());
+    assert_eq!(index.resident_bytes(), 0);
+    assert_eq!(index.page_count(), 0);
+    assert_eq!((policy.total_bytes(), policy.len()), (0, 0));
+    drop((paged, index, catalog, policy));
+
+    // The delete is in the tail log, so attachment must expose the Whole
+    // shadow from the checkpoint and charge it once.
+    let catalog = open(root.path());
+    let index = Arc::new(catalog.index(4));
+    let policy = index.restore_lru();
+    assert_eq!(index.whole_and_touch(&id), Some(Some(whole_disk)));
+    assert_eq!(
+        (index.len(), index.page_count(), index.resident_bytes()),
+        (1, 0, whole_bytes)
+    );
+    assert_eq!((policy.total_bytes(), policy.len()), (whole_bytes, 1));
     let recovered_handle = catalog
         .live
         .directory
@@ -861,16 +913,13 @@ async fn shared_slots_keep_store_addresses_and_reused_generations_distinct() {
         .rows
         .handle(&id)
         .unwrap();
-    let paged = store(&catalog);
-    paged.delete_block_async(&id).await.unwrap();
-    assert!(index.is_empty());
-    assert_eq!(index.resident_bytes(), 0);
     let whole = WholeBlockStore::open_with_catalog(
         root.path(),
         Arc::new(crate::fd_cache::FdCache::new(8)),
         catalog.clone(),
     )
     .unwrap();
+    assert_eq!(whole.get_bytes(&id).await.unwrap(), whole_data);
     whole.delete(&id).await.unwrap();
     assert!(index.shared_identity(&id).is_none());
     whole.put(&id, Bytes::from_static(b"ijkl")).await.unwrap();
@@ -891,8 +940,6 @@ async fn shared_slots_keep_store_addresses_and_reused_generations_distinct() {
         .put(&other_version, Bytes::from_static(b"mnop"))
         .await
         .unwrap();
-    let index = Arc::new(index);
-    let policy = index.restore_lru();
     assert_eq!(policy.len(), 2);
     assert_eq!(index.policy_version_blocks(&id).len(), 2);
     assert_eq!(index.get(&other_version).unwrap().id, other_version);
