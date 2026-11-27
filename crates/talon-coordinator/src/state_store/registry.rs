@@ -54,40 +54,16 @@ pub async fn change(
         let mut value = snapshot.value;
         match &change {
             MemberChange::Register { worker_id, zone } => {
-                match value.members.iter().find(|m| &m.worker_id == worker_id) {
-                    Some(member) if member.retired => {
-                        return Err(invalid(
-                            store.backend(),
-                            "member retired; explicit administrative re-enable required",
-                        ))
-                    }
-                    Some(member) if &member.zone != zone => {
-                        return Err(invalid(
-                            store.backend(),
-                            "member zone differs; explicit administrative change required",
-                        ))
-                    }
-                    Some(_) => return Ok(value),
-                    None => value.members.push(WorkerMember {
-                        worker_id: worker_id.clone(),
-                        zone: zone.clone(),
-                        retired: false,
-                    }),
+                let inserted = value
+                    .register(worker_id, zone.as_deref())
+                    .map_err(|detail| invalid(store.backend(), detail))?;
+                if !inserted {
+                    return Ok(value);
                 }
             }
-            MemberChange::SetMember(member) => {
-                if let Some(existing) = value
-                    .members
-                    .iter_mut()
-                    .find(|m| m.worker_id == member.worker_id)
-                {
-                    *existing = member.clone();
-                } else {
-                    value.members.push(member.clone());
-                }
-            }
+            MemberChange::SetMember(member) => value.set_member(member.clone()),
         }
-        value.members.sort_by(|a, b| a.worker_id.cmp(&b.worker_id));
+        value.sort_members();
         encode(&value, store.backend())?;
         if store
             .compare_member_registry(cluster, snapshot.revision.as_ref(), &value)
@@ -179,6 +155,22 @@ mod tests {
             .compare_member_registry("c", None, &MemberRegistry::default())
             .await
             .unwrap());
+        let registered = store.member_registry("c").await.unwrap();
+        let unchanged = change(
+            &store,
+            "c",
+            MemberChange::Register {
+                worker_id: "w".into(),
+                zone: Some("z".into()),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(unchanged, registered.value);
+        assert_eq!(
+            store.member_registry("c").await.unwrap().revision,
+            registered.revision
+        );
         change(
             &store,
             "c",

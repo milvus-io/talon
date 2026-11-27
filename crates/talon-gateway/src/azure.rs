@@ -18,6 +18,7 @@ use talon_backend::{
 use talon_cache_client::{BlockReader, CacheReadError, FileView, DEFAULT_TRANSFER_CHUNK_BYTES};
 use talon_core::{Backend, ObjectId, Version};
 
+use crate::read_conditions::{byte_range, origin_conditions, RangeError};
 use crate::{
     AuthenticatedPrincipal, EffectiveDecision, FailureReason, GatewayAccess, GatewayAdapter,
     GatewayOperation, GatewayOutcome, GatewayRequestContext, GatewayResponse, GatewayRoute,
@@ -1114,56 +1115,27 @@ fn requested_range(
     headers: &HeaderMap,
     object_size: u64,
 ) -> Result<Option<(u64, u64)>, AzureRequestError> {
-    let value = headers
+    headers
         .get("x-ms-range")
-        .or_else(|| headers.get(header::RANGE));
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    let value = value.to_str().map_err(|_| {
-        AzureRequestError::invalid("InvalidHeaderValue", "range header is not ASCII")
-    })?;
-    if value.contains(',') {
-        return Err(AzureRequestError::invalid(
-            "MultipleConditionHeadersNotSupported",
-            "multiple byte ranges are not supported",
-        ));
-    }
-    let range = value.strip_prefix("bytes=").ok_or_else(|| {
-        AzureRequestError::invalid("InvalidHeaderValue", "range unit must be bytes")
-    })?;
-    let (start, end) = range
-        .split_once('-')
-        .ok_or_else(|| AzureRequestError::invalid("InvalidHeaderValue", "malformed byte range"))?;
-    if object_size == 0 {
-        return Err(AzureRequestError::invalid_range(object_size));
-    }
-    if start.is_empty() {
-        let suffix = end
-            .parse::<u64>()
-            .ok()
-            .filter(|value| *value > 0)
-            .ok_or_else(|| AzureRequestError::invalid_range(object_size))?;
-        let start = object_size.saturating_sub(suffix);
-        return Ok(Some((start, object_size - 1)));
-    }
-    let start = start
-        .parse::<u64>()
-        .map_err(|_| AzureRequestError::invalid_range(object_size))?;
-    if start >= object_size {
-        return Err(AzureRequestError::invalid_range(object_size));
-    }
-    let end = if end.is_empty() {
-        object_size - 1
-    } else {
-        end.parse::<u64>()
-            .map_err(|_| AzureRequestError::invalid_range(object_size))?
-            .min(object_size - 1)
-    };
-    if end < start {
-        return Err(AzureRequestError::invalid_range(object_size));
-    }
-    Ok(Some((start, end)))
+        .or_else(|| headers.get(header::RANGE))
+        .map(|value| byte_range(value, object_size))
+        .transpose()
+        .map_err(|error| match error {
+            RangeError::NonAscii => {
+                AzureRequestError::invalid("InvalidHeaderValue", "range header is not ASCII")
+            }
+            RangeError::Multiple => AzureRequestError::invalid(
+                "MultipleConditionHeadersNotSupported",
+                "multiple byte ranges are not supported",
+            ),
+            RangeError::Unit => {
+                AzureRequestError::invalid("InvalidHeaderValue", "range unit must be bytes")
+            }
+            RangeError::Malformed => {
+                AzureRequestError::invalid("InvalidHeaderValue", "malformed byte range")
+            }
+            RangeError::Unsatisfiable => AzureRequestError::invalid_range(object_size),
+        })
 }
 
 fn if_range_matches(
@@ -1205,16 +1177,6 @@ fn required_u64_header(response: &HttpResponse, name: &str) -> Result<u64, Azure
     required_header(response, name)?
         .parse::<u64>()
         .map_err(|_| AzureRequestError::internal(format!("origin returned invalid {name}")))
-}
-
-fn origin_conditions(conditions: &[(String, String)], etag: &str) -> Vec<(String, String)> {
-    let mut output = conditions
-        .iter()
-        .filter(|(name, _)| !name.eq_ignore_ascii_case("if-match"))
-        .cloned()
-        .collect::<Vec<_>>();
-    output.push(("if-match".into(), format!("\"{etag}\"")));
-    output
 }
 
 struct ReadAccounting {
@@ -2112,6 +2074,15 @@ mod tests {
         );
         headers.insert(header::RANGE, HeaderValue::from_static("bytes=0-1,3-4"));
         assert!(requested_range(&headers, 10).is_err());
+
+        headers.insert("x-ms-range", HeaderValue::from_static("bytes=-20"));
+        assert_eq!(requested_range(&headers, 10).unwrap(), Some((0, 9)));
+        headers.insert(header::RANGE, HeaderValue::from_static("bytes=0-1"));
+        headers.insert("x-ms-range", HeaderValue::from_static("items=0-1"));
+        let error = requested_range(&headers, 10).unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(error.code, "InvalidHeaderValue");
+        assert_eq!(error.message, "range unit must be bytes");
     }
 
     #[tokio::test]

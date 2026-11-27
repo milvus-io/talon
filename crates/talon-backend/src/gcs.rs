@@ -18,6 +18,7 @@ use talon_core::{
     BackendStore, Error, ListPage, ListedObject, ObjectId, ObjectStat, Result, Version,
 };
 
+pub use crate::credentials::GcsHmacCredentials;
 use crate::http::{HttpClient, HttpRequest, Method};
 
 /// Percent-encode a query value. `/` is escaped: a listing prefix contains
@@ -69,17 +70,6 @@ impl GcsConfig {
 pub(crate) struct GcpBearerToken {
     // Share the token with outgoing requests without copying its contents.
     pub(crate) token: Arc<String>,
-}
-
-/// GCS HMAC access ID and secret for XML API requests.
-///
-/// Deliberately omits `Debug` so formatting credentials cannot expose the secret.
-#[derive(Clone)]
-pub struct GcsHmacCredentials {
-    /// Access ID of a Google Cloud Storage HMAC key.
-    pub access_key_id: String,
-    /// Secret associated with the HMAC key.
-    pub secret_access_key: String,
 }
 
 /// Credentials used to authenticate GCS requests.

@@ -699,14 +699,14 @@ impl CoordinatorObservability {
         tokio::time::timeout(self.request_timeout, async {
             let current = self.store.member_registry(&self.cluster_id).await?;
             if current.revision.as_ref().map(|r| r.as_str()) != expected_revision { return Ok(false); }
-            if current.value.members.iter().any(|old| !value.members.iter().any(|new| old.worker_id == new.worker_id)) {
-                return Err(crate::state_store::registry::invalid(self.store.backend(), "retain all member records; retire instead of deleting"));
-            }
+            value
+                .validate_retained_members(&current.value)
+                .map_err(|detail| crate::state_store::registry::invalid(self.store.backend(), detail))?;
             let instances = self.store.instance_snapshot(&self.cluster_id).await?;
-            if value.members.iter().any(|m| m.retired && instances.nodes.iter().any(|n| n.node.id.0 == m.worker_id && n.ready)) {
-                return Err(crate::state_store::registry::invalid(self.store.backend(), "stop worker and wait for instance withdrawal/expiration before retirement"));
-            }
-            value.members.sort_by(|a,b| a.worker_id.cmp(&b.worker_id));
+            value
+                .validate_retirements(&instances.nodes)
+                .map_err(|detail| crate::state_store::registry::invalid(self.store.backend(), detail))?;
+            value.sort_members();
             let applied = self.store.compare_member_registry(&self.cluster_id, current.revision.as_ref(), &value).await?;
             if applied { tracing::info!(cluster = %self.cluster_id, ?value, "administrative membership update"); }
             Ok(applied)

@@ -29,6 +29,82 @@ impl Default for MemberRegistry {
 }
 
 impl MemberRegistry {
+    /// Register a worker idempotently. Changing an existing zone or re-enabling
+    /// a retired worker requires an explicit administrative update.
+    pub fn register(&mut self, worker_id: &str, zone: Option<&str>) -> Result<bool, &'static str> {
+        match self.members.iter().find(|m| m.worker_id == worker_id) {
+            Some(member) if member.retired => {
+                Err("member retired; explicit administrative re-enable required")
+            }
+            Some(member) if member.zone.as_deref() != zone => {
+                Err("member zone differs; explicit administrative change required")
+            }
+            Some(_) => Ok(false),
+            None => {
+                self.members.push(WorkerMember {
+                    worker_id: worker_id.to_owned(),
+                    zone: zone.map(str::to_owned),
+                    retired: false,
+                });
+                Ok(true)
+            }
+        }
+    }
+
+    /// Replace or insert an explicitly configured member.
+    pub fn set_member(&mut self, member: WorkerMember) {
+        if let Some(existing) = self
+            .members
+            .iter_mut()
+            .find(|m| m.worker_id == member.worker_id)
+        {
+            *existing = member;
+        } else {
+            self.members.push(member);
+        }
+    }
+
+    /// Put member records in stable worker ID order for persistence.
+    pub fn sort_members(&mut self) {
+        self.members.sort_by(|a, b| a.worker_id.cmp(&b.worker_id));
+    }
+
+    /// Require a replacement to retain every existing member ID.
+    pub fn validate_retained_members(&self, current: &Self) -> Result<(), &'static str> {
+        if current.members.iter().any(|old| {
+            !self
+                .members
+                .iter()
+                .any(|new| old.worker_id == new.worker_id)
+        }) {
+            return Err("retain all member records; retire instead of deleting");
+        }
+        Ok(())
+    }
+
+    /// Require ready instances to withdraw before their members can be retired.
+    pub fn validate_retirements(
+        &self,
+        instances: &[crate::NodeStatus],
+    ) -> Result<(), &'static str> {
+        if self.members.iter().any(|member| {
+            member.retired
+                && instances
+                    .iter()
+                    .any(|instance| instance.node.id.0 == member.worker_id && instance.ready)
+        }) {
+            return Err(
+                "stop worker and wait for instance withdrawal/expiration before retirement",
+            );
+        }
+        Ok(())
+    }
+
+    /// Non-retired members in registry order.
+    pub fn active_members(&self) -> impl Iterator<Item = &WorkerMember> {
+        self.members.iter().filter(|member| !member.retired)
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.format_version != 1 {
             return Err("unsupported member registry format".into());
@@ -63,7 +139,7 @@ impl MemberRegistry {
 
     /// Deterministic equality token. Neither addresses nor liveness participate.
     pub fn topology_token(&self) -> u64 {
-        let mut members: Vec<_> = self.members.iter().filter(|m| !m.retired).collect();
+        let mut members: Vec<_> = self.active_members().collect();
         members.sort_by(|a, b| a.worker_id.cmp(&b.worker_id));
         u64::from_le_bytes(
             Sha256::digest(serde_json::to_vec(&members).expect("member JSON"))[..8]
@@ -111,9 +187,7 @@ impl WorkerDiscovery {
                 .or_insert(Some(instance));
         }
         let mut workers: Vec<_> = registry
-            .members
-            .iter()
-            .filter(|m| !m.retired)
+            .active_members()
             .map(|member| {
                 let state = match candidates.get(member.worker_id.as_str()) {
                     None => InstanceState::Offline,

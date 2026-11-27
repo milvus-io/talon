@@ -40,15 +40,16 @@ mod time {
     pub use tokio::time::{sleep, timeout};
 }
 
-pub use azure::{AzureBackend, AzureConfig, AzureCredentials, AzureSas};
+pub use azure::{AzureBackend, AzureConfig, AzureCredentials};
 pub use broker::{resolve_azure_broker_sas, BrokerConfig};
 pub use credentials::{
-    CredentialsFetch, CredentialsObserver, NoopObserver, ProvideBearerToken, ProvideS3Credentials,
-    ProvideSasToken, RefreshPolicy, RefreshingCredentials, StaticBearerToken, StaticS3Credentials,
+    AzureSas, CredentialsFetch, CredentialsObserver, GcsHmacCredentials, NoopObserver,
+    ProvideBearerToken, ProvideS3Credentials, ProvideSasToken, RefreshPolicy,
+    RefreshingCredentials, S3Credentials, StaticBearerToken, StaticS3Credentials,
 };
 pub use delay::{DelayConfig, DelayingHttpClient};
 pub use endpoint::endpoint_host;
-pub use gcs::{GcsBackend, GcsConfig, GcsCredentials, GcsHmacCredentials};
+pub use gcs::{GcsBackend, GcsConfig, GcsCredentials};
 pub use http::{
     HttpClient, HttpRequest, HttpRequestBody, HttpResponse, HttpStreamResponse, Method,
 };
@@ -58,7 +59,7 @@ pub use routing::{
     BackendResolver, BackendRouter, DefaultBackendResolver, DynamicBackendDefaults,
     LegacyBackendFactory, RouteRequest,
 };
-pub use s3::{S3Backend, S3Config, S3Credentials, S3MultipartRequest, S3PresignedQuery};
+pub use s3::{S3Backend, S3Config, S3MultipartRequest, S3PresignedQuery};
 pub use sigv4::{sign_request, AmzDate};
 pub use workload_identity::{
     resolve_azure_credentials, resolve_gcs_credentials, resolve_s3_credentials, CredentialMode,

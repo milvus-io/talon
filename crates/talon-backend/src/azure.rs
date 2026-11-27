@@ -33,6 +33,7 @@ use talon_core::{
     BackendStore, Error, ListPage, ListedObject, ObjectId, ObjectStat, Result, Version,
 };
 
+pub use crate::credentials::AzureSas;
 use crate::http::{
     HttpClient, HttpRequest, HttpRequestBody, HttpResponse, HttpStreamResponse, Method,
 };
@@ -100,43 +101,6 @@ impl AzureConfig {
             endpoint_host: Some(endpoint_host.into()),
             path_style: true,
         }
-    }
-}
-
-/// An origin-issued Azure SAS query, preserved byte-for-byte after an optional
-/// leading `?`.
-#[derive(Clone, PartialEq, Eq)]
-pub struct AzureSas(String);
-
-impl AzureSas {
-    /// Validate the credential shape without verifying its signature.
-    pub fn new(raw: impl Into<String>) -> std::result::Result<Self, String> {
-        let raw = raw.into();
-        let query = raw.strip_prefix('?').unwrap_or(&raw);
-        if query.is_empty()
-            || query.contains('#')
-            || query.bytes().any(|byte| byte.is_ascii_control())
-        {
-            return Err("Azure SAS query credential is malformed".into());
-        }
-        let contains_key = |expected: &str| {
-            url::form_urlencoded::parse(query.as_bytes()).any(|(key, _)| key == expected)
-        };
-        if !contains_key("sig") || !contains_key("sv") {
-            return Err("Azure SAS query credential is incomplete".into());
-        }
-        Ok(Self(query.to_owned()))
-    }
-
-    /// Access the exact raw query for origin request construction.
-    pub fn expose_secret(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::fmt::Debug for AzureSas {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("AzureSas([REDACTED])")
     }
 }
 

@@ -17,8 +17,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
+use crate::credentials::{GcsHmacCredentials, S3Credentials};
 use crate::http::{HttpRequest, Method};
-use crate::s3::S3Credentials;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -319,7 +319,7 @@ pub fn sign_request_with_payload_hash(
 /// `payload_hash` lets streaming uploads select GCS's `UNSIGNED-PAYLOAD` mode.
 pub(crate) fn sign_gcs_request(
     req: &mut HttpRequest,
-    creds: &crate::gcs::GcsHmacCredentials,
+    creds: &GcsHmacCredentials,
     date: &AmzDate,
     payload_hash: Option<&str>,
 ) {
@@ -394,7 +394,7 @@ pub(crate) fn sign_gcs_request(
 mod tests {
     #[test]
     fn gcs_hmac_matches_independent_signature_vector() {
-        let credentials = crate::gcs::GcsHmacCredentials {
+        let credentials = GcsHmacCredentials {
             access_key_id: "test-access".into(),
             secret_access_key: "test-secret".into(),
         };

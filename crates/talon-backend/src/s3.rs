@@ -22,6 +22,7 @@ use talon_core::{
     BackendStore, Error, ListPage, ListedObject, ObjectId, ObjectStat, Result, Version,
 };
 
+pub use crate::credentials::S3Credentials;
 use crate::http::{
     HttpClient, HttpRequest, HttpRequestBody, HttpResponse, HttpStreamResponse, Method,
 };
@@ -88,17 +89,6 @@ impl S3Config {
             tls: true,
         }
     }
-}
-
-/// Static S3 credentials. Secrets come from env/config, never logged.
-#[derive(Clone)]
-pub struct S3Credentials {
-    /// Access key id.
-    pub access_key_id: String,
-    /// Secret access key.
-    pub secret_access_key: String,
-    /// Optional session token (STS).
-    pub session_token: Option<String>,
 }
 
 /// An origin-issued S3 presigned query, preserved byte-for-byte after an
@@ -341,32 +331,42 @@ impl S3Backend {
         }
     }
 
-    /// Sign `req` with AWS SigV4 for this backend's region, stamping the current
-    /// wall-clock time. Called on every request just before it is executed.
-    ///
-    /// The credential snapshot is taken here, and `sign_request` re-stamps the
-    /// session-token header from the same snapshot it signs with, so a
-    /// concurrent refresh can never pair one snapshot's token with another's
-    /// signature.
-    fn signed(&self, mut req: HttpRequest) -> HttpRequest {
+    /// Prepare credentials before building the request or hashing a file. SigV4
+    /// restamps the session token from the same snapshot used for signing.
+    async fn prepare_and_sign(
+        &self,
+        payload: PayloadHash<'_>,
+        build: impl FnOnce() -> HttpRequest,
+    ) -> std::result::Result<HttpRequest, String> {
+        self.credentials.prepare().await?;
+        let file_hash;
+        let payload_hash = match payload {
+            PayloadHash::Buffered => None,
+            PayloadHash::Precomputed(hash) => Some(hash),
+            PayloadHash::File { path, len } => {
+                let path = path.to_path_buf();
+                file_hash = tokio::task::spawn_blocking(move || hash_file(path, len))
+                    .await
+                    .map_err(|error| format!("S3 payload hashing task failed: {error}"))??;
+                Some(file_hash.as_str())
+            }
+        };
+        let mut request = build();
         let date = crate::sigv4::AmzDate::from_system_time(std::time::SystemTime::now());
         let creds = self.credentials.current();
-        crate::sigv4::sign_request(&mut req, &creds, &self.config.region, "s3", &date);
-        req
-    }
-
-    fn signed_with_payload_hash(&self, mut req: HttpRequest, payload_hash: &str) -> HttpRequest {
-        let date = crate::sigv4::AmzDate::from_system_time(std::time::SystemTime::now());
-        let creds = self.credentials.current();
-        crate::sigv4::sign_request_with_payload_hash(
-            &mut req,
-            &creds,
-            &self.config.region,
-            "s3",
-            &date,
-            payload_hash,
-        );
-        req
+        let region = &self.config.region;
+        match payload_hash {
+            Some(hash) => crate::sigv4::sign_request_with_payload_hash(
+                &mut request,
+                &creds,
+                region,
+                "s3",
+                &date,
+                hash,
+            ),
+            None => crate::sigv4::sign_request(&mut request, &creds, region, "s3", &date),
+        }
+        Ok(request)
     }
 
     fn session_headers(&self) -> Vec<(String, String)> {
@@ -385,10 +385,14 @@ impl S3Backend {
         obj: &ObjectId,
         conditions: &[(String, String)],
     ) -> std::result::Result<HttpResponse, String> {
-        self.credentials.prepare().await?;
-        let mut request = self.build_head(obj);
-        request.headers.extend_from_slice(conditions);
-        self.http.execute(self.signed(request)).await
+        let request = self
+            .prepare_and_sign(PayloadHash::Buffered, || {
+                let mut request = self.build_head(obj);
+                request.headers.extend_from_slice(conditions);
+                request
+            })
+            .await?;
+        self.http.execute(request).await
     }
 
     /// Execute a raw bucket existence probe (`HEAD /<bucket>`).
@@ -400,13 +404,16 @@ impl S3Backend {
         &self,
         bucket: &str,
     ) -> std::result::Result<HttpResponse, String> {
-        self.credentials.prepare().await?;
-        let request = HttpRequest::new(
-            Method::Head,
-            self.bucket_url(bucket),
-            self.session_headers(),
-        );
-        self.http.execute(self.signed(request)).await
+        let request = self
+            .prepare_and_sign(PayloadHash::Buffered, || {
+                HttpRequest::new(
+                    Method::Head,
+                    self.bucket_url(bucket),
+                    self.session_headers(),
+                )
+            })
+            .await?;
+        self.http.execute(request).await
     }
 
     /// Execute a whole or ranged GET without buffering its response body.
@@ -416,14 +423,17 @@ impl S3Backend {
         range: Option<(u64, u64)>,
         conditions: &[(String, String)],
     ) -> std::result::Result<HttpStreamResponse, String> {
-        self.credentials.prepare().await?;
-        let mut headers = self.session_headers();
-        if let Some((start, end)) = range {
-            headers.push(("range".into(), format!("bytes={start}-{end}")));
-        }
-        headers.extend_from_slice(conditions);
-        let request = HttpRequest::new(Method::Get, self.object_url(obj), headers);
-        self.http.execute_stream(self.signed(request)).await
+        let request = self
+            .prepare_and_sign(PayloadHash::Buffered, || {
+                let mut headers = self.session_headers();
+                if let Some((start, end)) = range {
+                    headers.push(("range".into(), format!("bytes={start}-{end}")));
+                }
+                headers.extend_from_slice(conditions);
+                HttpRequest::new(Method::Get, self.object_url(obj), headers)
+            })
+            .await?;
+        self.http.execute_stream(request).await
     }
 
     fn presigned_object_request(
@@ -535,30 +545,33 @@ impl S3Backend {
         max_keys: u32,
         encoding_type: Option<&str>,
     ) -> std::result::Result<HttpResponse, String> {
-        self.credentials.prepare().await?;
-        let mut query = format!("list-type=2&max-keys={}", max_keys.min(1000));
-        if !prefix.is_empty() {
-            query.push_str("&prefix=");
-            query.push_str(&encode_query_value(prefix));
-        }
-        if let Some(delimiter) = delimiter {
-            query.push_str("&delimiter=");
-            query.push_str(&encode_query_value(delimiter));
-        }
-        if let Some(token) = continuation_token {
-            query.push_str("&continuation-token=");
-            query.push_str(&encode_query_value(token));
-        }
-        if let Some(encoding_type) = encoding_type {
-            query.push_str("&encoding-type=");
-            query.push_str(&encode_query_value(encoding_type));
-        }
-        let request = HttpRequest::new(
-            Method::Get,
-            format!("{}?{query}", self.bucket_url(bucket)),
-            self.session_headers(),
-        );
-        self.http.execute(self.signed(request)).await
+        let request = self
+            .prepare_and_sign(PayloadHash::Buffered, || {
+                let mut query = format!("list-type=2&max-keys={}", max_keys.min(1000));
+                if !prefix.is_empty() {
+                    query.push_str("&prefix=");
+                    query.push_str(&encode_query_value(prefix));
+                }
+                if let Some(delimiter) = delimiter {
+                    query.push_str("&delimiter=");
+                    query.push_str(&encode_query_value(delimiter));
+                }
+                if let Some(token) = continuation_token {
+                    query.push_str("&continuation-token=");
+                    query.push_str(&encode_query_value(token));
+                }
+                if let Some(encoding_type) = encoding_type {
+                    query.push_str("&encoding-type=");
+                    query.push_str(&encode_query_value(encoding_type));
+                }
+                HttpRequest::new(
+                    Method::Get,
+                    format!("{}?{query}", self.bucket_url(bucket)),
+                    self.session_headers(),
+                )
+            })
+            .await?;
+        self.http.execute(request).await
     }
 
     /// Execute one raw ListObjects (V1) page. The V1 response body
@@ -573,30 +586,33 @@ impl S3Backend {
         max_keys: u32,
         encoding_type: Option<&str>,
     ) -> std::result::Result<HttpResponse, String> {
-        self.credentials.prepare().await?;
-        let mut query = format!("max-keys={}", max_keys.min(1000));
-        if !prefix.is_empty() {
-            query.push_str("&prefix=");
-            query.push_str(&encode_query_value(prefix));
-        }
-        if let Some(delimiter) = delimiter {
-            query.push_str("&delimiter=");
-            query.push_str(&encode_query_value(delimiter));
-        }
-        if let Some(marker) = marker {
-            query.push_str("&marker=");
-            query.push_str(&encode_query_value(marker));
-        }
-        if let Some(encoding_type) = encoding_type {
-            query.push_str("&encoding-type=");
-            query.push_str(&encode_query_value(encoding_type));
-        }
-        let request = HttpRequest::new(
-            Method::Get,
-            format!("{}?{query}", self.bucket_url(bucket)),
-            self.session_headers(),
-        );
-        self.http.execute(self.signed(request)).await
+        let request = self
+            .prepare_and_sign(PayloadHash::Buffered, || {
+                let mut query = format!("max-keys={}", max_keys.min(1000));
+                if !prefix.is_empty() {
+                    query.push_str("&prefix=");
+                    query.push_str(&encode_query_value(prefix));
+                }
+                if let Some(delimiter) = delimiter {
+                    query.push_str("&delimiter=");
+                    query.push_str(&encode_query_value(delimiter));
+                }
+                if let Some(marker) = marker {
+                    query.push_str("&marker=");
+                    query.push_str(&encode_query_value(marker));
+                }
+                if let Some(encoding_type) = encoding_type {
+                    query.push_str("&encoding-type=");
+                    query.push_str(&encode_query_value(encoding_type));
+                }
+                HttpRequest::new(
+                    Method::Get,
+                    format!("{}?{query}", self.bucket_url(bucket)),
+                    self.session_headers(),
+                )
+            })
+            .await?;
+        self.http.execute(request).await
     }
 
     /// Execute a single-use streaming PUT. The payload declaration is signed
@@ -609,10 +625,13 @@ impl S3Backend {
         len: u64,
         payload_hash: &str,
     ) -> std::result::Result<HttpResponse, String> {
-        self.credentials.prepare().await?;
-        let mut request = self.build_streamed_put(obj, len, None);
-        request.headers.extend_from_slice(headers);
-        let request = self.signed_with_payload_hash(request, payload_hash);
+        let request = self
+            .prepare_and_sign(PayloadHash::Precomputed(payload_hash), || {
+                let mut request = self.build_streamed_put(obj, len, None);
+                request.headers.extend_from_slice(headers);
+                request
+            })
+            .await?;
         self.http.execute_body(request, body, len).await
     }
 
@@ -625,10 +644,13 @@ impl S3Backend {
         len: u64,
         payload_hash: &str,
     ) -> std::result::Result<HttpResponse, String> {
-        self.credentials.prepare().await?;
-        let mut request = self.build_streamed_put(obj, len, None);
-        request.headers.extend_from_slice(headers);
-        let request = self.signed_with_payload_hash(request, payload_hash);
+        let request = self
+            .prepare_and_sign(PayloadHash::Precomputed(payload_hash), || {
+                let mut request = self.build_streamed_put(obj, len, None);
+                request.headers.extend_from_slice(headers);
+                request
+            })
+            .await?;
         self.http.execute_file(request, path, len).await
     }
 
@@ -639,10 +661,14 @@ impl S3Backend {
         obj: &ObjectId,
         headers: &[(String, String)],
     ) -> std::result::Result<HttpResponse, String> {
-        self.credentials.prepare().await?;
-        let mut request = self.build_streamed_put(obj, 0, None);
-        request.headers.extend_from_slice(headers);
-        self.http.execute(self.signed(request)).await
+        let request = self
+            .prepare_and_sign(PayloadHash::Buffered, || {
+                let mut request = self.build_streamed_put(obj, 0, None);
+                request.headers.extend_from_slice(headers);
+                request
+            })
+            .await?;
+        self.http.execute(request).await
     }
 
     /// Execute an idempotent raw object DELETE with validated conditions.
@@ -651,10 +677,14 @@ impl S3Backend {
         obj: &ObjectId,
         conditions: &[(String, String)],
     ) -> std::result::Result<HttpResponse, String> {
-        self.credentials.prepare().await?;
-        let mut request = self.build_delete(obj);
-        request.headers.extend_from_slice(conditions);
-        self.http.execute(self.signed(request)).await
+        let request = self
+            .prepare_and_sign(PayloadHash::Buffered, || {
+                let mut request = self.build_delete(obj);
+                request.headers.extend_from_slice(conditions);
+                request
+            })
+            .await?;
+        self.http.execute(request).await
     }
 
     /// Execute a batch DeleteObjects (`POST /{bucket}?delete`) with an
@@ -667,18 +697,22 @@ impl S3Backend {
         headers: &[(String, String)],
         body: bytes::Bytes,
     ) -> std::result::Result<HttpResponse, String> {
-        self.credentials.prepare().await?;
-        let mut request = HttpRequest::with_body(
-            Method::Post,
-            format!("{}?delete=", self.bucket_url(bucket)),
-            self.session_headers(),
-            body,
-        );
-        request
-            .headers
-            .push(("content-length".into(), request.body.len().to_string()));
-        request.headers.extend_from_slice(headers);
-        self.http.execute(self.signed(request)).await
+        let request = self
+            .prepare_and_sign(PayloadHash::Buffered, || {
+                let mut request = HttpRequest::with_body(
+                    Method::Post,
+                    format!("{}?delete=", self.bucket_url(bucket)),
+                    self.session_headers(),
+                    body,
+                );
+                request
+                    .headers
+                    .push(("content-length".into(), request.body.len().to_string()));
+                request.headers.extend_from_slice(headers);
+                request
+            })
+            .await?;
+        self.http.execute(request).await
     }
 
     /// Execute a bodyless multipart request with an adapter-validated query.
@@ -686,14 +720,18 @@ impl S3Backend {
         &self,
         request: S3MultipartRequest<'_>,
     ) -> std::result::Result<HttpResponse, String> {
-        self.credentials.prepare().await?;
-        let mut outgoing = HttpRequest::new(
-            request.method,
-            format!("{}?{}", self.object_url(request.object), request.query),
-            self.session_headers(),
-        );
-        outgoing.headers.extend_from_slice(request.headers);
-        self.http.execute(self.signed(outgoing)).await
+        let outgoing = self
+            .prepare_and_sign(PayloadHash::Buffered, || {
+                let mut outgoing = HttpRequest::new(
+                    request.method,
+                    format!("{}?{}", self.object_url(request.object), request.query),
+                    self.session_headers(),
+                );
+                outgoing.headers.extend_from_slice(request.headers);
+                outgoing
+            })
+            .await?;
+        self.http.execute(outgoing).await
     }
 
     /// Execute a single-use multipart request body without implicit replay.
@@ -704,17 +742,20 @@ impl S3Backend {
         len: u64,
         payload_hash: &str,
     ) -> std::result::Result<HttpResponse, String> {
-        self.credentials.prepare().await?;
-        let mut outgoing = HttpRequest::new(
-            request.method,
-            format!("{}?{}", self.object_url(request.object), request.query),
-            self.session_headers(),
-        );
-        outgoing
-            .headers
-            .push(("content-length".into(), len.to_string()));
-        outgoing.headers.extend_from_slice(request.headers);
-        let outgoing = self.signed_with_payload_hash(outgoing, payload_hash);
+        let outgoing = self
+            .prepare_and_sign(PayloadHash::Precomputed(payload_hash), || {
+                let mut outgoing = HttpRequest::new(
+                    request.method,
+                    format!("{}?{}", self.object_url(request.object), request.query),
+                    self.session_headers(),
+                );
+                outgoing
+                    .headers
+                    .push(("content-length".into(), len.to_string()));
+                outgoing.headers.extend_from_slice(request.headers);
+                outgoing
+            })
+            .await?;
         self.http.execute_body(outgoing, body, len).await
     }
 
@@ -726,17 +767,20 @@ impl S3Backend {
         len: u64,
         payload_hash: &str,
     ) -> std::result::Result<HttpResponse, String> {
-        self.credentials.prepare().await?;
-        let mut outgoing = HttpRequest::new(
-            request.method,
-            format!("{}?{}", self.object_url(request.object), request.query),
-            self.session_headers(),
-        );
-        outgoing
-            .headers
-            .push(("content-length".into(), len.to_string()));
-        outgoing.headers.extend_from_slice(request.headers);
-        let outgoing = self.signed_with_payload_hash(outgoing, payload_hash);
+        let outgoing = self
+            .prepare_and_sign(PayloadHash::Precomputed(payload_hash), || {
+                let mut outgoing = HttpRequest::new(
+                    request.method,
+                    format!("{}?{}", self.object_url(request.object), request.query),
+                    self.session_headers(),
+                );
+                outgoing
+                    .headers
+                    .push(("content-length".into(), len.to_string()));
+                outgoing.headers.extend_from_slice(request.headers);
+                outgoing
+            })
+            .await?;
         self.http.execute_file(outgoing, path, len).await
     }
 
@@ -758,9 +802,15 @@ impl S3Backend {
     }
 }
 
-fn hash_file(path: PathBuf, len: u64) -> Result<String> {
+enum PayloadHash<'a> {
+    Buffered,
+    Precomputed(&'a str),
+    File { path: &'a Path, len: u64 },
+}
+
+fn hash_file(path: PathBuf, len: u64) -> std::result::Result<String, String> {
     let file = std::fs::File::open(&path)
-        .map_err(|error| Error::Backend(format!("open {} for hashing: {error}", path.display())))?;
+        .map_err(|error| format!("open {} for hashing: {error}", path.display()))?;
     let mut reader: Take<std::fs::File> = file.take(len);
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; 1024 * 1024];
@@ -768,7 +818,7 @@ fn hash_file(path: PathBuf, len: u64) -> Result<String> {
     loop {
         let count = reader
             .read(&mut buffer)
-            .map_err(|error| Error::Backend(format!("hash {}: {error}", path.display())))?;
+            .map_err(|error| format!("hash {}: {error}", path.display()))?;
         if count == 0 {
             break;
         }
@@ -776,10 +826,10 @@ fn hash_file(path: PathBuf, len: u64) -> Result<String> {
         read_len += count as u64;
     }
     if read_len != len {
-        return Err(Error::Backend(format!(
+        return Err(format!(
             "{} ended after {read_len} bytes while hashing {len} bytes",
             path.display()
-        )));
+        ));
     }
     Ok(format!("{:x}", hasher.finalize()))
 }
@@ -805,8 +855,12 @@ impl BackendStore for S3Backend {
         if len == 0 {
             return Ok(bytes::Bytes::new());
         }
-        self.credentials.prepare().await.map_err(Error::Backend)?;
-        let req = self.signed(self.build_get_if_match(obj, offset, len, if_match));
+        let req = self
+            .prepare_and_sign(PayloadHash::Buffered, || {
+                self.build_get_if_match(obj, offset, len, if_match)
+            })
+            .await
+            .map_err(Error::Backend)?;
         let resp = self.http.execute(req).await.map_err(Error::Backend)?;
         // 206 (range honored) or 200 (server ignored Range, returned the whole
         // object). `range_body` yields exactly the requested window in both
@@ -851,23 +905,27 @@ impl BackendStore for S3Backend {
         cursor: Option<&str>,
         max_keys: u32,
     ) -> Result<ListPage> {
-        self.credentials.prepare().await.map_err(Error::Backend)?;
-        // S3 caps a page at 1000 regardless of what is asked, so clamping here
-        // keeps the request honest rather than relying on the service to
-        // silently reduce it.
-        let max_keys = max_keys.clamp(1, 1000);
-        let mut query = format!("list-type=2&max-keys={max_keys}");
-        if !prefix.is_empty() {
-            query.push_str(&format!("&prefix={}", encode_query_value(prefix)));
-        }
-        if let Some(token) = cursor {
-            query.push_str(&format!(
-                "&continuation-token={}",
-                encode_query_value(token)
-            ));
-        }
-        let url = format!("{}?{query}", self.bucket_url(bucket));
-        let req = self.signed(HttpRequest::new(Method::Get, url, Vec::new()));
+        let req = self
+            .prepare_and_sign(PayloadHash::Buffered, || {
+                // S3 caps a page at 1000 regardless of what is asked, so clamping here
+                // keeps the request honest rather than relying on the service to
+                // silently reduce it.
+                let max_keys = max_keys.clamp(1, 1000);
+                let mut query = format!("list-type=2&max-keys={max_keys}");
+                if !prefix.is_empty() {
+                    query.push_str(&format!("&prefix={}", encode_query_value(prefix)));
+                }
+                if let Some(token) = cursor {
+                    query.push_str(&format!(
+                        "&continuation-token={}",
+                        encode_query_value(token)
+                    ));
+                }
+                let url = format!("{}?{query}", self.bucket_url(bucket));
+                HttpRequest::new(Method::Get, url, Vec::new())
+            })
+            .await
+            .map_err(Error::Backend)?;
         let resp = self.http.execute(req).await.map_err(Error::Backend)?;
         if resp.status == 404 {
             return Err(Error::NotFound(bucket.to_string()));
@@ -884,8 +942,10 @@ impl BackendStore for S3Backend {
     }
 
     async fn head(&self, obj: &ObjectId) -> Result<ObjectStat> {
-        self.credentials.prepare().await.map_err(Error::Backend)?;
-        let req = self.signed(self.build_head(obj));
+        let req = self
+            .prepare_and_sign(PayloadHash::Buffered, || self.build_head(obj))
+            .await
+            .map_err(Error::Backend)?;
         let resp = self.http.execute(req).await.map_err(Error::Backend)?;
         if resp.status == 404 {
             return Err(Error::NotFound(obj.to_path()));
@@ -924,8 +984,12 @@ impl BackendStore for S3Backend {
         body: bytes::Bytes,
         if_match: Option<&Version>,
     ) -> Result<Version> {
-        self.credentials.prepare().await.map_err(Error::Backend)?;
-        let req = self.signed(self.build_put(obj, body, if_match));
+        let req = self
+            .prepare_and_sign(PayloadHash::Buffered, || {
+                self.build_put(obj, body, if_match)
+            })
+            .await
+            .map_err(Error::Backend)?;
         let resp = self.http.execute(req).await.map_err(Error::Backend)?;
         if resp.status == 412 {
             // The If-Match precondition failed: the object changed since it was
@@ -958,15 +1022,12 @@ impl BackendStore for S3Backend {
     }
 
     async fn put_file(&self, obj: &ObjectId, path: &Path, len: u64) -> Result<Version> {
-        self.credentials.prepare().await.map_err(Error::Backend)?;
-        let payload_hash = tokio::task::spawn_blocking({
-            let path = path.to_path_buf();
-            move || hash_file(path, len)
-        })
-        .await
-        .map_err(|error| Error::Backend(format!("S3 payload hashing task failed: {error}")))??;
-        let request =
-            self.signed_with_payload_hash(self.build_streamed_put(obj, len, None), &payload_hash);
+        let request = self
+            .prepare_and_sign(PayloadHash::File { path, len }, || {
+                self.build_streamed_put(obj, len, None)
+            })
+            .await
+            .map_err(Error::Backend)?;
         let resp = self
             .http
             .execute_file(request, path, len)
@@ -990,8 +1051,10 @@ impl BackendStore for S3Backend {
     }
 
     async fn delete(&self, obj: &ObjectId) -> Result<()> {
-        self.credentials.prepare().await.map_err(Error::Backend)?;
-        let req = self.signed(self.build_delete(obj));
+        let req = self
+            .prepare_and_sign(PayloadHash::Buffered, || self.build_delete(obj))
+            .await
+            .map_err(Error::Backend)?;
         let resp = self.http.execute(req).await.map_err(Error::Backend)?;
         // 2xx or 404 are both success (delete is idempotent).
         if resp.is_success() || resp.status == 404 {
@@ -1096,6 +1159,85 @@ mod tests {
             "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=client%2Fscope&X-Amz-Date=20260810T000000Z&X-Amz-Expires=60&X-Amz-SignedHeaders=host&X-Amz-Signature=CLIENTSECRET",
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn service_requests_prepare_before_building_and_sign_with_the_latest_snapshot() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct Provider {
+            ready: AtomicBool,
+            snapshots: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl crate::credentials::ProvideS3Credentials for Provider {
+            fn current(&self) -> Arc<S3Credentials> {
+                assert!(self.ready.load(Ordering::Relaxed));
+                let snapshot = self.snapshots.fetch_add(1, Ordering::Relaxed);
+                Arc::new(S3Credentials {
+                    access_key_id: format!("KEY{snapshot}"),
+                    session_token: Some(format!("TOKEN{snapshot}")),
+                    ..creds()
+                })
+            }
+
+            async fn prepare(&self) -> std::result::Result<(), String> {
+                assert!(!self.ready.swap(true, Ordering::Relaxed));
+                Ok(())
+            }
+        }
+
+        let http = MockHttp::new(HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: bytes::Bytes::new(),
+        });
+        let backend = S3Backend::with_credentials_provider(
+            S3Config::aws("us-east-1"),
+            Arc::new(Provider::default()),
+            http.clone(),
+        );
+        backend.execute_head_raw(&obj(), &[]).await.unwrap();
+        let request = http.last.lock().unwrap().take().unwrap();
+        assert_eq!(request.header("x-amz-security-token"), Some("TOKEN1"));
+        assert!(request
+            .header("authorization")
+            .unwrap()
+            .contains("Credential=KEY1/"));
+    }
+
+    #[tokio::test]
+    async fn staged_put_returns_credential_failure_before_hashing() {
+        struct FailingProvider;
+        #[async_trait]
+        impl crate::credentials::ProvideS3Credentials for FailingProvider {
+            fn current(&self) -> Arc<S3Credentials> {
+                panic!("failed preparation cannot use a credential snapshot");
+            }
+
+            async fn prepare(&self) -> std::result::Result<(), String> {
+                Err("prepare failed".into())
+            }
+        }
+        let http = MockHttp::new(HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: bytes::Bytes::new(),
+        });
+        let backend = S3Backend::with_credentials_provider(
+            S3Config::aws("us-east-1"),
+            Arc::new(FailingProvider),
+            http.clone(),
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing");
+        assert!(matches!(
+            backend.put_file(&obj(), &missing, 1).await,
+            Err(Error::Backend(message)) if message == "prepare failed"
+        ));
+        assert!(http.last_file.lock().unwrap().is_none());
     }
 
     #[tokio::test]
