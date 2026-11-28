@@ -480,7 +480,7 @@ whole/paged entries retain their existing version policy, including when mixed
 with packed objects in the same namespace.
 
 [Stale GC](async-eviction.md#stale-object-checks) checks only packed entries idle
-for more than 24 hours. A successful HEAD adds a temporary entry keyed by
+for more than 25 hours. A successful HEAD adds a 24-hour cooldown keyed by
 backend object, shared across offsets and versions. HEAD results leave access
 times and TTI eligibility unchanged.
 [Ownership GC](ownership-gc.md) traverses the compact catalog by logical

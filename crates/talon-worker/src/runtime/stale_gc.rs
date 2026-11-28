@@ -14,7 +14,8 @@ use std::{
 use talon_core::backend::BackgroundRoute;
 use talon_core::{BackendStore, Error, ObjectId, WorkerConfig};
 
-const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+const STALE_IDLE_MS: u64 = 25 * 60 * 60 * 1000;
+const POSITIVE_HEAD_COOLDOWN_MS: u64 = 24 * 60 * 60 * 1000;
 const MAX_HEADS: usize = 32;
 
 enum Candidate {
@@ -99,7 +100,9 @@ struct PositiveHeads {
 fn head_due(checked: &HeadTimes, object: ObjectRef<'_>, now: u64) -> bool {
     checked
         .get(&object as &dyn ObjectIdentity)
-        .map_or(true, |at| now.saturating_sub(*at) >= DAY_MS)
+        .map_or(true, |at| {
+            now.saturating_sub(*at) >= POSITIVE_HEAD_COOLDOWN_MS
+        })
 }
 
 impl PositiveHeads {
@@ -114,7 +117,7 @@ impl PositiveHeads {
         let mut budget = 256;
         let mut checked = self.checked.write().unwrap();
         while let Some((at, _)) = self.expiry.front() {
-            if now.saturating_sub(*at) < DAY_MS {
+            if now.saturating_sub(*at) < POSITIVE_HEAD_COOLDOWN_MS {
                 return false;
             }
             if budget == 0 {
@@ -319,7 +322,7 @@ impl StaleGc {
                     let (done, candidates) = small.stale_candidates(
                         &mut cursor,
                         round_now,
-                        DAY_MS,
+                        STALE_IDLE_MS,
                         scan,
                         deletes,
                         |object| head_due(&checked, object, now),
@@ -346,7 +349,7 @@ impl StaleGc {
                     let candidates = lru.filtered_idle_candidates(
                         &mut cursor,
                         round_now,
-                        DAY_MS,
+                        STALE_IDLE_MS,
                         scan,
                         deletes,
                         |object| head_due(&checked, object, now),
@@ -534,7 +537,7 @@ mod tests {
         }
     }
     fn cold_now() -> u64 {
-        access_millis() + DAY_MS + 1
+        access_millis() + STALE_IDLE_MS + 1
     }
 
     fn compact_runtime(root: &std::path::Path, paged: bool, origin: Arc<Origin>) -> Worker {
@@ -665,7 +668,7 @@ mod tests {
             .unwrap();
         let mut gc = StaleGc::default();
         let now = access_millis();
-        let original = now - DAY_MS - 1;
+        let original = now - STALE_IDLE_MS - 1;
         small.packed_access_time(&whole, Some(original));
         small.packed_access_time(&exact, Some(original));
         assert!(gc.positive_heads.checked.read().unwrap().is_empty());
@@ -675,14 +678,16 @@ mod tests {
         assert_eq!(small.packed_access_time(&whole, None), original);
         assert_eq!(small.packed_access_time(&exact, None), original);
         origin.mode.store(0, Ordering::Relaxed);
-        gc.run_round_at(&worker, now + DAY_MS - 1).await;
+        gc.run_round_at(&worker, now + POSITIVE_HEAD_COOLDOWN_MS - 1)
+            .await;
         assert_eq!(origin.calls.load(Ordering::Relaxed), 1);
         assert!(small.contains(&exact));
 
         // TTI is shorter and reads its own unaltered Small Store timestamp.
         worker.gc_small_idle_at(now).await;
         assert!(!small.contains(&whole));
-        gc.run_round_at(&worker, now + DAY_MS).await;
+        gc.run_round_at(&worker, now + POSITIVE_HEAD_COOLDOWN_MS)
+            .await;
         assert_eq!(origin.calls.load(Ordering::Relaxed), 2);
         assert!(!small.contains(&exact));
         assert!(gc.positive_heads.checked.read().unwrap().is_empty());
@@ -711,7 +716,7 @@ mod tests {
 
         let candidate = worker
             .lru
-            .idle_candidates(&mut (0, 0), now, DAY_MS, 8, 8)
+            .idle_candidates(&mut (0, 0), now, STALE_IDLE_MS, 8, 8)
             .pop()
             .unwrap();
         worker.unlink_idle_block(candidate, now).await;
@@ -719,10 +724,12 @@ mod tests {
         assert!(small.contains(&exact));
 
         origin.mode.store(0, Ordering::Relaxed);
-        gc.run_round_at(&worker, now + DAY_MS - 1).await;
+        gc.run_round_at(&worker, now + POSITIVE_HEAD_COOLDOWN_MS - 1)
+            .await;
         assert_eq!(origin.calls.load(Ordering::Relaxed), 1);
         assert!(small.contains(&exact));
-        gc.run_round_at(&worker, now + DAY_MS).await;
+        gc.run_round_at(&worker, now + POSITIVE_HEAD_COOLDOWN_MS)
+            .await;
         assert_eq!(origin.calls.load(Ordering::Relaxed), 2);
         assert!(!small.contains(&exact));
     }
@@ -753,19 +760,23 @@ mod tests {
             }
             for left in [769, 513, 257, 1] {
                 assert_eq!(
-                    gc.run_slice_with_clock(&worker, || DAY_MS + 1).await,
+                    gc.run_slice_with_clock(&worker, || POSITIVE_HEAD_COOLDOWN_MS + 1)
+                        .await,
                     Some(Duration::ZERO)
                 );
                 assert_eq!(gc.positive_heads.checked.read().unwrap().len(), left);
                 assert!(gc.round_now.is_none());
             }
-            let delay = gc.run_slice_with_clock(&worker, || DAY_MS + 1).await;
+            let delay = gc
+                .run_slice_with_clock(&worker, || POSITIVE_HEAD_COOLDOWN_MS + 1)
+                .await;
             assert_eq!(gc.positive_heads.checked.read().unwrap().capacity(), 0);
             assert_eq!(gc.positive_heads.expiry.capacity(), 0);
             if backend_ready {
                 assert_eq!(delay, Some(Duration::ZERO));
                 assert_eq!(
-                    gc.run_slice_with_clock(&worker, || DAY_MS + 1).await,
+                    gc.run_slice_with_clock(&worker, || POSITIVE_HEAD_COOLDOWN_MS + 1)
+                        .await,
                     Some(Duration::from_secs(3600))
                 );
             } else {
@@ -879,7 +890,7 @@ mod tests {
         warm.object.object_path = "warm".into();
         fill(&worker, &warm, false).await;
         let start = cold_now();
-        worker.index.set_policy_clock(&warm, start - DAY_MS);
+        worker.index.set_policy_clock(&warm, start - STALE_IDLE_MS);
 
         let mut gc = StaleGc::default();
         assert_eq!(
@@ -890,7 +901,7 @@ mod tests {
         assert_eq!(gc.positive_heads.checked.read().unwrap().len(), 1);
 
         origin.mode.store(0, Ordering::Relaxed);
-        let later = start + DAY_MS + 1;
+        let later = start + POSITIVE_HEAD_COOLDOWN_MS + 1;
         assert_eq!(
             gc.run_slice_with_clock(&worker, || later).await,
             Some(Duration::ZERO)
@@ -1175,6 +1186,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_gc_checks_ordinary_and_packed_entries_only_after_25_idle_hours() {
+        for paged in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let origin = Arc::new(Origin::default());
+            let worker = compact_runtime(root.path(), paged, origin.clone());
+            let ordinary = block(0);
+            fill(&worker, &ordinary, paged).await;
+            let mut packed = block(0);
+            packed.object.object_path = "packed".into();
+            let small = worker.small.as_ref().unwrap();
+            small
+                .put(
+                    &CacheUnit::Whole(packed.clone()),
+                    Bytes::from_static(b"packed"),
+                )
+                .await
+                .unwrap();
+            let last_access = access_millis();
+            worker.index.set_policy_clock(&ordinary, last_access);
+            small.packed_access_time(&packed, Some(last_access));
+
+            let mut gc = StaleGc::default();
+            let cutoff = last_access + 25 * 3_600_000;
+            gc.run_round_at(&worker, cutoff).await;
+            assert_eq!(origin.calls.load(Ordering::Relaxed), 0);
+            assert!(worker.index.get(&ordinary).is_some());
+            assert!(small.contains(&packed));
+
+            gc.run_round_at(&worker, cutoff + 1).await;
+            assert_eq!(origin.calls.load(Ordering::Relaxed), 2);
+            assert!(worker.index.get(&ordinary).is_none());
+            assert!(!small.contains(&packed));
+        }
+    }
+
+    #[tokio::test]
     async fn stale_gc_positive_checks_cover_other_offsets_for_24_hours() {
         for paged in [false, true] {
             let root = tempfile::tempdir().unwrap();
@@ -1189,7 +1236,7 @@ mod tests {
             gc.tick_at(&r, now).await;
             origin.mode.store(0, Ordering::Relaxed);
             for _ in 0..8 {
-                gc.tick_at(&r, now + DAY_MS - 1).await;
+                gc.tick_at(&r, now + 24 * 3_600_000 - 1).await;
             }
             assert_eq!(origin.calls.load(Ordering::Relaxed), 1);
             assert_eq!(
@@ -1198,7 +1245,7 @@ mod tests {
                 "a version change alone is not deletion"
             );
             for _ in 0..8 {
-                gc.tick_at(&r, now + DAY_MS).await;
+                gc.tick_at(&r, now + 24 * 3_600_000).await;
             }
             assert_eq!(r.logical_resident_bytes(), 0);
         }

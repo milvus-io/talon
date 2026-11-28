@@ -176,7 +176,7 @@ Ownership uses the snapshot published by the Worker control plane and never issu
 backend HEADs. The tasks share deletion budgets and guarded deletion paths for
 ordinary blocks and packed entries. Their scans and schedules are independent.
 
-Entries idle for **more than 24 hours** are eligible. Ordinary whole and paged
+Entries idle for **more than 25 hours** are eligible. Ordinary whole and paged
 blocks use a process-local block timestamp shared by the pages of each block.
 Packed whole objects and exact ranges use their own Small Store recency rows,
 including when TTI is disabled. Each round walks a fixed admission-ordered prefix
@@ -236,7 +236,7 @@ Deletion discovery depends on idle age, positive-check cooldown and scan progres
 
 ## Stale-object checks
 
-Stale GC preserves the hourly delay between completed rounds, idle age over 24
+Stale GC preserves the hourly delay between completed rounds, idle age over 25
 hours and positive HEAD cooldown of 24 hours. Warm scans immediately continue
 without per-batch sleeps. Backend HEAD traffic has an independent paced budget:
 `stale_gc_head_max_per_sec` (default 32, zero unlimited) and

@@ -365,7 +365,7 @@ pub struct WorkerConfig {
     pub ownership_gc_replicas: usize,
     /// Worker-wide LOAD payload bytes reserved through cache commit (default 1 GiB).
     pub load_inflight_bytes: u64,
-    /// Page time to idle in hours; 0 disables idle expiration.
+    /// Page and Small Store time to idle in hours (default 24); 0 disables idle expiration.
     pub page_tti_hours: u64,
     /// Dirty page access checkpoint interval in minutes.
     pub page_access_checkpoint_interval_minutes: u64,
@@ -652,6 +652,11 @@ impl WorkerConfig {
         Ok((defaults, buckets))
     }
 
+    /// Whether this cache layout supports page and Small Store idle expiration.
+    pub fn supports_page_tti(&self) -> bool {
+        self.l2_page_size_bytes > 0 || self.small_object_threshold_bytes > 0
+    }
+
     /// Resolve cache settings without changing process-wide resource budgets.
     pub fn for_namespace(&self, namespace: &crate::NamespaceId) -> Result<Self> {
         namespace
@@ -768,7 +773,7 @@ impl Default for WorkerConfig {
             ownership_gc_enabled: true,
             ownership_gc_replicas: 1,
             load_inflight_bytes: 1 << 30,
-            page_tti_hours: 0,
+            page_tti_hours: 24,
             page_access_checkpoint_interval_minutes: 1,
             page_gc_interval_minutes: 10,
             file_cleanup_interval_hours: 1,
@@ -1279,7 +1284,7 @@ pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
     ConfigVar { env: "TALON_WORKER_BACKGROUND_DELETE_BATCH_SIZE", key: "background_delete_batch_size", default: Some("1024"), cli: false, secret: false, help: "Maximum deletion candidates per watermark eviction or stale GC batch." },
     ConfigVar { env: "TALON_WORKER_BACKGROUND_IO_MAX_MB_PER_SEC", key: "background_io_max_mb_per_sec", default: Some("8"), cli: false, secret: false, help: "Shared background disk read/write MB/s (decimal); zero disables throttling." },
     ConfigVar { env: "TALON_WORKER_BACKGROUND_DELETE_MAX_PER_SEC", key: "background_delete_max_per_sec", default: Some("1024"), cli: false, secret: false, help: "Shared background deletion work items per second; zero disables throttling." },
-    ConfigVar { env: "TALON_WORKER_STALE_GC_ENABLED", key: "stale_gc_enabled", default: Some("true"), cli: false, secret: false, help: "Check blocks idle over 24 hours for deleted backend objects; cache successful checks for 24 hours." },
+    ConfigVar { env: "TALON_WORKER_STALE_GC_ENABLED", key: "stale_gc_enabled", default: Some("true"), cli: false, secret: false, help: "Check entries idle over 25 hours for deleted backend objects; cache successful HEAD results for 24 hours." },
     ConfigVar { env: "TALON_WORKER_STALE_GC_HEAD_CONCURRENCY", key: "stale_gc_head_concurrency", default: Some("4"), cli: false, secret: false, help: "Maximum concurrent backend HEAD checks in stale GC." },
     ConfigVar { env: "TALON_WORKER_STALE_GC_HEAD_MAX_PER_SEC", key: "stale_gc_head_max_per_sec", default: Some("32"), cli: false, secret: false, help: "Backend HEAD requests per second for stale GC; zero disables throttling." },
     ConfigVar { env: "TALON_WORKER_ASYNC_EVICTION_ENABLED", key: "async_eviction_enabled", default: Some("true"), cli: false, secret: false, help: "Enable background eviction at cache occupancy watermarks." },
@@ -1314,7 +1319,7 @@ pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
     ConfigVar { env: "TALON_WORKER_SMALL_OBJECT_SEGMENT_BYTES", key: "small_object_segment_bytes", default: Some("67108864"), cli: false, secret: false, help: "Target packed segment size, including its index." },
     ConfigVar { env: "TALON_WORKER_OWNERSHIP_GC_ENABLED", key: "ownership_gc_enabled", default: Some("true"), cli: false, secret: false, help: "Reclaim misplaced cache blocks on membership changes and hourly admission checks." },
     ConfigVar { env: "TALON_WORKER_OWNERSHIP_GC_REPLICAS", key: "ownership_gc_replicas", default: Some("1"), cli: false, secret: false, help: "Number of placement candidates to retain; must cover every reader replica count." },
-    ConfigVar { env: "TALON_WORKER_PAGE_TTI_HOURS", key: "page_tti_hours", default: Some("0"), cli: false, secret: false, help: "Page time to idle in hours; 0 disables idle expiration." },
+    ConfigVar { env: "TALON_WORKER_PAGE_TTI_HOURS", key: "page_tti_hours", default: Some("24"), cli: false, secret: false, help: "Time to idle in hours for paged L2 and Small Store entries. Set to 0 to disable idle expiration. Ignored when both stores are disabled." },
     ConfigVar { env: "TALON_WORKER_PAGE_ACCESS_CHECKPOINT_INTERVAL_MINUTES", key: "page_access_checkpoint_interval_minutes", default: Some("1"), cli: false, secret: false, help: "Dirty page access checkpoint interval in minutes." },
     ConfigVar { env: "TALON_WORKER_PAGE_GC_INTERVAL_MINUTES", key: "page_gc_interval_minutes", default: Some("10"), cli: false, secret: false, help: "Delay between complete page GC passes in minutes." },
     ConfigVar { env: "TALON_WORKER_FILE_CLEANUP_INTERVAL_HOURS", key: "file_cleanup_interval_hours", default: Some("1"), cli: false, secret: false, help: "Delay between complete file cleanup passes in hours, independent of page GC." },
@@ -2327,15 +2332,8 @@ impl WorkerConfig {
                 return Err(Error::Other(format!("{name} overflows monotonic clock")));
             }
         }
-        if self.page_tti_hours > 0
-            && self.l2_page_size_bytes == 0
-            && self.small_object_threshold_bytes == 0
-        {
-            return Err(Error::Other(
-                "page_tti_hours requires paged L2 or small-object storage".into(),
-            ));
-        }
-        if self.page_tti_hours > 0
+        if self.supports_page_tti()
+            && self.page_tti_hours > 0
             && self.page_access_checkpoint_interval_minutes > self.page_tti_hours * 60
         {
             return Err(Error::Other(
@@ -4161,6 +4159,32 @@ token = "file-token"
     }
 
     #[test]
+    fn page_tti_defaults_and_explicit_opt_out() {
+        let file =
+            WorkerConfigPatch::from_toml("[namespaces.opt-out]\npage_tti_hours = 0").unwrap();
+        let config = WorkerConfig::resolve(file, Default::default(), Default::default()).unwrap();
+        assert_eq!(config.l2_page_size_bytes, 0);
+        assert_eq!(config.small_object_threshold_bytes, 1 << 20);
+        assert!(config.supports_page_tti());
+        assert_eq!(config.page_tti_hours, 24);
+        assert_eq!(
+            config
+                .for_namespace(&crate::NamespaceId::named("opt-out"))
+                .unwrap()
+                .page_tti_hours,
+            0
+        );
+
+        let env = WorkerConfigPatch::from_env_with(|key| {
+            (key == worker_env::PAGE_TTI_HOURS).then(|| "0".into())
+        })
+        .unwrap();
+        let file = WorkerConfigPatch::from_toml("page_tti_hours = 8").unwrap();
+        let config = WorkerConfig::resolve(file, env, Default::default()).unwrap();
+        assert_eq!(config.page_tti_hours, 0);
+    }
+
+    #[test]
     fn page_tti_config_layers_and_validation() {
         let file = WorkerConfigPatch::from_toml(
             "l2_page_size_bytes = 1048576\npage_tti_hours = 2\npage_gc_scan_batch_size = 10\n",
@@ -4205,7 +4229,7 @@ token = "file-token"
         .unwrap();
         assert!(small_tti.small_object_threshold_bytes > 0);
         assert_eq!(small_tti.page_tti_hours, 1);
-        assert_eq!(WorkerConfig::default().page_tti_hours, 0);
+        assert_eq!(WorkerConfig::default().page_tti_hours, 24);
         assert_eq!(WorkerConfig::default().page_gc_interval_minutes, 10);
         assert_eq!(WorkerConfig::default().file_cleanup_interval_hours, 1);
         assert_eq!(c.file_cleanup_interval_hours, 4);
@@ -4217,7 +4241,6 @@ token = "file-token"
             2
         );
         for setting in [
-            "page_tti_hours = 1\nsmall_object_threshold_bytes = 0",
             "page_gc_interval_minutes = 0",
             "file_cleanup_interval_hours = 0",
             "page_access_checkpoint_interval_minutes = 0",

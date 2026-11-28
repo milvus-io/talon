@@ -59,7 +59,7 @@ are required; restoring a previous file is a valid rollback.
 
 | Hot setting | Behavior |
 | --- | --- |
-| `page_tti_hours` | Idle expiry in hours; zero disables only idle collection |
+| `page_tti_hours` | Idle expiry for paged L2 and Small Store, in hours. Defaults to 24. Zero disables idle collection. |
 | `paged_miss_run_concurrency` | Bound newly launched paged-miss runs |
 | `background_scan_batch_size`, `background_delete_batch_size` | Candidate batch limits in watermark eviction and stale GC |
 | `background_io_max_mb_per_sec`, `background_delete_max_per_sec` | Worker-wide background pacing; zero removes the rate limit |
@@ -88,8 +88,9 @@ namespace's admission policy preserves unchanged namespaces' consumed credits.
 In-flight work and already reserved operations finish under their earlier settings.
 Idle deletion candidates recheck TTI after waiting for permits. Access recording,
 access-age recovery and checkpoints remain enabled even when TTI is zero, so
-turning TTI on later retains prior access history. Positive TTI requires paged L2
-or small-object storage and must cover the namespace checkpoint interval.
+turning TTI on later retains prior access history. A positive TTI must cover the
+checkpoint interval for namespaces with paged L2 or Small Store. A namespace with
+both stores disabled has an effective TTI of zero, including after live updates.
 
 Listeners, storage geometry/directories, cache capacity, client configuration,
 resource-pool sizes and task-registration switches are read from this same file
@@ -147,8 +148,13 @@ includes `config_hash`, `config_restart_required` when applicable, and bounded
 `config_error` on failure. Read-only admin endpoints use the existing admin
 network policy and have no configuration mutation API.
 
-The namespace view reports effective TTI and read rate limits. Worker-global
-settings are visible in the applied document returned by `/api/v1/config`.
+The full document returned by `/api/v1/config` shows the applied TTI policy,
+including the value available for inheritance. The namespace endpoint reports
+the TTI used by that namespace's active storage layout and its read rate limits.
+For example, an explicitly named namespace `cold` configured with
+`page_tti_hours = 12` has a value of `12` under
+`effective_config.namespaces.cold.page_tti_hours`. If both paged L2 and Small Store
+are disabled for `cold`, `GET /api/v1/namespaces/cold/config` reports `0`.
 
 ## Namespace wildcard rules
 

@@ -69,21 +69,10 @@ impl WorkerRuntime {
                 "page GC duration overflows clock"
             );
         }
-        let effective_tti = self
-            .dynamic_settings
-            .load()
-            .as_ref()
-            .and_then(|c| {
-                c.settings_for(self.namespace.effective_name())
-                    .page_tti_hours
-            })
-            .map(|hours| hours * 3_600_000)
-            .unwrap_or(config.tti_ms);
+        self.page_gc_config = config;
+        let config = &self.page_gc_config;
+        let effective_tti = self.current_tti_ms();
         if effective_tti > 0 {
-            anyhow::ensure!(
-                self.paged.is_some() || self.small.as_ref().is_some(),
-                "TTI requires paged L2 or small-object storage"
-            );
             anyhow::ensure!(
                 config.checkpoint_interval_ms <= effective_tti,
                 "checkpoint interval exceeds TTI"
@@ -102,7 +91,6 @@ impl WorkerRuntime {
             .checkpoint_interval
             .set(config.checkpoint_interval_ms as f64 / 1000.0);
         self.fallback_background_io = Arc::new(tokio::sync::Semaphore::new(config.io_concurrency));
-        self.page_gc_config = config;
         Ok(self)
     }
 

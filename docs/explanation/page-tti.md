@@ -1,7 +1,7 @@
 # Page TTI (Time To Idle)
 
-Worker 的 paged L2 缓存可以按最后访问时间回收。TTI（Time To Idle）表示连续未访问的时长，
-成功访问会重新计时；不同于从写入时刻计算固定存活期的 TTL（Time To Live）。配置默认关闭；TTI 是本地缓存策略，
+Worker 默认在 paged L2 和 Small Store 条目空闲超过 24 小时后回收缓存。TTI（Time To Idle）表示连续未访问的时长，
+成功访问会重新计时。TTL（Time To Live）从写入时刻计算固定存活期。TTI 是本地缓存策略，
 不会删除源对象，不涉及 write-back staging、WAL 或跨 Worker 副本元数据。
 
 ## 使用方式
@@ -18,21 +18,22 @@ page_gc_delete_batch_size = 1024
 page_gc_io_concurrency = 4
 ```
 
-24 小时仅为示例。环境变量为上述字段加 `TALON_WORKER_` 前缀并转为大写，
-例如 `TALON_WORKER_PAGE_TTI_HOURS=24`。环境变量覆盖 TOML；没有专用 CLI flag 或热更新。
+环境变量为上述字段加 `TALON_WORKER_` 前缀并转为大写，例如 `TALON_WORKER_PAGE_TTI_HOURS=0`
+关闭按空闲时间回收。环境变量覆盖 TOML。使用 `TALON_WORKER_CONFIG` 时，支持在文件中
+[热更新 TTI](../reference/worker-dynamic-config.md)。
 完整默认值见[配置参考](../reference/configuration.md)。
 
 #580 新增的 TOML 名 `page_ttl_ms` 和环境变量 `TALON_WORKER_PAGE_TTL_MS`
 现统一改为 `page_tti_hours` 和 `TALON_WORKER_PAGE_TTI_HOURS`，不保留旧名别名。
 如果已经使用 #580 的配置，升级时需同步改名并将毫秒值换算为小时；旧 TOML 字段会报未知字段错误，
-旧环境变量不再读取（未设置新名时沿用 TOML 或默认值 `0`）。过期语义和默认关闭行为不变。
+旧环境变量不再读取。未设置新环境变量时，使用 TOML 配置或默认值 `24`。
 
 缓存维护时间配置统一使用分钟或小时，旧名不保留别名；TOML 字段和环境变量均需同步迁移。
 旧 TOML 字段会报未知字段错误，旧环境变量不再读取。
 
 | 旧配置名 | 新配置名 | 新默认值 |
 | --- | --- | --- |
-| `page_tti_ms` | `page_tti_hours` | `0`（关闭） |
+| `page_tti_ms` | `page_tti_hours` | `24` |
 | `page_access_checkpoint_interval_ms` | `page_access_checkpoint_interval_minutes` | `1` |
 | `page_gc_interval_ms` | `page_gc_interval_minutes` | `10` |
 | `file_cleanup_interval_ms` | `file_cleanup_interval_hours` | `1` |
@@ -48,10 +49,14 @@ Rust 字段已改名为 `WorkerConfig::page_tti_hours`、`WorkerConfigPatch::pag
 回收计数器的 `reason="ttl"` 改为 `reason="tti"`；自定义查询、面板和告警需同步更新。
 仓库内的告警规则已使用新名，混合版本部署期间自定义规则需兼顾两种名字。
 
-`page_tti_hours=0` 关闭 TTI 和访问时间 checkpoint，保留容量淘汰。命中时不取时间、
-不更新时间戳或 dirty 状态，仍保留读取/删除仲裁和容量策略的访问记录。
-开启 TTI 必须启用 paged L2，checkpoint 周期不能超过 TTI；其他周期、批量和并发配置必须为正数。
+`page_tti_hours=0` 关闭按空闲时间回收。paged L2 和 Small Store 仍记录和保存访问时间，容量淘汰继续运行。
+启用 paged L2 或 Small Store 的命名空间使用其配置的 TTI。正值必须不小于 checkpoint 周期。
+两种存储都关闭的命名空间有效 TTI 为 `0`，可以沿用默认配置。其他周期、批量和并发配置必须为正数。
 `capacity_bytes=0` 只关闭容量淘汰，不关闭 TTI。
+
+升级前检查省略了 `page_tti_hours` 的配置。启用 paged L2 或 Small Store 时，默认 TTI 为 24 小时，
+checkpoint 周期超过 1440 分钟会导致 Worker 拒绝启动。显式设置 `page_tti_hours = 0` 可保留原有行为。
+要采用新的默认 TTI，请将 `page_access_checkpoint_interval_minutes` 调至 1440 或更低。
 
 ## 访问与回收语义
 
@@ -262,7 +267,7 @@ Worker 实际 Ready 并成功读取已有缓存，并覆盖异常退出恢复、
 - 新磁盘/其他 Worker 使用自己的缓存状态，miss 按现有路径回源；没有访问时间广播。
 - Coordinator 断连或后端暂不可用不暂停 TTI。后端不可用时，失去的缓存无法保证立即回填。
 - 初次开启时旧 page 没有访问记录，可能集中回收。按 Worker 小批开启并观察回源压力。
-- 回滚旧版后不执行 TTI；再次升级不补偿旧版或 TTI 关闭期间未保存的访问。
+- 回滚到不支持 TTI 的版本时，未保存的访问时间无法在再次升级后恢复。
 - 当前服务使用首个 cache dir，本功能不新增多磁盘调度。
 
 <a id="diagnostics"></a>
@@ -272,7 +277,7 @@ Worker 实际 Ready 并成功读取已有缓存，并覆盖异常退出恢复、
 
 - `gc_scanned_total`：检查过的 page 数；`gc_batch_seconds`：单次调度片耗时；
   `gc_scan_seconds`：最近完整扫描各调度片的累计活动时间，含删除等待，不含片间调度排队。
-- `tti_seconds`：配置的空闲过期时长；`0` 表示关闭按空闲时间回收。
+- `tti_seconds`：有效的空闲过期时长。`0` 表示关闭按空闲时间回收。
 - `gc_reclaimed_total`、`gc_reclaimed_bytes_total`：成功回收；`reason=tti|capacity|superseded|backend_deleted|ownership`；`ownership` 来自stale GC 中的[归属清理任务](ownership-gc.md)。
 - `gc_delete_errors_total`、`gc_pending_retries`：删除故障和最近完整扫描看到的重试量。
 - `access_dirty_blocks`、`access_oldest_dirty_seconds`：从 dirty block 摘要统计的待保存状态，

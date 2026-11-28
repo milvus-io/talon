@@ -337,7 +337,11 @@ impl WorkerRuntime {
             rate_limiter: Arc::new(NamespaceRateLimiter::disabled()),
             page_lifecycle,
             page_clock: Arc::new(AccessClock::new()),
-            page_gc_config: PageGcConfig::default(),
+            // with_page_gc restores access ages before enabling idle expiration.
+            page_gc_config: PageGcConfig {
+                tti_ms: 0,
+                ..PageGcConfig::default()
+            },
             page_mutations: Arc::new(Mutations::default()),
             fallback_background_io: Arc::new(tokio::sync::Semaphore::new(4)),
             background_budget: None,
@@ -528,6 +532,9 @@ impl WorkerRuntime {
     }
 
     fn current_tti_ms(&self) -> u64 {
+        if !self.supports_page_tti() {
+            return 0;
+        }
         self.dynamic_settings
             .load()
             .as_ref()
@@ -537,6 +544,10 @@ impl WorkerRuntime {
             })
             .map(|hours| hours * 3_600_000)
             .unwrap_or(self.page_gc_config.tti_ms)
+    }
+
+    fn supports_page_tti(&self) -> bool {
+        self.paged.is_some() || self.small.is_some()
     }
 
     pub(crate) fn validate_dynamic_tti(
@@ -550,11 +561,8 @@ impl WorkerRuntime {
             if let Some(hours) = config
                 .settings_for(runtime.namespace.effective_name())
                 .page_tti_hours
-                .filter(|hours| *hours > 0)
+                .filter(|hours| *hours > 0 && runtime.supports_page_tti())
             {
-                if runtime.paged.is_none() && runtime.small.is_none() {
-                    return Err("TTI requires paged L2 or small-object storage".to_string());
-                }
                 if runtime.page_gc_config.checkpoint_interval_ms > hours * 3_600_000 {
                     return Err("checkpoint interval exceeds TTI".to_string());
                 }
