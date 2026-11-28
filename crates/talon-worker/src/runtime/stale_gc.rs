@@ -10,7 +10,8 @@ use std::{
 use talon_core::backend::BackgroundRoute;
 use talon_core::{BackendStore, Error, ObjectId, WorkerConfig};
 
-const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+const STALE_IDLE_MS: u64 = 25 * 60 * 60 * 1000;
+const POSITIVE_HEAD_COOLDOWN_MS: u64 = 24 * 60 * 60 * 1000;
 const MAX_HEADS: usize = 32;
 
 pub(super) struct StaleGc {
@@ -132,7 +133,14 @@ impl StaleGc {
             let scan = scan.min(4096);
             let deletes = deletes.min(256);
             let (cursor, candidates) = tokio::task::spawn_blocking(move || {
-                let candidates = lru.stale_gc_candidates(&mut cursor, now, DAY_MS, scan, deletes);
+                let candidates = lru.stale_gc_candidates(
+                    &mut cursor,
+                    now,
+                    STALE_IDLE_MS,
+                    POSITIVE_HEAD_COOLDOWN_MS,
+                    scan,
+                    deletes,
+                );
                 (cursor, candidates)
             })
             .await
@@ -149,9 +157,11 @@ impl StaleGc {
             }
             let candidate = self.pending.pop_front().unwrap();
             if worker.lru.stale_candidate_is_current(&candidate)
-                && worker
-                    .lru
-                    .stale_check_due(&candidate.block.object, now, DAY_MS)
+                && worker.lru.stale_check_due(
+                    &candidate.block.object,
+                    now,
+                    POSITIVE_HEAD_COOLDOWN_MS,
+                )
             {
                 let object = &candidate.block.object;
                 // Decide once per bucket for this batch before queuing HEADs.
@@ -315,7 +325,7 @@ mod tests {
         }
     }
     fn cold_now() -> u64 {
-        access_millis() + DAY_MS + 1
+        access_millis() + STALE_IDLE_MS + 1
     }
 
     #[cfg(target_os = "linux")]
@@ -529,6 +539,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_gc_checks_ordinary_and_packed_entries_only_after_25_idle_hours() {
+        for paged in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let origin = Arc::new(Origin::default());
+            let config = WorkerConfig {
+                backend: Some("s3".into()),
+                block_size: 32,
+                l1_page_size_bytes: 16,
+                l2_page_size_bytes: if paged { 16 } else { 0 },
+                ..Default::default()
+            };
+            let lock =
+                Arc::new(crate::page_access_store::CacheRootLock::acquire(root.path()).unwrap());
+            let worker = WorkerRuntime::open_namespaces(
+                &config,
+                lock,
+                origin.clone(),
+                WorkerMetrics::new(0),
+            )
+            .unwrap();
+            let admitted_at = access_millis();
+            let ordinary = block(0);
+            fill(&worker, &ordinary, paged).await;
+            let mut packed = block(0);
+            packed.object.object_path = "packed".into();
+            let small = worker.small.as_ref().unwrap();
+            small
+                .put(&packed, Bytes::from_static(b"packed"))
+                .await
+                .unwrap();
+
+            let mut gc = StaleGc::default();
+            gc.run_round_at(&worker, admitted_at + STALE_IDLE_MS).await;
+            assert_eq!(origin.calls.load(Ordering::Relaxed), 0);
+            assert!(worker.index.get(&ordinary).is_some());
+            assert!(small.contains(&packed));
+
+            gc.run_round_at(&worker, cold_now()).await;
+            assert_eq!(origin.calls.load(Ordering::Relaxed), 2);
+            assert!(worker.index.get(&ordinary).is_none());
+            assert!(!small.contains(&packed));
+        }
+    }
+
+    #[tokio::test]
     async fn stale_gc_positive_checks_cover_other_offsets_for_24_hours() {
         for paged in [false, true] {
             let root = tempfile::tempdir().unwrap();
@@ -543,7 +598,7 @@ mod tests {
             gc.tick_at(&r, now).await;
             origin.mode.store(0, Ordering::Relaxed);
             for _ in 0..8 {
-                gc.tick_at(&r, now + DAY_MS - 1).await;
+                gc.tick_at(&r, now + POSITIVE_HEAD_COOLDOWN_MS - 1).await;
             }
             assert_eq!(origin.calls.load(Ordering::Relaxed), 1);
             assert_eq!(
@@ -552,7 +607,7 @@ mod tests {
                 "a version change alone is not deletion"
             );
             for _ in 0..8 {
-                gc.tick_at(&r, now + DAY_MS).await;
+                gc.tick_at(&r, now + POSITIVE_HEAD_COOLDOWN_MS).await;
             }
             assert_eq!(r.logical_resident_bytes(), 0);
         }

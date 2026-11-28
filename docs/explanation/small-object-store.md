@@ -469,7 +469,8 @@ TTI, pinning, ownership cleanup and exact-key invalidation still apply. Ordinary
 whole/paged entries retain their existing version policy, including when mixed
 with packed objects in the same namespace.
 
-Origin-existence checks remain a separate optional background policy. Namespace
-startup constructs their reference-counted check table only when `stale_gc_enabled`
+[Stale GC](async-eviction.md#stale-object-checks) checks for origin deletion after
+more than 25 idle hours. A successful HEAD starts a 24-hour cooldown shared across
+cached offsets and versions of the same object. Namespace startup constructs their reference-counted check table only when `stale_gc_enabled`
 is true; disabling it skips both recovery-time and subsequent admission bookkeeping.
 The full key and persisted record formats are unchanged.

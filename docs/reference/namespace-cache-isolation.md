@@ -47,9 +47,10 @@ unconfigured namespaces inherit the global settings, not that entry. Namespace t
 are file-only and apply on worker restart. All namespaces use the same fixed logical
 block size; it cannot be overridden by a namespace or a request. L1 and L2 page sizes remain namespace settings.
 
-TTI and page GC apply to paged L2 storage. A zero TTI disables idle expiration;
-a zero L2 page size selects whole-block storage. Checkpoint and GC intervals
-are scheduled separately for each namespace. Ownership GC shares the worker's
+TTI defaults to 24 hours for paged L2 and Small Store entries. Setting TTI to zero
+disables idle expiration. A zero L2 page size selects whole-block storage. If
+Small Store is also disabled, the namespace's effective TTI is zero. Checkpoint
+and GC intervals are scheduled separately for each namespace. Ownership GC shares the worker's
 membership observation across namespaces, while keeping separate admission
 boundaries and scan progress for each namespace. New admissions after a topology
 observation are handled by the hourly supplemental scan; all scans use the

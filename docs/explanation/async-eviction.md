@@ -173,8 +173,8 @@ Ownership uses the snapshot published by the Worker control plane and never issu
 backend HEADs. The tasks share the resident block index, deletion
 budgets and whole-block reclaimer, while keeping scans and schedules independent.
 
-For backend-deletion checks, only blocks idle for **more than 24 hours** are eligible. Reads and admissions
-refresh a process-local, monotonic block timestamp, shared by all of its pages.
+For backend-deletion checks, only blocks idle for **more than 25 hours** are
+eligible. Reads and admissions refresh a process-local, monotonic block timestamp, shared by all of its pages.
 The task walks resident metadata, without scanning cache directories or listing
 the backend. Each round traverses one fixed queue generation in batches. Each
 batch scans at most 4096 blocks (or the smaller configured scan budget) and retains
@@ -215,14 +215,14 @@ counts the number of reclaimed pages under reason `backend_deleted` in the
 existing GC metrics; scheduler metrics expose task `stale_gc` for both forms.
 
 Idle timestamps and successful checks are in memory and retire with resident
-entries. Restart conservatively starts a fresh 24-hour idle window, including for
+entries. Restart conservatively starts a fresh 25-hour idle window, including for
 recovered cache files. This is eventual space reclamation: hot blocks remain
 cached, and deletion discovery is delayed by idle age, positive-check cooldown,
 and scan progress. It does not change read-path version semantics.
 
 ## Stale-object checks
 
-Stale GC preserves the hourly delay between completed rounds, idle age over 24
+Stale GC preserves the hourly delay between completed rounds, idle age over 25
 hours and positive HEAD cooldown of 24 hours. Warm scans immediately continue
 without per-batch sleeps. Backend HEAD traffic has an independent paced budget:
 `stale_gc_head_max_per_sec` (default 32, zero unlimited) and

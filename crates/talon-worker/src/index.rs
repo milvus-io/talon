@@ -1569,12 +1569,12 @@ mod tests {
         access.clock().store(100, Ordering::Relaxed);
 
         with_directory_reader(&index, || {
-            let candidates = lru.stale_gc_candidates(&mut (0, 0), 200, 50, 100, 100);
+            let candidates = lru.stale_gc_candidates(&mut (0, 0), 200, 50, 50, 100, 100);
             assert_eq!(candidates.len(), 1);
             assert!(lru.stale_candidate_is_current(&candidates[0]));
             lru.stale_verified(&id.object, 200);
             assert!(lru
-                .stale_gc_candidates(&mut (0, 0), 200, 50, 100, 100)
+                .stale_gc_candidates(&mut (0, 0), 200, 50, 50, 100, 100)
                 .is_empty());
             assert_eq!(lru.idle_candidates(&mut (0, 0), 200, 50, 100, 100).len(), 1);
             access.touch();

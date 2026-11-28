@@ -444,7 +444,7 @@ Shared background deletion work items per second; zero disables throttling.
 
 ### `stale_gc_enabled`
 
-Check blocks idle over 24 hours for deleted backend objects; cache successful checks for 24 hours.
+Check entries idle over 25 hours for deleted backend objects; cache successful HEAD results for 24 hours.
 
 - **Environment variable:** `TALON_WORKER_STALE_GC_ENABLED`
 - **Default:** `true`
@@ -556,10 +556,10 @@ Number of placement candidates to retain; must cover every reader replica count.
 
 ### `page_tti_hours`
 
-Page time to idle in hours; 0 disables idle expiration.
+Time to idle in hours for paged L2 and Small Store entries. Set to 0 to disable idle expiration. Ignored when both stores are disabled.
 
 - **Environment variable:** `TALON_WORKER_PAGE_TTI_HOURS`
-- **Default:** `0`
+- **Default:** `24`
 - **CLI flag:** not settable via CLI (config file or environment only)
 
 ### `page_access_checkpoint_interval_minutes`

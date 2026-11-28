@@ -1064,10 +1064,17 @@ impl Lru {
         cursor: &mut (u64, u64),
         now: u64,
         age: u64,
+        positive_head_cooldown: u64,
         scan_budget: usize,
         delete_budget: usize,
     ) -> Vec<StaleBlockCandidate> {
-        self.age_candidates(cursor, now, age, (scan_budget, delete_budget), true)
+        self.age_candidates(
+            cursor,
+            now,
+            age,
+            (scan_budget, delete_budget),
+            Some(positive_head_cooldown),
+        )
     }
 
     pub(crate) fn idle_candidates(
@@ -1078,7 +1085,7 @@ impl Lru {
         scan_budget: usize,
         delete_budget: usize,
     ) -> Vec<StaleBlockCandidate> {
-        self.age_candidates(cursor, now, age, (scan_budget, delete_budget), false)
+        self.age_candidates(cursor, now, age, (scan_budget, delete_budget), None)
     }
 
     fn age_candidates(
@@ -1087,7 +1094,7 @@ impl Lru {
         now: u64,
         age: u64,
         (scan_budget, delete_budget): (usize, usize),
-        consider_verified: bool,
+        positive_head_cooldown: Option<u64>,
     ) -> Vec<StaleBlockCandidate> {
         let mut out = Vec::new();
         if cursor.0 >= cursor.1 {
@@ -1105,12 +1112,12 @@ impl Lru {
             if activity.pins != 0 || now.saturating_sub(access) <= age {
                 continue;
             }
-            if consider_verified
-                && g.object_checks
+            if positive_head_cooldown.is_some_and(|cooldown| {
+                g.object_checks
                     .get(&block.view().object as &dyn ObjectIdentity)
                     .and_then(|check| check.1)
-                    .is_some_and(|at| now.saturating_sub(at) < age)
-            {
+                    .is_some_and(|at| now.saturating_sub(at) < cooldown)
+            }) {
                 continue;
             }
             out.push(StaleBlockCandidate {
@@ -1652,9 +1659,9 @@ mod tests {
         access.clock().store(100, Ordering::Relaxed);
         let mut cursor = (0, 0);
         assert!(lru
-            .stale_gc_candidates(&mut cursor, 200, 100, 8, 8)
+            .stale_gc_candidates(&mut cursor, 200, 100, 100, 8, 8)
             .is_empty());
-        let candidates = lru.stale_gc_candidates(&mut cursor, 201, 100, 8, 8);
+        let candidates = lru.stale_gc_candidates(&mut cursor, 201, 100, 100, 8, 8);
         assert_eq!(candidates.len(), 1);
         assert!(candidates.iter().all(|c| lru.stale_candidate_is_current(c)));
         // A touch of either page invalidates the block candidate.
@@ -1671,7 +1678,7 @@ mod tests {
         let unit = whole(1);
         let old = lru.insert(unit.clone(), 16);
         old.clock().store(1, Ordering::Relaxed);
-        let candidates = lru.stale_gc_candidates(&mut (0, 0), 200, 100, 8, 8);
+        let candidates = lru.stale_gc_candidates(&mut (0, 0), 200, 100, 100, 8, 8);
         assert_eq!(candidates.len(), 1);
         lru.stale_verified(&unit.block().object, 200);
         lru.remove(&unit);

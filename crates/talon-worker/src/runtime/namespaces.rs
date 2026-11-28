@@ -67,17 +67,11 @@ impl NamespaceRuntimes {
         config: &talon_core::dynamic_config::WorkerDynamicConfig,
     ) -> Result<(), String> {
         let validate = |static_config: &WorkerConfig, hours: u64| {
-            if hours > 0 {
-                if static_config.l2_page_size_bytes == 0
-                    && static_config.small_object_threshold_bytes == 0
-                {
-                    return Err("TTI requires paged L2 or small-object storage".to_string());
-                }
-                if static_config.page_access_checkpoint_interval_minutes * 60_000
-                    > hours * 3_600_000
-                {
-                    return Err("checkpoint interval exceeds TTI".to_string());
-                }
+            if static_config.supports_page_tti()
+                && hours > 0
+                && static_config.page_access_checkpoint_interval_minutes > hours * 60
+            {
+                return Err("checkpoint interval exceeds TTI".to_string());
             }
             Ok(())
         };
@@ -2981,6 +2975,65 @@ page_tti_hours = 2
         for name in ["../escape", ".", "..", "a/b", "a\\b", ""] {
             assert!(root.for_namespace(&NamespaceId::named(name)).await.is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn page_tti_defaults_apply_to_small_store_and_follow_namespace_storage() {
+        let dir = tempfile::tempdir().unwrap();
+        let defaults = WorkerConfig::default();
+        let root = open(dir.path(), &defaults, Arc::default());
+        assert!(root.small.is_some());
+        assert!(root.paged.is_none());
+        assert_eq!(root.current_tti_ms(), 24 * 3_600_000);
+        assert_eq!(root.page_gc_metrics.tti_seconds.get(), 86_400.0);
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = WorkerConfig {
+            small_object_threshold_bytes: 0,
+            namespaces: BTreeMap::from([(
+                "paged".into(),
+                NamespaceCacheConfig {
+                    l2_page_size_bytes: Some(1 << 20),
+                    ..Default::default()
+                },
+            )]),
+            ..defaults
+        };
+        let root = open(dir.path(), &config, Arc::default());
+        let paged = root
+            .for_namespace(&NamespaceId::named("paged"))
+            .await
+            .unwrap();
+        assert_eq!(root.current_tti_ms(), 0);
+        assert_eq!(paged.current_tti_ms(), 24 * 3_600_000);
+
+        let mut state = crate::dynamic_config::DynamicConfig::new(
+            config,
+            Default::default(),
+            Default::default(),
+        );
+        assert!(state.apply_runtime(
+            "small_object_threshold_bytes = 0\npage_tti_hours = 12\n\
+             [namespaces.paged]\npage_tti_hours = 0\n\
+             [namespaces.future]\npage_tti_hours = 12",
+            &root,
+        ));
+        let future = root
+            .for_namespace(&NamespaceId::named("future"))
+            .await
+            .unwrap();
+        assert_eq!(root.current_tti_ms(), 0);
+        assert_eq!(future.current_tti_ms(), 0);
+        assert_eq!(paged.current_tti_ms(), 0);
+        let status = state.status();
+        assert_eq!(
+            status.effective_config.as_ref().unwrap()["namespaces"]["future"]["page_tti_hours"],
+            12
+        );
+        let effective = root
+            .effective_namespace_settings(&NamespaceId::named("future"), status.config.as_ref())
+            .unwrap();
+        assert_eq!(effective.page_tti_hours, Some(0));
     }
 
     #[tokio::test]

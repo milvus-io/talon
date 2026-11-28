@@ -140,7 +140,7 @@ received during active work. Once converged, ownership waits for a membership
 event or its hourly admission check without occupying a task slot.
 
 Independent `stale_gc` retains its hourly round delay, one-second batch pacing,
-24-hour idle filter and positive HEAD cooldown. Only authoritative `NotFound`
+25-hour idle filter and 24-hour positive HEAD cooldown. Only authoritative `NotFound`
 authorizes backend-deletion reclamation. Each batch permits at most 32 distinct
 HEADs within a five-second backend work deadline. Neither ownership activity nor
 membership failure changes this schedule or policy.
