@@ -252,6 +252,27 @@ async fn cancelled_request_retains_service_admission_until_io_completes() {
     assert_eq!(s.admission.count.available_permits(), 1);
     assert_eq!(s.admission.bytes.available_permits(), 48);
 }
+
+#[tokio::test]
+async fn written_append_and_query_release_admission_before_completion() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = service(dir.path());
+    let a = stream(&s, "a");
+    let (max_requests, max_bytes) = (s.options.max_requests, s.options.max_bytes);
+    a.append((1, 1), Ack::Written).await.unwrap();
+    assert_eq!(s.admission.count.available_permits(), max_requests);
+    assert_eq!(s.admission.bytes.available_permits(), max_bytes);
+
+    let admission = s.admission.clone();
+    a.query(move |_| {
+        assert_eq!(admission.count.available_permits(), max_requests);
+        assert_eq!(admission.bytes.available_permits(), max_bytes);
+        Ok(())
+    })
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn queries_do_not_expose_state_after_failed_sync() {
     let dir = tempfile::tempdir().unwrap();
@@ -267,6 +288,7 @@ async fn append_projection_uses_the_append_sync() {
     let dir = tempfile::tempdir().unwrap();
     let service =
         JournalService::open(dir.path().to_owned(), Arc::new(()), Options::default()).unwrap();
+    let (max_requests, max_bytes) = (service.options.max_requests, service.options.max_bytes);
     for (name, fail) in [("success", false), ("failure", true)] {
         let handle = stream(&service, name);
         let pause = Arc::new(Pause::default());
@@ -275,11 +297,14 @@ async fn append_projection_uses_the_append_sync() {
         let append = {
             let handle = handle.clone();
             let published = published.clone();
+            let admission = service.admission.clone();
             tokio::spawn(async move {
                 handle
                     .append_with((7, 11), move |state, lsn| {
                         let value = state.0[&7];
                         move || {
+                            assert_eq!(admission.count.available_permits(), max_requests);
+                            assert_eq!(admission.bytes.available_permits(), max_bytes);
                             published.store(true, Ordering::Release);
                             (lsn, value)
                         }

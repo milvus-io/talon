@@ -6,7 +6,7 @@ struct Pending<M: Machine> {
 }
 struct Durable<M: Machine> {
     reply: DurableReply<M>,
-    _permits: Permits,
+    permits: Permits,
 }
 enum DurableReply<M: Machine> {
     Applied(AppliedReply),
@@ -74,8 +74,9 @@ pub(crate) async fn run<M: Machine>(
             // a snapshot waits for those permits; no per-caller list is retained.
             if matches!(barrier.as_ref().map(|r| &r.command), Some(Command::Checkpoint(_))) {
                 let request = barrier.take().unwrap();
-                if let Command::Checkpoint(done) = request.command {
+                if let Request { command: Command::Checkpoint(done), _permits: permits } = request {
                     let completion = pending_checkpoint.get_or_insert_with(|| watch::channel(false).0);
+                    drop(permits);
                     let _ = done.send(completion.subscribe());
                 }
             }
@@ -87,7 +88,10 @@ pub(crate) async fn run<M: Machine>(
                 if matches!(barrier.as_ref().map(|r|&r.command),Some(Command::Query(_))) {
                     disk.sync().await?;
                     let request=barrier.take().unwrap();
-                    if let Command::Query(query)=request.command {query(&machine);}
+                    if let Request { command: Command::Query(query), _permits: permits } = request {
+                        drop(permits);
+                        query(&machine);
+                    }
                     continue;
                 } else if checkpoint_ready && checkpoint.is_none() && (pending_checkpoint.is_some() || disk.offset>=disk.options.checkpoint_bytes) {
                     let snapshot=machine.snapshot()?;
@@ -108,6 +112,7 @@ pub(crate) async fn run<M: Machine>(
                             DurableReply::Applied(reply) => reply,
                             DurableReply::Unapplied { record, lsn, reply } => apply(&mut machine, lsn, record, reply)?,
                         };
+                        drop(pending.permits);
                         reply.send();
                     }
                 }
@@ -125,24 +130,26 @@ pub(crate) async fn run<M: Machine>(
                     write=None;
                     let (requests,result)=result;result?;
                     for pending in requests {
-                        let Request{command,_permits}=pending.request;
+                        let Request { command, _permits: permits } = pending.request;
                         if let Command::Append{record,bytes,ack,reply}=command {
                             let lsn = pending.lsn;
+                            drop(bytes);
                             if M::APPLY_AFTER_SYNC {
                                 durable.push(Durable {
                                     reply: DurableReply::Unapplied { record, lsn, reply },
-                                    _permits,
+                                    permits,
                                 });
+                                disk.lsn = lsn;
                             } else {
                                 let reply = apply(&mut machine, lsn, record, reply)?;
+                                disk.lsn = lsn;
                                 if ack == Ack::Durable {
-                                    durable.push(Durable { reply: DurableReply::Applied(reply), _permits });
+                                    durable.push(Durable { reply: DurableReply::Applied(reply), permits });
                                 } else {
+                                    drop(permits);
                                     reply.send();
                                 }
                             }
-                            disk.lsn = lsn;
-                            drop(bytes);
                         }
                     }
                 }
