@@ -259,7 +259,6 @@ impl WorkerBackground {
     /// using the same disk budget. External process shutdown deadlines still apply.
     pub async fn shutdown(self) {
         self.begin_shutdown();
-        let stop = self.scheduler.stop_signal();
         self.scheduler.shutdown().await;
         self.worker.drain_namespace_initializers().await;
         let namespaces = self.worker.namespace_runtimes();
@@ -276,8 +275,21 @@ impl WorkerBackground {
                 }
             }
         }
+        // All namespaces share one short window for advisory Small Store deltas.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        for namespace in &namespaces {
+            if let Some(small) = &namespace.small {
+                if let Err(error) = small
+                    .checkpoint_access_on_shutdown(namespace.background_budget.clone(), deadline)
+                    .await
+                {
+                    if error.kind() != std::io::ErrorKind::Interrupted {
+                        tracing::warn!(%error, "small object shutdown access flush failed");
+                    }
+                }
+            }
+        }
         for namespace in namespaces {
-            namespace.checkpoint_small_access(Some(&stop)).await;
             namespace.checkpoint_access_times().await;
             if let Err(error) = namespace.checkpoint_catalog().await {
                 tracing::error!(%error, "cache catalog shutdown checkpoint failed");

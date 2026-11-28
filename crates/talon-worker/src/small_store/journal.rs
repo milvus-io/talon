@@ -30,11 +30,7 @@ pub(super) struct Journal {
     handle: Handle<LiveModel>,
     pub(super) model: LiveModel,
     pub(super) readers: Arc<tokio::sync::RwLock<()>>,
-    // Full access snapshots sample a stable set of locations across batches.
-    pub(super) access_relocation: tokio::sync::RwLock<()>,
-    pub(super) access_log_write: tokio::sync::Mutex<()>,
-    pub(super) access_disk: std::sync::Mutex<super::access::DiskState>,
-    pub(super) access_bytes: AtomicU64,
+    pub(super) access: super::access::Persistence,
     pub(super) next: Arc<AtomicU64>,
     #[cfg(test)]
     pub(super) control: Arc<TestControl>,
@@ -84,7 +80,10 @@ impl Journal {
         let handle = service.open_stream_with_maintenance(
             relative_metadata,
             shared.clone(),
-            StreamOptions::default(),
+            StreamOptions {
+                defer_checkpoints: true,
+                ..StreamOptions::default()
+            },
             maintenance.map(|budget| budget as Arc<dyn talon_journal::Maintenance>),
         )?;
         let replay_ms = replay_started.elapsed().as_secs_f64() * 1000.0;
@@ -94,17 +93,14 @@ impl Journal {
         tracing::info!(root = %root.display(), segments = model.segments.len(),
             replay_ms, clone_ms, "small journal model restored");
         let next = Arc::new(AtomicU64::new(model.next.max(1)));
-        let access_bytes = AtomicU64::new(super::access::allocated(&root)?);
+        let access = super::access::Persistence::new(root.clone())?;
         Ok((
             Arc::new(Self {
                 root,
                 handle,
                 model: shared,
                 readers: Arc::default(),
-                access_relocation: Default::default(),
-                access_log_write: Default::default(),
-                access_disk: Default::default(),
-                access_bytes,
+                access,
                 next,
                 #[cfg(test)]
                 control: Default::default(),
@@ -213,9 +209,6 @@ impl Journal {
     pub fn data_path(&self, id: u64) -> PathBuf {
         data_path(&self.root, id)
     }
-    pub fn access_log_path(&self) -> PathBuf {
-        self.root.join("access.log")
-    }
     pub fn allocated(&self) -> u64 {
         self.handle.allocated_bytes()
     }
@@ -240,6 +233,10 @@ impl Journal {
             )
             .await?;
         self.handle.checkpoint().await
+    }
+
+    pub(super) fn start_checkpoints(&self) {
+        self.handle.start_checkpoints();
     }
 
     pub(super) fn stop_checkpoints(&self) {

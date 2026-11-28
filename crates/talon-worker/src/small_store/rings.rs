@@ -31,6 +31,13 @@ pub struct SmallObjectStore {
     pub(super) tasks: Arc<crate::page_gc::Mutations>,
 }
 
+pub(crate) struct SmallStoreOptions {
+    pub threshold: u64,
+    pub segment_size: u64,
+    pub capacity: u64,
+    pub compact: bool,
+}
+
 impl SmallObjectStore {
     pub fn open(
         root: PathBuf,
@@ -41,26 +48,30 @@ impl SmallObjectStore {
     ) -> io::Result<Self> {
         Self::open_with_service(
             root,
-            threshold,
-            segment_size,
-            capacity,
+            SmallStoreOptions {
+                threshold,
+                segment_size,
+                capacity,
+                compact: false,
+            },
             root_lock,
             None,
             None,
-            false,
         )
     }
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn open_with_service(
         root: PathBuf,
-        threshold: u64,
-        segment_size: u64,
-        capacity: u64,
+        options: SmallStoreOptions,
         root_lock: Option<Arc<crate::page_access_store::CacheRootLock>>,
         service: Option<&Arc<talon_journal::JournalService>>,
         maintenance: Option<Arc<crate::background::BackgroundBudget>>,
-        compact: bool,
     ) -> io::Result<Self> {
+        let SmallStoreOptions {
+            threshold,
+            segment_size,
+            capacity,
+            compact,
+        } = options;
         validate_geometry(threshold, segment_size, capacity)?;
         let journal_started = Instant::now();
         let (journal, model) = match service {
@@ -166,6 +177,7 @@ impl SmallObjectStore {
             state.allocated = state.allocated - segment.allocated + allocated;
             segment.allocated = allocated;
         }
+        journal.start_checkpoints();
         Ok(recovered)
     }
 
@@ -468,10 +480,7 @@ impl SmallObjectStore {
     }
 
     fn metadata_allocated_bytes(&self) -> u64 {
-        self.journal
-            .access_bytes
-            .load(std::sync::atomic::Ordering::Relaxed)
-            + self.journal.allocated()
+        self.journal.access.allocated_bytes() + self.journal.allocated()
     }
 
     #[cfg(test)]
@@ -670,14 +679,17 @@ impl SmallObjectStore {
         let store = self.clone();
         self.tasks
             .run(async move {
+                let mut result = Ok(());
                 for stream in store.streams() {
                     let _io = match &budget {
                         Some(budget) => Some(budget.io().await),
                         None => None,
                     };
-                    stream.checkpoint().await?;
+                    if let Err(error) = stream.checkpoint().await {
+                        result = result.and(Err(error));
+                    }
                 }
-                Ok(())
+                result
             })
             .await
     }
@@ -735,6 +747,26 @@ mod tests {
                 ring.drain().await;
                 result
             })
+    }
+
+    #[tokio::test]
+    async fn shutdown_seals_later_streams_after_the_first_error() {
+        let root = tempfile::tempdir().unwrap();
+        let store = open(root.path());
+        let first = store.writer(0).await.unwrap();
+        let next = store.writer(1).await.unwrap();
+        next.put_inner(&id("seal-after-error"), Bytes::from_static(b"data"), None)
+            .await
+            .unwrap();
+        let segment = next.state.lock().await.active.unwrap();
+        first.state.lock().await.poisoned = true;
+
+        let error = store.seal_for_shutdown(None).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "small object store needs restart after failed mutation"
+        );
+        assert!(store.journal.model.0.read().unwrap().model.segments[&segment].sealed);
     }
 
     #[tokio::test]
@@ -894,13 +926,15 @@ mod tests {
         }
         let reopened = SmallObjectStore::open_with_service(
             root.path().to_owned(),
-            128 << 10,
-            256 << 10,
-            16 << 20,
+            SmallStoreOptions {
+                threshold: 128 << 10,
+                segment_size: 256 << 10,
+                capacity: 16 << 20,
+                compact: true,
+            },
             None,
             None,
             None,
-            true,
         )
         .unwrap();
         let index = Arc::new(crate::BlockIndex::new());

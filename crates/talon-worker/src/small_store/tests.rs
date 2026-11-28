@@ -453,6 +453,7 @@ async fn legacy_and_trailer_records_survive_the_same_checkpoint() {
     let current = id("current");
     let (journal, _) = journal::Journal::open(dir.path().to_owned(), None, None).unwrap();
     journal.model.0.write().unwrap().activate().unwrap();
+    journal.start_checkpoints();
     let segment = journal.allocate().unwrap();
     let path = journal.data_path(segment);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();

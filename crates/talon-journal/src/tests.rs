@@ -34,7 +34,7 @@ pub(crate) fn crash(stage: &str) {
     }
 }
 #[derive(Clone, Default)]
-struct TestState<const AFTER_SYNC: bool>(BTreeMap<u64, u64>, Option<Arc<AtomicUsize>>);
+struct TestState<const AFTER_SYNC: bool>(BTreeMap<u64, u64>, Option<Arc<AtomicUsize>>, bool);
 type State = TestState<false>;
 
 impl<const AFTER_SYNC: bool> Machine for TestState<AFTER_SYNC> {
@@ -82,6 +82,12 @@ impl<const AFTER_SYNC: bool> Machine for TestState<AFTER_SYNC> {
     }
     fn restore(&mut self, r: Self::SnapshotRecord) -> io::Result<()> {
         self.apply(0, r)
+    }
+    fn finish_snapshot_restore(&mut self) -> io::Result<()> {
+        if self.2 && !self.0.is_empty() {
+            return Err(invalid("incomplete test snapshot"));
+        }
+        Ok(())
     }
 }
 fn service(root: &Path) -> Arc<JournalService> {
@@ -343,7 +349,7 @@ async fn shared_machine_applies_only_after_successful_sync() {
         let handle = service
             .open_stream(
                 name.into(),
-                TestState::<true>(BTreeMap::new(), Some(applied.clone())),
+                TestState::<true>(BTreeMap::new(), Some(applied.clone()), false),
                 StreamOptions::default(),
             )
             .unwrap();
@@ -695,7 +701,7 @@ async fn repeated_cancel_and_reopen_reuse_the_rotation_and_publish_the_next_cut(
     let a = s
         .open_stream(
             "a".into(),
-            TestState::<false>(BTreeMap::new(), Some(applied.clone())),
+            TestState::<false>(BTreeMap::new(), Some(applied.clone()), false),
             StreamOptions::default(),
         )
         .unwrap();
@@ -1022,6 +1028,181 @@ async fn recovered_tail_uses_initial_maintenance_for_automatic_snapshot() {
         a.query(|m| Ok(m.0.clone())).await.unwrap(),
         BTreeMap::from([(2, 2)])
     );
+}
+
+#[tokio::test]
+async fn deferral_keeps_requests_live_and_start_wakes_an_idle_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = service(dir.path());
+    let a = service
+        .open_stream(
+            "a".into(),
+            State::default(),
+            StreamOptions {
+                defer_checkpoints: true,
+                checkpoint_bytes: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    a.append((1, 11), Ack::Durable).await.unwrap();
+    let request = a.clone();
+    let checkpoint = tokio::spawn(async move { request.checkpoint().await });
+    tokio::task::yield_now().await;
+    assert_eq!(a.append((2, 22), Ack::Durable).await.unwrap(), 2);
+    assert_eq!(a.query(|m| Ok(m.0.len())).await.unwrap(), 2);
+    assert_eq!(std::fs::read_dir(dir.path().join("a")).unwrap().count(), 3);
+    assert!(!checkpoint.is_finished());
+    a.start_checkpoints();
+    tokio::time::timeout(Duration::from_secs(2), checkpoint)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(dir.path().join("a/snapshot.00000000000000000002").exists());
+}
+
+#[tokio::test]
+async fn open_propagates_snapshot_final_validation_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = service(dir.path());
+    let a = stream(&journal, "a");
+    a.append((1, 11), Ack::Durable).await.unwrap();
+    a.checkpoint().await.unwrap();
+    drop(a);
+    drop(journal);
+    JournalService::wait_for_retiring(dir.path()).unwrap();
+
+    let journal = service(dir.path());
+    let error = journal
+        .open_stream(
+            "a".into(),
+            TestState::<false>(BTreeMap::new(), None, true),
+            StreamOptions::default(),
+        )
+        .err()
+        .expect("invalid complete snapshot");
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(error.to_string(), "incomplete test snapshot");
+}
+
+async fn leave_pending_rotation(root: &Path) {
+    let journal = service(root);
+    let budget = Arc::new(BlockSnapshotBytes::default());
+    let a = journal
+        .open_stream_with_maintenance(
+            "a".into(),
+            State::default(),
+            StreamOptions::default(),
+            Some(budget.clone()),
+        )
+        .unwrap();
+    a.append((1, 11), Ack::Durable).await.unwrap();
+    let request = a.clone();
+    let checkpoint = tokio::spawn(async move { request.checkpoint().await });
+    tokio::time::timeout(Duration::from_secs(2), budget.0.notified())
+        .await
+        .unwrap();
+    for n in 2..=4 {
+        a.append((n, n * 11), Ack::Durable).await.unwrap();
+    }
+    a.stop_checkpoints();
+    assert_eq!(
+        checkpoint.await.unwrap().unwrap_err().kind(),
+        io::ErrorKind::Interrupted
+    );
+    drop(a);
+    drop(journal);
+    JournalService::wait_for_retiring(root).unwrap();
+}
+
+#[tokio::test]
+async fn covered_wal_prefix_must_reach_the_snapshot_cut() {
+    let dir = tempfile::tempdir().unwrap();
+    leave_pending_rotation(dir.path()).await;
+    let journal = service(dir.path());
+    let a = stream(&journal, "a");
+    a.checkpoint().await.unwrap();
+    drop(a);
+    drop(journal);
+    JournalService::wait_for_retiring(dir.path()).unwrap();
+
+    let log = dir.path().join("a/journal.00000000000000000002");
+    for (lsns, valid) in [
+        (&[2, 3, 5][..], false),
+        (&[2, 3][..], false),
+        (&[5][..], true),
+    ] {
+        let bytes: Vec<_> = lsns
+            .iter()
+            .flat_map(|&n| frame::encode(n, &State::encode(&(n, n * 11)).unwrap()).unwrap())
+            .collect();
+        std::fs::write(&log, bytes).unwrap();
+        let journal = service(dir.path());
+        let result = journal.open_stream("a".into(), State::default(), StreamOptions::default());
+        if valid {
+            let a = result.unwrap();
+            assert_eq!(
+                a.query(|m| Ok(m.0.get(&5).copied())).await.unwrap(),
+                Some(55)
+            );
+        } else {
+            let error = result.err().expect("gap at the end of the covered prefix");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(error.to_string(), "journal covered LSN gap");
+        }
+        drop(journal);
+        JournalService::wait_for_retiring(dir.path()).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn automatic_retry_counts_only_bytes_after_the_new_cut() {
+    let dir = tempfile::tempdir().unwrap();
+    leave_pending_rotation(dir.path()).await;
+    let journal = service(dir.path());
+    let a = journal
+        .open_stream(
+            "a".into(),
+            State::default(),
+            StreamOptions {
+                defer_checkpoints: true,
+                checkpoint_bytes: (2 * (frame::HEADER + 16)) as u64,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let retry = Arc::new(Pause::default());
+    *a.inner.control.snapshot_finalize_pause.lock().unwrap() = Some(retry.clone());
+    a.start_checkpoints();
+    tokio::time::timeout(Duration::from_secs(2), retry.entered.notified())
+        .await
+        .unwrap();
+    assert_eq!(a.append((5, 55), Ack::Durable).await.unwrap(), 5);
+    let next = Arc::new(Pause::default());
+    *a.inner.control.snapshot_finalize_pause.lock().unwrap() = Some(next.clone());
+    retry.resume.notify_one();
+    let root = dir.path().join("a");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while root.join("journal.00000000000000000001").exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), next.entered.notified())
+            .await
+            .is_err(),
+        "covered bytes triggered another automatic snapshot"
+    );
+    assert!(!root.join("journal.00000000000000000003").exists());
+    assert_eq!(a.append((6, 66), Ack::Durable).await.unwrap(), 6);
+    tokio::time::timeout(Duration::from_secs(2), next.entered.notified())
+        .await
+        .unwrap();
+    assert!(root.join("journal.00000000000000000003").exists());
+    next.resume.notify_one();
 }
 #[tokio::test]
 async fn automatic_snapshot_overlaps_tail_writes_and_recovers() {

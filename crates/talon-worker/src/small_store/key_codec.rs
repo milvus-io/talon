@@ -14,11 +14,6 @@ fn field(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(&[0, 0]);
 }
 
-fn unfield(input: &mut &[u8]) -> String {
-    let mut out = Vec::new();
-    object_field(input, &mut out).to_owned()
-}
-
 fn object_field<'a, 'b: 'a>(input: &mut &'b [u8], scratch: &'a mut Vec<u8>) -> &'a str {
     let end = input.iter().position(|&byte| byte == 0).unwrap();
     if input[end + 1] == 0 {
@@ -95,7 +90,7 @@ pub(super) fn encode(id: &dyn SmallIdentity) -> Vec<u8> {
 
 /// Size of the WAL identity before the reversible packed encoding.
 pub(super) fn logical_len(mut input: &[u8]) -> usize {
-    let mut len = 25;
+    let mut len = super::format::KEY_HEADER_LEN;
     for _ in 0..2 {
         loop {
             let end = input.iter().position(|&byte| byte == 0).unwrap();
@@ -210,48 +205,10 @@ pub(super) fn validated<'a>(
     Ok(key)
 }
 
-pub(super) fn decode(mut input: &[u8]) -> SmallKey {
-    let bucket = unfield(&mut input);
-    let path = unfield(&mut input);
-    let tag = input[0];
-    let kind = if tag & 0x80 != 0 {
-        UnitKind::ExactRange
-    } else {
-        UnitKind::Whole
-    };
-    let backend = backend(tag);
-    let block_size = u32::from_le_bytes(input[1..5].try_into().unwrap());
-    input = &input[5..];
-    let offset = if tag & 0x40 != 0 {
-        let offset = u64::from_le_bytes(input[..8].try_into().unwrap());
-        input = &input[8..];
-        offset
-    } else {
-        0
-    };
-    let version = if tag & 0x20 != 0 {
-        const HEX: &[u8] = b"0123456789abcdef";
-        input
-            .iter()
-            .flat_map(|b| [HEX[(b / 16) as usize], HEX[(b % 16) as usize]])
-            .collect()
-    } else {
-        input.to_vec()
-    };
-    let version = std::str::from_utf8(&version).expect("encoded small-object version");
-    SmallKey::new(&SmallRef {
-        kind,
-        block: BlockRef {
-            object: ObjectRef {
-                backend,
-                bucket: &bucket,
-                object_path: &path,
-            },
-            offset,
-            block_size,
-            version,
-        },
-    })
+pub(super) fn decode(input: &[u8]) -> SmallKey {
+    let mut scratch = Default::default();
+    let key = validated(input, &mut scratch).expect("encoded small-object key");
+    SmallKey::new(&key)
 }
 
 #[cfg(test)]

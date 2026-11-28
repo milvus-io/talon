@@ -6,10 +6,11 @@ use std::io::{self, Read, Write};
 use talon_core::Backend;
 
 pub(super) const MAX_KEY: usize = 64 * 1024;
+pub(super) const KEY_HEADER_LEN: usize = 1 + 8 + 4 + 3 * 4;
 
 pub(super) fn key_len(id: &dyn SmallIdentity) -> usize {
     let id = id.view();
-    25 + id.object.bucket.len() + id.object.object_path.len() + id.version.len()
+    KEY_HEADER_LEN + id.object.bucket.len() + id.object.object_path.len() + id.version.len()
 }
 
 pub(super) fn record_metadata_bytes(id: &dyn SmallIdentity) -> u64 {

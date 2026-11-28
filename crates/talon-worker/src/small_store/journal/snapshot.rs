@@ -9,7 +9,7 @@ use super::{
 };
 use bytes::Bytes;
 use std::{
-    collections::{btree_map, HashMap},
+    collections::{btree_map, hash_map::Entry, HashMap},
     io,
     ops::Range,
     sync::Arc,
@@ -83,26 +83,30 @@ fn encode_rows(id: u64, records: &Records, row: &mut usize) -> Option<Bytes> {
             continue;
         };
         let (prefix, suffix) = records.key_parts(*row);
-        let new_prefix = !prefix.is_empty() && !prefixes.contains_key(prefix);
+        let next_prefix = prefixes.len() as u16;
+        let entry = (!prefix.is_empty()).then(|| prefixes.entry(prefix));
         let extra = 14
             + 8 * usize::from(meta.checksum.is_some())
             + suffix.len()
-            + if new_prefix { 4 + prefix.len() } else { 0 };
+            + if matches!(entry, Some(Entry::Vacant(_))) {
+                4 + prefix.len()
+            } else {
+                0
+            };
         if count != 0
             && (usize::from(count) == BATCH_ROWS
                 || rows.len() + dictionary.len() + extra > BATCH_BYTES)
         {
             break;
         }
-        let prefix = if prefix.is_empty() {
-            NO_PREFIX
-        } else {
-            let next = prefixes.len() as u16;
-            *prefixes.entry(prefix).or_insert_with(|| {
+        let prefix = match entry {
+            None => NO_PREFIX,
+            Some(Entry::Occupied(entry)) => *entry.get(),
+            Some(Entry::Vacant(entry)) => {
                 dictionary.extend_from_slice(&(prefix.len() as u32).to_le_bytes());
                 dictionary.extend_from_slice(prefix);
-                next
-            })
+                *entry.insert(next_prefix)
+            }
         };
         rows.extend_from_slice(&(meta.offset as u32).to_le_bytes());
         rows.extend_from_slice(&(meta.len as u32).to_le_bytes());
@@ -352,6 +356,7 @@ pub(super) fn restore(model: &mut Model, record: SnapshotRecord) -> io::Result<(
             }
             state.remaining = rows;
             state.extent_end = 0;
+            segment.records.reserve_snapshot(rows, segment.bytes)?;
             if rows == 0 && segment.sealed {
                 segment.records.freeze_snapshot();
             }
