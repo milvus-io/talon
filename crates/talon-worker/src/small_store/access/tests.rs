@@ -263,7 +263,9 @@ async fn compact_access_relocation_keeps_durable_ages_through_log_repair_or_fail
             if scenario == "open-failure" {
                 std::fs::rename(saved, &log).unwrap();
             } else {
-                store.delete(&id(5)).await.unwrap();
+                let other = id(4);
+                assert_eq!(store.lookup_entry(&other).unwrap().unwrap().segment, source);
+                store.delete(&other).await.unwrap();
             }
         }
         assert!(store.maintain(false).await.unwrap(), "{scenario}");
@@ -693,6 +695,58 @@ async fn compact_access_resets_legacy_ages_and_rechecks_idle_candidates() {
         .unwrap());
     assert!(!store.contains(&key));
     assert_eq!(policy.len(), 0);
+}
+
+#[tokio::test]
+async fn compact_access_relocation_keeps_only_source_dirty_updates_pending() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (store, policy) = open_compact(dir.path());
+    for n in 0..6 {
+        store
+            .put(&id(n), Bytes::from(vec![n as u8; 48 << 10]))
+            .await
+            .unwrap();
+    }
+    store.maintain(true).await.unwrap();
+    for n in 0..3 {
+        store.delete(&id(n)).await.unwrap();
+        policy.remove(&CacheUnit::Whole(id(n)));
+    }
+    let touched = id(3);
+    let clean = id(4);
+    let cold = access_millis() - 30_000;
+    set_compact_age(&store, &touched, cold);
+    set_compact_age(&store, &clean, cold);
+    flush(&store).await;
+
+    let pause = Arc::new(crate::small_store::tests::AppendPause::default());
+    *store.streams()[0].relocation_pause.lock().unwrap() = Some(pause.clone());
+    let compacting = {
+        let store = store.clone();
+        tokio::spawn(async move { store.maintain(false).await.unwrap() })
+    };
+    tokio::time::timeout(Duration::from_secs(5), pause.entered.notified())
+        .await
+        .unwrap();
+    let translated = compact::read_log(dir.path());
+    assert_eq!(translated.len(), 2);
+    store.track_access(&touched).unwrap();
+    let hot = compact_age(&store, &touched);
+    assert!(hot > cold);
+    pause.resume.notify_one();
+    assert!(compacting.await.unwrap());
+    flush(&store).await;
+
+    let moved = store.lookup_entry(&touched).unwrap().unwrap();
+    let log = compact::read_log(dir.path());
+    assert_eq!(&log[..translated.len()], translated);
+    assert_eq!(
+        &log[translated.len()..],
+        &[(moved.segment, moved.offset as u32, hot)]
+    );
+    assert_eq!(compact_age(&store, &clean), cold);
 }
 
 #[tokio::test]

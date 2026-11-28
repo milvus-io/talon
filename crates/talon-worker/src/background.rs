@@ -260,10 +260,6 @@ pub struct BackgroundHandle {
     task: Option<tokio::task::JoinHandle<()>>,
 }
 impl BackgroundHandle {
-    pub(crate) fn stop_signal(&self) -> watch::Receiver<bool> {
-        self.stop.subscribe()
-    }
-
     /// Stop admitting new invocations while active tasks finish.
     pub fn begin_shutdown(&self) {
         let _ = self.stop.send(true);

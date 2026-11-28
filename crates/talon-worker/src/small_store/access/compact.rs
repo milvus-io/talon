@@ -270,6 +270,7 @@ impl SmallObjectStore {
         let mut fd = None;
         let mut _io = None;
         let mut written = 0;
+        let log_header = if state.log_bytes == 0 { HEADER } else { 0 };
         let result = loop {
             let (bytes, done) = match scan.next_batch(&self.journal.model, flush).await {
                 Ok(batch) => batch,
@@ -277,12 +278,11 @@ impl SmallObjectStore {
             };
             if !bytes.is_empty() {
                 let len = bytes.len() as u64;
-                let header = if state.log_bytes == 0 { HEADER } else { 0 };
-                if written + len + header > flush.byte_limit() {
+                if written + len + log_header > flush.byte_limit() {
                     break Err(io::ErrorKind::Interrupted.into());
                 }
                 if fd.is_none() {
-                    match flush.grant(budget, bytes.len() + header as usize).await {
+                    match flush.grant(budget, bytes.len() + log_header as usize).await {
                         Ok(permit) => _io = permit,
                         Err(error) => break Err(error),
                     }
