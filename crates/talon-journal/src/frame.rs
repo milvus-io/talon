@@ -5,10 +5,17 @@ pub(crate) const HEADER: usize = 32;
 pub(crate) const MAX_RECORD: usize = 16 << 20;
 
 pub(crate) fn encode(lsn: u64, body: &[u8]) -> io::Result<Bytes> {
+    let mut bytes = Vec::new();
+    encode_into(&mut bytes, lsn, body)?;
+    Ok(bytes.into())
+}
+
+pub(crate) fn encode_into(bytes: &mut Vec<u8>, lsn: u64, body: &[u8]) -> io::Result<()> {
     if body.len() > MAX_RECORD {
         return Err(invalid("journal frame too large"));
     }
-    let mut bytes = Vec::with_capacity(HEADER + body.len());
+    let start = bytes.len();
+    bytes.reserve(HEADER + body.len());
     bytes.extend_from_slice(MAGIC);
     bytes.extend_from_slice(&(body.len() as u32).to_le_bytes());
     bytes.extend_from_slice(&(!(body.len() as u32)).to_le_bytes());
@@ -16,10 +23,10 @@ pub(crate) fn encode(lsn: u64, body: &[u8]) -> io::Result<Bytes> {
     bytes.extend_from_slice(&[0; 8]);
     bytes.extend_from_slice(body);
     let mut hash = xxhash_rust::xxh3::Xxh3::new();
-    hash.update(&bytes[..24]);
+    hash.update(&bytes[start..start + 24]);
     hash.update(body);
-    bytes[24..32].copy_from_slice(&hash.digest().to_le_bytes());
-    Ok(bytes.into())
+    bytes[start + 24..start + HEADER].copy_from_slice(&hash.digest().to_le_bytes());
+    Ok(())
 }
 pub(crate) fn decode<T>(
     mut bytes: Vec<u8>,

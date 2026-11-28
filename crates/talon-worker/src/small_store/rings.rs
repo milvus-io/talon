@@ -355,14 +355,41 @@ impl SmallObjectStore {
         self.tasks
             .run(async move {
                 let _guard = store.mutation(&id).await;
-                // Existing identities stay in their original stream, including
-                // immutable-byte validation. New objects append on this ring.
-                let stream = match store.owner(&id) {
-                    Some(stream) => stream,
-                    None => store.writer(slot).await?,
-                };
-                stream
-                    .put_inner(&id, value, store.policy.get().cloned())
+                let policy = store.policy.get();
+                let index = store.index.get().and_then(Weak::upgrade);
+                let record =
+                    AppendRecord::new(&id, value, store.fallback.segment_size, index.as_deref())?;
+                // Resolve after admission: another writer may have published on
+                // another ring while we waited.
+                if let Some((owner, _)) = store.journal.model.lookup_append(&record.key) {
+                    let stream = store.writer(owner).await?;
+                    let _slot = stream
+                        .append_slots
+                        .acquire()
+                        .await
+                        .expect("append slots stay open");
+                    let state = stream.state.lock().await;
+                    stream.healthy(&state)?;
+                    // Compaction may have moved the extent while we were
+                    // waiting, but the guarded identity stays on this stream.
+                    let (_, current) = store
+                        .journal
+                        .model
+                        .lookup_append(&record.key)
+                        .filter(|(stream, _)| *stream == owner)
+                        .ok_or_else(|| invalid("small object placement changed during append"))?;
+                    let weight = record.validate_existing(current, state).await?;
+                    if let Some(policy) = policy {
+                        policy.refresh_small(record.key.0, weight, &stream.entries);
+                    }
+                    return Ok(record.charge);
+                }
+                // The identity guard rules out another publication until this
+                // append completes, even if writer setup or rollover awaits I/O.
+                store
+                    .writer(slot)
+                    .await?
+                    .append_new(record, policy.cloned())
                     .await
             })
             .await
@@ -1130,6 +1157,34 @@ mod tests {
         assert_eq!(value.as_ref(), vec![if success[0] { 0 } else { 1 }; 3072]);
     }
 
+    #[tokio::test]
+    async fn failed_journal_append_still_charges_completed_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open(dir.path());
+        store
+            .journal
+            .control
+            .fail
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let before = store.stats().unwrap().allocated_bytes;
+        assert!(store
+            .put(&id("failed"), Bytes::from(vec![7; 4096]))
+            .await
+            .is_err());
+        assert!(!store.contains(&id("failed")));
+        let stream = store.writer(0).await.unwrap();
+        let state = stream.state.lock().await;
+        let active = state.active.unwrap();
+        let actual = std::fs::metadata(store.journal.data_path(active))
+            .unwrap()
+            .blocks()
+            * 512;
+        assert!(actual > 0);
+        assert_eq!(state.segments[&active].allocated, actual);
+        assert_eq!(stream.stats().unwrap().allocated_bytes, actual);
+        assert!(store.stats().unwrap().allocated_bytes >= before + actual);
+    }
+
     #[test]
     fn old_format_is_rejected_without_modifying_it() {
         for name in ["MANIFEST", "1.index", "1.data", "ring-1"] {
@@ -1323,9 +1378,20 @@ mod recovery_tests {
             while store.lookup_entry(&id(1)).unwrap().unwrap().segment == old.segment {
                 tokio::task::yield_now().await;
             }
+            while stream.readers.try_read().is_ok() {
+                tokio::task::yield_now().await;
+            }
             assert!(old.file.path.is_file());
             stream
                 .put(&id(2), Bytes::from_static(b"foreground append"))
+                .await
+                .unwrap();
+            store
+                .put(&id(4), Bytes::from_static(b"shared foreground append"))
+                .await
+                .unwrap();
+            store
+                .put(&id(1), Bytes::from_static(b"survivor"))
                 .await
                 .unwrap();
             drop(held);

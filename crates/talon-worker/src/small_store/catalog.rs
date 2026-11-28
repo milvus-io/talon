@@ -79,6 +79,17 @@ impl Default for LiveModel {
 }
 
 impl LiveModel {
+    pub(super) fn lookup_append(&self, id: &dyn SmallIdentity) -> Option<(usize, Location)> {
+        let hash = super::records::key_hash(id);
+        let encoded = super::key_codec::encode(id);
+        let catalog = self.0.read().unwrap();
+        if let Some((_, record)) = catalog.find_record(hash, &encoded, VISIBLE) {
+            return Some((record.stream, catalog.payload_location(record, None)?));
+        }
+        let retired = catalog.retired.get(id).filter(|entry| entry.live)?;
+        Some((retired.slot, retired.location.clone()))
+    }
+
     pub fn lookup(&self, id: &dyn SmallIdentity) -> Option<Location> {
         let hash = super::records::key_hash(id);
         let encoded = super::key_codec::encode(id);

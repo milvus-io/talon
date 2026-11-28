@@ -771,9 +771,17 @@ impl BlockIndex {
         units
     }
 
+    pub(crate) fn indexed_identity(&self, id: &dyn BlockIdentity) -> Option<BlockKey> {
+        self.entries
+            .read()
+            .unwrap()
+            .get_key_value(id)
+            .map(|(key, _)| key.clone())
+    }
+
     pub(crate) fn shared_identity(&self, id: &dyn BlockIdentity) -> Option<BlockKey> {
-        if let Some((id, _)) = self.entries.read().unwrap().get_key_value(id) {
-            return Some(id.clone());
+        if let Some(id) = self.indexed_identity(id) {
+            return Some(id);
         }
         for kind in [UnitKind::Whole, UnitKind::ExactRange] {
             let key = SmallRef {
