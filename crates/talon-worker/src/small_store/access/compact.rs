@@ -93,9 +93,11 @@ impl SmallObjectStore {
             let Some(mut snapshot) = open_access(&self.root.join(FILE))? else {
                 return Ok((reset_state(&self.root), 0));
             };
-            let mut state = DiskState::default();
-            state.generation = read_header(&mut snapshot, SNAPSHOT_MAGIC)?;
-            state.snapshot_bytes = snapshot.get_ref().metadata()?.len();
+            let mut state = DiskState {
+                generation: read_header(&mut snapshot, SNAPSHOT_MAGIC)?,
+                snapshot_bytes: snapshot.get_ref().metadata()?.len(),
+                ..Default::default()
+            };
 
             let mut matched = 0;
             let mut repaired = false;
