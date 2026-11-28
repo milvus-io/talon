@@ -203,7 +203,14 @@ async fn compact_access_does_not_persist_ages_for_unacknowledged_addresses() {
 async fn compact_access_relocation_keeps_durable_ages_through_log_repair_or_failure() {
     use std::io::Write;
 
-    for scenario in ["torn", "missing", "stale", "open-failure", "sync-failure"] {
+    for scenario in [
+        "torn",
+        "missing",
+        "stale",
+        "open-failure",
+        "sync-failure",
+        "missing-sync-failure",
+    ] {
         let dir = tempfile::tempdir().unwrap();
         let key = id(3);
         let cold = access_millis() - 30_000;
@@ -237,7 +244,7 @@ async fn compact_access_relocation_keeps_durable_ages_through_log_repair_or_fail
                     .write_all(&tail)
                     .unwrap();
             }
-            "missing" => std::fs::remove_file(&log).unwrap(),
+            "missing" | "missing-sync-failure" => std::fs::remove_file(&log).unwrap(),
             "stale" => {
                 let mut bytes = std::fs::read(&log).unwrap();
                 bytes[8..16].copy_from_slice(&99u64.to_le_bytes());
@@ -247,7 +254,7 @@ async fn compact_access_relocation_keeps_durable_ages_through_log_repair_or_fail
         }
         let (store, _) = open_compact(dir.path());
         assert_eq!(compact_age(&store, &key), cold, "{scenario}");
-        if scenario == "open-failure" || scenario == "sync-failure" {
+        if scenario.ends_with("failure") {
             let saved = log.with_extension("saved");
             if scenario == "open-failure" {
                 std::fs::rename(&log, &saved).unwrap();
@@ -260,6 +267,12 @@ async fn compact_access_relocation_keeps_durable_ages_through_log_repair_or_fail
             }
             assert!(!store.maintain(false).await.unwrap(), "{scenario}");
             assert_eq!(store.lookup_entry(&key).unwrap().unwrap().segment, source);
+            assert_eq!(compact_age(&store, &key), cold, "{scenario}");
+            if scenario == "missing-sync-failure" {
+                let disk = store.journal.access.disk.lock().unwrap();
+                assert_eq!(disk.log_bytes, 0);
+                assert!(disk.log_truncate);
+            }
             if scenario == "open-failure" {
                 std::fs::rename(saved, &log).unwrap();
             } else {
@@ -419,7 +432,10 @@ async fn compact_delta_keeps_its_durable_prefix_on_byte_bound_or_scheduler_stop(
 
     let dir = tempfile::tempdir().unwrap();
     let (store, _) = open_compact(dir.path());
-    let rows = 6200;
+    let rows = 24_000;
+    let first = id(0);
+    let last = id(rows - 1);
+    let cold = access_millis() - 30_000;
     for n in 0..rows {
         store.put(&id(n), Bytes::from_static(b"x")).await.unwrap();
     }
@@ -460,8 +476,13 @@ async fn compact_delta_keeps_its_durable_prefix_on_byte_bound_or_scheduler_stop(
     let prefix = assert_prefix();
     assert!(prefix <= cap);
 
+    set_compact_age(&store, &first, cold);
+    set_compact_age(&store, &last, cold);
     flush(&store).await;
+    assert_eq!(store.journal.access.disk.lock().unwrap().log_bytes, HEADER);
     touch_all();
+    let first_address = store.lookup_entry(&first).unwrap().unwrap();
+    let first_age = compact_age(&store, &first);
     let budget = crate::background::BackgroundBudget::new(&talon_core::WorkerConfig {
         background_io_concurrency: 1,
         background_io_max_mb_per_sec: 1,
@@ -470,7 +491,7 @@ async fn compact_delta_keeps_its_durable_prefix_on_byte_bound_or_scheduler_stop(
     let held = budget.io().await;
     let mut scheduler = crate::background::BackgroundScheduler::new(1);
     let stop = scheduler.stop_signal();
-    let (done, finished) = tokio::sync::oneshot::channel();
+    let (done, mut finished) = tokio::sync::oneshot::channel();
     let mut done = Some(done);
     scheduler.register("compact_access_test", Duration::from_secs(60), {
         let store = store.clone();
@@ -488,26 +509,38 @@ async fn compact_delta_keeps_its_durable_prefix_on_byte_bound_or_scheduler_stop(
     });
     let scheduler = scheduler.start();
     tokio::time::timeout(Duration::from_secs(3), async {
-        while budget.charged_bytes() < prefix {
+        while budget.charged_bytes() == 0 {
             tokio::task::yield_now().await;
         }
     })
     .await
     .unwrap();
-    // Pace the second batch beyond the shutdown wait, leaving the first
-    // batch paid for and blocked only on the I/O slot.
-    let reservation = 4 << 20;
+    let first_group = budget.charged_bytes();
+    // Queue the next group behind a reservation. The first group's credit
+    // was reserved before it and can finish as soon as the slot is released.
+    let reservation = 1 << 30;
     let mut credit = std::pin::pin!(budget.bytes(reservation));
     assert!(futures::poll!(credit.as_mut()).is_pending());
     drop(held);
     tokio::time::timeout(Duration::from_secs(3), async {
-        while budget.charged_bytes() <= prefix + reservation as u64 {
+        while budget.charged_bytes() <= first_group + reservation as u64 {
             tokio::task::yield_now().await;
         }
     })
     .await
     .unwrap();
-    assert_eq!(budget.available_io(), 0, "retain the grant for prefix sync");
+    assert!(matches!(
+        finished.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+    let competing_io = futures::FutureExt::now_or_never(budget.io())
+        .expect("competing maintenance can acquire the slot during the next pacing wait");
+    assert_eq!(assert_prefix(), first_group);
+    assert!(compact::read_log(dir.path()).contains(&(
+        first_address.segment,
+        first_address.offset as u32,
+        first_age,
+    )));
     scheduler.begin_shutdown();
     tokio::time::timeout(Duration::from_secs(1), scheduler.shutdown())
         .await
@@ -516,8 +549,13 @@ async fn compact_delta_keeps_its_durable_prefix_on_byte_bound_or_scheduler_stop(
         finished.await.unwrap().unwrap_err().kind(),
         io::ErrorKind::Interrupted
     );
-    assert_eq!(assert_prefix(), prefix);
+    assert_eq!(assert_prefix(), first_group);
+    drop(competing_io);
     assert_eq!(budget.available_io(), 1);
+    drop(store);
+    let (reopened, _) = open_compact(dir.path());
+    assert_eq!(compact_age(&reopened, &first), first_age);
+    assert_eq!(compact_age(&reopened, &last), cold);
 }
 
 #[tokio::test]

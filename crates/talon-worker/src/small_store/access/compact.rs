@@ -8,6 +8,7 @@ const DELTA_MAGIC: &[u8; 8] = b"TLSL0002";
 const ENTRY_BYTES: usize = 12;
 const GROUP_HEADER_BYTES: usize = 12;
 const FRAME_HEADER_BYTES: usize = 12;
+const PERIODIC_DELTA_BATCHES: usize = 4;
 
 impl SmallObjectStore {
     #[cfg(test)]
@@ -267,56 +268,59 @@ impl SmallObjectStore {
         flush: Flush<'_>,
     ) -> io::Result<bool> {
         let persistence = &self.journal.access;
-        let mut fd = None;
-        let mut _io = None;
-        let mut written = 0;
-        let log_header = if state.log_bytes == 0 { HEADER } else { 0 };
-        let result = loop {
-            let (bytes, done) = match scan.next_batch(&self.journal.model, flush).await {
-                Ok(batch) => batch,
-                Err(error) => break Err(error),
-            };
-            if !bytes.is_empty() {
-                let len = bytes.len() as u64;
-                if written + len + log_header > flush.byte_limit() {
-                    break Err(io::ErrorKind::Interrupted.into());
-                }
-                if fd.is_none() {
-                    match flush.grant(budget, bytes.len() + log_header as usize).await {
-                        Ok(permit) => _io = permit,
-                        Err(error) => break Err(error),
-                    }
-                    persistence.disk.lock().unwrap().log_truncate = true;
-                    fd = Some(open_log_for_append(&persistence.root, &mut state).await?);
-                } else if let Some(budget) = budget {
-                    // Keep the permit needed to sync a valid prefix if
-                    // shutdown interrupts the next batch's pacing.
-                    if let Err(error) = flush.wait(budget.bytes(bytes.len())).await {
-                        break Err(error);
-                    }
-                }
-                disk_io::write(
-                    fd.as_ref().unwrap().clone(),
-                    bytes.into(),
-                    state.log_bytes + written,
-                )
-                .await?;
-                written += len;
-            }
-            if done {
-                break Ok(());
-            }
+        // Amortize periodic syncs while keeping shutdown admissions short.
+        let batch_limit = match flush {
+            Flush::Periodic(_) => PERIODIC_DELTA_BATCHES,
+            Flush::Shutdown { .. } => 1,
         };
-        let changed = fd.is_some();
-        if let Some(fd) = fd {
-            // Only complete frames advance the durable end after sync.
-            disk_io::sync(fd).await?;
-            state.log_bytes += written;
+        let mut group = Vec::with_capacity(batch_limit);
+        let mut fd = None;
+        let mut remaining = flush.byte_limit();
+        let mut done = false;
+        state.full = true;
+        while !done {
+            let mut group_bytes = 0;
+            while group.len() < batch_limit && !done {
+                let (bytes, finished) = scan.next_batch(&self.journal.model, flush).await?;
+                done = finished;
+                if !bytes.is_empty() {
+                    group_bytes += bytes.len();
+                    group.push(Bytes::from(bytes));
+                }
+            }
+            if group.is_empty() {
+                break;
+            }
+            if state.log_bytes == 0 {
+                group_bytes += HEADER as usize;
+            }
+            remaining = remaining
+                .checked_sub(group_bytes as u64)
+                .ok_or(io::ErrorKind::Interrupted)?;
+
+            // Pay for the whole group before taking a slot. Once admitted,
+            // finish the writes and sync before allowing another pacing wait.
+            let _io = flush.grant(budget, group_bytes).await?;
+            flush.check()?;
+            persistence.disk.lock().unwrap().log_truncate = true;
+            if fd.is_none() {
+                fd = Some(open_log_for_append(&persistence.root, &mut state).await?);
+            }
+            let file = fd.as_ref().unwrap();
+            let mut offset = state.log_bytes;
+            for bytes in group.drain(..) {
+                let len = bytes.len() as u64;
+                disk_io::write(file.clone(), bytes, offset).await?;
+                offset += len;
+            }
+            disk_io::sync(file.clone()).await?;
+            state.log_bytes = offset;
+            *persistence.disk.lock().unwrap() = state;
         }
-        let result = result.and_then(|()| flush.check());
-        state.full = result.is_err();
+        flush.check()?;
+        state.full = false;
         *persistence.disk.lock().unwrap() = state;
-        result.map(|()| changed)
+        Ok(fd.is_some())
     }
 }
 
@@ -408,6 +412,7 @@ async fn open_log_for_append(
         disk_io::rename(temp, path).await?;
         disk_io::sync_dir(root.to_owned()).await?;
         state.log_bytes = HEADER;
+        state.log_truncate = false;
         return Ok(fd);
     }
     let fd = disk_io::open(path, disk_io::Open::Update).await?;
