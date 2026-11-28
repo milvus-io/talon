@@ -50,6 +50,7 @@ impl SmallObjectStore {
             false,
         )
     }
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn open_with_service(
         root: PathBuf,
         threshold: u64,
