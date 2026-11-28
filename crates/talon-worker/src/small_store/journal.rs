@@ -1,6 +1,7 @@
 //! Small-store state machine adapter. All log I/O, queues, snapshots and replay
 //! belong to talon-journal; this module owns only segment recovery semantics.
 mod model;
+mod snapshot;
 #[cfg(test)]
 mod tests;
 use super::catalog::LiveModel;
@@ -22,14 +23,14 @@ use talon_journal::{Ack, Handle, JournalService, Options, StreamOptions};
 #[derive(Default)]
 pub(super) struct TestControl {
     pub fail: std::sync::atomic::AtomicBool,
+    pub fail_access_sync: std::sync::atomic::AtomicBool,
 }
 pub(super) struct Journal {
     root: PathBuf,
     handle: Handle<LiveModel>,
     pub(super) model: LiveModel,
     pub(super) readers: Arc<tokio::sync::RwLock<()>>,
-    // Full access snapshots sample a stable set of locations across batches.
-    pub(super) access_relocation: tokio::sync::RwLock<()>,
+    pub(super) access: super::access::Persistence,
     pub(super) next: Arc<AtomicU64>,
     #[cfg(test)]
     pub(super) control: Arc<TestControl>,
@@ -79,27 +80,27 @@ impl Journal {
         let handle = service.open_stream_with_maintenance(
             relative_metadata,
             shared.clone(),
-            StreamOptions::default(),
+            StreamOptions {
+                defer_checkpoints: true,
+                ..StreamOptions::default()
+            },
             maintenance.map(|budget| budget as Arc<dyn talon_journal::Maintenance>),
         )?;
         let replay_ms = replay_started.elapsed().as_secs_f64() * 1000.0;
         let clone_started = std::time::Instant::now();
-        let model = handle.query_blocking(|m| {
-            let mut catalog = m.0.write().unwrap();
-            catalog.activate()?;
-            Ok(catalog.model.clone())
-        })?;
+        let model = shared.0.read().unwrap().model.clone();
         let clone_ms = clone_started.elapsed().as_secs_f64() * 1000.0;
         tracing::info!(root = %root.display(), segments = model.segments.len(),
             replay_ms, clone_ms, "small journal model restored");
         let next = Arc::new(AtomicU64::new(model.next.max(1)));
+        let access = super::access::Persistence::new(root.clone())?;
         Ok((
             Arc::new(Self {
                 root,
                 handle,
                 model: shared,
                 readers: Arc::default(),
-                access_relocation: Default::default(),
+                access,
                 next,
                 #[cfg(test)]
                 control: Default::default(),
@@ -197,7 +198,7 @@ impl Journal {
         Ok(allocations)
     }
     #[cfg(test)]
-    pub fn set_budget(&self, budget: Arc<crate::background::BackgroundBudget>) {
+    pub fn set_budget(&self, budget: Arc<dyn talon_journal::Maintenance>) {
         self.handle.set_maintenance(budget);
     }
     pub fn allocate(&self) -> io::Result<u64> {
@@ -232,6 +233,20 @@ impl Journal {
             )
             .await?;
         self.handle.checkpoint().await
+    }
+
+    pub(super) fn start_checkpoints(&self) {
+        self.handle.start_checkpoints();
+    }
+
+    pub(super) fn stop_checkpoints(&self) {
+        self.handle.stop_checkpoints();
+    }
+
+    pub(super) fn mark_access_durable(&self, segment: u64, end: u64) {
+        if let Some(recency) = &mut self.model.0.write().unwrap().recency {
+            recency.mark_durable(segment, end);
+        }
     }
 }
 fn data_path(root: &Path, id: u64) -> PathBuf {

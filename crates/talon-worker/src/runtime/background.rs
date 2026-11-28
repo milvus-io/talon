@@ -113,12 +113,17 @@ impl WorkerBackground {
             );
             let last_checkpoint = Arc::new(Mutex::new(HashMap::new()));
             let last_small_checkpoint = Arc::new(Mutex::new(HashMap::new()));
+            let stop = scheduler.stop_signal();
             scheduler.register("access_checkpoint", period, move || {
                 let w = w.clone();
                 let last = last_checkpoint.clone();
                 let last_small = last_small_checkpoint.clone();
+                let stop = stop.clone();
                 async move {
                     for namespace in w.namespace_runtimes() {
+                        if *stop.borrow() {
+                            break;
+                        }
                         if due(
                             &last,
                             &namespace,
@@ -133,7 +138,7 @@ impl WorkerBackground {
                             &namespace,
                             namespace.page_gc_config.checkpoint_interval_ms,
                         ) {
-                            namespace.checkpoint_small_access().await;
+                            namespace.checkpoint_small_access(Some(&stop)).await;
                         }
                     }
                 }
@@ -243,6 +248,11 @@ impl WorkerBackground {
     pub fn begin_shutdown(&self) {
         self.scheduler.begin_shutdown();
         self.worker.default_runtime().stop_background_heads();
+        for namespace in self.worker.namespace_runtimes() {
+            if let Some(small) = &namespace.small {
+                small.stop_checkpoints();
+            }
+        }
     }
 
     /// Stop admission, finish active maintenance and owned mutations, then flush access metadata
@@ -251,15 +261,35 @@ impl WorkerBackground {
         self.begin_shutdown();
         self.scheduler.shutdown().await;
         self.worker.drain_namespace_initializers().await;
-        for namespace in self.worker.namespace_runtimes() {
+        let namespaces = self.worker.namespace_runtimes();
+        for namespace in &namespaces {
             namespace.drain_page_mutations().await;
-            if let Err(error) = namespace
-                .maintain_small_budget(true, namespace.background_budget.clone())
-                .await
-            {
-                tracing::warn!(%error, "small object shutdown checkpoint failed");
+            if let Some(small) = &namespace.small {
+                // Seals make payloads replayable. WAL rotation and compaction
+                // can wait until the next run without losing those writes.
+                if let Err(error) = small
+                    .seal_for_shutdown(namespace.background_budget.clone())
+                    .await
+                {
+                    tracing::warn!(%error, "small object shutdown seal failed");
+                }
             }
-            namespace.checkpoint_small_access().await;
+        }
+        // All namespaces share one short window for advisory Small Store deltas.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        for namespace in &namespaces {
+            if let Some(small) = &namespace.small {
+                if let Err(error) = small
+                    .checkpoint_access_on_shutdown(namespace.background_budget.clone(), deadline)
+                    .await
+                {
+                    if error.kind() != std::io::ErrorKind::Interrupted {
+                        tracing::warn!(%error, "small object shutdown access flush failed");
+                    }
+                }
+            }
+        }
+        for namespace in namespaces {
             namespace.checkpoint_access_times().await;
             if let Err(error) = namespace.checkpoint_catalog().await {
                 tracing::error!(%error, "cache catalog shutdown checkpoint failed");

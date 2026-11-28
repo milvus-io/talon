@@ -78,6 +78,11 @@ pub(super) struct Keys {
 }
 
 impl Keys {
+    #[cfg(test)]
+    pub fn retained_prefix_bytes(&self) -> usize {
+        self.prefix_bytes.capacity()
+    }
+
     pub fn get(&self, row: usize) -> Option<(&[u8], &[u8])> {
         let span = if self.offsets.is_empty() {
             *self.rows.get(row)?
@@ -90,11 +95,19 @@ impl Keys {
             }
         };
         let suffix = span.get(&self.suffixes);
-        let prefix = self
-            .prefix_ids
-            .get(row)
-            .and_then(|id| self.prefixes.get(id as usize));
+        let prefix = self.prefix_id(row).map(|id| self.prefixes[id]);
         Some((prefix.map_or(&[], |p| p.get(&self.prefix_bytes)), suffix))
+    }
+
+    fn prefix_id(&self, row: usize) -> Option<usize> {
+        let sentinel = match &self.prefix_ids {
+            Indices::Narrow(_) => u32::from(u16::MAX),
+            Indices::Wide(_) => u32::MAX,
+        };
+        self.prefix_ids
+            .get(row)
+            .filter(|&id| id != sentinel)
+            .map(|id| id as usize)
     }
 
     pub fn insert(&mut self, row: usize, key: &[u8], replace: bool) -> io::Result<()> {
@@ -166,8 +179,8 @@ impl Keys {
                 next.rows
                     .push(Span::append(&mut next.suffixes, suffix).unwrap());
                 if compressed {
-                    let old = self.prefix_ids.get(row).unwrap() as usize;
-                    let id = if let Some(id) = prefix_ids.get_mut(old) {
+                    let id = if let Some(old) = self.prefix_id(row) {
+                        let id = &mut prefix_ids[old];
                         if *id == u32::MAX {
                             *id = next.prefixes.len() as u32;
                             next.prefixes
@@ -195,6 +208,68 @@ impl Keys {
             self.freeze();
         }
         self.shrink_to_fit();
+    }
+
+    pub fn append_prefix(&mut self, prefix: &[u8]) -> io::Result<u32> {
+        let id = self.prefixes.len() as u32;
+        self.prefixes
+            .push(Span::append(&mut self.prefix_bytes, prefix)?);
+        Ok(id)
+    }
+
+    pub fn append_snapshot_key(&mut self, prefix: Option<u32>, suffix: &[u8]) -> io::Result<()> {
+        let index = self.rows.len();
+        self.rows.push(Span::append(&mut self.suffixes, suffix)?);
+        let Some(id) = prefix.or_else(|| (!self.prefix_ids.is_empty()).then_some(u32::MAX)) else {
+            return Ok(());
+        };
+        if matches!(&self.prefix_ids, Indices::Narrow(_))
+            && prefix.is_some_and(|id| id >= u16::MAX as u32)
+        {
+            let Indices::Narrow(ids) = std::mem::take(&mut self.prefix_ids) else {
+                unreachable!()
+            };
+            self.prefix_ids = Indices::Wide(
+                ids.into_iter()
+                    .map(|id| {
+                        if id == u16::MAX {
+                            u32::MAX
+                        } else {
+                            u32::from(id)
+                        }
+                    })
+                    .collect(),
+            );
+        }
+        match &mut self.prefix_ids {
+            Indices::Narrow(ids) => ids.push(id as u16),
+            Indices::Wide(ids) if ids.is_empty() && id < u16::MAX as u32 => {
+                let mut ids = vec![u16::MAX; index];
+                ids.push(id as u16);
+                self.prefix_ids = Indices::Narrow(ids);
+            }
+            Indices::Wide(ids) => {
+                if ids.is_empty() {
+                    ids.resize(index, u32::MAX);
+                }
+                ids.push(id);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn freeze_appended(&mut self) {
+        let offsets = self
+            .rows
+            .iter()
+            .map(|row| row.offset)
+            .chain(std::iter::once(self.suffixes.len() as u32));
+        self.offsets = if self.suffixes.len() <= usize::from(u16::MAX) {
+            Indices::Narrow(offsets.map(|offset| offset as u16).collect())
+        } else {
+            Indices::Wide(offsets.collect())
+        };
+        self.rows = Vec::new();
     }
 
     fn freeze(&mut self) {
@@ -385,6 +460,36 @@ mod tests {
             assert_eq!([prefix, suffix].concat(), *key);
         }
         assert!(keys.get(expected.len()).is_none());
+    }
+
+    #[test]
+    fn narrow_snapshot_no_prefix_survives_unused_dictionary_entries_and_repacking() {
+        let mut keys = Keys::default();
+        let first = keys.append_prefix(b"used-").unwrap();
+        keys.append_snapshot_key(Some(first), b"one").unwrap();
+        for _ in 1..u16::MAX {
+            keys.append_prefix(b"unused-").unwrap();
+        }
+        let sentinel = keys.append_prefix(b"wide-").unwrap();
+        assert_eq!(sentinel, u32::from(u16::MAX));
+        keys.append_snapshot_key(None, b"two").unwrap();
+        assert!(matches!(keys.prefix_ids, Indices::Narrow(_)));
+        let expected = [b"used-one".to_vec(), b"two".to_vec()];
+        check(&keys, &expected);
+        let mut repacked = keys.clone();
+        repacked.freeze();
+        repacked.retain(|_| true);
+        check(&repacked, &expected);
+        keys.append_snapshot_key(Some(sentinel), b"three").unwrap();
+        assert!(matches!(keys.prefix_ids, Indices::Wide(_)));
+        check(
+            &keys,
+            &[
+                expected[0].clone(),
+                expected[1].clone(),
+                b"wide-three".to_vec(),
+            ],
+        );
     }
 
     #[test]

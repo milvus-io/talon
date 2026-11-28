@@ -5,27 +5,23 @@ use std::sync::Arc;
 
 use crate::cache_reset::incompatible;
 use crate::page_access_store::CacheRootLock;
-use crate::small_store::SmallObjectStore;
+use crate::small_store::{SmallObjectStore, SmallStoreOptions};
 use talon_core::Result;
 
 pub(super) fn open_small_store(
     root: &Path,
-    threshold: u64,
-    segment_size: u64,
-    capacity: u64,
+    options: SmallStoreOptions,
     root_lock: Option<Arc<CacheRootLock>>,
     service: Option<&Arc<talon_journal::JournalService>>,
     maintenance: Option<Arc<crate::background::BackgroundBudget>>,
 ) -> Result<Option<Arc<SmallObjectStore>>> {
-    check_small_routing(root, threshold)?;
-    if threshold == 0 {
+    check_small_routing(root, options.threshold)?;
+    if options.threshold == 0 {
         return Ok(None);
     }
     Ok(Some(Arc::new(SmallObjectStore::open_with_service(
         root.join("small"),
-        threshold,
-        segment_size,
-        capacity,
+        options,
         root_lock,
         service,
         maintenance,

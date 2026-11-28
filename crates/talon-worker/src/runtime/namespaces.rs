@@ -171,9 +171,12 @@ impl NamespaceRuntimes {
         }
         let small = cache_routing::open_small_store(
             &root,
-            config.small_object_threshold_bytes,
-            config.small_object_segment_bytes,
-            config.capacity_bytes,
+            crate::small_store::SmallStoreOptions {
+                threshold: config.small_object_threshold_bytes,
+                segment_size: config.small_object_segment_bytes,
+                capacity: config.capacity_bytes,
+                compact: true,
+            },
             Some(self.root_lock.clone()),
             Some(&self.journal_service),
             Some(self.background_budget.clone()),
@@ -1180,9 +1183,12 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         cache_routing::open_small_store(
             &root,
-            cfg.small_object_threshold_bytes,
-            cfg.small_object_segment_bytes,
-            cfg.capacity_bytes,
+            crate::small_store::SmallStoreOptions {
+                threshold: cfg.small_object_threshold_bytes,
+                segment_size: cfg.small_object_segment_bytes,
+                capacity: cfg.capacity_bytes,
+                compact: false,
+            },
             None,
             None,
             None,
@@ -2547,9 +2553,12 @@ page_tti_hours = 2
             std::fs::create_dir_all(&scope).unwrap();
             cache_routing::open_small_store(
                 &scope,
-                cfg.small_object_threshold_bytes,
-                cfg.small_object_segment_bytes,
-                cfg.capacity_bytes,
+                crate::small_store::SmallStoreOptions {
+                    threshold: cfg.small_object_threshold_bytes,
+                    segment_size: cfg.small_object_segment_bytes,
+                    capacity: cfg.capacity_bytes,
+                    compact: false,
+                },
                 None,
                 None,
                 None,
@@ -3386,9 +3395,8 @@ page_tti_hours = 2
             .put(&block(16), Bytes::from_static(b"x"))
             .await
             .unwrap();
-        let background = super::super::background::WorkerBackground::start(root.clone(), &config);
-        background.begin_shutdown();
         let permit = namespace.background_budget.as_ref().unwrap().io().await;
+        let background = super::super::background::WorkerBackground::start(root.clone(), &config);
         let worker = root.clone();
         let mut checkpoint = tokio::spawn(async move { worker.checkpoint_catalog().await });
         let mut small_checkpoint = tokio::spawn(async move { small.maintain(true).await });

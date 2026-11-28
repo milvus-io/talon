@@ -33,13 +33,15 @@ pub(super) struct Recency {
 struct SegmentRecency {
     times: Vec<AtomicU64>,
     dirty: Vec<AtomicU64>,
+    durable_end: u64,
 }
 
 impl SegmentRecency {
-    fn with_slots(slots: usize) -> Self {
+    fn recovered(slots: usize, durable_end: u64) -> Self {
         let mut rows = Self {
             times: (0..slots).map(|_| AtomicU64::new(0)).collect(),
             dirty: Vec::new(),
+            durable_end,
         };
         rows.resize_dirty();
         rows
@@ -57,7 +59,12 @@ impl Recency {
             rows: model
                 .segments
                 .iter()
-                .map(|(&id, meta)| (id, SegmentRecency::with_slots(meta.records.slots())))
+                .map(|(&id, meta)| {
+                    (
+                        id,
+                        SegmentRecency::recovered(meta.records.slots(), meta.durable_end),
+                    )
+                })
                 .collect(),
             dirty_groups: Mutex::default(),
             started: access_millis(),
@@ -81,6 +88,20 @@ impl Recency {
 
     pub fn restore(&self, value: &AtomicU64, time: u64) -> bool {
         time != 0 && value.fetch_max(time.min(self.started), Relaxed) == 0
+    }
+
+    pub fn segment_times(&self, segment: u64) -> &[AtomicU64] {
+        &self.rows[&segment].times
+    }
+
+    pub fn mark_durable(&mut self, segment: u64, end: u64) {
+        if let Some(rows) = self.rows.get_mut(&segment) {
+            rows.durable_end = end;
+        }
+    }
+
+    pub fn durable_end(&self, segment: u64) -> u64 {
+        self.rows[&segment].durable_end
     }
 
     fn touch(&self, segment: u64, row: usize) {
@@ -252,13 +273,20 @@ impl Catalog {
         }
     }
 
-    pub(super) fn relocate_recency(&self, old: Address, new_slot: usize) {
+    pub(super) fn relocate_recency(&self, old: Address, new_slot: usize, persisted: bool) {
         if let Some(recency) = &self.recency {
             let (segment, row) = self.row(self.lookup.handle(new_slot)).unwrap();
             let old_row = self.segment(old.0).unwrap().records.position(old.1);
-            let time = recency.rows[&old.0].times[old_row].load(Relaxed);
-            recency.rows[&segment].times[row].store(time | DIRTY, Relaxed);
-            recency.mark_dirty(segment, row);
+            // Publication holds the catalog write lock. Keep any hit that
+            // arrived after sampling the source for the relocation log.
+            let mut value = recency.rows[&old.0].times[old_row].load(Relaxed);
+            if !persisted {
+                value |= DIRTY;
+            }
+            recency.rows[&segment].times[row].store(value, Relaxed);
+            if value & DIRTY != 0 {
+                recency.mark_dirty(segment, row);
+            }
         }
     }
 

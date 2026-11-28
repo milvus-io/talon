@@ -6,7 +6,7 @@ struct Pending<M: Machine> {
 }
 struct Durable<M: Machine> {
     reply: DurableReply<M>,
-    _permits: Permits,
+    permits: Permits,
 }
 enum DurableReply<M: Machine> {
     Applied(AppliedReply),
@@ -54,12 +54,13 @@ pub(crate) async fn run<M: Machine>(
     failed: &AtomicBool,
     policy: Arc<std::sync::RwLock<Option<Arc<dyn Maintenance>>>>,
     snapshot_slots: Arc<Semaphore>,
+    life: Arc<lifecycle::Life>,
 ) -> io::Result<()> {
     let mut write: Option<WriteBatch<M>> = None;
     let mut sync: Option<SyncBatch<M>> = None;
     let mut durable = Vec::new();
     let mut barrier: Option<Request<M>> = None;
-    let mut checkpoint: Option<LocalBoxFuture<'static, io::Result<disk::Snapshot>>> = None;
+    let mut checkpoint: Option<LocalBoxFuture<'static, io::Result<Option<disk::Snapshot>>>> = None;
     let mut checkpoint_completion: Option<watch::Sender<bool>> = None;
     let mut pending_checkpoint: Option<watch::Sender<bool>> = None;
     let mut closed = false;
@@ -67,13 +68,16 @@ pub(crate) async fn run<M: Machine>(
     let result=async {
         loop {
             if failed.load(Ordering::Acquire) {return Err(stopped());}
+            let checkpoints_started = life.checkpoints_started();
+            let checkpoint_ready = checkpoints_started && !life.checkpoints_stopped();
             // Coalesce callers by snapshot cut and release queue admission.
             // Appends holding maintenance permits must remain admissible while
             // a snapshot waits for those permits; no per-caller list is retained.
             if matches!(barrier.as_ref().map(|r| &r.command), Some(Command::Checkpoint(_))) {
                 let request = barrier.take().unwrap();
-                if let Command::Checkpoint(done) = request.command {
+                if let Request { command: Command::Checkpoint(done), _permits: permits } = request {
                     let completion = pending_checkpoint.get_or_insert_with(|| watch::channel(false).0);
+                    drop(permits);
                     let _ = done.send(completion.subscribe());
                 }
             }
@@ -85,16 +89,24 @@ pub(crate) async fn run<M: Machine>(
                 if matches!(barrier.as_ref().map(|r|&r.command),Some(Command::Query(_))) {
                     disk.sync().await?;
                     let request=barrier.take().unwrap();
-                    if let Command::Query(query)=request.command {query(&machine);}
-                } else if checkpoint.is_none() && (pending_checkpoint.is_some() || disk.offset>=disk.options.checkpoint_bytes) {
+                    if let Request { command: Command::Query(query), _permits: permits } = request {
+                        drop(permits);
+                        query(&machine);
+                    }
+                    continue;
+                } else if checkpoint_ready && checkpoint.is_none() && (pending_checkpoint.is_some() || disk.checkpoint_due()) {
                     let snapshot=machine.snapshot()?;
-                    let generation=disk.rotate().await?;
-                    checkpoint=Some(disk.snapshot::<M>(generation,disk.lsn,snapshot,policy.read().unwrap().clone(),snapshot_slots.clone()));
+                    let generation=disk.snapshot_generation().await?;
+                    checkpoint=Some(disk.snapshot::<M>(generation,disk.lsn,snapshot,policy.read().unwrap().clone(),snapshot_slots.clone(),life.clone()));
                     checkpoint_completion=pending_checkpoint.take();
                 }
             }
-            if closed && write.is_none() && sync.is_none() && checkpoint.is_none() && barrier.is_none() && pending_checkpoint.is_none() {return Ok(());}
+            if closed && write.is_none() && sync.is_none() && checkpoint.is_none() && barrier.is_none() {
+                disk.sync().await?;
+                return Ok(());
+            }
             tokio::select! {
+                () = life.checkpoint_start(), if !checkpoints_started => {}
                 result=async {sync.as_mut().unwrap().await}, if sync.is_some()=>{
                     sync=None;let (requests,result)=result;result?;
                     for pending in requests {
@@ -102,42 +114,51 @@ pub(crate) async fn run<M: Machine>(
                             DurableReply::Applied(reply) => reply,
                             DurableReply::Unapplied { record, lsn, reply } => apply(&mut machine, lsn, record, reply)?,
                         };
+                        drop(pending.permits);
                         reply.send();
                     }
                 }
                 result=async {checkpoint.as_mut().unwrap().await}, if checkpoint.is_some()=>{
-                    checkpoint=None;disk.publish_snapshot(result?).await?;
-                    if let Some(completion)=checkpoint_completion.take() {completion.send_replace(true);}
+                    checkpoint=None;
+                    if let Some(snapshot)=result? {
+                        disk.publish_snapshot(snapshot, &life).await?;
+                        if let Some(completion)=checkpoint_completion.take() {completion.send_replace(true);}
+                    } else {
+                        drop(checkpoint_completion.take());
+                        disk.discard_snapshot().await?;
+                    }
                 }
                 result=async {write.as_mut().unwrap().await}, if write.is_some()=>{
                     write=None;
                     let (requests,result)=result;result?;
                     for pending in requests {
-                        let Request{command,_permits}=pending.request;
+                        let Request { command, _permits: permits } = pending.request;
                         if let Command::Append{record,bytes,ack,reply}=command {
                             let lsn = pending.lsn;
+                            drop(bytes);
                             if M::APPLY_AFTER_SYNC {
                                 durable.push(Durable {
                                     reply: DurableReply::Unapplied { record, lsn, reply },
-                                    _permits,
+                                    permits,
                                 });
+                                disk.lsn = lsn;
                             } else {
                                 let reply = apply(&mut machine, lsn, record, reply)?;
+                                disk.lsn = lsn;
                                 if ack == Ack::Durable {
-                                    durable.push(Durable { reply: DurableReply::Applied(reply), _permits });
+                                    durable.push(Durable { reply: DurableReply::Applied(reply), permits });
                                 } else {
+                                    drop(permits);
                                     reply.send();
                                 }
                             }
-                            disk.lsn = lsn;
-                            drop(bytes);
                         }
                     }
                 }
                 // Do not extend the log beyond an unfinished batch. Ordering
                 // only apply/ack lets later pwrite calls leave an interior hole
                 // after process loss, which is not a recoverable torn tail.
-                request=receive.recv(), if !closed && write.is_none() && barrier.is_none() && (disk.offset<disk.options.checkpoint_bytes || checkpoint.is_some())=>{
+                request=receive.recv(), if !closed && write.is_none() && barrier.is_none() && (!checkpoint_ready || !disk.checkpoint_due() || checkpoint.is_some())=>{
                     let Some(request)=request else {closed=true;continue;};
                     if !matches!(request.command,Command::Append{..}) {barrier=Some(request);continue;}
                     let mut requests=vec![request];let mut bytes=Vec::new();let mut pending=Vec::new();
@@ -163,6 +184,7 @@ pub(crate) async fn run<M: Machine>(
     drop(checkpoint_completion);
     drop(pending_checkpoint);
     drop(durable);
+    life.close();
     // Accepted native I/O retains its buffers/descriptors and lease even after
     // another operation failed. Do not race a reopen against abandoned writes.
     if let Some(write) = write {
@@ -174,5 +196,6 @@ pub(crate) async fn run<M: Machine>(
     if let Some(checkpoint) = checkpoint {
         let _ = checkpoint.await;
     }
-    result
+    result?;
+    Ok(())
 }

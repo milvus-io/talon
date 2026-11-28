@@ -61,39 +61,36 @@ read invalidated a GC observation. Idle eviction applies to packed whole objects
 and exact ranges, including when paged L2 is disabled. Idle eviction and stale GC
 scan segment rows in bounded batches with independent cursors.
 
-The access-checkpoint interval flushes only dirty keys to `small/access.log`;
-graceful shutdown performs the same flush.
+Periodic checkpoints append dirty ages to `small/access.log`. The first flush
+and a log reaching `max(1 MiB, base snapshot size / 2)` rebuild
+`small/access.checkpoint` from current residents. Recovery also requests a
+rebuild when a live row lacks an age or needed clock repair.
 
-`small/access.checkpoint` is a full base snapshot. The first flush, migration
-from `TLSA0001`, or a log reaching `max(1 MiB, base snapshot size / 2)` rebuilds it
-from current residents. The compact policy reads and writes the existing formats
-in bounded batches, deriving each encoded key from the index when it is saved.
-Recovery also requests a base
-checkpoint when a resident key has no saved age, or an age needed clock repair,
-so repeated restarts do not keep granting that key a fresh idle window.
-Deleted identities disappear
-at compaction; until then recovery ignores them. Each delta contains the full
-encoded cache-unit key and a Unix-millisecond access time, with length and checksum
-framing (20 bytes plus the encoded key). There is no persistent item-ID map.
+Namespace Small Stores write compact snapshots (`TLSA0003`) and delta logs
+(`TLSL0002`). Checksummed frames group 32-bit payload offsets and Unix-millisecond
+timestamps by segment ID. A snapshot has a footer. Recovery applies ages to
+live rows inside durable segment prefixes. Relocation syncs translated
+destination ages in the current log generation before publishing the
+replacement in the metadata journal. Dirty bitmap markers are cleared before
+sampling so a racing hit is included or remains pending for the next flush.
+The keyed format uses `TLSA0002` and `TLSL0001`, with read support for
+`TLSA0001` snapshots. Switching access formats refreshes advisory idle windows.
 
-The compact checkpoint walks dirty bitmap groups. A flush resets markers before
-sampling so concurrent hits are either included or remain pending for a later
-checkpoint. Write failures request a new base snapshot from live recency.
+Snapshot publication syncs and renames the temporary file, then directory-syncs
+the new snapshot before replacing the log with its new-generation header.
+Recovery ignores a log from a different generation. A damaged compact log
+retains its validated prefix and is truncated to that prefix before reuse.
+An invalid base snapshot starts fresh idle windows. Startup and failed writes
+reclaim temporary access files, and allocation accounting includes both paths.
 
-Snapshot publication uses temporary-file sync, rename and directory sync, then
-publishes an empty log for the same generation. A crash between these steps
-leaves a valid new snapshot and an old-generation log, which recovery ignores.
-Normal appends use one file sync per batch and share the background disk budget;
-accepted flushes finish even if their caller is cancelled. The format uses
-`TLSA0002` for snapshots and `TLSL0001` for logs. Older readers reject the new
-advisory snapshot and start fresh idle windows; they cannot consume its deltas.
-
-Recovery validates the base and log before applying ages, only to objects
-within recovered durable segment prefixes, including relocated objects. A torn
-final log frame retains the valid prefix and requests compaction before the
-next append. Checksum/format corruption grants fresh idle intervals with a
-warning; access metadata never establishes residency or makes payload recovery
-fail. Future timestamps are clamped to startup time after clock rollback.
+Shutdown interrupts periodic byte and I/O waits and preserves the previous
+snapshot if a rewrite has yet to publish. After sealing payloads, shutdown
+attempts only incremental access flushes. Each Small Store can add up to 16 MiB
+within a one-second window shared across namespaces. An interrupted compact append
+syncs the complete frames already written under its I/O grant and advances the
+log's durable end to that prefix. A later periodic flush rebuilds the base from
+live recency. Access files carry advisory timestamps independently of payload
+recovery. Future timestamps are clamped to startup time after clock rollback.
 Downtime counts toward idle age, and a crash can lose unflushed accesses, so
 expiry remains approximate. Ordinary whole admissions preserve paged residency during active fills;
 conflicting small and ordinary admissions are rejected under the block gate.
@@ -212,10 +209,13 @@ committed data fail recovery closed. Removing a partial WAL tail is recovery
 repair. Payload tail truncation also occurs only during exclusive startup recovery,
 before any readers or writers can retain that file.
 
-Snapshots written before durable-prefix support remain readable: sealed segments
-derive their durable end from their length, and unsealed segments have no durable
-prefix. Older binaries cannot read the new flush/recovery records or snapshots;
-downgrades require a new empty cache root.
+Metadata snapshots use an allocator record, per-segment headers, and bounded
+packed-row batches with key-prefix dictionaries. This format breaks
+compatibility with earlier Small Store metadata snapshots. Opening an
+incompatible snapshot returns `InvalidData`. Use an empty cache root to upgrade
+or downgrade across the format boundary. Workers configured with
+`reset_incompatible_cache` can clear an incompatible cache and reopen it empty.
+Journal WAL record encoding is unchanged by the packed snapshot format.
 
 The engine and metadata writer both retain metadata proportional to resident
 objects. Keys are compact binary identities, but the writer's checkpoint state
@@ -334,7 +334,7 @@ mutations on that data stream without invalidating its previously durable prefix
 
 ## Snapshots and log reclamation
 
-At 64 MiB of log growth, or an explicit maintenance/shutdown checkpoint, the
+At 64 MiB of log growth, or an explicit maintenance checkpoint, the
 stream drains preceding writes and syncs them, creates the next log generation,
 and publishes CURRENT with the old snapshot and both log generations before
 acknowledging any append in the new log. It captures metadata at that boundary.
@@ -344,7 +344,11 @@ buffer. One snapshot can be in progress per stream; the shared service permits
 at most two encoders/writers at once while other streams keep appending. Its asynchronous
 write and fsync overlap appends to the new log; snapshot encoding does not run on
 the log reactor. The first mutation of a shared segment map may copy that map,
-so snapshotting still has CPU/memory cost.
+so snapshotting still has CPU/memory cost. Small Store opens defer checkpoints
+until the recovered catalog has been activated and payloads reconciled. On
+shutdown the worker stops metadata snapshots, then attempts to durably seal
+every active data stream before the final access and catalog checkpoints.
+The resulting WAL remains replayable when the metadata snapshot was cancelled.
 
 Publication writes and syncs the snapshot, syncs the metadata directory, atomically
 replaces `metadata/CURRENT` with the new snapshot and tail set, and syncs its

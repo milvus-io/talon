@@ -3,9 +3,24 @@ use crate::small_store::catalog::Address;
 use std::io::{BufReader, Read};
 
 const ROWS_PER_BATCH: usize = 512;
-const BATCH_BYTES: usize = 64 << 10;
+const SNAPSHOT_MAGIC: &[u8; 8] = b"TLSA0003";
+const DELTA_MAGIC: &[u8; 8] = b"TLSL0002";
+const ENTRY_BYTES: usize = 12;
+const GROUP_HEADER_BYTES: usize = 12;
+const FRAME_HEADER_BYTES: usize = 12;
+const PERIODIC_DELTA_BATCHES: usize = 4;
 
 impl SmallObjectStore {
+    #[cfg(test)]
+    pub(crate) fn compact_access_age(&self, key: &talon_core::BlockId) -> u64 {
+        let catalog = self.journal.model.0.read().unwrap();
+        let slot = catalog
+            .find(&key.view(), super::super::lookup::VISIBLE)
+            .unwrap();
+        let (recency, time) = catalog.recency_at(slot).unwrap();
+        recency.time(time.load(Ordering::Relaxed))
+    }
+
     pub(crate) fn init_recency(&self) {
         let mut catalog = self.journal.model.0.write().unwrap();
         catalog.recency = Some(crate::small_store::recency::Recency::new(&catalog.model));
@@ -63,55 +78,85 @@ impl SmallObjectStore {
     }
 
     pub(super) fn restore_compact_access(&self) {
+        let started = Instant::now();
+        let persistence = &self.journal.access;
+        let root = &persistence.root;
         let catalog = self.journal.model.0.read().unwrap();
         let recency = catalog.recency.as_ref().unwrap();
-        let result = (|| -> io::Result<DiskState> {
-            let Some(mut snapshot) = open_access(&self.root.join(FILE))? else {
-                return Ok(DiskState::default());
+        let result = (|| -> io::Result<(DiskState, usize)> {
+            let Some(mut snapshot) = open_access(&root.join(FILE))? else {
+                return Ok((reset_state(root)?, 0));
             };
-            let mut state = DiskState::default();
-            let mut magic = [0; 8];
-            snapshot.read_exact(&mut magic)?;
-            match &magic {
-                LEGACY => {}
-                MAGIC => {
-                    state.generation = read_generation(&mut snapshot)?;
-                    state.snapshot_bytes = snapshot.get_ref().metadata()?.len();
-                }
-                _ => return Err(invalid("small access snapshot version")),
-            }
+            let mut state = DiskState {
+                generation: read_header(&mut snapshot, SNAPSHOT_MAGIC)?,
+                snapshot_bytes: snapshot.get_ref().metadata()?.len(),
+                ..Default::default()
+            };
+
             let mut matched = 0;
             let mut repaired = false;
-            let mut apply = |key: CacheUnit, time: u64| {
-                if let Some(slot) = catalog.find(&key.view(), super::super::lookup::VISIBLE) {
-                    if let Some((recency, value)) = catalog.recency_at(slot) {
-                        matched += usize::from(recency.restore(value, time));
+            let mut apply = |id, entries: &[u8]| {
+                let Some(segment) = catalog.model.segments.get(&id) else {
+                    return;
+                };
+                let records = &segment.records;
+                let times = recency.segment_times(id);
+                let mut row = 0;
+                for (offset, time) in decode_entries(entries) {
+                    let offset = u64::from(offset);
+                    if offset >= segment.durable_end {
+                        break;
+                    }
+                    row = records.position_from(row, offset);
+                    if records.offset_matches(row, offset) {
+                        matched += usize::from(recency.restore(&times[row], time));
                         repaired |= time == 0 || time > recency.started;
+                        row += 1;
                     }
                 }
             };
             replay_access(&mut snapshot, false, &mut apply)?;
-            if &magic == MAGIC {
-                if let Some(mut log) = open_access(&self.root.join(LOG))? {
-                    log.read_exact(&mut magic)?;
-                    if &magic != LOG_MAGIC {
-                        return Err(invalid("small access log version"));
-                    }
-                    if read_generation(&mut log)? == state.generation {
-                        state.full = replay_access(&mut log, true, &mut apply)?;
-                        state.log_bytes = log.get_ref().metadata()?.len();
-                    }
+            if let Some(mut log) = open_access(&root.join(LOG))? {
+                if read_header(&mut log, DELTA_MAGIC).ok() == Some(state.generation) {
+                    state.log_bytes = HEADER;
+                    let result = replay_access(&mut log, true, |id, body| {
+                        apply(id, body);
+                        state.log_bytes +=
+                            (FRAME_HEADER_BYTES + GROUP_HEADER_BYTES + body.len()) as u64;
+                    });
+                    // Only complete, validated frames belong to this log. Keep
+                    // their ages even if the following frame is damaged.
+                    state.log_truncate = !matches!(result, Ok(false));
+                    state.full = state.log_truncate;
                 }
             }
             state.full |= repaired || matched < catalog.live.values().sum();
-            Ok(state)
+            Ok((state, matched))
         })();
         match result {
-            Ok(state) => *self.access_disk.lock().unwrap() = state,
+            Ok((state, matched)) => {
+                *persistence.disk.lock().unwrap() = state;
+                tracing::info!(root = %self.root.display(), matched,
+                    access_ms = started.elapsed().as_secs_f64() * 1000.0,
+                    snapshot_bytes = state.snapshot_bytes, log_bytes = state.log_bytes,
+                    "small compact access restored");
+            }
             Err(error) => {
                 // Startup publishes no readers until the replay is complete.
                 recency.reset();
+                if let Ok(state) = reset_state(root) {
+                    *persistence.disk.lock().unwrap() = state;
+                } else {
+                    // Retry starts only after the exhausted log can be removed.
+                    persistence.disk.lock().unwrap().generation = u64::MAX;
+                }
                 tracing::warn!(%error, root = %self.root.display(), "small object access recovery failed; starting fresh idle windows");
+            }
+        }
+        match allocated(root) {
+            Ok(size) => persistence.bytes.store(size, Ordering::Relaxed),
+            Err(error) => {
+                tracing::warn!(%error, root = %root.display(), "refreshing small access allocation failed")
             }
         }
     }
@@ -119,146 +164,369 @@ impl SmallObjectStore {
     pub(super) async fn checkpoint_compact_access(
         &self,
         budget: Option<&crate::background::BackgroundBudget>,
-    ) -> io::Result<()> {
-        let mut state = {
-            let mut disk = self.access_disk.lock().unwrap();
-            let state = *disk;
-            // An error after sampling dirty rows requires a fresh snapshot.
-            disk.full = true;
-            state
-        };
+        flush: Flush<'_>,
+    ) -> io::Result<bool> {
+        let persistence = &self.journal.access;
+        let mut state = *persistence.disk.lock().unwrap();
         let full = state.full
             || state.log_bytes >= MIN_COMPACT_BYTES.max(state.snapshot_bytes.div_ceil(2));
-        let access_relocation = if full {
-            Some(self.journal.access_relocation.write().await)
-        } else {
-            None
+        // A stopped or failed flush may already have sampled dirty rows.
+        // Retry from all live ages, keeping the durable log end for relocation.
+        persistence.disk.lock().unwrap().full = true;
+        if full && !flush.allows_full() {
+            return Ok(false);
+        }
+        let mut scan = AccessScan {
+            cursor: (0, 0),
+            ceiling: self
+                .journal
+                .model
+                .0
+                .read()
+                .unwrap()
+                .model
+                .segments
+                .last_key_value()
+                .map_or((0, 0), |(&id, segment)| (id, segment.bytes)),
+            full,
         };
-        let mut cursor: Address = (0, 0);
-        let ceiling = self
-            .journal
-            .model
-            .0
-            .read()
-            .unwrap()
-            .model
-            .segments
-            .last_key_value()
-            .map_or((0, 0), |(&id, segment)| (id, segment.bytes));
-        let tmp = self.root.join("access.checkpoint.tmp");
-        let mut fd = None;
-        let mut offset = state.log_bytes;
+        let root = &persistence.root;
         if full {
+            if state.snapshot_bytes == 0 && state.generation == u64::MAX {
+                flush.check()?;
+                let reset_root = root.clone();
+                state = tokio::task::spawn_blocking(move || reset_state(&reset_root))
+                    .await
+                    .map_err(io::Error::other)??;
+            }
             state.generation = state
                 .generation
                 .checked_add(1)
                 .ok_or_else(|| invalid("access generation exhausted"))?;
-            let file = {
-                let _io = match budget {
-                    Some(b) => Some(b.io().await),
-                    None => None,
-                };
-                disk_io::open(tmp.clone(), disk_io::Open::Replace).await?
-            };
-            self.write_access_chunks(&file, header(MAGIC, state.generation).into(), 0, budget)
+            let tmp = root.join(SNAPSHOT_TEMP);
+            let fd = {
+                let _io = flush.grant(budget, HEADER as usize).await?;
+                let fd = disk_io::open(tmp.clone(), disk_io::Open::Replace).await?;
+                disk_io::write(
+                    fd.clone(),
+                    header(SNAPSHOT_MAGIC, state.generation).into(),
+                    0,
+                )
                 .await?;
-            offset = HEADER;
-            fd = Some(file);
-        }
-        #[cfg(test)]
-        {
-            let pause = self.access_pause.lock().unwrap().take();
-            if let Some((entered, release)) = pause {
-                entered.notify_one();
-                release.notified().await;
-            }
-        }
-        loop {
-            let mut bytes = Vec::new();
-            let mut result = Ok(());
-            let done = {
-                let catalog = self.journal.model.0.read().unwrap();
-                let recency = catalog.recency.as_ref().unwrap();
-                let mut sample = |id, row| {
-                    if let Some(time) = recency.sample(id, row, full) {
-                        let (_, record) = catalog.segment(id).unwrap().records.get(row).unwrap();
-                        result = encode(&mut bytes, &record.key, time);
-                    }
-                    result.is_ok() && bytes.len() < BATCH_BYTES
-                };
-                if full {
-                    catalog.visit_recency(&mut cursor, ceiling, ROWS_PER_BATCH, |_, id, row| {
-                        sample(id, row)
-                    })
-                } else {
-                    catalog.visit_dirty_recency(&mut cursor, ceiling, ROWS_PER_BATCH, sample)
-                }
+                fd
             };
-            result?;
-            if !bytes.is_empty() {
-                if fd.is_none() {
-                    fd = Some(disk_io::open(self.root.join(LOG), disk_io::Open::Update).await?);
+            #[cfg(test)]
+            self.pause_access_flush().await;
+            let mut offset = HEADER;
+            loop {
+                let (bytes, done) = scan.next_batch(&self.journal.model, flush).await?;
+                if !bytes.is_empty() {
+                    let _io = flush.grant(budget, bytes.len()).await?;
+                    let len = bytes.len() as u64;
+                    disk_io::write(fd.clone(), bytes.into(), offset).await?;
+                    offset += len;
                 }
+                if done {
+                    break;
+                }
+            }
+            let mut footer = Vec::new();
+            format::frame(&mut footer, &[])?;
+            let _io = flush.grant(budget, footer.len()).await?;
+            let len = footer.len() as u64;
+            disk_io::write(fd.clone(), footer.into(), offset).await?;
+            offset += len;
+            disk_io::sync(fd).await?;
+            drop(_io);
+            // Once rename starts, finish both directory updates with this grant.
+            let _io = flush.grant(budget, HEADER as usize).await?;
+            disk_io::rename(tmp, root.join(FILE)).await?;
+            state.snapshot_bytes = offset;
+            state.log_bytes = 0;
+            state.log_truncate = false;
+            // A retry syncs this rename before replacing the preceding log.
+            *persistence.disk.lock().unwrap() = DiskState {
+                full: true,
+                ..state
+            };
+            open_log_for_append(root, &mut state).await?;
+            state.full = false;
+            *persistence.disk.lock().unwrap() = state;
+            return Ok(true);
+        }
+
+        #[cfg(test)]
+        self.pause_access_flush().await;
+        self.append_access_delta(scan, state, budget, flush).await
+    }
+
+    async fn append_access_delta(
+        &self,
+        mut scan: AccessScan,
+        mut state: DiskState,
+        budget: Option<&crate::background::BackgroundBudget>,
+        flush: Flush<'_>,
+    ) -> io::Result<bool> {
+        let persistence = &self.journal.access;
+        // Amortize periodic syncs while keeping shutdown admissions short.
+        let batch_limit = match flush {
+            Flush::Periodic(_) => PERIODIC_DELTA_BATCHES,
+            Flush::Shutdown { .. } => 1,
+        };
+        let mut group = Vec::with_capacity(batch_limit);
+        let mut fd = None;
+        let mut remaining = flush.byte_limit();
+        let mut done = false;
+        state.full = true;
+        while !done {
+            let mut group_bytes = 0;
+            while group.len() < batch_limit && !done {
+                let (bytes, finished) = scan.next_batch(&self.journal.model, flush).await?;
+                done = finished;
+                if !bytes.is_empty() {
+                    group_bytes += bytes.len();
+                    group.push(Bytes::from(bytes));
+                }
+            }
+            if group.is_empty() {
+                break;
+            }
+            if state.log_bytes == 0 {
+                group_bytes += HEADER as usize;
+            }
+            remaining = remaining
+                .checked_sub(group_bytes as u64)
+                .ok_or(io::ErrorKind::Interrupted)?;
+
+            // Pay for the whole group before taking a slot. Once admitted,
+            // finish the writes and sync before allowing another pacing wait.
+            let _io = flush.grant(budget, group_bytes).await?;
+            flush.check()?;
+            persistence.disk.lock().unwrap().log_truncate = true;
+            if fd.is_none() {
+                fd = Some(open_log_for_append(&persistence.root, &mut state).await?);
+            }
+            let file = fd.as_ref().unwrap();
+            let mut offset = state.log_bytes;
+            for bytes in group.drain(..) {
                 let len = bytes.len() as u64;
-                self.write_access_chunks(fd.as_ref().unwrap(), bytes.into(), offset, budget)
-                    .await?;
+                disk_io::write(file.clone(), bytes, offset).await?;
                 offset += len;
             }
-            if done {
-                break;
+            disk_io::sync(file.clone()).await?;
+            state.log_bytes = offset;
+            *persistence.disk.lock().unwrap() = state;
+        }
+        flush.check()?;
+        state.full = false;
+        *persistence.disk.lock().unwrap() = state;
+        Ok(fd.is_some())
+    }
+}
+
+struct AccessScan {
+    cursor: Address,
+    ceiling: Address,
+    full: bool,
+}
+
+impl AccessScan {
+    async fn next_batch(
+        &mut self,
+        model: &super::super::catalog::LiveModel,
+        flush: Flush<'_>,
+    ) -> io::Result<(Vec<u8>, bool)> {
+        let mut batch = AgeBatch::default();
+        loop {
+            flush.check()?;
+            let done = {
+                let catalog = model.0.read().unwrap();
+                let recency = catalog.recency.as_ref().unwrap();
+                let mut sample = |id, row| {
+                    let segment = catalog.segment(id).unwrap();
+                    let offset = segment.records.offset_at(row);
+                    // The journal applies events before acknowledging fsync.
+                    if offset < recency.durable_end(id) {
+                        if let Some(time) = recency.sample(id, row, self.full) {
+                            batch.push(id, offset as u32, time);
+                        }
+                    }
+                    true
+                };
+                if self.full {
+                    catalog.visit_recency(
+                        &mut self.cursor,
+                        self.ceiling,
+                        ROWS_PER_BATCH,
+                        |_, id, row| sample(id, row),
+                    )
+                } else {
+                    catalog.visit_dirty_recency(
+                        &mut self.cursor,
+                        self.ceiling,
+                        ROWS_PER_BATCH,
+                        sample,
+                    )
+                }
+            };
+            // Keep each on-disk frame bounded independently of the write size.
+            batch.flush();
+            if done || batch.bytes.len() >= WRITE_BYTES {
+                return Ok((batch.bytes, done));
             }
             tokio::task::yield_now().await;
         }
-        drop(access_relocation);
-        if let Some(fd) = fd {
-            self.sync_access(fd, budget).await?;
-            if full {
-                self.rename_access(tmp, FILE, budget).await?;
-                self.publish_access(LOG, header(LOG_MAGIC, state.generation).into(), budget)
-                    .await?;
-                state.snapshot_bytes = offset;
-                state.log_bytes = HEADER;
-            } else {
-                state.log_bytes = offset;
-            }
-            let root = self.root.clone();
-            let size = tokio::task::spawn_blocking(move || allocated(&root))
-                .await
-                .map_err(io::Error::other)??;
-            self.access_bytes.store(size, Ordering::Relaxed);
-        }
-        state.full = false;
-        *self.access_disk.lock().unwrap() = state;
-        Ok(())
     }
+}
+
+pub(super) fn relocation_bytes(rows: usize) -> usize {
+    if rows == 0 {
+        return 0;
+    }
+    rows * ENTRY_BYTES
+        + rows.div_ceil(ROWS_PER_BATCH) * (GROUP_HEADER_BYTES + FRAME_HEADER_BYTES)
+        + HEADER as usize
 }
 
 fn open_access(path: &std::path::Path) -> io::Result<Option<BufReader<std::fs::File>>> {
     match std::fs::File::open(path) {
-        Ok(file) => Ok(Some(BufReader::new(file))),
+        Ok(file) => Ok(Some(BufReader::with_capacity(1 << 20, file))),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
 }
 
-fn read_generation(reader: &mut impl Read) -> io::Result<u64> {
-    let mut generation = [0; 8];
-    reader.read_exact(&mut generation)?;
-    Ok(u64::from_le_bytes(generation))
+async fn open_log_for_append(
+    root: &std::path::Path,
+    state: &mut DiskState,
+) -> io::Result<Arc<OwnedFd>> {
+    let path = root.join(LOG);
+    if state.log_bytes == 0 {
+        // A previous checkpoint may have stopped after renaming its snapshot.
+        // Commit the directory entry before overwriting a superseded log.
+        disk_io::sync_dir(root.to_owned()).await?;
+        let temp = root.join(LOG_TEMP);
+        let fd = disk_io::open(temp.clone(), disk_io::Open::Replace).await?;
+        disk_io::write(fd.clone(), header(DELTA_MAGIC, state.generation).into(), 0).await?;
+        disk_io::sync(fd.clone()).await?;
+        disk_io::rename(temp, path).await?;
+        disk_io::sync_dir(root.to_owned()).await?;
+        state.log_bytes = HEADER;
+        state.log_truncate = false;
+        return Ok(fd);
+    }
+    let fd = disk_io::open(path, disk_io::Open::Update).await?;
+    if state.log_truncate {
+        disk_io::truncate(fd.clone(), state.log_bytes).await?;
+        state.log_truncate = false;
+    }
+    Ok(fd)
+}
+
+fn read_header(reader: &mut impl Read, magic: &[u8; 8]) -> io::Result<u64> {
+    let mut header = [0; HEADER as usize];
+    reader.read_exact(&mut header).map_err(|error| {
+        if error.kind() == io::ErrorKind::UnexpectedEof {
+            invalid("truncated compact access header")
+        } else {
+            error
+        }
+    })?;
+    if &header[..8] != magic {
+        return Err(invalid("unsupported compact access version"));
+    }
+    let generation = u64::from_le_bytes(header[8..].try_into().unwrap());
+    if generation == 0 {
+        return Err(invalid("invalid compact access generation"));
+    }
+    Ok(generation)
+}
+
+fn reset_state(root: &std::path::Path) -> io::Result<DiskState> {
+    // A new checkpoint must also supersede any compatible log left after
+    // a reset. A crash before log replacement must not resurrect its ages.
+    let path = root.join(LOG);
+    let generation = match open_access(&path)? {
+        Some(mut file) => match read_header(&mut file, DELTA_MAGIC) {
+            Ok(generation) => generation,
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => 0,
+            Err(error) => return Err(error),
+        },
+        None => 0,
+    };
+    let generation = if generation == u64::MAX {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        std::fs::File::open(root)?.sync_all()?;
+        0
+    } else {
+        generation
+    };
+    Ok(DiskState {
+        generation,
+        ..DiskState::default()
+    })
+}
+
+#[derive(Default)]
+struct AgeBatch {
+    bytes: Vec<u8>,
+    group: Vec<u8>,
+    segment: u64,
+}
+
+impl AgeBatch {
+    fn push(&mut self, segment: u64, offset: u32, time: u64) {
+        if self.group.is_empty() || self.segment != segment {
+            self.flush();
+            self.segment = segment;
+            self.group.extend_from_slice(&segment.to_le_bytes());
+            self.group.extend_from_slice(&[0; 4]);
+        }
+        self.group.extend_from_slice(&offset.to_le_bytes());
+        self.group.extend_from_slice(&time.to_le_bytes());
+    }
+
+    fn flush(&mut self) {
+        if self.group.is_empty() {
+            return;
+        }
+        let count = ((self.group.len() - GROUP_HEADER_BYTES) / ENTRY_BYTES) as u32;
+        self.group[8..12].copy_from_slice(&count.to_le_bytes());
+        format::frame(&mut self.bytes, &self.group).expect("write access frame to memory");
+        self.group.clear();
+    }
+}
+
+fn decode_entries(input: &[u8]) -> impl Iterator<Item = (u32, u64)> + '_ {
+    input.chunks_exact(ENTRY_BYTES).map(|row| {
+        (
+            u32::from_le_bytes(row[..4].try_into().unwrap()),
+            u64::from_le_bytes(row[4..].try_into().unwrap()),
+        )
+    })
 }
 
 fn replay_access(
     reader: &mut impl Read,
-    allow_partial_tail: bool,
-    mut apply: impl FnMut(CacheUnit, u64),
+    log: bool,
+    mut apply: impl FnMut(u64, &[u8]),
 ) -> io::Result<bool> {
-    let mut header = [0; 12];
+    let mut header = [0; FRAME_HEADER_BYTES];
     let mut record = Vec::new();
+    let mut previous = (0, 0);
     let read_tail = |reader: &mut dyn Read, target: &mut [u8]| -> io::Result<bool> {
         match reader.read_exact(target) {
             Ok(()) => Ok(true),
-            Err(error) if allow_partial_tail && error.kind() == io::ErrorKind::UnexpectedEof => {
-                Ok(false)
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                if log {
+                    Ok(false)
+                } else {
+                    Err(invalid("truncated compact access snapshot"))
+                }
             }
             Err(error) => Err(error),
         }
@@ -266,15 +534,31 @@ fn replay_access(
     loop {
         match reader.read_exact(&mut header[..1]) {
             Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                return if log {
+                    Ok(false)
+                } else {
+                    Err(invalid("missing compact access footer"))
+                };
+            }
             Err(error) => return Err(error),
         }
         if !read_tail(reader, &mut header[1..])? {
             return Ok(true);
         }
         let len = u32::from_le_bytes(header[..4].try_into().unwrap()) as usize;
-        if len > format::MAX_KEY + 32 {
-            return Err(invalid("small access frame length"));
+        if len == 0 && !log {
+            let expected = u64::from_le_bytes(header[4..].try_into().unwrap());
+            if expected != xxhash_rust::xxh3::xxh3_64(&[]) || reader.read(&mut [0])? != 0 {
+                return Err(invalid("invalid compact access footer"));
+            }
+            return Ok(false);
+        }
+        if !(GROUP_HEADER_BYTES + ENTRY_BYTES..=GROUP_HEADER_BYTES + ROWS_PER_BATCH * ENTRY_BYTES)
+            .contains(&len)
+            || (len - GROUP_HEADER_BYTES) % ENTRY_BYTES != 0
+        {
+            return Err(invalid("compact access frame length"));
         }
         record.resize(len, 0);
         if !read_tail(reader, &mut record)? {
@@ -282,10 +566,113 @@ fn replay_access(
         }
         let expected = u64::from_le_bytes(header[4..].try_into().unwrap());
         if xxhash_rust::xxh3::xxh3_64(&record) != expected {
-            return Err(invalid("small access frame checksum"));
+            return Err(invalid("compact access frame checksum"));
         }
         let mut body = record.as_slice();
-        let time = format::u64(&mut body)?;
-        apply(format::id(body)?, time);
+        let segment = format::u64(&mut body)?;
+        let count = format::u32(&mut body)? as usize;
+        if segment == 0 || count != body.len() / ENTRY_BYTES {
+            return Err(invalid("compact access frame count or segment"));
+        }
+        if log {
+            previous = (0, 0);
+        }
+        for (offset, time) in decode_entries(body) {
+            let address = (segment, offset);
+            if offset >= 1 << 30 || time >= 1 << 62 || address <= previous {
+                return Err(invalid("compact access row bounds or order"));
+            }
+            previous = address;
+        }
+        apply(segment, body);
     }
+}
+
+// Called after syncing the destination data and directory, with the relocation
+// gate and I/O permit held but outside the foreground publication locks. A
+// failed Replace leaves the source visible. The destination stays invisible
+// and its durable file or WAL record prevents allocator reuse after a crash.
+pub(in crate::small_store) async fn persist_relocation(
+    journal: &journal::Journal,
+    old: u64,
+    copy: &StagedSegment,
+) -> io::Result<bool> {
+    let persistence = &journal.access;
+    let _writer = persistence.log_write.lock().await;
+    let mut state = {
+        let mut disk = persistence.disk.lock().unwrap();
+        if disk.snapshot_bytes == 0 {
+            return Ok(false);
+        }
+        let state = *disk;
+        // On error a retry must discard only the attempted append.
+        disk.log_truncate = true;
+        state
+    };
+    let result = async {
+        let fd = open_log_for_append(&persistence.root, &mut state).await?;
+        let mut translations: Vec<_> = copy
+            .records
+            .iter()
+            .map(|(&old, record)| (old, record.new_offset))
+            .collect();
+        translations.sort_unstable();
+        let mut batch = AgeBatch::default();
+        for rows in translations.chunks(ROWS_PER_BATCH) {
+            {
+                let catalog = journal.model.0.read().unwrap();
+                let recency = catalog.recency.as_ref().unwrap();
+                let times = recency.segment_times(old);
+                let records = &catalog.segment(old).unwrap().records;
+                let mut row = 0;
+                for &(offset, new_offset) in rows {
+                    row = records.position_from(row, offset);
+                    // Staged deletes are reconciled before Replace.
+                    if records.offset_matches(row, offset) {
+                        let time = recency.time(times[row].load(Ordering::Relaxed));
+                        batch.push(copy.id, new_offset as u32, time);
+                        row += 1;
+                    }
+                }
+            }
+            batch.flush();
+            if batch.bytes.len() >= WRITE_BYTES {
+                let bytes = std::mem::take(&mut batch.bytes);
+                let len = bytes.len() as u64;
+                disk_io::write(fd.clone(), bytes.into(), state.log_bytes).await?;
+                state.log_bytes += len;
+            }
+        }
+        if !batch.bytes.is_empty() {
+            let len = batch.bytes.len() as u64;
+            disk_io::write(fd.clone(), batch.bytes.into(), state.log_bytes).await?;
+            state.log_bytes += len;
+        }
+        #[cfg(test)]
+        if journal
+            .control
+            .fail_access_sync
+            .swap(false, Ordering::Relaxed)
+        {
+            return Err(io::Error::other("injected access relocation sync failure"));
+        }
+        disk_io::sync(fd).await?;
+        *persistence.disk.lock().unwrap() = state;
+        Ok(true)
+    }
+    .await;
+    persistence.refresh_allocated(result).await?;
+    Ok(true)
+}
+
+#[cfg(test)]
+pub(super) fn read_log(path: &std::path::Path) -> Vec<(u64, u32, u64)> {
+    let mut log = open_access(&path.join(LOG)).unwrap().unwrap();
+    read_header(&mut log, DELTA_MAGIC).unwrap();
+    let mut rows = Vec::new();
+    assert!(!replay_access(&mut log, true, |segment, body| {
+        rows.extend(decode_entries(body).map(|(offset, time)| (segment, offset, time)));
+    })
+    .unwrap());
+    rows
 }

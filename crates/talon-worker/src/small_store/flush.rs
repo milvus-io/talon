@@ -82,6 +82,7 @@ impl SegmentStore {
             Ok(()) => {
                 self.healthy(&state)?;
                 state.segments.get_mut(&id).unwrap().durable_end = end;
+                self.journal.mark_access_durable(id, end);
                 state.last_flush = Instant::now();
                 Ok(())
             }

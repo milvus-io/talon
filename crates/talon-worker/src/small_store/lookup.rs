@@ -100,24 +100,30 @@ impl Lookup {
     }
 
     pub fn insert(&mut self, hash: u32, handle: u32, flags: u8) -> usize {
-        assert!(handle != EMPTY && handle != DELETED);
+        let slot = self.vacancy(hash, |_, _| false).expect("unchecked insert");
+        self.insert_at(slot, hash, handle, flags);
+        slot
+    }
+
+    /// Find the insertion position and check for an equal key along the same
+    /// probe chain. A tombstone may precede an equal live key.
+    pub fn vacancy(&self, hash: u32, mut equal: impl FnMut(u32, u8) -> bool) -> Option<usize> {
         let mut slot = self.start_slot(hash);
+        let fingerprint = (hash >> 27) as u8;
         let mut tombstone = None;
         for _ in 0..self.capacity() {
             match self.handles[slot] {
-                EMPTY => {
-                    let slot = tombstone.unwrap_or(slot);
-                    self.deleted -= usize::from(tombstone.is_some());
-                    self.handles[slot] = handle;
-                    *self.control[slot].get_mut() = (hash >> 27) as u8 | (flags & !FINGERPRINT);
-                    self.len += 1;
-                    self.changed();
-                    return slot;
-                }
+                EMPTY => return Some(tombstone.unwrap_or(slot)),
                 DELETED => {
                     tombstone.get_or_insert(slot);
                 }
-                _ => {}
+                handle => {
+                    let control = self.control[slot].load(Ordering::Relaxed);
+                    if control & FINGERPRINT == fingerprint && equal(handle, control & !FINGERPRINT)
+                    {
+                        return None;
+                    }
+                }
             }
             slot += 1;
             if slot == self.capacity() {
@@ -125,6 +131,17 @@ impl Lookup {
             }
         }
         panic!("lookup reservation exhausted")
+    }
+
+    pub fn insert_at(&mut self, slot: usize, hash: u32, handle: u32, flags: u8) {
+        assert!(handle != EMPTY && handle != DELETED);
+        let old = self.handles[slot];
+        debug_assert!(old == EMPTY || old == DELETED);
+        self.deleted -= usize::from(old == DELETED);
+        self.handles[slot] = handle;
+        *self.control[slot].get_mut() = (hash >> 27) as u8 | (flags & !FINGERPRINT);
+        self.len += 1;
+        self.changed();
     }
 
     pub fn remove(&mut self, slot: usize) -> u8 {

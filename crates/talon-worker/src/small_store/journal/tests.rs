@@ -21,7 +21,7 @@ fn snapshot_keeps_rows_when_live_deletion_compacts_and_append_moves_them() {
     model.apply(insert(10, "last")).unwrap();
     let mut snapshot = model.snapshot().unwrap();
     let mut restored = Model::default();
-    for _ in 0..3 {
+    for _ in 0..2 {
         restored
             .restore(Model::decode_snapshot(&snapshot.next().unwrap().unwrap()).unwrap())
             .unwrap();
@@ -96,6 +96,72 @@ fn dense_segment_snapshot_restores_one_hundred_thousand_extents() {
             crate::small_store::key::SmallIdentity::view(&id(&offset.to_string()))
         );
     }
+}
+
+#[test]
+fn snapshot_restore_reuses_long_prefixes_across_batches() {
+    use talon_journal::Machine;
+
+    let mut model = Model::default();
+    let shared = "路\0".repeat(246);
+    let mut offset = 0;
+    // Every pass exceeds the batch byte limit before any prefix repeats.
+    // The final character has a shared leading UTF-8 byte.
+    for suffix in 'Ā'..='ď' {
+        for group in 0..160 {
+            let key = id(&format!("group-{group:03}/{shared}{suffix}"));
+            model
+                .apply(Event::Insert {
+                    slot: 0,
+                    segment: 1,
+                    offset,
+                    record: Record {
+                        key: crate::small_store::key::SmallKey::new(&key),
+                        len: 1,
+                        checksum: Some(offset),
+                    },
+                })
+                .unwrap();
+            offset += 1;
+        }
+    }
+    let mut short = id("short");
+    short.object.bucket = "other-bucket".into();
+    model
+        .apply(Event::Insert {
+            slot: 0,
+            segment: 1,
+            offset,
+            record: Record {
+                key: crate::small_store::key::SmallKey::new(&short),
+                len: 1,
+                checksum: Some(offset),
+            },
+        })
+        .unwrap();
+    model.apply(Event::Seal { segment: 1 }).unwrap();
+    let original = &model.segments[&1].records;
+    assert!(original.retained_prefix_bytes() > 128 << 10);
+    assert!(original.key_parts(original.slots() - 1).0.is_empty());
+
+    let mut restored = Model::default();
+    let mut batches = 0;
+    for bytes in model.snapshot().unwrap() {
+        let record = Model::decode_snapshot(&bytes.unwrap()).unwrap();
+        batches += usize::from(matches!(record, super::snapshot::SnapshotRecord::Rows(_)));
+        restored.restore(record).unwrap();
+    }
+    restored.finish_snapshot_restore().unwrap();
+    assert!(batches > 16, "expected repeated prefixes across batches");
+    let recovered = &restored.segments[&1].records;
+    assert_eq!(recovered.slots(), original.slots());
+    for row in 0..original.slots() {
+        assert_eq!(recovered.key_parts(row), original.key_parts(row));
+    }
+    assert_eq!(
+        recovered.retained_prefix_bytes(),
+        original.retained_prefix_bytes()
+    );
 }
 
 #[test]
@@ -223,22 +289,76 @@ async fn compact_journal_preserves_live_and_recovered_identity() {
 }
 
 #[test]
-fn legacy_snapshot_headers_preserve_the_original_durability_boundary() {
+fn legacy_snapshot_records_require_an_empty_cache() {
     use talon_journal::Machine;
-    for sealed in [false, true] {
-        let mut bytes = vec![4];
-        for n in [1u64, 0, 5, 64] {
-            bytes.extend_from_slice(&n.to_le_bytes());
-        }
-        bytes.push(u8::from(sealed));
-        let record = Model::decode_snapshot(&bytes).unwrap();
-        let mut model = Model {
-            next: 2,
-            ..Default::default()
+    for kind in [0, 4, 5, 8, 9] {
+        let Err(error) = Model::decode_snapshot(&[kind, 0, 0, 0, 0, 0, 0, 0, 0]) else {
+            panic!("legacy snapshot record accepted");
         };
-        model.restore(record).unwrap();
-        assert_eq!(model.segments[&1].durable_end, if sealed { 5 } else { 0 });
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
+}
+
+#[test]
+fn packed_snapshot_validates_keys_counts_and_extent_bounds() {
+    use talon_journal::Machine;
+
+    let mut model = Model::default();
+    model
+        .apply(Event::Insert {
+            slot: 0,
+            segment: 1,
+            offset: 0,
+            record: Record {
+                key: crate::small_store::key::SmallKey::new(&id("valid")),
+                len: 5,
+                checksum: None,
+            },
+        })
+        .unwrap();
+    model.apply(Event::Seal { segment: 1 }).unwrap();
+    let frames = model
+        .snapshot()
+        .unwrap()
+        .collect::<io::Result<Vec<_>>>()
+        .unwrap();
+    let restore_header = || {
+        let mut restored = Model::default();
+        for bytes in &frames[..2] {
+            restored
+                .restore(Model::decode_snapshot(bytes).unwrap())
+                .unwrap();
+        }
+        restored
+    };
+    assert_eq!(
+        restore_header()
+            .finish_snapshot_restore()
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidData
+    );
+
+    // Single trailer row with no prefix. Its key starts after the frame
+    // header and the row's offset, length, prefix index and suffix length.
+    let mut broken = frames[2].to_vec();
+    broken[28] = 0xff;
+    assert!(
+        matches!(Model::decode_snapshot(&broken), Err(error) if error.kind() == io::ErrorKind::InvalidData)
+    );
+    assert!(
+        matches!(Model::decode_snapshot(&frames[2][..frames[2].len() - 1]), Err(error) if error.kind() == io::ErrorKind::InvalidData)
+    );
+
+    let mut broken = frames[2].to_vec();
+    broken[14..18].copy_from_slice(&9u32.to_le_bytes());
+    assert_eq!(
+        restore_header()
+            .restore(Model::decode_snapshot(&broken).unwrap())
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidData
+    );
 }
 
 #[test]
@@ -509,9 +629,12 @@ async fn recovered_small_store_tail_uses_initial_snapshot_budget() {
     let store = Arc::new(
         crate::small_store::SmallObjectStore::open_with_service(
             root.clone(),
-            128 << 10,
-            256 << 10,
-            4 << 20,
+            crate::small_store::SmallStoreOptions {
+                threshold: 128 << 10,
+                segment_size: 256 << 10,
+                capacity: 4 << 20,
+                compact: true,
+            },
             None,
             Some(&service),
             Some(budget),

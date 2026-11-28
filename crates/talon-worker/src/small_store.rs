@@ -24,6 +24,7 @@ mod rings;
 mod tickets;
 pub(crate) use recency::IdleRecencyCursor;
 pub use rings::SmallObjectStore;
+pub(crate) use rings::SmallStoreOptions;
 #[cfg(test)]
 pub(crate) mod tests;
 
@@ -399,6 +400,7 @@ impl SegmentStore {
             threshold,
             segment_size,
             root_lock,
+            false,
         )?;
         if streams.len() != 1 {
             return Err(invalid("test stream has foreign slot"));
@@ -942,24 +944,29 @@ impl SegmentStore {
             }
             (old, entries, cost)
         };
+        let tracks_access = self.journal.model.0.read().unwrap().recency.is_some();
         if let Some(budget) = budget {
-            budget.bytes(cost as usize).await;
+            let access_bytes = if tracks_access {
+                self.journal.access.relocation_bytes(entries.len())
+            } else {
+                0
+            };
+            budget.bytes(cost as usize + access_bytes).await;
         }
 
-        // Full access checkpoints take this gate before I/O. Preserve that
-        // ordering so a snapshot and relocation cannot wait on each other.
-        let tracks_access = self.journal.model.0.read().unwrap().recency.is_some();
+        // Keep the access generation stable from translation through Replace,
+        // including while releasing the I/O permit to reconcile tombstones.
+        // Checkpoints also acquire this gate before taking their I/O permit.
+        let access_relocation = if tracks_access {
+            Some(self.journal.access.relocation.read().await)
+        } else {
+            None
+        };
         let acquire_io = || async {
-            let access_relocation = if tracks_access {
-                Some(self.journal.access_relocation.read().await)
-            } else {
-                None
-            };
-            let io = match budget {
+            match budget {
                 Some(budget) => Some(budget.io().await),
                 None => None,
-            };
-            (access_relocation, io)
+            }
         };
         let mut io = acquire_io().await;
         let mut staged = if entries.is_empty() {
@@ -969,6 +976,34 @@ impl SegmentStore {
         };
         #[cfg(test)]
         tests::crash("compact_copy");
+
+        let access_persisted = if let Some(copy) = staged.as_ref().filter(|_| tracks_access) {
+            match access::persist_relocation(&self.journal, old, copy).await {
+                Ok(persisted) => persisted,
+                Err(error) => {
+                    // If access persistence fails, retire just the staged copy.
+                    // The live source and its previously durable ages stay put.
+                    tracing::warn!(%error, old, new = copy.id, "small access relocation deferred");
+                    self.state.lock().await.compaction_deletes = None;
+                    self.journal
+                        .append(
+                            journal::Event::Replace {
+                                old: copy.id,
+                                new: None,
+                            },
+                            true,
+                        )
+                        .await?;
+                    drop(io);
+                    drop(access_relocation);
+                    self.unlink_compacted_segment(copy.id, budget).await?;
+                    self.cached_stats.lock().unwrap().staging_allocated = 0;
+                    return Ok(false);
+                }
+            }
+        } else {
+            false
+        };
 
         let mut source = loop {
             #[cfg(test)]
@@ -988,7 +1023,7 @@ impl SegmentStore {
             else {
                 state.compaction_deletes = None;
                 break self
-                    .publish_compaction(&mut state, old, &mut staged)
+                    .publish_compaction(&mut state, old, &mut staged, access_persisted)
                     .await?;
             };
             let deleted = std::mem::take(&mut deletes.offsets);
@@ -1008,6 +1043,7 @@ impl SegmentStore {
             self.reconcile_copy(copy, deleted).await?;
         };
         drop(io);
+        drop(access_relocation);
 
         // A reader which resolved the old address must retain its fd before
         // the path goes away. Readers starting after this barrier see new locators.
@@ -1149,6 +1185,7 @@ impl SegmentStore {
         state: &mut State,
         old: u64,
         staged: &mut Option<StagedSegment>,
+        access_persisted: bool,
     ) -> io::Result<Segment> {
         let replacement = staged
             .as_ref()
@@ -1178,7 +1215,11 @@ impl SegmentStore {
         state.written -= source.bytes + source.metadata;
         {
             let mut entries = self.entries.write().unwrap();
-            entries.replace_segment(old, staged.as_ref().filter(|_| replacement.is_some()));
+            entries.replace_segment(
+                old,
+                staged.as_ref().filter(|_| replacement.is_some()),
+                access_persisted,
+            );
         }
         // The source's physical allocation stays charged until unlink.
         let mut cached = self.cached_stats.lock().unwrap();
@@ -1354,6 +1395,9 @@ impl SegmentStore {
                 // Publication lock excludes delete/GC until the seal record is durable.
                 s.sealed = true;
                 s.durable_end = s.bytes;
+                if !empty {
+                    self.journal.mark_access_durable(id, s.bytes);
+                }
                 s.close_writers();
                 state.allocated = state
                     .allocated
@@ -1402,7 +1446,13 @@ impl SegmentStore {
         }
     }
 
-    fn recover(&mut self, id: u64, meta: &journal::SegmentMeta) -> io::Result<()> {
+    fn recover(
+        &mut self,
+        id: u64,
+        meta: &journal::SegmentMeta,
+        catalog: &mut catalog::Catalog,
+        compact: bool,
+    ) -> io::Result<()> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -1417,29 +1467,16 @@ impl SegmentStore {
             fd: tokio::sync::Mutex::new(Weak::new()),
         });
         let allocated = metadata.blocks() * 512;
-        let mut records = 0;
-        let mut live = 0;
-        let mut live_data_bytes = 0;
-        for (offset, record) in meta.records.before(meta.durable_end) {
-            records += 1;
-            live += charge(&record.key, record.len);
-            live_data_bytes += record.stored_len();
-            self.entries.write().unwrap().restore(
-                &record.key,
-                Location {
-                    file: file.clone(),
-                    segment: id,
-                    offset,
-                    len: record.len,
-                    checksum: record.checksum,
-                    access: None,
-                },
-            )?;
-        }
+        let (live, live_data_bytes, records) =
+            catalog.restore_segment(id, meta, file.clone(), compact)?;
         let state = self.state.get_mut();
         state.allocated += allocated;
         state.live += live;
-        let recovered_metadata = meta.recovered_metadata();
+        let recovered_metadata = if meta.sealed {
+            meta.metadata
+        } else {
+            8 + live - live_data_bytes
+        };
         state.written += meta.durable_end + recovered_metadata;
         state.segments.insert(
             id,

@@ -6,16 +6,21 @@ use std::io::{self, Read, Write};
 use talon_core::Backend;
 
 pub(super) const MAX_KEY: usize = 64 * 1024;
+pub(super) const KEY_HEADER_LEN: usize = 1 + 8 + 4 + 3 * 4;
 
 pub(super) fn key_len(id: &dyn SmallIdentity) -> usize {
     let id = id.view();
-    25 + id.object.bucket.len() + id.object.object_path.len() + id.version.len()
+    KEY_HEADER_LEN + id.object.bucket.len() + id.object.object_path.len() + id.version.len()
 }
 
 pub(super) fn record_metadata_bytes(id: &dyn SmallIdentity) -> u64 {
+    metadata_bytes_for_key_len(key_len(id))
+}
+
+pub(super) fn metadata_bytes_for_key_len(len: usize) -> u64 {
     // Existing segment estimate, including the eight checksum bytes.
     // Records with a trailer account for those bytes in the data file instead.
-    37 + key_len(id) as u64
+    37 + len as u64
 }
 
 pub(super) fn validate_key(id: &dyn SmallIdentity) -> io::Result<()> {

@@ -1,6 +1,7 @@
 //! Last-drop never joins an I/O thread on a serving reactor. Startup-only
 //! reopen waits for a retiring writer, before touching that cache's files.
 use super::*;
+use std::future::Future;
 use std::sync::Weak;
 use std::sync::{Condvar, OnceLock};
 
@@ -37,6 +38,10 @@ pub(crate) fn wait_for_retiring(root: &Path) -> io::Result<()> {
 #[derive(Default)]
 pub(crate) struct Life {
     closing: AtomicBool,
+    checkpoints_started: AtomicBool,
+    checkpoint_start: tokio::sync::Notify,
+    checkpoints_stopped: AtomicBool,
+    checkpoint_stop: tokio::sync::Notify,
     done: Mutex<bool>,
     changed: Condvar,
 }
@@ -82,6 +87,40 @@ impl Life {
     }
     pub fn close(&self) {
         self.closing.store(true, Ordering::Release);
+        self.stop_checkpoints();
+    }
+    pub fn start_checkpoints(&self) {
+        self.checkpoints_started.store(true, Ordering::Release);
+        self.checkpoint_start.notify_waiters();
+    }
+    pub fn checkpoints_started(&self) -> bool {
+        self.checkpoints_started.load(Ordering::Acquire)
+    }
+    pub async fn checkpoint_start(&self) {
+        let notified = self.checkpoint_start.notified();
+        if !self.checkpoints_started() {
+            notified.await;
+        }
+    }
+    pub fn stop_checkpoints(&self) {
+        self.checkpoints_stopped.store(true, Ordering::Release);
+        self.checkpoint_stop.notify_waiters();
+    }
+    pub fn checkpoints_stopped(&self) -> bool {
+        self.checkpoints_stopped.load(Ordering::Acquire)
+    }
+    async fn checkpoint_stop(&self) {
+        let notified = self.checkpoint_stop.notified();
+        if !self.checkpoints_stopped() {
+            notified.await;
+        }
+    }
+    pub async fn until_checkpoint_stop<T>(&self, work: impl Future<Output = T>) -> Option<T> {
+        tokio::select! {
+            biased;
+            () = self.checkpoint_stop() => None,
+            result = work => Some(result),
+        }
     }
     fn wait(&self) {
         let mut done = self.done.lock().unwrap();

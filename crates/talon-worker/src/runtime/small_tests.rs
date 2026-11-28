@@ -91,9 +91,19 @@ fn runtime_with_tracking(
         ranges: Mutex::new(Vec::new()),
     });
     std::fs::create_dir_all(root).unwrap();
-    let small =
-        cache_routing::open_small_store(root, threshold, segment, capacity, None, None, None)
-            .unwrap();
+    let small = cache_routing::open_small_store(
+        root,
+        crate::small_store::SmallStoreOptions {
+            threshold,
+            segment_size: segment,
+            capacity,
+            compact: false,
+        },
+        None,
+        None,
+        None,
+    )
+    .unwrap();
     let store = WholeBlockStore::open(root).unwrap();
     let index = Arc::new(BlockIndex::new());
     store.restore_index(&index).unwrap();
@@ -217,9 +227,12 @@ async fn small_routing_rejects_whole_only_upgrade_without_orphaning_files() {
         if versioned {
             assert!(cache_routing::open_small_store(
                 dir.path(),
-                0,
-                256 << 10,
-                16 << 20,
+                crate::small_store::SmallStoreOptions {
+                    threshold: 0,
+                    segment_size: 256 << 10,
+                    capacity: 16 << 20,
+                    compact: false,
+                },
                 None,
                 None,
                 None
@@ -233,9 +246,12 @@ async fn small_routing_rejects_whole_only_upgrade_without_orphaning_files() {
         drop(store);
         assert!(cache_routing::open_small_store(
             dir.path(),
-            128 << 10,
-            256 << 10,
-            16 << 20,
+            crate::small_store::SmallStoreOptions {
+                threshold: 128 << 10,
+                segment_size: 256 << 10,
+                capacity: 16 << 20,
+                compact: false,
+            },
             None,
             None,
             None
@@ -544,9 +560,12 @@ async fn small_routing_rejects_incompatible_or_unversioned_cache_at_startup() {
     for threshold in [0, 64 << 10, 256 << 10] {
         let error = cache_routing::open_small_store(
             dir.path(),
-            threshold,
-            512 << 10,
-            16 << 20,
+            crate::small_store::SmallStoreOptions {
+                threshold,
+                segment_size: 512 << 10,
+                capacity: 16 << 20,
+                compact: false,
+            },
             None,
             None,
             None,
@@ -564,9 +583,12 @@ async fn small_routing_rejects_incompatible_or_unversioned_cache_at_startup() {
     std::fs::write(&marker, b"broken").unwrap();
     let error = cache_routing::open_small_store(
         dir.path(),
-        128 << 10,
-        256 << 10,
-        16 << 20,
+        crate::small_store::SmallStoreOptions {
+            threshold: 128 << 10,
+            segment_size: 256 << 10,
+            capacity: 16 << 20,
+            compact: false,
+        },
         None,
         None,
         None,
@@ -577,9 +599,12 @@ async fn small_routing_rejects_incompatible_or_unversioned_cache_at_startup() {
     std::fs::remove_file(&marker).unwrap();
     let error = cache_routing::open_small_store(
         dir.path(),
-        128 << 10,
-        256 << 10,
-        16 << 20,
+        crate::small_store::SmallStoreOptions {
+            threshold: 128 << 10,
+            segment_size: 256 << 10,
+            capacity: 16 << 20,
+            compact: false,
+        },
         None,
         None,
         None,
@@ -795,7 +820,7 @@ async fn small_tti_checkpoint_survives_restart_relocation_and_deletion() {
         .access(&blocks[0])
         .unwrap()
         .restore(cold);
-    w.checkpoint_small_access().await;
+    w.checkpoint_small_access(None).await;
     assert!(dir.path().join("small/access.checkpoint").exists());
     // A stale snapshot still contains the deleted identity. Relocate the other
     // records without rewriting their access snapshot, then restart.
@@ -862,7 +887,7 @@ async fn small_tti_hit_is_checkpointed_and_bad_snapshot_does_not_drop_data() {
         .unwrap()
         .last_access();
     w.maintain_small(true).await.unwrap();
-    w.checkpoint_small_access().await;
+    w.checkpoint_small_access(None).await;
     drop(w);
     let (_, w) = runtime(dir.path(), false, false);
     assert_eq!(
@@ -916,6 +941,193 @@ async fn small_tti_hit_is_checkpointed_and_bad_snapshot_does_not_drop_data() {
             .last_access()
             <= crate::eviction::access_millis()
     );
+}
+
+#[tokio::test]
+async fn worker_shutdown_cancels_small_journal_snapshot_before_sealing_tail() {
+    #[derive(Default)]
+    struct ThrottledSnapshot(tokio::sync::Notify);
+
+    impl talon_journal::Maintenance for ThrottledSnapshot {
+        fn bytes(&self, _: usize) -> futures::future::LocalBoxFuture<'_, ()> {
+            Box::pin(async {
+                self.0.notify_one();
+                std::future::pending().await
+            })
+        }
+        fn io(&self) -> futures::future::LocalBoxFuture<'_, Box<dyn Send>> {
+            Box::pin(async { Box::new(()) as Box<dyn Send> })
+        }
+        fn delete(&self) -> futures::future::LocalBoxFuture<'_, ()> {
+            Box::pin(async {})
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let (_, w) = runtime(dir.path(), false, false);
+    let w = Arc::new(w);
+    w.write_object(&object(), data()).await.unwrap();
+    let small = w.small.as_ref().unwrap().clone();
+    let throttle = Arc::new(ThrottledSnapshot::default());
+    small.set_journal_maintenance(throttle.clone());
+    let checkpoint = tokio::spawn({
+        let small = small.clone();
+        async move { small.maintain(true).await }
+    });
+    tokio::time::timeout(Duration::from_secs(3), throttle.0.notified())
+        .await
+        .unwrap();
+    let mut tail = id(&w);
+    tail.object.object_path = "tail".into();
+    small.put(&tail, data()).await.unwrap();
+    let service = WorkerBackground::start(
+        Worker::standalone(w.clone()),
+        &WorkerConfig {
+            stale_gc_enabled: false,
+            ownership_gc_enabled: false,
+            async_eviction_enabled: false,
+            background_io_max_mb_per_sec: 0,
+            ..Default::default()
+        },
+    );
+    tokio::time::timeout(Duration::from_secs(3), service.shutdown())
+        .await
+        .unwrap();
+    assert_eq!(
+        checkpoint.await.unwrap().unwrap_err().kind(),
+        std::io::ErrorKind::Interrupted
+    );
+    assert!(small.contains(&tail));
+    drop(small);
+    drop(w);
+    let (_, reopened) = runtime(dir.path(), false, false);
+    assert_eq!(
+        reopened.small.as_ref().unwrap().read(&tail).await.unwrap(),
+        Some(data())
+    );
+}
+
+#[tokio::test]
+async fn worker_shutdown_interrupts_throttled_compact_access_before_sealing_tail() {
+    use std::io::Write;
+    use tokio::sync::Notify;
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = WorkerConfig {
+        backend: Some("s3".into()),
+        block_size: 1 << 20,
+        capacity_bytes: 16 << 20,
+        l2_page_size_bytes: 0,
+        small_object_threshold_bytes: 128 << 10,
+        small_object_segment_bytes: 256 << 10,
+        page_tti_hours: 1,
+        stale_gc_enabled: false,
+        ownership_gc_enabled: false,
+        async_eviction_enabled: false,
+        background_io_max_mb_per_sec: 1,
+        ..Default::default()
+    };
+    let open = || {
+        let lock = Arc::new(crate::page_access_store::CacheRootLock::acquire(dir.path()).unwrap());
+        Arc::new(
+            Worker::open_namespaces(
+                &config,
+                lock,
+                Arc::new(ExactLargeOrigin(Mutex::new(Vec::new()))),
+                WorkerMetrics::new(config.capacity_bytes),
+            )
+            .unwrap(),
+        )
+    };
+    let worker = open();
+    let w = worker.default_runtime();
+    let snapshot_key = id(w);
+    let mut log_key = snapshot_key.clone();
+    log_key.object.object_path = "delta".into();
+    let mut tail = snapshot_key.clone();
+    tail.object.object_path = "tail".into();
+    let small = w.small.as_ref().unwrap();
+    assert!(small.has_recency());
+    for key in [&snapshot_key, &log_key] {
+        w.commit_cached_block(key, data()).await.unwrap();
+    }
+    w.maintain_small(true).await.unwrap();
+    small.checkpoint_access(None, None).await.unwrap();
+    let snapshot_age = small.compact_access_age(&snapshot_key);
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    small.read(&log_key).await.unwrap().unwrap();
+    let log_age = small.compact_access_age(&log_key);
+    assert!(log_age > small.compact_access_age(&snapshot_key));
+    small.checkpoint_access(None, None).await.unwrap();
+    let root = w.store.root().join("small");
+    let snapshot = root.join("access.checkpoint");
+    let log = root.join("access.log");
+    let tmp = root.join("access.checkpoint.tmp");
+    let durable_snapshot = std::fs::read(&snapshot).unwrap();
+    drop(worker);
+
+    // A torn frame forces a rewrite on reopen while the preceding frame
+    // still provides the delta age.
+    assert!(std::fs::metadata(&log).unwrap().len() > 16);
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&log)
+        .unwrap()
+        .write_all(&[1])
+        .unwrap();
+    let durable_log = std::fs::read(&log).unwrap();
+    let worker = open();
+    let w = worker.default_runtime();
+    let small = w.small.as_ref().unwrap();
+    assert_eq!(small.compact_access_age(&log_key), log_age);
+    let budget = w.background_budget.as_ref().unwrap();
+    let entered = Arc::new(Notify::new());
+    let resume = Arc::new(Notify::new());
+    *small.access_pause.lock().unwrap() = Some((entered.clone(), resume.clone()));
+    let service = WorkerBackground::start(worker.clone(), &config);
+    tokio::time::timeout(Duration::from_secs(3), entered.notified())
+        .await
+        .unwrap();
+    assert_eq!(std::fs::metadata(&tmp).unwrap().len(), 16);
+
+    // Reserve 60 seconds on the real byte clock, after the rewrite has
+    // written its header. The next batch will sample ages and block there.
+    {
+        let mut reservation = std::pin::pin!(budget.bytes(60_000_000));
+        assert!(futures::poll!(reservation.as_mut()).is_pending());
+    }
+    let charged = budget.charged_bytes();
+    resume.notify_one();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while budget.charged_bytes() == charged {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    w.commit_cached_block(&tail, data()).await.unwrap();
+    // The outstanding reservation still blocks the rewrite. Let later
+    // operations, including the catalog checkpoint, use the unpaced budget.
+    budget.update(&talon_core::dynamic_config::WorkerDynamicConfig {
+        background_io_max_mb_per_sec: Some(0),
+        ..Default::default()
+    });
+    let charged = budget.charged_bytes();
+    tokio::time::timeout(Duration::from_secs(3), service.shutdown())
+        .await
+        .unwrap();
+    assert_eq!(budget.charged_bytes(), charged, "drain started a rewrite");
+    assert!(!tmp.exists());
+    assert_eq!(std::fs::read(&snapshot).unwrap(), durable_snapshot);
+    assert_eq!(std::fs::read(&log).unwrap(), durable_log);
+    drop(worker);
+
+    let reopened = open();
+    let small = reopened.default_runtime().small.as_ref().unwrap();
+    assert!(!tmp.exists());
+    assert_eq!(small.compact_access_age(&snapshot_key), snapshot_age);
+    assert_eq!(small.compact_access_age(&log_key), log_age);
+    assert_eq!(small.read(&tail).await.unwrap(), Some(data()));
 }
 
 #[tokio::test]
@@ -1826,7 +2038,7 @@ async fn exact_range_access_age_survives_checkpoint_and_restart() {
     let age = crate::eviction::access_millis() - 1234;
     let small = w.small.as_ref().unwrap();
     small.access(&unit).unwrap().restore(age);
-    small.checkpoint_access(None).await.unwrap();
+    small.checkpoint_access(None, None).await.unwrap();
     w.maintain_small(true).await.unwrap();
     drop(w);
     let (backend, recovered) = exact_runtime(dir.path(), true, false);
@@ -1975,7 +2187,7 @@ async fn exact_range_admission_and_hits_survive_incremental_access_recovery() {
     };
     let (_, worker) = open();
     let small = worker.small.as_ref().unwrap();
-    small.checkpoint_access(None).await.unwrap();
+    small.checkpoint_access(None, None).await.unwrap();
     let root = dir.path().join("small");
     let checkpoint = std::fs::read(root.join("access.checkpoint")).unwrap();
     let request = request();
@@ -1989,13 +2201,13 @@ async fn exact_range_admission_and_hits_survive_incremental_access_recovery() {
         .access(&unit)
         .unwrap()
         .restore(crate::eviction::access_millis() - 30_000);
-    small.checkpoint_access(None).await.unwrap();
+    small.checkpoint_access(None, None).await.unwrap();
     worker
         .serve_exact(&request, &version, 2 << 20)
         .await
         .unwrap();
     let last_access = small.access(&unit).unwrap().last_access();
-    small.checkpoint_access(None).await.unwrap();
+    small.checkpoint_access(None, None).await.unwrap();
     assert_eq!(
         std::fs::read(root.join("access.checkpoint")).unwrap(),
         checkpoint
@@ -2051,7 +2263,7 @@ async fn recovered_exact_hits_keep_coexisting_ordinary_blocks_active() {
     let age = crate::eviction::access_millis() - 1234;
     let small = worker.small.as_ref().unwrap();
     small.access(&unit).unwrap().restore(age);
-    small.checkpoint_access(None).await.unwrap();
+    small.checkpoint_access(None, None).await.unwrap();
     worker.maintain_small(true).await.unwrap();
     drop(worker);
 

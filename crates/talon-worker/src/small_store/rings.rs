@@ -21,16 +21,21 @@ pub struct SmallObjectStore {
     allocation_unit: u64,
     pub(super) access_checkpoint: tokio::sync::Mutex<()>,
     #[cfg(test)]
-    pub(super) access_pause: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+    pub(crate) access_pause: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     pub(super) access_dirty: Arc<super::access::DirtyQueue>,
-    pub(super) access_disk: Mutex<super::access::DiskState>,
-    pub(super) access_bytes: std::sync::atomic::AtomicU64,
     streams: RwLock<BTreeMap<usize, Stream>>,
     policy: std::sync::OnceLock<Arc<Lru>>,
     index: std::sync::OnceLock<Weak<crate::BlockIndex>>,
     // Only in-flight identities are retained; no second resident-object index.
     mutations: Arc<InFlightLoads>,
     pub(super) tasks: Arc<crate::page_gc::Mutations>,
+}
+
+pub(crate) struct SmallStoreOptions {
+    pub threshold: u64,
+    pub segment_size: u64,
+    pub capacity: u64,
+    pub compact: bool,
 }
 
 impl SmallObjectStore {
@@ -43,9 +48,12 @@ impl SmallObjectStore {
     ) -> io::Result<Self> {
         Self::open_with_service(
             root,
-            threshold,
-            segment_size,
-            capacity,
+            SmallStoreOptions {
+                threshold,
+                segment_size,
+                capacity,
+                compact: false,
+            },
             root_lock,
             None,
             None,
@@ -53,13 +61,17 @@ impl SmallObjectStore {
     }
     pub(crate) fn open_with_service(
         root: PathBuf,
-        threshold: u64,
-        segment_size: u64,
-        capacity: u64,
+        options: SmallStoreOptions,
         root_lock: Option<Arc<crate::page_access_store::CacheRootLock>>,
         service: Option<&Arc<talon_journal::JournalService>>,
         maintenance: Option<Arc<crate::background::BackgroundBudget>>,
     ) -> io::Result<Self> {
+        let SmallStoreOptions {
+            threshold,
+            segment_size,
+            capacity,
+            compact,
+        } = options;
         validate_geometry(threshold, segment_size, capacity)?;
         let journal_started = Instant::now();
         let (journal, model) = match service {
@@ -68,8 +80,14 @@ impl SmallObjectStore {
         };
         let journal_ms = journal_started.elapsed().as_secs_f64() * 1000.0;
         let locators_started = Instant::now();
-        let recovered =
-            Self::recover_streams(&journal, &model, threshold, segment_size, root_lock)?;
+        let recovered = Self::recover_streams(
+            &journal,
+            &model,
+            threshold,
+            segment_size,
+            root_lock,
+            compact,
+        )?;
         let locators_ms = locators_started.elapsed().as_secs_f64() * 1000.0;
         let setup_started = Instant::now();
         let mut streams = BTreeMap::new();
@@ -78,7 +96,6 @@ impl SmallObjectStore {
             streams.insert(slot, Arc::new(OnceCell::new_with(Some(Arc::new(stream)))));
         }
         let fallback = streams[&0].get().unwrap().clone();
-        let access_bytes = super::access::allocated(&root)?;
         let allocation_unit = crate::capacity::filesystem_stats(&root)
             .map_err(io::Error::other)?
             .f_frsize
@@ -92,8 +109,6 @@ impl SmallObjectStore {
             #[cfg(test)]
             access_pause: Mutex::default(),
             access_dirty: Arc::default(),
-            access_disk: Mutex::default(),
-            access_bytes: std::sync::atomic::AtomicU64::new(access_bytes),
             root,
             fallback,
             journal,
@@ -111,6 +126,7 @@ impl SmallObjectStore {
         threshold: u64,
         segment_size: u64,
         root_lock: Option<Arc<crate::page_access_store::CacheRootLock>>,
+        compact: bool,
     ) -> io::Result<BTreeMap<usize, SegmentStore>> {
         let mut recovered = BTreeMap::new();
         recovered.insert(
@@ -123,21 +139,33 @@ impl SmallObjectStore {
                 journal.clone(),
             ),
         );
-        for (&id, meta) in model
-            .segments
-            .iter()
-            .filter(|(_, meta)| meta.durable_end > 0)
         {
-            let stream = recovered.entry(meta.slot).or_insert_with(|| {
-                SegmentStore::empty(
-                    threshold,
-                    segment_size,
-                    root_lock.clone(),
-                    meta.slot,
-                    journal.clone(),
-                )
-            });
-            stream.recover(id, meta)?;
+            let started = Instant::now();
+            let mut catalog = journal.model.0.write().unwrap();
+            catalog.reserve_recovery();
+            for (&id, meta) in model
+                .segments
+                .iter()
+                .filter(|(_, meta)| meta.durable_end > 0)
+            {
+                let stream = recovered.entry(meta.slot).or_insert_with(|| {
+                    SegmentStore::empty(
+                        threshold,
+                        segment_size,
+                        root_lock.clone(),
+                        meta.slot,
+                        journal.clone(),
+                    )
+                });
+                stream.recover(id, meta, &mut catalog, compact)?;
+            }
+            catalog.activate()?;
+            tracing::info!(
+                catalog_ms = started.elapsed().as_secs_f64() * 1000.0,
+                slots = catalog.lookup.capacity(),
+                compact,
+                "small catalog activated"
+            );
         }
         for (id, allocated) in journal.finish_recovery(model)? {
             let state = recovered
@@ -149,6 +177,7 @@ impl SmallObjectStore {
             state.allocated = state.allocated - segment.allocated + allocated;
             segment.allocated = allocated;
         }
+        journal.start_checkpoints();
         Ok(recovered)
     }
 
@@ -451,7 +480,7 @@ impl SmallObjectStore {
     }
 
     fn metadata_allocated_bytes(&self) -> u64 {
-        self.access_bytes.load(std::sync::atomic::Ordering::Relaxed) + self.journal.allocated()
+        self.journal.access.allocated_bytes() + self.journal.allocated()
     }
 
     #[cfg(test)]
@@ -633,6 +662,38 @@ impl SmallObjectStore {
         self.maintain_with_budget(checkpoint, None).await
     }
 
+    pub(crate) fn stop_checkpoints(&self) {
+        self.journal.stop_checkpoints();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_journal_maintenance(&self, budget: Arc<dyn talon_journal::Maintenance>) {
+        self.journal.set_budget(budget);
+    }
+
+    pub(crate) async fn seal_for_shutdown(
+        self: &Arc<Self>,
+        budget: Option<Arc<crate::background::BackgroundBudget>>,
+    ) -> io::Result<()> {
+        self.stop_checkpoints();
+        let store = self.clone();
+        self.tasks
+            .run(async move {
+                let mut result = Ok(());
+                for stream in store.streams() {
+                    let _io = match &budget {
+                        Some(budget) => Some(budget.io().await),
+                        None => None,
+                    };
+                    if let Err(error) = stream.checkpoint().await {
+                        result = result.and(Err(error));
+                    }
+                }
+                result
+            })
+            .await
+    }
+
     pub(crate) async fn maintain_with_budget(
         self: &Arc<Self>,
         checkpoint: bool,
@@ -686,6 +747,26 @@ mod tests {
                 ring.drain().await;
                 result
             })
+    }
+
+    #[tokio::test]
+    async fn shutdown_seals_later_streams_after_the_first_error() {
+        let root = tempfile::tempdir().unwrap();
+        let store = open(root.path());
+        let first = store.writer(0).await.unwrap();
+        let next = store.writer(1).await.unwrap();
+        next.put_inner(&id("seal-after-error"), Bytes::from_static(b"data"), None)
+            .await
+            .unwrap();
+        let segment = next.state.lock().await.active.unwrap();
+        first.state.lock().await.poisoned = true;
+
+        let error = store.seal_for_shutdown(None).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "small object store needs restart after failed mutation"
+        );
+        assert!(store.journal.model.0.read().unwrap().model.segments[&segment].sealed);
     }
 
     #[tokio::test]
@@ -821,7 +902,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compact_recovery_classifies_all_streams_in_one_lookup_pass() {
+    async fn compact_recovery_admits_all_streams_during_activation() {
         let root = tempfile::tempdir().unwrap();
         let mut fixtures = Vec::new();
         {
@@ -843,7 +924,19 @@ mod tests {
             }
             store.maintain(true).await.unwrap();
         }
-        let reopened = open(root.path());
+        let reopened = SmallObjectStore::open_with_service(
+            root.path().to_owned(),
+            SmallStoreOptions {
+                threshold: 128 << 10,
+                segment_size: 256 << 10,
+                capacity: 16 << 20,
+                compact: true,
+            },
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let index = Arc::new(crate::BlockIndex::new());
         let mut generic = Vec::new();
         reopened.restore_policy_units(&index, &mut generic, false);
@@ -851,7 +944,7 @@ mod tests {
         reopened.assert_no_resident_policy_allocations();
         {
             let catalog = reopened.journal.model.0.read().unwrap();
-            assert_eq!(catalog.compact_recovery_slots, catalog.lookup.capacity());
+            assert_eq!(catalog.compact_recovery_slots, 0);
             for slot in 0..4 {
                 let expected = fixtures
                     .iter()

@@ -168,6 +168,7 @@ impl Catalog {
         (self.segment_chunks[&segment][row / 1024] << 10 | (row % 1024) as u32) + 1
     }
 
+    #[cfg(test)]
     pub fn find(&self, key: &dyn SmallIdentity, flags: u8) -> Option<usize> {
         let encoded = super::key_codec::encode(key);
         self.find_record(self.hash(key), &encoded, flags)
@@ -336,6 +337,7 @@ impl Catalog {
         start: usize,
         limit: usize,
         flags: &[(u64, u8)],
+        grows: bool,
     ) -> io::Result<()> {
         let Some(meta) = self.segment(segment) else {
             return Ok(());
@@ -343,7 +345,9 @@ impl Catalog {
         let slots = meta.records.slots();
         self.allocate_chunks(segment, slots)?;
         let end = slots.min(limit);
-        self.reserve(end.saturating_sub(start));
+        if grows {
+            self.reserve(end.saturating_sub(start));
+        }
         for row in start..end {
             let Some(record) = self.segment(segment).unwrap().records.metadata(row) else {
                 continue;
@@ -379,18 +383,7 @@ impl Catalog {
         flags
     }
 
-    pub fn activate(&mut self) -> io::Result<()> {
-        if self.active {
-            return Ok(());
-        }
-        for meta in self.model.segments.values_mut() {
-            let meta = Arc::make_mut(meta);
-            if meta.sealed {
-                meta.records.seal();
-            } else {
-                meta.records.shrink_to_fit();
-            }
-        }
+    pub fn reserve_recovery(&mut self) {
         let count = self
             .model
             .segments
@@ -398,9 +391,82 @@ impl Catalog {
             .map(|meta| meta.records.len())
             .sum();
         self.lookup.rebuild(count, |_| unreachable!());
+    }
+
+    pub fn restore_segment(
+        &mut self,
+        segment: u64,
+        meta: &SegmentMeta,
+        file: Arc<SegmentFile>,
+        compact: bool,
+    ) -> io::Result<(u64, u64, usize)> {
+        let records = &meta.records;
+        self.allocate_chunks(segment, records.slots())?;
+        let chunks = &self.segment_chunks[&segment];
+        let mut live = 0;
+        let mut data = 0;
+        let mut count = 0;
+        let mut key_scratch = Vec::new();
+        for row in 0..records.slots() {
+            let Some(record) = records.metadata(row) else {
+                continue;
+            };
+            let handle = (chunks[row / 1024] << 10 | (row % 1024) as u32) + 1;
+            if record.offset < meta.durable_end {
+                let encoded = records.encoded_key(row, &mut key_scratch);
+                let slot = self
+                    .lookup
+                    .vacancy(record.hash, |handle, flags| {
+                        if flags & VISIBLE == 0 {
+                            return false;
+                        }
+                        let (segment, row) = self.row(handle).expect("recovered lookup handle");
+                        let records = &self.segment(segment).expect("recovered segment").records;
+                        records
+                            .metadata(row)
+                            .is_some_and(|meta| meta.hash == record.hash)
+                            && records.matches(row, encoded)
+                    })
+                    .ok_or_else(|| super::invalid("duplicate recovered object"))?;
+                let flags = VISIBLE | if compact { POLICY } else { 0 };
+                self.lookup.insert_at(slot, record.hash, handle, flags);
+                live += record.len
+                    + super::format::metadata_bytes_for_key_len(super::key_codec::logical_len(
+                        encoded,
+                    ));
+                data += record.stored_len();
+                count += 1;
+            } else {
+                self.lookup.insert(record.hash, handle, 0);
+            }
+        }
+        if count != 0 {
+            self.files.insert(segment, file);
+            self.publish_segment(segment);
+            *self.live.entry(meta.slot).or_default() += count;
+            self.shared.live_count.fetch_add(count, Relaxed);
+        }
+        if compact {
+            self.compact_streams.insert(meta.slot);
+            let total = self.compact_totals.entry(meta.slot).or_default();
+            total.0 += data;
+            total.1 += count;
+        }
+        Ok((live, data, count))
+    }
+
+    pub fn activate(&mut self) -> io::Result<()> {
+        if self.active {
+            return Ok(());
+        }
+        if self.lookup.capacity() == 0 {
+            self.reserve_recovery();
+        }
         let segments: Vec<_> = self.model.segments.keys().copied().collect();
         for segment in segments {
-            self.index_rows(segment, 0, usize::MAX, &[])?;
+            if !self.segment_chunks.contains_key(&segment) {
+                self.index_rows(segment, 0, usize::MAX, &[], false)?;
+            }
         }
         self.active = true;
         Ok(())
@@ -580,7 +646,9 @@ impl Catalog {
             }
         }
         if let Some((segment, row, limit)) = changed {
-            self.index_rows(segment, row, limit, &flags)?;
+            // A delete or recovery compaction only reinserts a subset of
+            // the hashes it just removed. Their probe chains have room.
+            self.index_rows(segment, row, limit, &flags, !removing)?;
             if removing {
                 self.trim_index();
             }
@@ -631,6 +699,9 @@ impl talon_journal::Machine for LiveModel {
     }
     fn restore(&mut self, record: Self::SnapshotRecord) -> io::Result<()> {
         self.0.write().unwrap().model.restore(record)
+    }
+    fn finish_snapshot_restore(&mut self) -> io::Result<()> {
+        self.0.write().unwrap().model.finish_snapshot_restore()
     }
 }
 
@@ -704,5 +775,45 @@ mod tests {
         assert_eq!(catalog.free_chunks.len(), catalog.chunks.len());
         assert_eq!(catalog.lookup.len(), 0);
         assert!(catalog.lookup.capacity() <= 64);
+    }
+    #[test]
+    fn recovery_at_eighty_percent_does_not_copy_sealed_rows_or_rebuild_lookup() {
+        let mut catalog = Catalog::default();
+        for offset in 0..256 {
+            catalog
+                .apply(Event::Insert {
+                    slot: 0,
+                    segment: if offset == 255 { 2 } else { 1 },
+                    offset,
+                    record: super::super::journal::Record {
+                        key: SmallKey::new(&BlockId::new(
+                            ObjectId::new(Backend::S3, "b", offset.to_string()),
+                            0,
+                            1024,
+                            Version::new("v"),
+                        )),
+                        len: 1,
+                        checksum: Some(0),
+                    },
+                })
+                .unwrap();
+        }
+        catalog.apply(Event::Seal { segment: 2 }).unwrap();
+        catalog
+            .apply(Event::Flush {
+                segment: 1,
+                durable_end: 254,
+            })
+            .unwrap();
+        let sealed = catalog.model.segments[&2].clone();
+        catalog.activate().unwrap();
+        assert!(Arc::ptr_eq(&sealed, &catalog.model.segments[&2]));
+        assert_eq!(
+            (catalog.lookup.len(), catalog.lookup.capacity()),
+            (256, 320)
+        );
+        catalog.apply(Event::Recover { segment: 1 }).unwrap();
+        assert_eq!(catalog.lookup.len(), 255);
+        assert_eq!(catalog.lookup.rebuilds(), 1);
     }
 }

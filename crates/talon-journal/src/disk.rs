@@ -88,8 +88,8 @@ impl Current {
         if !input.is_empty()
             || snapshot == 0
             || logs[0] != snapshot
-            || logs.windows(2).any(|p| p[1] != p[0] + 1)
-            || (pending != 0 && pending != *logs.last().unwrap())
+            || logs.windows(2).any(|p| Some(p[1]) != p[0].checked_add(1))
+            || (pending != 0 && (pending == snapshot || pending != *logs.last().unwrap()))
             || garbage
                 .iter()
                 .any(|(s, g)| (*s && *g == snapshot) || (!s && logs.contains(g)))
@@ -160,6 +160,7 @@ pub(crate) struct Disk {
     current: Current,
     pub file: Rc<monoio::fs::File>,
     pub offset: u64,
+    checkpoint_offset: u64,
     pub lsn: u64,
     pub options: StreamOptions,
     accounting: Arc<Accounting>,
@@ -203,6 +204,7 @@ fn recover<M: Machine>(root: PathBuf, mut machine: M, threads: usize) -> io::Res
         }
         Err(e) => return Err(e),
     };
+    let snapshot_started = std::time::Instant::now();
     let snapshot = path(&root, true, current.snapshot);
     if std::fs::metadata(&snapshot)?.len() != current.bytes {
         return Err(invalid("snapshot length mismatch"));
@@ -218,15 +220,32 @@ fn recover<M: Machine>(root: PathBuf, mut machine: M, threads: usize) -> io::Res
     if ordinal != current.records {
         return Err(invalid("snapshot record count mismatch"));
     }
+    machine.finish_snapshot_restore()?;
+    let snapshot_ms = snapshot_started.elapsed().as_secs_f64() * 1000.0;
+    let wal_started = std::time::Instant::now();
     let mut lsn = current.lsn;
     let mut offset = 0;
+    let mut wal_bytes = 0;
     for (i, g) in current.logs.iter().enumerate() {
+        let mut covered = None::<u64>;
         offset = replay::read(
             &path(&root, false, *g),
             i + 1 == current.logs.len(),
             threads,
             M::decode,
             |n, r| {
+                // A retried snapshot may cover a prefix of the surviving WAL.
+                // The snapshot owns those records; replay only its successor.
+                if i == 0 && n <= current.lsn && lsn == current.lsn {
+                    if n == 0 || covered.is_some_and(|last| last.checked_add(1) != Some(n)) {
+                        return Err(invalid("journal covered LSN gap"));
+                    }
+                    covered = Some(n);
+                    return Ok(());
+                }
+                if covered.take().is_some_and(|last| last != current.lsn) {
+                    return Err(invalid("journal covered LSN gap"));
+                }
                 if Some(n) != lsn.checked_add(1) {
                     return Err(invalid("journal LSN gap"));
                 }
@@ -235,7 +254,16 @@ fn recover<M: Machine>(root: PathBuf, mut machine: M, threads: usize) -> io::Res
                 Ok(())
             },
         )?;
+        if covered.is_some_and(|last| last != current.lsn) {
+            return Err(invalid("journal covered LSN gap"));
+        }
+        wal_bytes += offset;
     }
+    tracing::info!(path = %root.display(), snapshot_ms,
+        wal_ms = wal_started.elapsed().as_secs_f64() * 1000.0,
+        snapshot_bytes = current.bytes, wal_bytes, snapshot_records = ordinal,
+        wal_records = lsn - current.lsn, recovery_threads = threads,
+        "journal replay phases");
     let last = path(&root, false, *current.logs.last().unwrap());
     let file = OpenOptions::new().write(true).open(&last)?;
     if file.metadata()?.len() != offset {
@@ -245,14 +273,14 @@ fn recover<M: Machine>(root: PathBuf, mut machine: M, threads: usize) -> io::Res
     for (s, g) in &current.garbage {
         remove_sync(&path(&root, *s, *g))?;
     }
-    if current.pending != 0 {
+    if current.logs.len() > 1 {
+        current.pending = *current.logs.last().unwrap();
         remove_sync(&path(&root, true, current.pending))?;
     }
     for name in ["CURRENT.tmp", "journal.tmp", "snapshot.tmp"] {
         remove_sync(&root.join(name))?;
     }
     current.garbage.clear();
-    current.pending = 0;
     File::open(&root)?.sync_all()?;
     publish_sync(&root, &current)?;
     let mut files = BTreeMap::new();
@@ -322,6 +350,7 @@ impl Disk {
                 root: r.root,
                 current: r.current,
                 offset: r.offset,
+                checkpoint_offset: 0,
                 lsn: r.lsn,
                 file: Rc::new(file),
                 options,
@@ -332,6 +361,9 @@ impl Disk {
             },
             r.machine,
         ))
+    }
+    pub fn checkpoint_due(&self) -> bool {
+        self.offset.saturating_sub(self.checkpoint_offset) >= self.options.checkpoint_bytes
     }
     pub fn write(&self, bytes: Bytes, offset: u64) -> LocalBoxFuture<'static, io::Result<()>> {
         let file = self.file.clone();
@@ -386,8 +418,14 @@ impl Disk {
         self.accounting.set(self.root.join("CURRENT"), n);
         Ok(())
     }
-    pub async fn rotate(&mut self) -> io::Result<u64> {
+    pub async fn snapshot_generation(&mut self) -> io::Result<u64> {
         self.sync().await?;
+        // A previous cut already opened this WAL. Take a fresh cut without
+        // rotating again, and leave the covered prefix in place until the
+        // next successful rotation. The live WAL keeps accepting tail writes.
+        if self.current.logs.len() > 1 {
+            return Ok(*self.current.logs.last().unwrap());
+        }
         let generation = self
             .current
             .logs
@@ -409,6 +447,7 @@ impl Disk {
         crate::tests::crash("rotate");
         self.file = Rc::new(f);
         self.offset = 0;
+        self.checkpoint_offset = 0;
         Ok(generation)
     }
     pub fn snapshot<M: Machine>(
@@ -418,25 +457,35 @@ impl Disk {
         snapshot: M::Snapshot,
         policy: Option<Arc<dyn Maintenance>>,
         slots: Arc<Semaphore>,
-    ) -> LocalBoxFuture<'static, io::Result<Snapshot>> {
+        life: Arc<lifecycle::Life>,
+    ) -> LocalBoxFuture<'static, io::Result<Option<Snapshot>>> {
         let root = self.root.clone();
         let accounting = self.accounting.clone();
+        let wal_offset = self.offset;
         #[cfg(test)]
         let control = self.control.clone();
         Box::pin(async move {
             // One shared service bounds snapshot encoder threads/buffers even
             // if thousands of namespaces cross the rotation threshold together.
-            let _slot = slots.acquire_owned().await.map_err(io::Error::other)?;
+            let Some(slot) = life.until_checkpoint_stop(slots.acquire_owned()).await else {
+                return Ok(None);
+            };
+            let slot = Arc::new(slot.map_err(io::Error::other)?);
+            let encoder_slot = slot.clone();
             // At most four chunks beyond the encoder's current frame. Blocking
             // sends happen only on the CPU encoder, never on the I/O runtime.
             let (send, mut receive) = mpsc::channel::<io::Result<Bytes>>(4);
             std::thread::Builder::new()
                 .name("journal-snapshot".into())
                 .spawn(move || {
+                    let _slot = encoder_slot;
                     let mut buffer = Vec::new();
                     let mut ordinal = 0;
                     let result = (|| {
                         for item in snapshot {
+                            if send.is_closed() {
+                                return Err(stopped());
+                            }
                             let bytes = item?;
                             ordinal += 1;
                             let encoded = frame::encode(ordinal, &bytes)?;
@@ -464,7 +513,10 @@ impl Disk {
             let temp = root.join("snapshot.tmp");
             let f = {
                 let _io = match &policy {
-                    Some(p) => Some(p.io().await),
+                    Some(p) => match life.until_checkpoint_stop(p.io()).await {
+                        Some(permit) => Some(permit),
+                        None => return Ok(None),
+                    },
                     None => None,
                 };
                 create(&temp).await?
@@ -472,7 +524,10 @@ impl Disk {
             let mut offset = 0;
             let mut records = 0;
             let mut encoded_all = false;
-            while let Some(bytes) = receive.recv().await {
+            while let Some(chunk) = life.until_checkpoint_stop(receive.recv()).await {
+                let Some(bytes) = chunk else {
+                    return Err(io::Error::other("snapshot encoder stopped"));
+                };
                 let bytes = bytes?;
                 if bytes.is_empty() {
                     encoded_all = true;
@@ -487,10 +542,19 @@ impl Disk {
                     records += 1;
                 }
                 if let Some(p) = &policy {
-                    p.bytes(bytes.len()).await;
+                    if life
+                        .until_checkpoint_stop(p.bytes(bytes.len()))
+                        .await
+                        .is_none()
+                    {
+                        return Ok(None);
+                    }
                 }
                 let _io = match &policy {
-                    Some(p) => Some(p.io().await),
+                    Some(p) => match life.until_checkpoint_stop(p.io()).await {
+                        Some(permit) => Some(permit),
+                        None => return Ok(None),
+                    },
                     None => None,
                 };
                 let n = bytes.len() as u64;
@@ -499,14 +563,23 @@ impl Disk {
                 accounting.set(temp.clone(), f.metadata().await?.blocks() * 512);
             }
             if !encoded_all {
-                return Err(io::Error::other("snapshot encoder stopped"));
+                return Ok(None);
             }
             #[cfg(test)]
-            crate::tests::pause(&control.snapshot_finalize_pause).await;
+            if life
+                .until_checkpoint_stop(crate::tests::pause(&control.snapshot_finalize_pause))
+                .await
+                .is_none()
+            {
+                return Ok(None);
+            }
             // Acquire outside the writer loop, which must keep serving callers
             // that can hold this permit. Retain it through CURRENT and cleanup.
             let io = match &policy {
-                Some(p) => Some(p.io().await),
+                Some(p) => match life.until_checkpoint_stop(p.io()).await {
+                    Some(permit) => Some(permit),
+                    None => return Ok(None),
+                },
                 None => None,
             };
             f.sync_all().await?;
@@ -519,17 +592,30 @@ impl Disk {
             sync_dir(&root).await?;
             #[cfg(test)]
             crate::tests::crash("snapshot_file");
-            Ok(Snapshot {
+            Ok(Some(Snapshot {
                 generation,
                 lsn,
+                wal_offset,
                 bytes: offset,
                 records,
                 policy,
                 _io: io,
-            })
+            }))
         })
     }
-    pub async fn publish_snapshot(&mut self, snapshot: Snapshot) -> io::Result<()> {
+    pub async fn discard_snapshot(&self) -> io::Result<()> {
+        let file = self.root.join("snapshot.tmp");
+        remove(&file).await?;
+        self.accounting.remove(&file);
+        // A crash can resurrect this temporary path. Recovery removes it
+        // without changing the published WAL set or its pending rotation.
+        Ok(())
+    }
+    pub async fn publish_snapshot(
+        &mut self,
+        snapshot: Snapshot,
+        life: &lifecycle::Life,
+    ) -> io::Result<()> {
         self.current.garbage.push((true, self.current.snapshot));
         for &g in &self.current.logs {
             if g < snapshot.generation {
@@ -543,11 +629,17 @@ impl Disk {
         self.current.pending = 0;
         self.current.logs.retain(|g| *g >= snapshot.generation);
         self.publish().await?;
+        self.checkpoint_offset = snapshot.wal_offset;
         #[cfg(test)]
         crate::tests::crash("snapshot_current");
         for (s, g) in &self.current.garbage {
+            if life.checkpoints_stopped() {
+                return Ok(());
+            }
             if let Some(p) = &snapshot.policy {
-                p.delete().await;
+                if life.until_checkpoint_stop(p.delete()).await.is_none() {
+                    return Ok(());
+                }
             }
             let p = path(&self.root, *s, *g);
             remove(&p).await?;
@@ -563,6 +655,7 @@ impl Disk {
 pub(crate) struct Snapshot {
     generation: u64,
     lsn: u64,
+    wal_offset: u64,
     bytes: u64,
     records: u64,
     policy: Option<Arc<dyn Maintenance>>,

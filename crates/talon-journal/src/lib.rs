@@ -43,6 +43,9 @@ pub trait Machine: Send + 'static {
     fn snapshot(&self) -> io::Result<Self::Snapshot>;
     fn decode_snapshot(bytes: &[u8]) -> io::Result<Self::SnapshotRecord>;
     fn restore(&mut self, record: Self::SnapshotRecord) -> io::Result<()>;
+    fn finish_snapshot_restore(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -68,12 +71,16 @@ impl Default for Options {
 pub struct StreamOptions {
     pub checkpoint_bytes: u64,
     pub max_record_bytes: usize,
+    /// Keep checkpoints queued until the caller finishes startup.
+    /// Appends and queries remain available during that phase.
+    pub defer_checkpoints: bool,
 }
 impl Default for StreamOptions {
     fn default() -> Self {
         Self {
             checkpoint_bytes: 64 << 20,
             max_record_bytes: 4 << 20,
+            defer_checkpoints: false,
         }
     }
 }
@@ -277,7 +284,11 @@ impl JournalService {
             }
         }
         let life = lifecycle::enter(&self.streams, &path)?;
+        if !options.defer_checkpoints {
+            life.start_checkpoints();
+        }
         let exit = lifecycle::Exit(life.clone());
+        let writer_life = life.clone();
         // Startup-only: persist every newly created stream ancestor before an
         // acknowledgement can depend on that path surviving a crash.
         let mut parent = path.parent();
@@ -308,9 +319,16 @@ impl JournalService {
                         #[cfg(test)]
                         let disk = disk.with_control(test_control);
                         let _ = ready.send(Ok(()));
-                        if let Err(error) =
-                            writer::run(disk, machine, receive, &poison, policy, snapshot_slots)
-                                .await
+                        if let Err(error) = writer::run(
+                            disk,
+                            machine,
+                            receive,
+                            &poison,
+                            policy,
+                            snapshot_slots,
+                            writer_life,
+                        )
+                        .await
                         {
                             poison.store(true, Ordering::Release);
                             tracing::error!(%error, "journal stream stopped; restart required");
@@ -485,7 +503,22 @@ impl<M: Machine> Handle<M> {
         // The independent journal thread still enforces admission and ordering.
         futures::executor::block_on(tokio::task::unconstrained(self.query(query)))
     }
+    /// Allow queued and automatic checkpoints to start.
+    pub fn start_checkpoints(&self) {
+        self.inner.life.start_checkpoints();
+    }
+    /// Cancel snapshot maintenance while permitting the final metadata appends.
+    pub fn stop_checkpoints(&self) {
+        self.inner.life.stop_checkpoints();
+    }
     pub async fn checkpoint(&self) -> io::Result<()> {
+        self.inner
+            .life
+            .until_checkpoint_stop(self.request_checkpoint())
+            .await
+            .unwrap_or_else(|| Err(io::ErrorKind::Interrupted.into()))
+    }
+    async fn request_checkpoint(&self) -> io::Result<()> {
         let permits = self.inner.service.admission.acquire(1).await?;
         let (done, wait) = oneshot::channel();
         self.send(Command::Checkpoint(done), permits).await?;
