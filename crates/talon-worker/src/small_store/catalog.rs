@@ -6,8 +6,8 @@ use crate::small_store::key::{SmallIdentity, SmallKey};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::sync::atomic::{
-    AtomicBool, AtomicU64, AtomicUsize,
-    Ordering::{Acquire, Relaxed, Release},
+    AtomicU64, AtomicUsize,
+    Ordering::{Relaxed, Release},
 };
 use std::sync::{Arc, RwLock, Weak};
 
@@ -59,7 +59,6 @@ pub(super) struct CatalogState {
     pub live_count: AtomicUsize,
     pub last_publication: AtomicU64,
     pub ownership: super::gc::OwnershipEpoch,
-    ready: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -429,7 +428,15 @@ impl Catalog {
                 let slot = self
                     .lookup
                     .vacancy(record.hash, |handle, flags| {
-                        flags & VISIBLE != 0 && self.matches(handle, encoded)
+                        if flags & VISIBLE == 0 {
+                            return false;
+                        }
+                        let (segment, row) = self.row(handle).expect("recovered lookup handle");
+                        let records = &self.segment(segment).expect("recovered segment").records;
+                        records
+                            .metadata(row)
+                            .is_some_and(|meta| meta.hash == record.hash)
+                            && records.matches(row, encoded)
                     })
                     .ok_or_else(|| super::invalid("duplicate recovered object"))?;
                 let flags = VISIBLE | if compact { POLICY } else { 0 };
@@ -473,7 +480,6 @@ impl Catalog {
             }
         }
         self.active = true;
-        self.shared.ready.store(true, Release);
         Ok(())
     }
 
@@ -695,9 +701,6 @@ impl talon_journal::Machine for LiveModel {
     }
     fn apply(&mut self, _: u64, record: Event) -> io::Result<()> {
         self.0.write().unwrap().apply(record)
-    }
-    fn checkpoint_ready(&self) -> bool {
-        self.1.ready.load(Acquire)
     }
     fn snapshot(&self) -> io::Result<Self::Snapshot> {
         self.0.read().unwrap().model.snapshot()

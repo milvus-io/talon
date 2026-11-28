@@ -93,7 +93,9 @@ impl Rows {
     fn store(&mut self, index: usize, row: WideRow, replace: bool) {
         if row.offset >= OFFSET_LIMIT || row.len >= LENGTH_LIMIT {
             if let Self::Compact(rows) = self {
-                *self = Self::Wide(rows.iter().copied().map(WideRow::from).collect());
+                let mut wide = Vec::with_capacity(rows.capacity());
+                wide.extend(rows.iter().copied().map(WideRow::from));
+                *self = Self::Wide(wide);
             }
         }
         fn store<T>(rows: &mut Vec<T>, index: usize, row: T, replace: bool) {
@@ -232,11 +234,10 @@ impl Records {
 
     pub fn get(&self, row: usize) -> Option<(u64, Record)> {
         let meta = self.metadata(row)?;
-        let (prefix, suffix) = self.keys.get(row).expect("small-object key");
         Some((
             meta.offset,
             Record {
-                key: key_codec::decode(&[prefix, suffix].concat()),
+                key: key_codec::decode(self.encoded_key(row, &mut Vec::new())),
                 len: meta.len,
                 checksum: meta.checksum,
             },
@@ -245,18 +246,7 @@ impl Records {
 
     pub fn object<'a>(&'a self, row: usize, scratch: &'a mut [Vec<u8>; 3]) -> ObjectRef<'a> {
         let [scratch, bucket, path] = scratch;
-        let (prefix, suffix) = self.keys.get(row).expect("small-object key");
-        let key = if prefix.is_empty() {
-            suffix
-        } else if suffix.is_empty() {
-            prefix
-        } else {
-            scratch.clear();
-            scratch.extend_from_slice(prefix);
-            scratch.extend_from_slice(suffix);
-            scratch
-        };
-        key_codec::object(key, bucket, path)
+        key_codec::object(self.encoded_key(row, scratch), bucket, path)
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (u64, Record)> + '_ {
@@ -318,6 +308,17 @@ impl Records {
         self.insert_key(offset, len, checksum, hash, |keys, index, replace| {
             keys.insert(index, key, replace)
         })
+    }
+
+    pub fn reserve_snapshot(&mut self, rows: usize, segment_bytes: u64) -> io::Result<()> {
+        if segment_bytes > u64::from(OFFSET_LIMIT) {
+            self.rows = Rows::Wide(Vec::new());
+        }
+        match &mut self.rows {
+            Rows::Compact(storage) => storage.try_reserve_exact(rows),
+            Rows::Wide(storage) => storage.try_reserve_exact(rows),
+        }
+        .map_err(io::Error::other)
     }
 
     pub fn append_snapshot_prefix(&mut self, prefix: &[u8]) -> io::Result<u32> {

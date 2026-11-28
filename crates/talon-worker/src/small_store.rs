@@ -24,6 +24,7 @@ mod rings;
 mod tickets;
 pub(crate) use recency::IdleRecencyCursor;
 pub use rings::SmallObjectStore;
+pub(crate) use rings::SmallStoreOptions;
 #[cfg(test)]
 pub(crate) mod tests;
 
@@ -992,8 +993,8 @@ impl SegmentStore {
         };
         let tracks_access = self.journal.model.0.read().unwrap().recency.is_some();
         if let Some(budget) = budget {
-            let access_bytes = if tracks_access && !entries.is_empty() {
-                12 * entries.len() + 24 * entries.len().div_ceil(512) + 16
+            let access_bytes = if tracks_access {
+                self.journal.access.relocation_bytes(entries.len())
             } else {
                 0
             };
@@ -1004,7 +1005,7 @@ impl SegmentStore {
         // including while releasing the I/O permit to reconcile tombstones.
         // Checkpoints also acquire this gate before taking their I/O permit.
         let access_relocation = if tracks_access {
-            Some(self.journal.access_relocation.read().await)
+            Some(self.journal.access.relocation.read().await)
         } else {
             None
         };
@@ -1023,28 +1024,33 @@ impl SegmentStore {
         #[cfg(test)]
         tests::crash("compact_copy");
 
-        if let Some(copy) = staged.as_ref().filter(|_| tracks_access) {
-            if let Err(error) = access::persist_relocation(&self.journal, old, copy).await {
-                // If access persistence fails, retire just the staged copy.
-                // The live source and its previously durable ages stay put.
-                tracing::warn!(%error, old, new = copy.id, "small access relocation deferred");
-                self.state.lock().await.compaction_deletes = None;
-                self.journal
-                    .append(
-                        journal::Event::Replace {
-                            old: copy.id,
-                            new: None,
-                        },
-                        true,
-                    )
-                    .await?;
-                drop(io);
-                drop(access_relocation);
-                self.unlink_compacted_segment(copy.id, budget).await?;
-                self.cached_stats.lock().unwrap().staging_allocated = 0;
-                return Ok(false);
+        let access_persisted = if let Some(copy) = staged.as_ref().filter(|_| tracks_access) {
+            match access::persist_relocation(&self.journal, old, copy).await {
+                Ok(persisted) => persisted,
+                Err(error) => {
+                    // If access persistence fails, retire just the staged copy.
+                    // The live source and its previously durable ages stay put.
+                    tracing::warn!(%error, old, new = copy.id, "small access relocation deferred");
+                    self.state.lock().await.compaction_deletes = None;
+                    self.journal
+                        .append(
+                            journal::Event::Replace {
+                                old: copy.id,
+                                new: None,
+                            },
+                            true,
+                        )
+                        .await?;
+                    drop(io);
+                    drop(access_relocation);
+                    self.unlink_compacted_segment(copy.id, budget).await?;
+                    self.cached_stats.lock().unwrap().staging_allocated = 0;
+                    return Ok(false);
+                }
             }
-        }
+        } else {
+            false
+        };
 
         let mut source = loop {
             #[cfg(test)]
@@ -1064,7 +1070,7 @@ impl SegmentStore {
             else {
                 state.compaction_deletes = None;
                 break self
-                    .publish_compaction(&mut state, old, &mut staged)
+                    .publish_compaction(&mut state, old, &mut staged, access_persisted)
                     .await?;
             };
             let deleted = std::mem::take(&mut deletes.offsets);
@@ -1226,6 +1232,7 @@ impl SegmentStore {
         state: &mut State,
         old: u64,
         staged: &mut Option<StagedSegment>,
+        access_persisted: bool,
     ) -> io::Result<Segment> {
         let replacement = staged
             .as_ref()
@@ -1255,7 +1262,11 @@ impl SegmentStore {
         state.written -= source.bytes + source.metadata;
         {
             let mut entries = self.entries.write().unwrap();
-            entries.replace_segment(old, staged.as_ref().filter(|_| replacement.is_some()));
+            entries.replace_segment(
+                old,
+                staged.as_ref().filter(|_| replacement.is_some()),
+                access_persisted,
+            );
         }
         // The source's physical allocation stays charged until unlink.
         let mut cached = self.cached_stats.lock().unwrap();

@@ -68,7 +68,8 @@ pub(crate) async fn run<M: Machine>(
     let result=async {
         loop {
             if failed.load(Ordering::Acquire) {return Err(stopped());}
-            let checkpoint_ready = !life.checkpoints_stopped() && machine.checkpoint_ready();
+            let checkpoints_started = life.checkpoints_started();
+            let checkpoint_ready = checkpoints_started && !life.checkpoints_stopped();
             // Coalesce callers by snapshot cut and release queue admission.
             // Appends holding maintenance permits must remain admissible while
             // a snapshot waits for those permits; no per-caller list is retained.
@@ -93,7 +94,7 @@ pub(crate) async fn run<M: Machine>(
                         query(&machine);
                     }
                     continue;
-                } else if checkpoint_ready && checkpoint.is_none() && (pending_checkpoint.is_some() || disk.offset>=disk.options.checkpoint_bytes) {
+                } else if checkpoint_ready && checkpoint.is_none() && (pending_checkpoint.is_some() || disk.checkpoint_due()) {
                     let snapshot=machine.snapshot()?;
                     let generation=disk.snapshot_generation().await?;
                     checkpoint=Some(disk.snapshot::<M>(generation,disk.lsn,snapshot,policy.read().unwrap().clone(),snapshot_slots.clone(),life.clone()));
@@ -105,6 +106,7 @@ pub(crate) async fn run<M: Machine>(
                 return Ok(());
             }
             tokio::select! {
+                () = life.checkpoint_start(), if !checkpoints_started => {}
                 result=async {sync.as_mut().unwrap().await}, if sync.is_some()=>{
                     sync=None;let (requests,result)=result;result?;
                     for pending in requests {
@@ -156,7 +158,7 @@ pub(crate) async fn run<M: Machine>(
                 // Do not extend the log beyond an unfinished batch. Ordering
                 // only apply/ack lets later pwrite calls leave an interior hole
                 // after process loss, which is not a recoverable torn tail.
-                request=receive.recv(), if !closed && write.is_none() && barrier.is_none() && (!checkpoint_ready || disk.offset<disk.options.checkpoint_bytes || checkpoint.is_some())=>{
+                request=receive.recv(), if !closed && write.is_none() && barrier.is_none() && (!checkpoint_ready || !disk.checkpoint_due() || checkpoint.is_some())=>{
                     let Some(request)=request else {closed=true;continue;};
                     if !matches!(request.command,Command::Append{..}) {barrier=Some(request);continue;}
                     let mut requests=vec![request];let mut bytes=Vec::new();let mut pending=Vec::new();

@@ -55,6 +55,7 @@ pub trait Machine: Send + 'static {
     fn snapshot(&self) -> io::Result<Self::Snapshot>;
     fn decode_snapshot(bytes: &[u8]) -> io::Result<Self::SnapshotRecord>;
     fn restore(&mut self, record: Self::SnapshotRecord) -> io::Result<()>;
+    fn finish_snapshot_restore(&mut self) -> io::Result<()> { Ok(()) }
 }
 
 // Startup-only blocking methods.
@@ -69,9 +70,18 @@ handle.query_blocking(|machine: &M| -> io::Result<R>) -> io::Result<R>;
 handle.append(record, Ack) -> io::Result<Lsn>;
 handle.query(|machine: &M| -> io::Result<R>) -> io::Result<R>;
 handle.checkpoint() -> io::Result<()>;
+handle.start_checkpoints();
+handle.stop_checkpoints();
 handle.poison();
 handle.allocated_bytes() -> u64;
 ```
+
+`StreamOptions::defer_checkpoints` holds automatic and explicit checkpoints
+while startup appends and queries continue. `Handle::start_checkpoints()` wakes
+the writer as soon as the adapter is ready. `Handle::stop_checkpoints()` cancels
+checkpoint waits and unpublished snapshots while permitting durable appends.
+Recovery calls `Machine::finish_snapshot_restore()` after validating the
+snapshot frame count and before replaying the WAL.
 
 Startup synchronous bridges wrap their entire future in
 `tokio::task::unconstrained` before `futures::executor::block_on`. A caller
@@ -125,6 +135,10 @@ before allowing acknowledgements in the new log. One snapshot per stream can
 be in progress, with at most two snapshot encoders/writers active per service.
 Streams waiting for a snapshot slot continue accepting log appends. Its frozen state corresponds exactly to the rotation boundary.
 Encoding streams bounded chunks from a CPU thread while new appends continue.
+If interrupted, the next cut reuses the already-open WAL and can cover some
+of its records. Any covered prefix must be contiguous and reach the snapshot's
+LSN, even at EOF. After publication, automatic checkpoints count WAL growth
+from that cut until the next rotation.
 
 Publication syncs the new snapshot and its directory, then atomically replaces
 and directory-syncs CURRENT with the new snapshot and tail log set. Only then
@@ -157,6 +171,9 @@ TTI checkpoints, capacity eviction and garbage-ratio policy. Insert requests
 `Durable` after their required data/directory ordering. Flush records a recoverable
 prefix without sealing the active segment. Snapshots retain its durable end and
 any pending tail; startup trims the tail before durably finalizing the prefix.
+Small Store starts checkpoints after catalog activation and payload
+reconciliation. Shutdown stops snapshots, attempts every stream's durable
+payload seal, then flushes bounded access deltas before the catalog checkpoint.
 Small objects are not also recorded in
 the paged catalog. Each adapter decides which state is safe to recover.
 

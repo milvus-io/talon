@@ -160,6 +160,7 @@ pub(crate) struct Disk {
     current: Current,
     pub file: Rc<monoio::fs::File>,
     pub offset: u64,
+    checkpoint_offset: u64,
     pub lsn: u64,
     pub options: StreamOptions,
     accounting: Arc<Accounting>,
@@ -242,6 +243,9 @@ fn recover<M: Machine>(root: PathBuf, mut machine: M, threads: usize) -> io::Res
                     covered = Some(n);
                     return Ok(());
                 }
+                if covered.take().is_some_and(|last| last != current.lsn) {
+                    return Err(invalid("journal covered LSN gap"));
+                }
                 if Some(n) != lsn.checked_add(1) {
                     return Err(invalid("journal LSN gap"));
                 }
@@ -250,6 +254,9 @@ fn recover<M: Machine>(root: PathBuf, mut machine: M, threads: usize) -> io::Res
                 Ok(())
             },
         )?;
+        if covered.is_some_and(|last| last != current.lsn) {
+            return Err(invalid("journal covered LSN gap"));
+        }
         wal_bytes += offset;
     }
     tracing::info!(path = %root.display(), snapshot_ms,
@@ -343,6 +350,7 @@ impl Disk {
                 root: r.root,
                 current: r.current,
                 offset: r.offset,
+                checkpoint_offset: 0,
                 lsn: r.lsn,
                 file: Rc::new(file),
                 options,
@@ -353,6 +361,9 @@ impl Disk {
             },
             r.machine,
         ))
+    }
+    pub fn checkpoint_due(&self) -> bool {
+        self.offset.saturating_sub(self.checkpoint_offset) >= self.options.checkpoint_bytes
     }
     pub fn write(&self, bytes: Bytes, offset: u64) -> LocalBoxFuture<'static, io::Result<()>> {
         let file = self.file.clone();
@@ -436,6 +447,7 @@ impl Disk {
         crate::tests::crash("rotate");
         self.file = Rc::new(f);
         self.offset = 0;
+        self.checkpoint_offset = 0;
         Ok(generation)
     }
     pub fn snapshot<M: Machine>(
@@ -449,6 +461,7 @@ impl Disk {
     ) -> LocalBoxFuture<'static, io::Result<Option<Snapshot>>> {
         let root = self.root.clone();
         let accounting = self.accounting.clone();
+        let wal_offset = self.offset;
         #[cfg(test)]
         let control = self.control.clone();
         Box::pin(async move {
@@ -582,6 +595,7 @@ impl Disk {
             Ok(Some(Snapshot {
                 generation,
                 lsn,
+                wal_offset,
                 bytes: offset,
                 records,
                 policy,
@@ -615,6 +629,7 @@ impl Disk {
         self.current.pending = 0;
         self.current.logs.retain(|g| *g >= snapshot.generation);
         self.publish().await?;
+        self.checkpoint_offset = snapshot.wal_offset;
         #[cfg(test)]
         crate::tests::crash("snapshot_current");
         for (s, g) in &self.current.garbage {
@@ -640,6 +655,7 @@ impl Disk {
 pub(crate) struct Snapshot {
     generation: u64,
     lsn: u64,
+    wal_offset: u64,
     bytes: u64,
     records: u64,
     policy: Option<Arc<dyn Maintenance>>,

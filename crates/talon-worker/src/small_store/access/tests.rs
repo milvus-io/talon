@@ -203,7 +203,14 @@ async fn compact_access_does_not_persist_ages_for_unacknowledged_addresses() {
 async fn compact_access_relocation_keeps_durable_ages_through_log_repair_or_failure() {
     use std::io::Write;
 
-    for scenario in ["torn", "missing", "stale", "open-failure", "sync-failure"] {
+    for scenario in [
+        "torn",
+        "missing",
+        "stale",
+        "open-failure",
+        "sync-failure",
+        "missing-sync-failure",
+    ] {
         let dir = tempfile::tempdir().unwrap();
         let key = id(3);
         let cold = access_millis() - 30_000;
@@ -227,13 +234,17 @@ async fn compact_access_relocation_keeps_durable_ages_through_log_repair_or_fail
             }
         }
         match scenario {
-            "torn" => std::fs::OpenOptions::new()
-                .append(true)
-                .open(&log)
-                .unwrap()
-                .write_all(&[1, 2])
-                .unwrap(),
-            "missing" => std::fs::remove_file(&log).unwrap(),
+            "torn" => {
+                let mut tail = [0; 96];
+                tail[..4].copy_from_slice(&120_u32.to_le_bytes());
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&log)
+                    .unwrap()
+                    .write_all(&tail)
+                    .unwrap();
+            }
+            "missing" | "missing-sync-failure" => std::fs::remove_file(&log).unwrap(),
             "stale" => {
                 let mut bytes = std::fs::read(&log).unwrap();
                 bytes[8..16].copy_from_slice(&99u64.to_le_bytes());
@@ -243,7 +254,7 @@ async fn compact_access_relocation_keeps_durable_ages_through_log_repair_or_fail
         }
         let (store, _) = open_compact(dir.path());
         assert_eq!(compact_age(&store, &key), cold, "{scenario}");
-        if scenario == "open-failure" || scenario == "sync-failure" {
+        if scenario.ends_with("failure") {
             let saved = log.with_extension("saved");
             if scenario == "open-failure" {
                 std::fs::rename(&log, &saved).unwrap();
@@ -256,18 +267,295 @@ async fn compact_access_relocation_keeps_durable_ages_through_log_repair_or_fail
             }
             assert!(!store.maintain(false).await.unwrap(), "{scenario}");
             assert_eq!(store.lookup_entry(&key).unwrap().unwrap().segment, source);
+            assert_eq!(compact_age(&store, &key), cold, "{scenario}");
+            if scenario == "missing-sync-failure" {
+                let disk = store.journal.access.disk.lock().unwrap();
+                assert_eq!(disk.log_bytes, 0);
+                assert!(disk.log_truncate);
+            }
             if scenario == "open-failure" {
                 std::fs::rename(saved, &log).unwrap();
+            } else {
+                let other = id(4);
+                assert_eq!(store.lookup_entry(&other).unwrap().unwrap().segment, source);
+                store.delete(&other).await.unwrap();
             }
         }
         assert!(store.maintain(false).await.unwrap(), "{scenario}");
         assert_ne!(store.lookup_entry(&key).unwrap().unwrap().segment, source);
+        assert!(!compact::read_log(dir.path()).is_empty(), "{scenario}");
+        assert!(
+            !store.journal.access.disk.lock().unwrap().log_truncate,
+            "{scenario}"
+        );
         drop(store);
 
         // No access checkpoint between durable Replace and reopen.
         let (reopened, _) = open_compact(dir.path());
         assert_eq!(compact_age(&reopened, &key), cold, "{scenario}");
+        assert!(
+            !reopened.journal.access.disk.lock().unwrap().log_truncate,
+            "{scenario}"
+        );
     }
+}
+
+#[test]
+fn access_temporary_files_count_toward_allocation_and_are_reclaimed_on_open() {
+    for compact in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut blocks = 0;
+        for name in [SNAPSHOT_TEMP, LOG_TEMP] {
+            let path = root.join(name);
+            std::fs::write(&path, vec![1; 65536]).unwrap();
+            blocks += std::fs::metadata(&path).unwrap().blocks();
+        }
+        assert_eq!(allocated(root).unwrap(), blocks * 512);
+        let store = if compact {
+            open_compact(root).0
+        } else {
+            open(root)
+        };
+        assert!(!root.join(SNAPSHOT_TEMP).exists());
+        assert!(!root.join(LOG_TEMP).exists());
+        assert_eq!(store.journal.access.allocated_bytes(), 0);
+    }
+}
+
+#[tokio::test]
+async fn compact_reset_does_not_replay_a_stale_log_after_snapshot_publication() {
+    for generation in [1_u64, u64::MAX] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let key = id(1);
+        {
+            let (store, _) = open_compact(root);
+            store
+                .put(&key, Bytes::from_static(b"payload"))
+                .await
+                .unwrap();
+            store.maintain(true).await.unwrap();
+            flush(&store).await;
+            store.track_access(&key).unwrap();
+            flush(&store).await;
+        }
+        let mut old_log = std::fs::read(root.join(LOG)).unwrap();
+        old_log[8..HEADER as usize].copy_from_slice(&generation.to_le_bytes());
+        std::fs::write(root.join(LOG), &old_log).unwrap();
+        std::fs::remove_file(root.join(FILE)).unwrap();
+
+        let (store, _) = open_compact(root);
+        let expected = if generation == u64::MAX {
+            0
+        } else {
+            generation
+        };
+        assert_eq!(
+            store.journal.access.disk.lock().unwrap().generation,
+            expected
+        );
+        assert_eq!(root.join(LOG).exists(), generation != u64::MAX);
+        let cold = access_millis() - 20_000;
+        set_compact_age(&store, &key, cold);
+        // Leave the old log in place after the new snapshot has been renamed.
+        std::fs::create_dir(root.join(LOG_TEMP)).unwrap();
+        assert!(store.checkpoint_access(None, None).await.is_err());
+        assert_eq!(
+            store.journal.access.disk.lock().unwrap().generation,
+            expected + 1
+        );
+        drop(store);
+        let (reopened, _) = open_compact(root);
+        assert_eq!(compact_age(&reopened, &key), cold);
+    }
+}
+
+#[tokio::test]
+async fn compact_shutdown_saves_a_clean_delta_and_bounds_io_admission() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _) = open_compact(dir.path());
+    let key = id(1);
+    store
+        .put(&key, Bytes::from_static(b"payload"))
+        .await
+        .unwrap();
+    store.maintain(true).await.unwrap();
+    set_compact_age(&store, &key, access_millis() - 20_000);
+    flush(&store).await;
+    assert!(!store.journal.access.disk.lock().unwrap().full);
+    store.track_access(&key).unwrap();
+    let age = compact_age(&store, &key);
+    let budget = crate::background::BackgroundBudget::new(&talon_core::WorkerConfig {
+        background_io_concurrency: 1,
+        background_io_max_mb_per_sec: 0,
+        ..Default::default()
+    });
+    store
+        .checkpoint_access_on_shutdown(
+            Some(budget.clone()),
+            TokioInstant::now() + Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+    let state = *store.journal.access.disk.lock().unwrap();
+    assert!(!state.full);
+    assert!(!state.log_truncate);
+    assert_eq!(budget.charged_bytes(), state.log_bytes - HEADER);
+    assert_eq!(compact::read_log(dir.path())[0].2, age);
+
+    store.track_access(&key).unwrap();
+    let _io = budget.io().await;
+    let error = store
+        .checkpoint_access_on_shutdown(
+            Some(budget.clone()),
+            TokioInstant::now() + Duration::from_millis(20),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    let stopped = *store.journal.access.disk.lock().unwrap();
+    assert!(stopped.full);
+    assert!(!stopped.log_truncate);
+    assert_eq!(stopped.log_bytes, state.log_bytes);
+    assert_eq!(compact::read_log(dir.path()).len(), 1);
+    drop(store);
+    let (reopened, _) = open_compact(dir.path());
+    assert_eq!(compact_age(&reopened, &key), age);
+}
+
+#[tokio::test]
+async fn compact_delta_keeps_its_durable_prefix_on_byte_bound_or_scheduler_stop() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _) = open_compact(dir.path());
+    let rows = 24_000;
+    let first = id(0);
+    let last = id(rows - 1);
+    let cold = access_millis() - 30_000;
+    for n in 0..rows {
+        store.put(&id(n), Bytes::from_static(b"x")).await.unwrap();
+    }
+    store.maintain(true).await.unwrap();
+    let touch_all = || {
+        for n in 0..rows {
+            store.track_access(&id(n)).unwrap();
+        }
+    };
+    let assert_prefix = || {
+        let state = *store.journal.access.disk.lock().unwrap();
+        let persisted = compact::read_log(dir.path());
+        assert!(state.full);
+        assert!(!state.log_truncate);
+        assert_eq!(
+            state.log_bytes,
+            std::fs::metadata(dir.path().join(LOG)).unwrap().len()
+        );
+        assert!(!persisted.is_empty());
+        assert!(persisted.len() < rows);
+        state.log_bytes - HEADER
+    };
+    flush(&store).await;
+    touch_all();
+    let cap = (WRITE_BYTES + 8 * 1024) as u64;
+    let deadline = TokioInstant::now() + Duration::from_secs(5);
+    let error = store
+        .flush_access(
+            None,
+            Flush::Shutdown {
+                deadline,
+                bytes: cap,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    let prefix = assert_prefix();
+    assert!(prefix <= cap);
+
+    set_compact_age(&store, &first, cold);
+    set_compact_age(&store, &last, cold);
+    flush(&store).await;
+    assert_eq!(store.journal.access.disk.lock().unwrap().log_bytes, HEADER);
+    touch_all();
+    let first_address = store.lookup_entry(&first).unwrap().unwrap();
+    let first_age = compact_age(&store, &first);
+    let budget = crate::background::BackgroundBudget::new(&talon_core::WorkerConfig {
+        background_io_concurrency: 1,
+        background_io_max_mb_per_sec: 1,
+        ..Default::default()
+    });
+    let held = budget.io().await;
+    let mut scheduler = crate::background::BackgroundScheduler::new(1);
+    let stop = scheduler.stop_signal();
+    let (done, mut finished) = tokio::sync::oneshot::channel();
+    let mut done = Some(done);
+    scheduler.register("compact_access_test", Duration::from_secs(60), {
+        let store = store.clone();
+        let budget = budget.clone();
+        move || {
+            let store = store.clone();
+            let budget = budget.clone();
+            let stop = stop.clone();
+            let done = done.take().unwrap();
+            async move {
+                done.send(store.checkpoint_access(Some(budget), Some(&stop)).await)
+                    .unwrap();
+            }
+        }
+    });
+    let scheduler = scheduler.start();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while budget.charged_bytes() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let first_group = budget.charged_bytes();
+    // Queue the next group behind a reservation. The first group's credit
+    // was reserved before it and can finish as soon as the slot is released.
+    let reservation = 1 << 30;
+    let mut credit = std::pin::pin!(budget.bytes(reservation));
+    assert!(futures::poll!(credit.as_mut()).is_pending());
+    drop(held);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while budget.charged_bytes() <= first_group + reservation as u64 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        finished.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+    let competing_io = futures::FutureExt::now_or_never(budget.io())
+        .expect("competing maintenance can acquire the slot during the next pacing wait");
+    assert_eq!(assert_prefix(), first_group);
+    assert!(compact::read_log(dir.path()).contains(&(
+        first_address.segment,
+        first_address.offset as u32,
+        first_age,
+    )));
+    scheduler.begin_shutdown();
+    tokio::time::timeout(Duration::from_secs(1), scheduler.shutdown())
+        .await
+        .unwrap();
+    assert_eq!(
+        finished.await.unwrap().unwrap_err().kind(),
+        io::ErrorKind::Interrupted
+    );
+    assert_eq!(assert_prefix(), first_group);
+    drop(competing_io);
+    assert_eq!(budget.available_io(), 1);
+    drop(store);
+    let (reopened, _) = open_compact(dir.path());
+    assert_eq!(compact_age(&reopened, &first), first_age);
+    assert_eq!(compact_age(&reopened, &last), cold);
 }
 
 #[tokio::test]
@@ -311,7 +599,7 @@ async fn compact_access_ignores_removed_addresses_and_merges_valid_log_prefix() 
     let (store, _) = open_compact(dir.path());
     assert_eq!(compact_age(&store, &live), updated);
     assert!(compact_age(&store, &retired) > cold);
-    assert!(store.journal.access_disk.lock().unwrap().full);
+    assert!(store.journal.access.disk.lock().unwrap().full);
 }
 
 #[tokio::test]
@@ -336,7 +624,7 @@ async fn compact_access_resets_a_snapshot_truncated_at_a_frame_boundary() {
     let (store, _) = open_compact(dir.path());
     assert!(store.contains(&key));
     assert!(compact_age(&store, &key) > cold);
-    assert!(store.journal.access_disk.lock().unwrap().full);
+    assert!(store.journal.access.disk.lock().unwrap().full);
 }
 
 #[tokio::test]
@@ -448,6 +736,58 @@ async fn compact_access_resets_legacy_ages_and_rechecks_idle_candidates() {
 }
 
 #[tokio::test]
+async fn compact_access_relocation_keeps_only_source_dirty_updates_pending() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (store, policy) = open_compact(dir.path());
+    for n in 0..6 {
+        store
+            .put(&id(n), Bytes::from(vec![n as u8; 48 << 10]))
+            .await
+            .unwrap();
+    }
+    store.maintain(true).await.unwrap();
+    for n in 0..3 {
+        store.delete(&id(n)).await.unwrap();
+        policy.remove(&CacheUnit::Whole(id(n)));
+    }
+    let touched = id(3);
+    let clean = id(4);
+    let cold = access_millis() - 30_000;
+    set_compact_age(&store, &touched, cold);
+    set_compact_age(&store, &clean, cold);
+    flush(&store).await;
+
+    let pause = Arc::new(crate::small_store::tests::AppendPause::default());
+    *store.streams()[0].relocation_pause.lock().unwrap() = Some(pause.clone());
+    let compacting = {
+        let store = store.clone();
+        tokio::spawn(async move { store.maintain(false).await.unwrap() })
+    };
+    tokio::time::timeout(Duration::from_secs(5), pause.entered.notified())
+        .await
+        .unwrap();
+    let translated = compact::read_log(dir.path());
+    assert_eq!(translated.len(), 2);
+    store.track_access(&touched).unwrap();
+    let hot = compact_age(&store, &touched);
+    assert!(hot > cold);
+    pause.resume.notify_one();
+    assert!(compacting.await.unwrap());
+    flush(&store).await;
+
+    let moved = store.lookup_entry(&touched).unwrap().unwrap();
+    let log = compact::read_log(dir.path());
+    assert_eq!(&log[..translated.len()], translated);
+    assert_eq!(
+        &log[translated.len()..],
+        &[(moved.segment, moved.offset as u32, hot)]
+    );
+    assert_eq!(compact_age(&store, &clean), cold);
+}
+
+#[tokio::test]
 async fn compact_access_keeps_ages_through_row_compaction_and_relocation() {
     let dir = tempfile::tempdir().unwrap();
     let (store, policy) = open_compact(dir.path());
@@ -474,7 +814,7 @@ async fn compact_access_keeps_ages_through_row_compaction_and_relocation() {
         .unwrap();
     assert_eq!(&data[..], &[3; 8]);
     flush(&store).await;
-    store.journal.access_disk.lock().unwrap().log_bytes = MIN_COMPACT_BYTES;
+    store.journal.access.disk.lock().unwrap().log_bytes = MIN_COMPACT_BYTES;
     flush(&store).await;
     assert!(compact::read_log(dir.path()).is_empty());
     drop(store);
@@ -557,7 +897,7 @@ async fn full_access_checkpoint_and_relocation_share_the_publication_boundary() 
             store.delete(&id(n)).await.unwrap();
             policy.remove(&CacheUnit::Whole(id(n)));
         }
-        store.journal.access_disk.lock().unwrap().full = true;
+        store.journal.access.disk.lock().unwrap().full = true;
 
         let budget = crate::background::BackgroundBudget::new(&talon_core::WorkerConfig {
             background_io_concurrency: 1,
@@ -761,12 +1101,12 @@ async fn compact_full_checkpoint_retries_after_sampling_with_one_io_permit() {
     assert!(store.get(&key).await.unwrap().is_some());
     let touched = compact_age(&store, &key);
 
-    store.journal.access_disk.lock().unwrap().full = true;
+    store.journal.access.disk.lock().unwrap().full = true;
     // Fail after the full snapshot sampled the dirty rows and replaced FILE.
     let log_temp = dir.path().join("access.log.tmp");
     std::fs::create_dir(&log_temp).unwrap();
     assert!(flush_with_budget().await.is_err());
-    assert!(store.journal.access_disk.lock().unwrap().full);
+    assert!(store.journal.access.disk.lock().unwrap().full);
     std::fs::remove_dir(log_temp).unwrap();
     flush_with_budget().await.unwrap();
     drop(store);
@@ -866,7 +1206,7 @@ async fn sparse_hits_append_once_and_clean_flush_does_not_rewrite() {
     flush(&store).await;
     assert_eq!(std::fs::read(dir.path().join(LOG)).unwrap(), bytes);
     assert_eq!(
-        store.journal.access_bytes.load(Ordering::Relaxed),
+        store.journal.access.allocated_bytes(),
         allocated(dir.path()).unwrap()
     );
     let last = access.last_access();
@@ -943,9 +1283,9 @@ async fn failed_append_retries_as_full_checkpoint() {
     access.touch();
     std::fs::remove_file(dir.path().join(LOG)).unwrap();
     assert!(store.checkpoint_access(None, None).await.is_err());
-    assert!(store.journal.access_disk.lock().unwrap().full);
+    assert!(store.journal.access.disk.lock().unwrap().full);
     flush(&store).await;
-    assert_eq!(store.journal.access_disk.lock().unwrap().generation, 2);
+    assert_eq!(store.journal.access.disk.lock().unwrap().generation, 2);
     assert!(log(dir.path()).is_empty());
 }
 
@@ -960,7 +1300,7 @@ async fn published_snapshot_ignores_previous_generation_log_after_restart() {
     access.touch();
     flush(&store).await;
     let old_log = std::fs::read(dir.path().join(LOG)).unwrap();
-    store.journal.access_disk.lock().unwrap().full = true;
+    store.journal.access.disk.lock().unwrap().full = true;
     // Fail after durable snapshot replacement, before the new log exists.
     std::fs::create_dir(dir.path().join("access.log.tmp")).unwrap();
     assert!(store.checkpoint_access(None, None).await.is_err());
@@ -969,7 +1309,7 @@ async fn published_snapshot_ignores_previous_generation_log_after_restart() {
     drop(store);
     let store = open(dir.path());
     assert_eq!(store.access(&id(0)).unwrap().last_access(), last);
-    assert!(store.journal.access_disk.lock().unwrap().full);
+    assert!(store.journal.access.disk.lock().unwrap().full);
     std::fs::remove_dir(dir.path().join("access.log.tmp")).unwrap();
     flush(&store).await;
 }
@@ -1020,9 +1360,9 @@ async fn legacy_snapshot_migrates_and_log_threshold_compacts() {
     store.access(&id(0)).unwrap().touch();
     flush(&store).await;
     assert_eq!(log(dir.path()).len(), 1);
-    store.journal.access_disk.lock().unwrap().log_bytes = MIN_COMPACT_BYTES;
+    store.journal.access.disk.lock().unwrap().log_bytes = MIN_COMPACT_BYTES;
     flush(&store).await;
-    assert_eq!(store.journal.access_disk.lock().unwrap().generation, 2);
+    assert_eq!(store.journal.access.disk.lock().unwrap().generation, 2);
     assert!(log(dir.path()).is_empty());
 }
 
@@ -1041,17 +1381,17 @@ async fn log_compaction_requires_one_mib_and_half_the_snapshot_size() {
         flush(&store).await;
         let baseline = std::fs::read(dir.path().join(FILE)).unwrap();
         {
-            let mut state = store.journal.access_disk.lock().unwrap();
+            let mut state = store.journal.access.disk.lock().unwrap();
             state.snapshot_bytes = snapshot_bytes;
             state.log_bytes = threshold - 1;
         }
         flush(&store).await;
-        assert_eq!(store.journal.access_disk.lock().unwrap().generation, 1);
+        assert_eq!(store.journal.access.disk.lock().unwrap().generation, 1);
         assert_eq!(std::fs::read(dir.path().join(FILE)).unwrap(), baseline);
 
-        store.journal.access_disk.lock().unwrap().log_bytes = threshold;
+        store.journal.access.disk.lock().unwrap().log_bytes = threshold;
         flush(&store).await;
-        assert_eq!(store.journal.access_disk.lock().unwrap().generation, 2);
+        assert_eq!(store.journal.access.disk.lock().unwrap().generation, 2);
         assert_eq!(
             std::fs::metadata(dir.path().join(LOG)).unwrap().len(),
             HEADER
@@ -1070,7 +1410,7 @@ async fn dirty_budget_overflow_falls_back_without_losing_live_ages() {
     assert!(store.access_dirty.overflow.load(Ordering::Acquire));
     assert!(store.access_dirty.pending.lock().unwrap().keys.is_empty());
     flush(&store).await;
-    assert_eq!(store.journal.access_disk.lock().unwrap().generation, 2);
+    assert_eq!(store.journal.access.disk.lock().unwrap().generation, 2);
     access.touch();
     flush(&store).await;
     assert_eq!(
@@ -1107,7 +1447,7 @@ async fn torn_append_preserves_base_and_complete_deltas_then_repairs() {
             store.access(&id(1)).unwrap().last_access(),
             hot.last_access()
         );
-        assert!(store.journal.access_disk.lock().unwrap().full);
+        assert!(store.journal.access.disk.lock().unwrap().full);
         flush(&store).await;
         assert!(log(dir.path()).is_empty());
     }
@@ -1180,7 +1520,7 @@ async fn newly_recovered_key_without_age_is_saved_without_a_read() {
     drop(store);
     let store = open(dir.path());
     let recovered_age = store.access(&id(1)).unwrap().last_access();
-    assert!(store.journal.access_disk.lock().unwrap().full);
+    assert!(store.journal.access.disk.lock().unwrap().full);
     flush(&store).await;
     let mut ages = HashMap::new();
     decode(

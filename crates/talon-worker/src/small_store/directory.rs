@@ -256,7 +256,12 @@ impl Directory {
         self.relocate_row(&mut catalog, key, location)
     }
 
-    pub(super) fn replace_segment(&mut self, old: u64, replacement: Option<&super::StagedSegment>) {
+    pub(super) fn replace_segment(
+        &mut self,
+        old: u64,
+        replacement: Option<&super::StagedSegment>,
+        access_persisted: bool,
+    ) {
         let mut catalog = self.catalog.0.write().unwrap();
         if let Some(new) = replacement {
             catalog.files.insert(new.id, new.segment.file.clone());
@@ -265,7 +270,14 @@ impl Directory {
                 let new_address = (new.id, record.new_offset);
                 let old_slot = catalog.at(old_address).expect("reconciled source record");
                 let new_slot = catalog.at(new_address).expect("staged replacement record");
-                Self::transfer_row(&mut catalog, old_slot, old_address, new_slot, new_address);
+                Self::transfer_row(
+                    &mut catalog,
+                    old_slot,
+                    old_address,
+                    new_slot,
+                    new_address,
+                    access_persisted,
+                );
                 let flags = catalog.lookup.flags(new_slot);
                 catalog.lookup.set_flags(new_slot, flags | VISIBLE);
                 if let Some(ownership) = &mut catalog.ownership {
@@ -286,12 +298,13 @@ impl Directory {
         old_address: Address,
         new_slot: usize,
         new_address: Address,
+        access_persisted: bool,
     ) {
         let flags = catalog.lookup.flags(old_slot);
         catalog
             .lookup
             .set_flags(old_slot, flags & !(VISIBLE | POLICY | REFERENCED));
-        catalog.relocate_recency(old_address, new_slot);
+        catalog.relocate_recency(old_address, new_slot, access_persisted);
         catalog.relocate_policy(old_address, new_address, new_slot);
         if let Some(policy) = catalog.policy.remove(&old_address) {
             catalog.policy.insert(new_address, policy);
@@ -377,7 +390,7 @@ impl Directory {
         let old = old_slot.and_then(|slot| catalog.location_for_move(slot));
         if let Some(old_slot) = old_slot.filter(|old| *old != slot) {
             let old_address = catalog.metadata(catalog.lookup.handle(old_slot)).unwrap().0;
-            Self::transfer_row(catalog, old_slot, old_address, slot, address);
+            Self::transfer_row(catalog, old_slot, old_address, slot, address, false);
             *catalog.live.entry(self.slot).or_default() -= 1;
             if !relocating {
                 catalog.shared.live_count.fetch_sub(1, Relaxed);

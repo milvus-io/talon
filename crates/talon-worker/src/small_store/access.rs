@@ -7,11 +7,15 @@ mod tests;
 
 use super::*;
 use crate::eviction::AccessHandle;
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::{watch, OwnedSemaphorePermit};
+use tokio::time::Instant as TokioInstant;
 
 pub(super) const FILE: &str = "access.checkpoint";
 const LOG: &str = "access.log";
+const SNAPSHOT_TEMP: &str = "access.checkpoint.tmp";
+const LOG_TEMP: &str = "access.log.tmp";
 const LEGACY: &[u8; 8] = b"TLSA0001";
 const MAGIC: &[u8; 8] = b"TLSA0002";
 const LOG_MAGIC: &[u8; 8] = b"TLSL0001";
@@ -19,37 +23,74 @@ const HEADER: u64 = 16;
 const MIN_COMPACT_BYTES: u64 = 1 << 20;
 const MAX_DIRTY_KEYS: usize = 262_144;
 const MAX_DIRTY_BYTES: usize = 64 << 20;
+const WRITE_BYTES: usize = 64 << 10;
+const SHUTDOWN_DELTA_BYTES: u64 = 16 << 20;
 
-fn checkpoint_stopped(stop: Option<&watch::Receiver<bool>>) -> bool {
-    stop.is_some_and(|stop| *stop.borrow())
+#[derive(Clone, Copy)]
+enum Flush<'a> {
+    Periodic(Option<&'a watch::Receiver<bool>>),
+    Shutdown { deadline: TokioInstant, bytes: u64 },
 }
 
-// Only race resource waits against shutdown. The caller keeps this grant
-// through any submitted I/O and its durable publication steps.
-async fn access_grant(
-    budget: Option<&crate::background::BackgroundBudget>,
-    bytes: usize,
-    stop: Option<&watch::Receiver<bool>>,
-) -> io::Result<Option<OwnedSemaphorePermit>> {
-    let grant = async {
-        if let Some(budget) = budget {
-            if bytes != 0 {
-                budget.bytes(bytes).await;
+impl Flush<'_> {
+    fn allows_full(self) -> bool {
+        matches!(self, Self::Periodic(_))
+    }
+
+    fn byte_limit(self) -> u64 {
+        match self {
+            Self::Periodic(_) => u64::MAX,
+            Self::Shutdown { bytes, .. } => bytes,
+        }
+    }
+
+    fn check(self) -> io::Result<()> {
+        let stopped = match self {
+            Self::Periodic(stop) => stop.is_some_and(|stop| *stop.borrow()),
+            Self::Shutdown { deadline, .. } => TokioInstant::now() >= deadline,
+        };
+        if stopped {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        Ok(())
+    }
+
+    // Race only resource waits. Submitted I/O and its durability step
+    // finish under their existing grant.
+    async fn wait<T>(self, work: impl Future<Output = T>) -> io::Result<T> {
+        self.check()?;
+        match self {
+            Self::Periodic(Some(stop)) => {
+                let mut stop = stop.clone();
+                tokio::select! {
+                    biased;
+                    _ = stop.wait_for(|stopped| *stopped) => Err(io::ErrorKind::Interrupted.into()),
+                    result = work => Ok(result),
+                }
             }
-            Some(budget.io().await)
-        } else {
-            None
+            Self::Periodic(None) => Ok(work.await),
+            Self::Shutdown { deadline, .. } => tokio::time::timeout_at(deadline, work)
+                .await
+                .map_err(|_| io::ErrorKind::Interrupted.into()),
         }
-    };
-    if let Some(stop) = stop {
-        let mut stop = stop.clone();
-        tokio::select! {
-            biased;
-            _ = stop.wait_for(|stopped| *stopped) => Err(io::ErrorKind::Interrupted.into()),
-            permit = grant => Ok(permit),
-        }
-    } else {
-        Ok(grant.await)
+    }
+
+    async fn grant(
+        self,
+        budget: Option<&crate::background::BackgroundBudget>,
+        bytes: usize,
+    ) -> io::Result<Option<OwnedSemaphorePermit>> {
+        self.wait(async {
+            if let Some(budget) = budget {
+                if bytes != 0 {
+                    budget.bytes(bytes).await;
+                }
+                Some(budget.io().await)
+            } else {
+                None
+            }
+        })
+        .await
     }
 }
 
@@ -107,7 +148,7 @@ impl DirtyAccess {
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct DiskState {
+struct DiskState {
     generation: u64,
     snapshot_bytes: u64,
     log_bytes: u64,
@@ -126,14 +167,80 @@ impl Default for DiskState {
     }
 }
 
-pub(super) fn allocated(root: &std::path::Path) -> io::Result<u64> {
-    [FILE, LOG]
-        .into_iter()
-        .try_fold(0, |sum, name| match std::fs::metadata(root.join(name)) {
+pub(super) struct Persistence {
+    root: PathBuf,
+    // A relocation keeps the generation stable through metadata Replace.
+    pub(super) relocation: tokio::sync::RwLock<()>,
+    log_write: tokio::sync::Mutex<()>,
+    disk: Mutex<DiskState>,
+    bytes: AtomicU64,
+}
+
+impl Persistence {
+    pub(super) fn new(root: PathBuf) -> io::Result<Self> {
+        discard_temporary(&root);
+        Ok(Self {
+            bytes: AtomicU64::new(allocated(&root)?),
+            root,
+            relocation: Default::default(),
+            log_write: Default::default(),
+            disk: Default::default(),
+        })
+    }
+
+    pub(super) fn allocated_bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn relocation_bytes(&self, rows: usize) -> usize {
+        compact::relocation_bytes(rows)
+    }
+
+    async fn refresh_allocated(&self, result: io::Result<bool>) -> io::Result<()> {
+        if matches!(result, Ok(false)) {
+            return Ok(());
+        }
+        let root = self.root.clone();
+        let discard = result.is_err();
+        let size = tokio::task::spawn_blocking(move || {
+            if discard {
+                discard_temporary(&root);
+            }
+            allocated(&root)
+        })
+        .await
+        .map_err(io::Error::other)
+        .and_then(|size| size);
+        match size {
+            Ok(size) => self.bytes.store(size, Ordering::Relaxed),
+            Err(error) if discard => tracing::warn!(%error, root = %self.root.display(),
+                "refreshing small access allocation failed"),
+            Err(error) => return Err(error),
+        }
+        result.map(|_| ())
+    }
+}
+
+fn discard_temporary(root: &std::path::Path) {
+    for name in [SNAPSHOT_TEMP, LOG_TEMP] {
+        let path = root.join(name);
+        if let Err(error) = std::fs::remove_file(&path) {
+            if error.kind() != io::ErrorKind::NotFound {
+                tracing::warn!(%error, path = %path.display(), "discarding temporary small access file failed");
+            }
+        }
+    }
+}
+
+fn allocated(root: &std::path::Path) -> io::Result<u64> {
+    [FILE, LOG, SNAPSHOT_TEMP, LOG_TEMP].into_iter().try_fold(
+        0,
+        |sum, name| match std::fs::metadata(root.join(name)) {
             Ok(m) => Ok(sum + m.blocks() * 512),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(sum),
             Err(e) => Err(e),
-        })
+        },
+    )
 }
 
 fn header(magic: &[u8; 8], generation: u64) -> Vec<u8> {
@@ -236,7 +343,7 @@ impl SmallObjectStore {
             // A payload may have sealed after the last access flush. Its fresh
             // recovery age must be saved even if it is never read again.
             state.full |= matched < residents;
-            *self.journal.access_disk.lock().unwrap() = state;
+            *self.journal.access.disk.lock().unwrap() = state;
             Ok(())
         })();
         if let Err(error) = result {
@@ -318,141 +425,190 @@ impl SmallObjectStore {
         budget: Option<Arc<crate::background::BackgroundBudget>>,
         stop: Option<&watch::Receiver<bool>>,
     ) -> io::Result<()> {
-        let store = self.clone();
         let stop = stop.cloned();
+        let store = self.clone();
         self.tasks
             .run(async move {
-                let _gate = store.access_checkpoint.lock().await;
-                if store.has_recency() {
-                    store.enable_access_tracking()?;
-                    return store
-                        .checkpoint_compact_access(budget.as_deref(), stop.as_ref())
-                        .await;
-                }
-                let prepare = store.clone();
-                let prepare_stop = stop.clone();
-                let (mut state, full, bytes) =
-                    tokio::task::spawn_blocking(move || -> io::Result<_> {
-                        prepare.enable_access_tracking()?;
-                        let mut state = *prepare.journal.access_disk.lock().unwrap();
-                        let overflow = prepare.access_dirty.overflow.swap(false, Ordering::AcqRel);
-                        let full = state.full
-                            || overflow
-                            || state.log_bytes
-                                >= MIN_COMPACT_BYTES.max(state.snapshot_bytes.div_ceil(2));
-                        // Failure after consuming dirty state must retry from all live
-                        // timestamps, including a partial append or ambiguous rename.
-                        prepare.journal.access_disk.lock().unwrap().full = true;
-                        if full && checkpoint_stopped(prepare_stop.as_ref()) {
-                            return Err(io::ErrorKind::Interrupted.into());
-                        }
-                        let pending =
-                            std::mem::take(&mut *prepare.access_dirty.pending.lock().unwrap());
-                        let mut bytes = Vec::new();
-                        if full {
-                            state.generation = state
-                                .generation
-                                .checked_add(1)
-                                .ok_or_else(|| invalid("access generation exhausted"))?;
-                            bytes = header(MAGIC, state.generation);
-                            for stream in prepare.streams() {
-                                if checkpoint_stopped(prepare_stop.as_ref()) {
-                                    return Err(io::ErrorKind::Interrupted.into());
-                                }
-                                let entries: Vec<_> = stream
-                                    .entries
-                                    .read()
-                                    .unwrap()
-                                    .iter()
-                                    .filter_map(|(key, loc)| {
-                                        loc.access.clone().map(|access| (key.clone(), access))
-                                    })
-                                    .collect();
-                                for (key, access) in entries {
-                                    if checkpoint_stopped(prepare_stop.as_ref()) {
-                                        return Err(io::ErrorKind::Interrupted.into());
-                                    }
-                                    encode(&mut bytes, &key, access.sample_small())?;
-                                }
-                            }
-                        } else {
-                            for token in pending.keys.values() {
-                                token.consume();
-                                if let Some(access) =
-                                    prepare.lookup_entry(&token.key)?.and_then(|loc| loc.access)
-                                {
-                                    // Deleted/re-admitted keys have a different clock.
-                                    if Arc::ptr_eq(access.clock(), &token.clock) {
-                                        encode(&mut bytes, &token.key, access.last_access())?;
-                                    }
-                                }
-                            }
-                        }
-                        Ok((state, full, Bytes::from(bytes)))
-                    })
+                store
+                    .flush_access(budget.as_deref(), Flush::Periodic(stop.as_ref()))
                     .await
-                    .map_err(io::Error::other)??;
-                #[cfg(test)]
-                {
-                    let pause = store.access_pause.lock().unwrap().take();
-                    if let Some((entered, release)) = pause {
-                        entered.notify_one();
-                        release.notified().await;
-                    }
-                }
-                let written = full || !bytes.is_empty();
-                if full {
-                    state.snapshot_bytes = bytes.len() as u64;
-                    store
-                        .publish_access(FILE, bytes, budget.as_deref(), stop.as_ref())
-                        .await?;
-                    store
-                        .publish_access(
-                            LOG,
-                            header(LOG_MAGIC, state.generation).into(),
-                            budget.as_deref(),
-                            None,
-                        )
-                        .await?;
-                    state.log_bytes = HEADER;
-                } else if !bytes.is_empty() {
-                    let fd = disk_io::open(store.root.join(LOG), disk_io::Open::Update).await?;
-                    store
-                        .write_access(
-                            fd.clone(),
-                            bytes.clone(),
-                            state.log_bytes,
-                            budget.as_deref(),
-                            None,
-                        )
-                        .await?;
-                    state.log_bytes += bytes.len() as u64;
-                }
-                if written {
-                    let root = store.root.clone();
-                    let size = tokio::task::spawn_blocking(move || allocated(&root))
-                        .await
-                        .map_err(io::Error::other)??;
-                    store.journal.access_bytes.store(size, Ordering::Relaxed);
-                }
-                state.full = false;
-                *store.journal.access_disk.lock().unwrap() = state;
-                Ok(())
             })
             .await
     }
 
-    async fn write_access(
-        &self,
-        fd: Arc<OwnedFd>,
-        bytes: Bytes,
-        offset: u64,
-        budget: Option<&crate::background::BackgroundBudget>,
-        stop: Option<&watch::Receiver<bool>>,
+    pub(crate) async fn checkpoint_access_on_shutdown(
+        self: &Arc<Self>,
+        budget: Option<Arc<crate::background::BackgroundBudget>>,
+        deadline: TokioInstant,
     ) -> io::Result<()> {
-        self.write_access_chunks(&fd, bytes, offset, budget, stop)
-            .await?;
-        self.sync_access(fd, budget, stop).await
+        let store = self.clone();
+        self.tasks
+            .run(async move {
+                store
+                    .flush_access(
+                        budget.as_deref(),
+                        Flush::Shutdown {
+                            deadline,
+                            bytes: SHUTDOWN_DELTA_BYTES,
+                        },
+                    )
+                    .await
+            })
+            .await
+    }
+
+    async fn flush_access(
+        self: &Arc<Self>,
+        budget: Option<&crate::background::BackgroundBudget>,
+        flush: Flush<'_>,
+    ) -> io::Result<()> {
+        let _gate = flush.wait(self.access_checkpoint.lock()).await?;
+        self.enable_access_tracking()?;
+        let persistence = &self.journal.access;
+        if self.has_recency() {
+            // Cleanup must remain serialized with log repair and Replace.
+            let _relocation = flush.wait(persistence.relocation.write()).await?;
+            let result = self.checkpoint_compact_access(budget, flush).await;
+            persistence.refresh_allocated(result).await
+        } else {
+            let result = self.checkpoint_keyed_access(budget, flush).await;
+            persistence.refresh_allocated(result).await
+        }
+    }
+
+    async fn checkpoint_keyed_access(
+        self: &Arc<Self>,
+        budget: Option<&crate::background::BackgroundBudget>,
+        flush: Flush<'_>,
+    ) -> io::Result<bool> {
+        let prepare = self.clone();
+        let stop = match flush {
+            Flush::Periodic(stop) => stop.cloned(),
+            _ => None,
+        };
+        let shutdown = match flush {
+            Flush::Shutdown { deadline, bytes } => Some((deadline, bytes)),
+            _ => None,
+        };
+        let Some((mut state, full, bytes)) =
+            tokio::task::spawn_blocking(move || -> io::Result<_> {
+                let flush = shutdown.map_or(Flush::Periodic(stop.as_ref()), |(deadline, bytes)| {
+                    Flush::Shutdown { deadline, bytes }
+                });
+                let disk = &prepare.journal.access.disk;
+                let mut state = *disk.lock().unwrap();
+                let overflow = prepare.access_dirty.overflow.swap(false, Ordering::AcqRel);
+                let full = state.full
+                    || overflow
+                    || state.log_bytes >= MIN_COMPACT_BYTES.max(state.snapshot_bytes.div_ceil(2));
+                // An interrupted flush may have consumed dirty state.
+                disk.lock().unwrap().full = true;
+                if full && !flush.allows_full() {
+                    return Ok(None);
+                }
+                flush.check()?;
+                let pending = std::mem::take(&mut *prepare.access_dirty.pending.lock().unwrap());
+                let mut bytes = Vec::new();
+                if full {
+                    state.generation = state
+                        .generation
+                        .checked_add(1)
+                        .ok_or_else(|| invalid("access generation exhausted"))?;
+                    bytes = header(MAGIC, state.generation);
+                    for stream in prepare.streams() {
+                        flush.check()?;
+                        let entries: Vec<_> = stream
+                            .entries
+                            .read()
+                            .unwrap()
+                            .iter()
+                            .filter_map(|(key, loc)| {
+                                loc.access.clone().map(|access| (key.clone(), access))
+                            })
+                            .collect();
+                        for (key, access) in entries {
+                            flush.check()?;
+                            encode(&mut bytes, &key, access.sample_small())?;
+                        }
+                    }
+                } else {
+                    for token in pending.keys.values() {
+                        flush.check()?;
+                        token.consume();
+                        if let Some(access) =
+                            prepare.lookup_entry(&token.key)?.and_then(|loc| loc.access)
+                        {
+                            // Deleted/re-admitted keys have a different clock.
+                            if Arc::ptr_eq(access.clock(), &token.clock) {
+                                encode(&mut bytes, &token.key, access.last_access())?;
+                                if bytes.len() as u64 > flush.byte_limit() {
+                                    return Err(io::ErrorKind::Interrupted.into());
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(Some((state, full, Bytes::from(bytes))))
+            })
+            .await
+            .map_err(io::Error::other)??
+        else {
+            return Ok(false);
+        };
+        #[cfg(test)]
+        self.pause_access_flush().await;
+        let persistence = &self.journal.access;
+        let root = &persistence.root;
+        let written = full || !bytes.is_empty();
+        if full {
+            state.snapshot_bytes = bytes.len() as u64;
+            let tmp = root.join(SNAPSHOT_TEMP);
+            let fd = {
+                let _io = flush.grant(budget, 0).await?;
+                disk_io::open(tmp.clone(), disk_io::Open::Replace).await?
+            };
+            self.write_access_chunks(&fd, bytes, 0, budget, flush)
+                .await?;
+            self.sync_access(fd, budget, flush).await?;
+            // Complete both directory updates under the publication grant.
+            let _io = flush.grant(budget, HEADER as usize).await?;
+            disk_io::rename(tmp, root.join(FILE)).await?;
+            state.log_bytes = 0;
+            *persistence.disk.lock().unwrap() = DiskState {
+                full: true,
+                ..state
+            };
+            disk_io::sync_dir(root.clone()).await?;
+            let temp = root.join(LOG_TEMP);
+            let fd = disk_io::open(temp.clone(), disk_io::Open::Replace).await?;
+            disk_io::write(fd.clone(), header(LOG_MAGIC, state.generation).into(), 0).await?;
+            disk_io::sync(fd).await?;
+            disk_io::rename(temp, root.join(LOG)).await?;
+            disk_io::sync_dir(root.clone()).await?;
+            state.log_bytes = HEADER;
+        } else if !bytes.is_empty() {
+            let fd = {
+                let _io = flush.grant(budget, 0).await?;
+                disk_io::open(root.join(LOG), disk_io::Open::Update).await?
+            };
+            let len = bytes.len() as u64;
+            self.write_access_chunks(&fd, bytes, state.log_bytes, budget, flush)
+                .await?;
+            state.log_bytes += len;
+            self.sync_access(fd, budget, flush).await?;
+        }
+        state.full = false;
+        *persistence.disk.lock().unwrap() = state;
+        Ok(written)
+    }
+
+    #[cfg(test)]
+    async fn pause_access_flush(&self) {
+        let pause = self.access_pause.lock().unwrap().take();
+        if let Some((entered, release)) = pause {
+            entered.notify_one();
+            release.notified().await;
+        }
     }
 
     async fn write_access_chunks(
@@ -461,11 +617,11 @@ impl SmallObjectStore {
         bytes: Bytes,
         offset: u64,
         budget: Option<&crate::background::BackgroundBudget>,
-        stop: Option<&watch::Receiver<bool>>,
+        flush: Flush<'_>,
     ) -> io::Result<()> {
-        for start in (0..bytes.len()).step_by(64 << 10) {
-            let end = (start + (64 << 10)).min(bytes.len());
-            let _io = access_grant(budget, end - start, stop).await?;
+        for start in (0..bytes.len()).step_by(WRITE_BYTES) {
+            let end = (start + WRITE_BYTES).min(bytes.len());
+            let _io = flush.grant(budget, end - start).await?;
             disk_io::write(fd.clone(), bytes.slice(start..end), offset + start as u64).await?;
         }
         Ok(())
@@ -475,29 +631,9 @@ impl SmallObjectStore {
         &self,
         fd: Arc<OwnedFd>,
         budget: Option<&crate::background::BackgroundBudget>,
-        stop: Option<&watch::Receiver<bool>>,
+        flush: Flush<'_>,
     ) -> io::Result<()> {
-        let _io = access_grant(budget, 0, stop).await?;
+        let _io = flush.grant(budget, 0).await?;
         disk_io::sync(fd).await
-    }
-
-    async fn publish_access(
-        &self,
-        name: &str,
-        bytes: Bytes,
-        budget: Option<&crate::background::BackgroundBudget>,
-        stop: Option<&watch::Receiver<bool>>,
-    ) -> io::Result<()> {
-        let tmp = self.root.join(format!("{name}.tmp"));
-        let fd = {
-            let _io = access_grant(budget, 0, stop).await?;
-            disk_io::open(tmp.clone(), disk_io::Open::Replace).await?
-        };
-        self.write_access_chunks(&fd, bytes, 0, budget, stop)
-            .await?;
-        self.sync_access(fd, budget, stop).await?;
-        let _io = access_grant(budget, 0, stop).await?;
-        disk_io::rename(tmp, self.root.join(name)).await?;
-        disk_io::sync_dir(self.root.clone()).await
     }
 }

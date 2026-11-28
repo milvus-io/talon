@@ -91,9 +91,19 @@ fn runtime_with_tracking(
         ranges: Mutex::new(Vec::new()),
     });
     std::fs::create_dir_all(root).unwrap();
-    let small =
-        cache_routing::open_small_store(root, threshold, segment, capacity, None, None, None)
-            .unwrap();
+    let small = cache_routing::open_small_store(
+        root,
+        crate::small_store::SmallStoreOptions {
+            threshold,
+            segment_size: segment,
+            capacity,
+            compact: false,
+        },
+        None,
+        None,
+        None,
+    )
+    .unwrap();
     let store = WholeBlockStore::open(root).unwrap();
     let index = Arc::new(BlockIndex::new());
     store.restore_index(&index).unwrap();
@@ -217,9 +227,12 @@ async fn small_routing_rejects_whole_only_upgrade_without_orphaning_files() {
         if versioned {
             assert!(cache_routing::open_small_store(
                 dir.path(),
-                0,
-                256 << 10,
-                16 << 20,
+                crate::small_store::SmallStoreOptions {
+                    threshold: 0,
+                    segment_size: 256 << 10,
+                    capacity: 16 << 20,
+                    compact: false,
+                },
                 None,
                 None,
                 None
@@ -233,9 +246,12 @@ async fn small_routing_rejects_whole_only_upgrade_without_orphaning_files() {
         drop(store);
         assert!(cache_routing::open_small_store(
             dir.path(),
-            128 << 10,
-            256 << 10,
-            16 << 20,
+            crate::small_store::SmallStoreOptions {
+                threshold: 128 << 10,
+                segment_size: 256 << 10,
+                capacity: 16 << 20,
+                compact: false,
+            },
             None,
             None,
             None
@@ -544,9 +560,12 @@ async fn small_routing_rejects_incompatible_or_unversioned_cache_at_startup() {
     for threshold in [0, 64 << 10, 256 << 10] {
         let error = cache_routing::open_small_store(
             dir.path(),
-            threshold,
-            512 << 10,
-            16 << 20,
+            crate::small_store::SmallStoreOptions {
+                threshold,
+                segment_size: 512 << 10,
+                capacity: 16 << 20,
+                compact: false,
+            },
             None,
             None,
             None,
@@ -564,9 +583,12 @@ async fn small_routing_rejects_incompatible_or_unversioned_cache_at_startup() {
     std::fs::write(&marker, b"broken").unwrap();
     let error = cache_routing::open_small_store(
         dir.path(),
-        128 << 10,
-        256 << 10,
-        16 << 20,
+        crate::small_store::SmallStoreOptions {
+            threshold: 128 << 10,
+            segment_size: 256 << 10,
+            capacity: 16 << 20,
+            compact: false,
+        },
         None,
         None,
         None,
@@ -577,9 +599,12 @@ async fn small_routing_rejects_incompatible_or_unversioned_cache_at_startup() {
     std::fs::remove_file(&marker).unwrap();
     let error = cache_routing::open_small_store(
         dir.path(),
-        128 << 10,
-        256 << 10,
-        16 << 20,
+        crate::small_store::SmallStoreOptions {
+            threshold: 128 << 10,
+            segment_size: 256 << 10,
+            capacity: 16 << 20,
+            compact: false,
+        },
         None,
         None,
         None,
@@ -1092,7 +1117,7 @@ async fn worker_shutdown_interrupts_throttled_compact_access_before_sealing_tail
         .await
         .unwrap();
     assert_eq!(budget.charged_bytes(), charged, "drain started a rewrite");
-    assert_eq!(std::fs::metadata(&tmp).unwrap().len(), 16);
+    assert!(!tmp.exists());
     assert_eq!(std::fs::read(&snapshot).unwrap(), durable_snapshot);
     assert_eq!(std::fs::read(&log).unwrap(), durable_log);
     drop(worker);

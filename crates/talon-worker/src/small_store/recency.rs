@@ -90,8 +90,8 @@ impl Recency {
         time != 0 && value.fetch_max(time.min(self.started), Relaxed) == 0
     }
 
-    pub fn value(&self, segment: u64, row: usize) -> &AtomicU64 {
-        &self.rows[&segment].times[row]
+    pub fn segment_times(&self, segment: u64) -> &[AtomicU64] {
+        &self.rows[&segment].times
     }
 
     pub fn mark_durable(&mut self, segment: u64, end: u64) {
@@ -273,13 +273,20 @@ impl Catalog {
         }
     }
 
-    pub(super) fn relocate_recency(&self, old: Address, new_slot: usize) {
+    pub(super) fn relocate_recency(&self, old: Address, new_slot: usize, persisted: bool) {
         if let Some(recency) = &self.recency {
             let (segment, row) = self.row(self.lookup.handle(new_slot)).unwrap();
             let old_row = self.segment(old.0).unwrap().records.position(old.1);
-            let time = recency.rows[&old.0].times[old_row].load(Relaxed);
-            recency.rows[&segment].times[row].store(time | DIRTY, Relaxed);
-            recency.mark_dirty(segment, row);
+            // Publication holds the catalog write lock. Keep any hit that
+            // arrived after sampling the source for the relocation log.
+            let mut value = recency.rows[&old.0].times[old_row].load(Relaxed);
+            if !persisted {
+                value |= DIRTY;
+            }
+            recency.rows[&segment].times[row].store(value, Relaxed);
+            if value & DIRTY != 0 {
+                recency.mark_dirty(segment, row);
+            }
         }
     }
 

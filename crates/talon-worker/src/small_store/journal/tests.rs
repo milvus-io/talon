@@ -629,13 +629,15 @@ async fn recovered_small_store_tail_uses_initial_snapshot_budget() {
     let store = Arc::new(
         crate::small_store::SmallObjectStore::open_with_service(
             root.clone(),
-            128 << 10,
-            256 << 10,
-            4 << 20,
+            crate::small_store::SmallStoreOptions {
+                threshold: 128 << 10,
+                segment_size: 256 << 10,
+                capacity: 4 << 20,
+                compact: true,
+            },
             None,
             Some(&service),
             Some(budget),
-            true,
         )
         .unwrap(),
     );
